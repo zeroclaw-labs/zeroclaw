@@ -37,7 +37,10 @@ Use a fresh mock and runtime data directory for each run. Configure:
   same setting and history policy in both runs.
 
 Every tool has a 3,072-byte input schema using Python's default JSON serialization
-(compact wire encoding is slightly smaller). One turn makes **25 sequential real
+(compact wire encoding is slightly smaller). The synthetic schema has three
+simple properties and reaches that size by padding a description. It does not
+represent the allocation shape of every deeply nested real-world MCP schema;
+report this shape as well as the serialized size. One turn makes **25 sequential real
 MCP calls**, then a 26th provider request yields the final answer. The iteration
 cap therefore needs to be 26, not 25. Names cycle deterministically across all 36
 tools; arguments and call IDs are unique per turn/step. The mock refuses to advance
