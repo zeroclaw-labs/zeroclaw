@@ -85,6 +85,8 @@ file edits require the normal daemon reload (or a standalone gateway restart).
 
 `POST /admin/reload` re-reads `config.toml` and rebuilds every subsystem in place (same PID, sub-second downtime). It is the supported way to apply config changes without a full restart. By default it only accepts **loopback** callers, so a remote dashboard or `curl` from another machine gets `403 Forbidden`.
 
+A reload replaces the gateway instance, so chat WebSocket connections opened before it cannot run further turns. The gateway closes them with close code `1001` (going away) once they are idle; a turn in progress finishes first. Clients should treat that close as "connect again": the dashboard does so automatically.
+
 To allow authenticated remote reloads:
 
 ```toml
