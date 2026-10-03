@@ -48,6 +48,13 @@ const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
+/// The host the desktop app opens its dashboard on. With RPC readiness the
+/// supervisor pins the daemon's gateway to it, so the address the core
+/// reports as bound is the address the app dials.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_GATEWAY_HOST: &str = "127.0.0.1";
+/// How often RPC readiness retries the daemon endpoint while it starts.
+const DESKTOP_ENDPOINT_POLL: Duration = Duration::from_millis(100);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -747,11 +754,6 @@ fn emit_desktop_frame(frame: &str) {
     let _ = std::io::Write::flush(&mut stdout);
 }
 
-fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
-    let line = desktop_handshake_frame(prefix, message);
-    emit_desktop_frame(&line);
-}
-
 fn emit_desktop_error(error: &anyhow::Error) {
     let frame = desktop_error_frame(error);
     emit_desktop_frame(&frame);
@@ -1325,31 +1327,192 @@ async fn supervise_launchd_child(
     }
 }
 
+/// When the desktop supervisor tells the app that launched it that the
+/// daemon is ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DesktopReadiness {
+    /// `READY` as soon as the daemon child starts: the exact line every
+    /// desktop app understands, and the default.
+    Spawned,
+    /// `READY {"endpoint":…,"pid":…}` once the daemon child itself serves its
+    /// RPC endpoint. The supervisor pins that endpoint for every generation
+    /// through `ZEROCLAW_SOCKET`, so the app never derives it. Opt-in: only an
+    /// app that asked for it can parse the extended frame.
+    Rpc { endpoint: PathBuf },
+}
+
+/// Why the daemon never became ready under [`DesktopReadiness::Rpc`]. The
+/// supervisor reports it as `ERROR {"reason":…,"message":…}`.
+#[derive(Debug)]
+struct DesktopReadinessFailure {
+    /// `endpoint_held` or `daemon_exited`.
+    reason: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for DesktopReadinessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DesktopReadinessFailure {}
+
+fn desktop_rpc_ready_frame(endpoint: &Path, pid: Option<u32>) -> String {
+    let body = serde_json::json!({
+        "endpoint": endpoint.to_string_lossy(),
+        "pid": pid,
+    });
+    desktop_handshake_frame("READY", Some(&body.to_string()))
+}
+
+/// The structured `ERROR {"reason":…,"message":…}` frame. When it would
+/// exceed [`DESKTOP_READINESS_FRAME_MAX_BYTES`], the message is shortened and
+/// the body serialized again until the frame fits, so the reader always gets
+/// valid JSON with its reason. Cutting the serialized bytes instead could
+/// split an escape sequence or drop the closing brace.
+fn desktop_failure_frame(failure: &DesktopReadinessFailure) -> String {
+    // `ERROR `, the body, and the newline must fit the frame.
+    let budget = DESKTOP_READINESS_FRAME_MAX_BYTES - "ERROR ".len() - 1;
+    // Every character serializes to at least one byte, so no more than
+    // `budget` of them can ever fit.
+    let mut message: String = failure.message.chars().take(budget).collect();
+    let mut shortened = message.len() < failure.message.len();
+    loop {
+        let text = if shortened {
+            format!("{message}...")
+        } else {
+            message.clone()
+        };
+        let body = serde_json::json!({ "reason": failure.reason, "message": text }).to_string();
+        if body.len() <= budget {
+            return desktop_handshake_frame("ERROR", Some(&body));
+        }
+        // A character serializes to at most six bytes (`\u001f`), so dropping
+        // this many removes at most a few bytes more than the excess.
+        let excess_chars = (body.len() - budget).div_ceil(6);
+        let keep = message.chars().count().saturating_sub(excess_chars);
+        message = message.chars().take(keep).collect();
+        shortened = true;
+    }
+}
+
+/// The frame reporting `error`: structured for a readiness failure, the
+/// plain `ERROR <message>` line otherwise.
+fn desktop_error_result_frame(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<DesktopReadinessFailure>() {
+        Some(failure) => desktop_failure_frame(failure),
+        None => desktop_error_frame(error),
+    }
+}
+
+/// The endpoint the desktop daemon binds, resolved the way the daemon
+/// resolves it, so the app never has to derive it.
+async fn desktop_rpc_endpoint() -> Result<PathBuf> {
+    let (_, data_dir) = resolve_runtime_dirs().await?;
+    Ok(crate::rpc::local::socket_path_for_data_dir(&data_dir))
+}
+
+/// Wait until `endpoint` accepts connections. On Unix the kernel reports who
+/// serves it: when that is not the daemon child `pid`, another process holds
+/// the endpoint and the child can never bind it. Windows cannot attribute a
+/// pipe server here, so an open pipe counts as ready.
+async fn wait_for_desktop_endpoint(
+    endpoint: &Path,
+    pid: Option<u32>,
+) -> std::result::Result<(), DesktopReadinessFailure> {
+    loop {
+        #[cfg(unix)]
+        if let Ok(stream) = tokio::net::UnixStream::connect(endpoint).await {
+            let served_by = stream.peer_cred().ok().and_then(|cred| cred.pid());
+            return match (served_by, pid) {
+                (Some(served_by), Some(child)) if u32::try_from(served_by).ok() != Some(child) => {
+                    Err(DesktopReadinessFailure {
+                        reason: "endpoint_held",
+                        message: format!(
+                            "another process (pid {served_by}) already serves the daemon endpoint {}",
+                            endpoint.display()
+                        ),
+                    })
+                }
+                _ => Ok(()),
+            };
+        }
+        #[cfg(windows)]
+        if tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(endpoint.as_os_str())
+            .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(DESKTOP_ENDPOINT_POLL).await;
+    }
+}
+
+/// The supervised daemon's arguments. `gateway_host`, set in RPC-readiness
+/// mode, overrides the configured gateway host.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn desktop_daemon_args(port: u16, gateway_host: Option<&str>) -> Vec<String> {
+    let mut args = vec!["daemon".to_string(), "-p".to_string(), port.to_string()];
+    if let Some(host) = gateway_host {
+        args.extend(["--host".to_string(), host.to_string()]);
+    }
+    args
+}
+
+/// Run the desktop supervisor. `rpc_readiness` selects
+/// [`DesktopReadiness::Rpc`]; without it the supervisor keeps the `READY`
+/// line older desktop apps expect.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+pub async fn run_desktop_daemon(port: u16, rpc_readiness: bool) -> Result<()> {
     let path = handle_desktop_preflight(desktop_log_path().await, emit_desktop_error)?;
     let executable = handle_desktop_preflight(
         std::env::current_exe().context("Failed to resolve the desktop daemon executable"),
         emit_desktop_error,
     )?;
-    run_desktop_capture_with_executable(path, executable, port).await
+    let readiness = if rpc_readiness {
+        let endpoint = handle_desktop_preflight(desktop_rpc_endpoint().await, emit_desktop_error)?;
+        DesktopReadiness::Rpc { endpoint }
+    } else {
+        DesktopReadiness::Spawned
+    };
+    run_desktop_capture_with_executable(path, executable, port, readiness).await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub async fn run_desktop_daemon(port: u16) -> Result<()> {
-    let _ = port;
+pub async fn run_desktop_daemon(port: u16, rpc_readiness: bool) -> Result<()> {
+    let _ = (port, rpc_readiness);
     bail!("the desktop daemon runner is unsupported on this platform")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[cfg(test)]
 async fn run_with_desktop_capture<F>(path: PathBuf, make_command: F) -> Result<()>
+where
+    F: FnMut() -> Result<TokioCommand>,
+{
+    run_with_desktop_capture_mode(
+        path,
+        &DesktopReadiness::Spawned,
+        make_command,
+        &mut emit_desktop_frame,
+    )
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_with_desktop_capture_mode<F>(
+    path: PathBuf,
+    readiness: &DesktopReadiness,
+    make_command: F,
+    emit: &mut dyn FnMut(&str),
+) -> Result<()>
 where
     F: FnMut() -> Result<TokioCommand>,
 {
     let writers = match ServiceLogWriters::open_combined(&path) {
         Ok(writers) => writers,
         Err(error) => {
-            emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+            emit(&desktop_error_frame(&error));
             return Err(error);
         }
     };
@@ -1358,29 +1521,39 @@ where
         .parent()
         .context("desktop log path has no logs directory")?
         .to_path_buf();
-    let result =
-        async { supervise_desktop_child(&mut make_command, &writers, &logs_dir).await }.await;
+    let result = async {
+        supervise_desktop_child(&mut make_command, &writers, &logs_dir, readiness, emit).await
+    }
+    .await;
     if let Err(error) = &result {
         writers
             .stderr
             .push(format!("desktop capture failed: {error:#}\n").into_bytes());
-        emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+        emit(&desktop_error_result_frame(error));
     }
     writers.finish().await;
     result
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn run_desktop_capture_with_executable(
     path: PathBuf,
     executable: PathBuf,
     port: u16,
+    readiness: DesktopReadiness,
 ) -> Result<()> {
-    run_with_desktop_capture(path, move || {
-        let mut command = TokioCommand::new(&executable);
-        command.arg("daemon").arg("-p").arg(port.to_string());
-        Ok(command)
-    })
+    let gateway_host =
+        matches!(readiness, DesktopReadiness::Rpc { .. }).then_some(DESKTOP_GATEWAY_HOST);
+    run_with_desktop_capture_mode(
+        path,
+        &readiness,
+        move || {
+            let mut command = TokioCommand::new(&executable);
+            command.args(desktop_daemon_args(port, gateway_host));
+            Ok(command)
+        },
+        &mut emit_desktop_frame,
+    )
     .await
 }
 
@@ -1438,6 +1611,8 @@ async fn supervise_desktop_child(
     make_command: &mut impl FnMut() -> Result<TokioCommand>,
     writers: &ServiceLogWriters,
     logs_dir: &Path,
+    readiness: &DesktopReadiness,
+    emit: &mut dyn FnMut(&str),
 ) -> Result<()> {
     #[cfg(unix)]
     let mut signals = ServiceSignals::new()?;
@@ -1452,6 +1627,9 @@ async fn supervise_desktop_child(
             .env(crate::restart::DESKTOP_SUPERVISED_ENV, "1")
             .env(crate::restart::DESKTOP_RESTART_MARKER_ENV, &marker_path)
             .kill_on_drop(true);
+        if let DesktopReadiness::Rpc { endpoint } = readiness {
+            command.env("ZEROCLAW_SOCKET", endpoint);
+        }
         #[cfg(windows)]
         let mut child = {
             let mut command = CommandWrap::from(command);
@@ -1494,8 +1672,44 @@ async fn supervise_desktop_child(
         let stderr_task =
             zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop", None));
         if first_generation {
-            emit_desktop_handshake("READY", None);
             first_generation = false;
+            match readiness {
+                DesktopReadiness::Spawned => emit(&desktop_handshake_frame("READY", None)),
+                DesktopReadiness::Rpc { endpoint } => {
+                    let pid = child.id();
+                    let failure = tokio::select! {
+                        ready = wait_for_desktop_endpoint(endpoint, pid) => match ready {
+                            Ok(()) => {
+                                emit(&desktop_rpc_ready_frame(endpoint, pid));
+                                None
+                            }
+                            Err(failure) => {
+                                let _ = child.start_kill();
+                                let _ = child.wait().await;
+                                Some(failure)
+                            }
+                        },
+                        status = child.wait() => Some(DesktopReadinessFailure {
+                            reason: "daemon_exited",
+                            message: match status {
+                                Ok(status) => format!(
+                                    "the daemon exited before its RPC endpoint {} was ready ({status})",
+                                    endpoint.display()
+                                ),
+                                Err(error) => format!(
+                                    "the daemon stopped before its RPC endpoint {} was ready: {error}",
+                                    endpoint.display()
+                                ),
+                            },
+                        }),
+                    };
+                    if let Some(failure) = failure {
+                        finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT)
+                            .await;
+                        return Err(failure.into());
+                    }
+                }
+            }
         }
         #[cfg(unix)]
         let outcome = wait_for_service_child(&mut child, &mut signals).await;
@@ -3601,6 +3815,28 @@ mod bounded_service_log_tests {
                     .expect("write nonzero fixture");
                 std::process::exit(7);
             }
+            // Bind the endpoint the supervisor pinned, a little after
+            // starting, and serve it until the supervisor is done.
+            #[cfg(unix)]
+            Ok("serve-socket") => {
+                let endpoint = std::env::var_os("ZEROCLAW_SOCKET").expect("pinned endpoint");
+                std::thread::sleep(Duration::from_millis(300));
+                let listener =
+                    std::os::unix::net::UnixListener::bind(endpoint).expect("bind endpoint");
+                listener
+                    .set_nonblocking(true)
+                    .expect("non-blocking listener");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    let _ = listener.accept();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::process::exit(0);
+            }
+            Ok("idle") => {
+                std::thread::sleep(Duration::from_secs(10));
+                std::process::exit(0);
+            }
             mode => panic!("unexpected desktop capture helper mode: {mode:?}"),
         }
     }
@@ -3943,6 +4179,175 @@ mod bounded_service_log_tests {
         assert_eq!(frame.matches('\n').count(), 1);
     }
 
+    async fn capture_frames(
+        readiness: DesktopReadiness,
+        mode: &str,
+    ) -> (Result<()>, Vec<String>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut frames = Vec::new();
+        let result = run_with_desktop_capture_mode(
+            path,
+            &readiness,
+            || Ok(desktop_capture_test_command(mode)),
+            &mut |frame: &str| frames.push(frame.to_string()),
+        )
+        .await;
+        (result, frames, dir)
+    }
+
+    fn frame_json(frame: &str, prefix: &str) -> serde_json::Value {
+        let body = frame
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .unwrap_or_else(|| panic!("expected a {prefix} frame, got {frame:?}"));
+        serde_json::from_str(body.trim_end()).expect("structured readiness frame")
+    }
+
+    #[tokio::test]
+    async fn desktop_default_readiness_keeps_the_exact_ready_line() {
+        let (result, frames, _dir) = capture_frames(DesktopReadiness::Spawned, "streams").await;
+        result.expect("child exits cleanly");
+        assert_eq!(frames, ["READY\n"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_rpc_readiness_waits_for_the_child_to_serve_its_endpoint() {
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let endpoint = socket_dir.path().join("d.sock");
+        let (result, frames, _dir) = capture_frames(
+            DesktopReadiness::Rpc {
+                endpoint: endpoint.clone(),
+            },
+            "serve-socket",
+        )
+        .await;
+        result.expect("child exits cleanly after serving");
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let ready = frame_json(&frames[0], "READY");
+        assert_eq!(ready["endpoint"], endpoint.to_string_lossy().as_ref());
+        let pid = ready["pid"].as_u64().expect("child pid in the frame");
+        assert_ne!(pid, u64::from(std::process::id()));
+        assert!(frames[0].len() <= DESKTOP_READINESS_FRAME_MAX_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_rpc_readiness_reports_an_endpoint_held_by_another_process() {
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let endpoint = socket_dir.path().join("d.sock");
+        // This test process holds the endpoint; the child never binds it.
+        let _held = std::os::unix::net::UnixListener::bind(&endpoint).expect("hold endpoint");
+        let started = Instant::now();
+        let (result, frames, _dir) = capture_frames(
+            DesktopReadiness::Rpc {
+                endpoint: endpoint.clone(),
+            },
+            "idle",
+        )
+        .await;
+        let error = result.expect_err("a held endpoint fails readiness");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the idle child was not stopped"
+        );
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let failure = frame_json(&frames[0], "ERROR");
+        assert_eq!(failure["reason"], "endpoint_held");
+        let message = failure["message"].as_str().expect("message");
+        assert!(
+            message.contains(&format!("pid {}", std::process::id())),
+            "{message}"
+        );
+        assert!(error.to_string().contains("already serves"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_rpc_readiness_reports_a_daemon_that_exits_first() {
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let (result, frames, _dir) = capture_frames(
+            DesktopReadiness::Rpc {
+                endpoint: socket_dir.path().join("d.sock"),
+            },
+            "nonzero",
+        )
+        .await;
+        result.expect_err("an early exit fails readiness");
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        let failure = frame_json(&frames[0], "ERROR");
+        assert_eq!(failure["reason"], "daemon_exited");
+        assert!(
+            failure["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("before its RPC endpoint"))
+        );
+    }
+
+    #[test]
+    fn desktop_failure_frame_stays_valid_json_within_the_frame_limit() {
+        for (label, original) in [
+            (
+                "three-byte characters",
+                "界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES),
+            ),
+            ("four-byte characters", "🦀".repeat(1024)),
+            ("JSON escapes", "\u{0001}".repeat(1024)),
+            ("quotes and backslashes", "\"\\".repeat(2048)),
+            ("ASCII", "x".repeat(5000)),
+        ] {
+            let frame = desktop_failure_frame(&DesktopReadinessFailure {
+                reason: "daemon_exited",
+                message: original.clone(),
+            });
+            assert!(
+                frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES,
+                "{label}: {} bytes",
+                frame.len()
+            );
+            assert!(
+                frame.ends_with('\n') && !frame.ends_with("...\n"),
+                "{label}"
+            );
+            let body = frame_json(&frame, "ERROR");
+            assert_eq!(body["reason"], "daemon_exited", "{label}");
+            let message = body["message"].as_str().expect("message");
+            let kept = message
+                .strip_suffix("...")
+                .expect("a shortened message says so");
+            assert!(!kept.is_empty() && original.starts_with(kept), "{label}");
+            // Shortened only as far as the limit needs.
+            assert!(
+                frame.len() + 8 > DESKTOP_READINESS_FRAME_MAX_BYTES,
+                "{label}: {} bytes",
+                frame.len()
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_daemon_pins_its_gateway_host_only_for_rpc_readiness() {
+        assert_eq!(desktop_daemon_args(42617, None), ["daemon", "-p", "42617"]);
+        assert_eq!(
+            desktop_daemon_args(42617, Some(DESKTOP_GATEWAY_HOST)),
+            ["daemon", "-p", "42617", "--host", "127.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn desktop_failure_frame_keeps_a_short_message_whole() {
+        let frame = desktop_failure_frame(&DesktopReadinessFailure {
+            reason: "endpoint_held",
+            message: "another process (pid 7) already serves \"d.sock\"".to_string(),
+        });
+        let body = frame_json(&frame, "ERROR");
+        assert_eq!(
+            body["message"],
+            "another process (pid 7) already serves \"d.sock\""
+        );
+    }
+
     #[tokio::test]
     async fn desktop_capture_combines_both_child_streams() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4090,7 +4495,7 @@ mod bounded_service_log_tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make initial child executable");
 
-        run_desktop_capture_with_executable(path.clone(), executable, 0)
+        run_desktop_capture_with_executable(path.clone(), executable, 0, DesktopReadiness::Spawned)
             .await
             .expect("stable executable should survive an atomic replacement");
 

@@ -33,6 +33,7 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+pub mod core_rpc;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -73,7 +74,7 @@ use axum::body::Bytes;
 use axum::extract::Path;
 use axum::{
     Router,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
@@ -1065,6 +1066,20 @@ pub async fn run_gateway_with_plugin_webhooks(
         ),
         None => (None, None, None),
     };
+
+    // The in-process RPC seam: dial the daemon's dispatcher when a
+    // supervised run provides its connector, and hand the handle to every
+    // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
+    let core_rpc = core_rpc::CoreRpc::default();
+    if let Some(connector) = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
+    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -2430,7 +2445,12 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc))
+        .layer(axum::Extension(HealthProver(readiness.as_ref().and_then(
+            zeroclaw_runtime::daemon::GatewayReadinessReporter::prover,
+        ))));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2478,9 +2498,14 @@ pub async fn run_gateway_with_plugin_webhooks(
         _ => None,
     };
 
-    if let Some(readiness) = readiness {
+    if let Some(readiness) = &readiness {
         readiness.report_ready(actual_addr);
     }
+    // However the gateway returns from here, the owner stops publishing the
+    // address before the listening socket closes: this guard is declared
+    // after the listener, so it drops first. The shutdown paths below report
+    // the release earlier still, at the signal.
+    let _listener_publication = ListenerPublication(readiness.clone());
 
     if let Some(tls_acceptor) = tls_acceptor {
         // Manual TLS accept loop — serves each connection via hyper.
@@ -2540,6 +2565,11 @@ pub async fn run_gateway_with_plugin_webhooks(
                     });
                 }
                 _ = shutdown_signal.changed() => {
+                    // No more connections are accepted from here on; the
+                    // listener closes once the loop ends.
+                    if let Some(readiness) = &readiness {
+                        readiness.report_released();
+                    }
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
                     break;
                 }
@@ -2547,12 +2577,20 @@ pub async fn run_gateway_with_plugin_webhooks(
         }
     } else {
         // Plain TCP — use axum's built-in serve.
+        let release = readiness.clone();
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
+            // Axum stops accepting and closes the listener as soon as this
+            // future completes, then drains the connections it has. Report
+            // the release first: the address must not stay published while
+            // another program could already bind it.
+            if let Some(release) = &release {
+                release.report_released();
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -2676,14 +2714,56 @@ fn public_health_snapshot() -> serde_json::Value {
     })
 }
 
-/// GET /health — always public (no secrets leaked)
-async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-    let body = serde_json::json!({
+/// Reports the gateway's listener released when it is dropped. Declared
+/// after the listener in [`run_gateway`], so it runs before the listening
+/// socket closes on every return path.
+struct ListenerPublication(Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>);
+
+impl Drop for ListenerPublication {
+    fn drop(&mut self) {
+        if let Some(readiness) = &self.0 {
+            readiness.report_released();
+        }
+    }
+}
+
+/// What this gateway's listener answers `/health` challenges with: present
+/// only when the daemon that owns it handed it a possession key.
+#[derive(Clone)]
+struct HealthProver(Option<zeroclaw_runtime::daemon::possession::GatewayProver>);
+
+/// The possession challenge a `GET /health` query carries: the nonce a
+/// client holds from the core's RPC socket, as `challenge=<nonce>`. Read by
+/// hand, so no query fails: whatever a monitoring probe adds, `/health`
+/// answers it.
+fn health_challenge(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("challenge="))
+}
+
+/// GET /health — always public (no secrets leaked). With `?challenge=<nonce>`
+/// the body also carries `challenge_proof`, the HMAC of the nonce under this
+/// listener's possession key, while the listener accepts connections. The
+/// proof reveals nothing about the key, and a nonce the core did not issue
+/// proves nothing to anyone.
+async fn handle_health(
+    State(state): State<AppState>,
+    RawQuery(query): RawQuery,
+    prover: Option<axum::Extension<HealthProver>>,
+) -> impl IntoResponse {
+    let mut body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
         "runtime": public_health_snapshot(),
     });
+    if let (Some(challenge), Some(axum::Extension(HealthProver(Some(prover))))) =
+        (health_challenge(query.as_deref()), prover)
+        && let Some(proof) = prover.prove(challenge)
+    {
+        body["challenge_proof"] = serde_json::Value::String(proof);
+    }
     Json(body)
 }
 
@@ -5525,9 +5605,13 @@ mod tests {
         zeroclaw_runtime::health::mark_component_error(&component, sensitive_error);
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
-            .await
-            .into_response();
+        let response = handle_health(
+            State(admin_paircode_state(&tmp, false, false)),
+            RawQuery(None),
+            None,
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -5546,6 +5630,30 @@ mod tests {
                 .as_deref(),
             Some(sensitive_error)
         );
+    }
+
+    /// `/health` answers `200` whatever query a monitoring probe adds: a
+    /// query it cannot read counts as one without a challenge.
+    #[tokio::test]
+    async fn health_answers_whatever_query_it_is_sent() {
+        use tower::ServiceExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = Router::new()
+            .route("/health", get(handle_health))
+            .with_state(admin_paircode_state(&tmp, false, false));
+        for query in [
+            "challenge=a&challenge=b",
+            "%zz=%",
+            "challenge",
+            "=&&=x",
+            "challenge=%E0%A4%A",
+        ] {
+            let request = axum::http::Request::get(format!("/health?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/health?{query}");
+        }
     }
 
     #[test]
@@ -6933,6 +7041,125 @@ path = "{trigger_path}"
 
         std::net::TcpListener::bind(("127.0.0.1", port))
             .expect("gateway should release the listener after external shutdown");
+    }
+
+    /// The owner stops publishing the listener at the shutdown signal, before
+    /// the listening socket closes, not when the drain ends. Here a stream
+    /// holds the drain open: by the time another program can bind the port,
+    /// the release has been reported and the gateway is still draining.
+    /// Before that, the listener answers a possession challenge with its key.
+    #[tokio::test]
+    async fn the_listener_is_released_before_its_port_can_be_bound_during_drain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.gateway.require_pairing = false;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let key = zeroclaw_runtime::daemon::GatewayPossession::generate();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = {
+            let released = Arc::clone(&released);
+            zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+                let _ = ready_tx.send(Some(addr));
+            })
+            .on_release(move || released.store(true, std::sync::atomic::Ordering::SeqCst))
+            .with_possession(key)
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the gateway reports its bind");
+        let addr = format!("127.0.0.1:{port}");
+
+        let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+        let mut probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        probe
+            .write_all(request("/health?challenge=n0nce").as_bytes())
+            .await
+            .unwrap();
+        let mut answer = vec![0; 16 * 1024];
+        let read = probe.read(&mut answer).await.unwrap();
+        let answer = String::from_utf8_lossy(&answer[..read]);
+        assert!(
+            answer.contains(&key.proof("n0nce")),
+            "the listener proves its key: {answer}"
+        );
+        drop(probe);
+
+        // A stream the drain must wait for.
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(request("/api/events").as_bytes())
+            .await
+            .unwrap();
+        let mut head = [0; 64];
+        let read = stream.read(&mut head).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"),
+            "the stream opened"
+        );
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(rebound) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    return rebound;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the listening socket closes at the signal");
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "the release was reported before the port could be bound again"
+        );
+        assert!(!handle.is_finished(), "the gateway is still draining");
+
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the drain ends once the stream closes")
+            .expect("the gateway task does not panic")
+            .expect("the shutdown is graceful");
     }
 
     #[tokio::test]

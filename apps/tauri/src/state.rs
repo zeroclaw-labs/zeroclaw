@@ -12,6 +12,43 @@ pub enum AgentStatus {
     Error,
 }
 
+/// Where startup stands. The splash reads it to decide what to show, and
+/// `open_dashboard` refuses to open the dashboard unless it is
+/// [`Startup::Ready`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Startup {
+    /// Still looking for a gateway, or starting one and checking it.
+    Pending { message: String },
+    /// The dashboard may open: a gateway that was already running answered,
+    /// or the daemon this app launched passed its startup checks.
+    Ready,
+    /// Startup failed and the dashboard must not open. `kind` names the
+    /// failure for the splash.
+    Failed { kind: &'static str, message: String },
+}
+
+impl Default for Startup {
+    fn default() -> Self {
+        Self::Pending {
+            message: "Starting ZeroClaw…".to_string(),
+        }
+    }
+}
+
+impl Startup {
+    /// Whether the dashboard may open now; otherwise the reason it may not.
+    pub fn dashboard_gate(&self) -> Result<(), String> {
+        match self {
+            Self::Ready => Ok(()),
+            Self::Pending { .. } => {
+                Err("ZeroClaw is still starting; the dashboard opens once it is ready.".to_string())
+            }
+            Self::Failed { message, .. } => Err(message.clone()),
+        }
+    }
+}
+
 /// Shared application state behind an `Arc<RwLock<_>>`.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -19,6 +56,11 @@ pub struct AppState {
     pub token: Option<String>,
     pub connected: bool,
     pub agent_status: AgentStatus,
+    pub startup: Startup,
+    /// The daemon this app launched, verified over RPC. While it is set,
+    /// every credential sent to the dashboard address travels on a
+    /// connection that first proved it is this core's own gateway.
+    pub core: Option<Arc<crate::possession::CoreLink>>,
 }
 
 impl Default for AppState {
@@ -28,6 +70,8 @@ impl Default for AppState {
             token: None,
             connected: false,
             agent_status: AgentStatus::Idle,
+            startup: Startup::default(),
+            core: None,
         }
     }
 }
@@ -51,6 +95,41 @@ mod tests {
         assert!(state.token.is_none());
         assert!(!state.connected);
         assert_eq!(state.agent_status, AgentStatus::Idle);
+        assert!(matches!(state.startup, Startup::Pending { .. }));
+    }
+
+    #[test]
+    fn only_a_ready_startup_lets_the_dashboard_open() {
+        assert_eq!(Startup::Ready.dashboard_gate(), Ok(()));
+        assert!(Startup::default().dashboard_gate().is_err());
+        let failed = Startup::Failed {
+            kind: "incompatible",
+            message: "bundled core version mismatch".to_string(),
+        };
+        assert_eq!(
+            failed.dashboard_gate(),
+            Err("bundled core version mismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn startup_serializes_for_the_splash() {
+        assert_eq!(
+            serde_json::to_value(Startup::Ready).unwrap(),
+            serde_json::json!({ "state": "ready" })
+        );
+        assert_eq!(
+            serde_json::to_value(Startup::Failed {
+                kind: "port_held",
+                message: "m".to_string()
+            })
+            .unwrap(),
+            serde_json::json!({ "state": "failed", "kind": "port_held", "message": "m" })
+        );
+        assert_eq!(
+            serde_json::to_value(Startup::default()).unwrap()["state"],
+            "pending"
+        );
     }
 
     #[test]

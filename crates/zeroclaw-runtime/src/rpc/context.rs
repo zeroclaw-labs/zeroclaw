@@ -135,6 +135,132 @@ impl ApprovalPendingMap {
 /// value into delegated handlers without lifetime coupling.
 pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
 
+/// The daemon's own gateway listener while it accepts connections: the
+/// address it actually bound, and the key it proves possession of that
+/// address with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundGateway {
+    pub addr: std::net::SocketAddr,
+    pub possession: crate::daemon::GatewayPossession,
+}
+
+/// Where the daemon's own gateway listener is bound, for the current gateway
+/// generation. `None` until that generation binds, and again from the moment
+/// its listener stops accepting connections, until the next generation binds.
+#[derive(Clone)]
+pub struct GatewayBinding(Arc<dyn Fn() -> Option<BoundGateway> + Send + Sync>);
+
+impl GatewayBinding {
+    pub fn new(bound: impl Fn() -> Option<BoundGateway> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(bound))
+    }
+
+    pub fn bound(&self) -> Option<BoundGateway> {
+        (self.0)()
+    }
+
+    pub fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.bound().map(|bound| bound.addr)
+    }
+}
+
+/// The most gateway listeners in other processes registered at once.
+pub const MAX_EXTERNAL_GATEWAY_LISTENERS: usize = 64;
+
+/// Gateway listeners in other processes (a separate `zeroclaw-gw`) that
+/// registered with the core over their own local administrator connection,
+/// each with the address it bound and the key it proves possession with. A
+/// registration lives only as long as the connection that made it and the
+/// authority its registrant held, and ends earlier when that gateway
+/// releases it at its shutdown signal.
+#[derive(Default)]
+pub struct ExternalGatewayListeners {
+    next_id: std::sync::atomic::AtomicU64,
+    listeners: parking_lot::Mutex<Vec<ExternalGatewayListener>>,
+}
+
+struct ExternalGatewayListener {
+    id: u64,
+    bound: BoundGateway,
+    /// The registering connection's liveness: dead once it closes.
+    connection: std::sync::Weak<()>,
+    /// Who registered it, re-resolved on current grants whenever the core
+    /// vouches for it.
+    registrant: crate::rpc::auth::ConnectionAuth,
+}
+
+impl ExternalGatewayListeners {
+    /// Register a listener for as long as `connection` lives. Returns its
+    /// id, or `None` when [`MAX_EXTERNAL_GATEWAY_LISTENERS`] live ones exist.
+    /// A registration is live while its connection is open and `admitted`
+    /// still accepts its registrant; the others end here, before the count,
+    /// so a registrant that lost its authority holds no place.
+    pub fn register(
+        &self,
+        bound: BoundGateway,
+        connection: &Arc<()>,
+        registrant: crate::rpc::auth::ConnectionAuth,
+        admitted: impl Fn(&crate::rpc::auth::ConnectionAuth) -> bool,
+    ) -> Option<u64> {
+        let mut listeners = self.listeners.lock();
+        listeners.retain(|listener| {
+            listener.connection.strong_count() > 0 && admitted(&listener.registrant)
+        });
+        if listeners.len() >= MAX_EXTERNAL_GATEWAY_LISTENERS {
+            return None;
+        }
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        listeners.push(ExternalGatewayListener {
+            id,
+            bound,
+            connection: Arc::downgrade(connection),
+            registrant,
+        });
+        Some(id)
+    }
+
+    /// End registration `id`, if `connection` made it. Whether it did.
+    pub fn release(&self, id: u64, connection: &Arc<()>) -> bool {
+        let mut listeners = self.listeners.lock();
+        let before = listeners.len();
+        listeners.retain(|listener| {
+            !(listener.id == id
+                && listener
+                    .connection
+                    .upgrade()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, connection)))
+        });
+        listeners.len() != before
+    }
+
+    /// The listener registered for `addr` by a connection that is still
+    /// open, by a registrant `admitted` still accepts. Several may be: a
+    /// gateway restarting at the same address registers before its
+    /// predecessor's connection has closed. The most recent one is vouched
+    /// for, and an older one only once every newer one has ended. A
+    /// registration at `addr` whose registrant is no longer admitted ends
+    /// here.
+    pub fn bound_at(
+        &self,
+        addr: std::net::SocketAddr,
+        admitted: impl Fn(&crate::rpc::auth::ConnectionAuth) -> bool,
+    ) -> Option<BoundGateway> {
+        let mut listeners = self.listeners.lock();
+        listeners.retain(|listener| {
+            listener.connection.strong_count() > 0
+                && (listener.bound.addr != addr || admitted(&listener.registrant))
+        });
+        listeners
+            .iter()
+            .rev()
+            .find(|listener| listener.bound.addr == addr)
+            .map(|listener| listener.bound)
+    }
+}
+
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
     /// Live config behind a read-write lock so `config/set` can mutate
@@ -198,6 +324,13 @@ pub struct RpcContext {
     /// Write `true` to ask the current gateway listener to shut down before
     /// daemon reload rebinds the same address.
     pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// The daemon gateway's bound address, reported by `health`. `None` when
+    /// this context has no daemon gateway (standalone and test contexts).
+    pub gateway_binding: Option<GatewayBinding>,
+
+    /// Gateway listeners in other processes that registered with the core.
+    pub external_gateways: Arc<ExternalGatewayListeners>,
 
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
@@ -305,6 +438,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
@@ -337,6 +472,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -377,6 +514,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -459,6 +598,8 @@ impl RpcContext {
             subscriptions,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -495,6 +636,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -537,6 +680,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -572,6 +717,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -608,6 +755,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -645,6 +794,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
@@ -682,6 +833,8 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx,
             gateway_shutdown_tx,
+            gateway_binding: None,
+            external_gateways: Arc::default(),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
