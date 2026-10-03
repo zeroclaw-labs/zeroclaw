@@ -14,6 +14,7 @@ use zeroclaw_config::traits::AliasSource;
 /// the apply path so SSE/dashboard consumers can filter by origin
 /// without parsing message strings.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
     Web,
@@ -75,6 +76,7 @@ fn merge_attrs(base: serde_json::Value, extra: serde_json::Value) -> serde_json:
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct AppliedAgent {
     pub alias: String,
     pub model_provider: String,
@@ -85,6 +87,7 @@ pub struct AppliedAgent {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QuickstartStep {
     ModelProvider,
@@ -125,6 +128,7 @@ impl QuickstartStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuickstartError {
     pub step: QuickstartStep,
     pub field: String,
@@ -676,6 +680,7 @@ fn collect_aliased_refs<T: serde::Serialize>(value: &T) -> Vec<String> {
 /// covers. The TUI / web ask the runtime for the shape, then render
 /// inputs dumbly off the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FieldSection {
     ModelProvider,
@@ -684,6 +689,7 @@ pub enum FieldSection {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct FieldDescriptor {
     /// Schema-side field key (kebab-case terminal segment). The

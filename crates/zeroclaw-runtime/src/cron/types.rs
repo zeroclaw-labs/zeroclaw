@@ -24,6 +24,7 @@ pub fn deserialize_maybe_stringified<T: serde::de::DeserializeOwned>(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum JobType {
     #[default]
@@ -56,6 +57,7 @@ impl TryFrom<&str> for JobType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SessionTarget {
     #[default]
@@ -97,6 +99,7 @@ impl SessionTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
     Cron {
@@ -105,6 +108,7 @@ pub enum Schedule {
         tz: Option<String>,
     },
     At {
+        #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
         at: DateTime<Utc>,
     },
     Every {
@@ -113,6 +117,7 @@ pub enum Schedule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DeliveryConfig {
     #[serde(default)]
     pub mode: String,
@@ -147,6 +152,7 @@ fn default_source() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CronJob {
     pub id: String,
     pub expression: String,
@@ -181,18 +187,24 @@ pub struct CronJob {
     /// the config; imperative jobs read it from the stored field in the DB.
     #[serde(default)]
     pub shell_output_format: CronShellOutputFormat,
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
     pub created_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
     pub next_run: DateTime<Utc>,
+    #[cfg_attr(feature = "schema-export", schemars(with = "Option<String>"))]
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CronRun {
     pub id: i64,
     pub job_id: String,
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
     pub started_at: DateTime<Utc>,
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
     pub finished_at: DateTime<Utc>,
     pub status: String,
     pub output: Option<String>,
