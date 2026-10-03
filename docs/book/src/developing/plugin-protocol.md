@@ -996,3 +996,34 @@ These delegate to the `zeroclaw-plugins` crate features
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory. Signature-policy refusals, healthy packages,
+loaded aliases, symlinks, and uninspectable contents remain protected. Recovery
+claims a single directory generation before admission and deletion; it never
+uses a stale verdict to recursively delete a replacement at the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. A process that cannot take it within 60 seconds gives up and
+names the lock file. Any account that can read that file can hold the lock,
+and where the operating system or filesystem offers no file locking, install
+and remove refuse. New staging directories use unique generations and an OS-held
+lease, rather than a PID as ownership evidence. Recovery cleans an abandoned
+protocol stage only while recovering an actual final package, or while finishing
+the delete of one an earlier remove had judged. Legacy PID-only
+stages without proof of abandonment are retained and their paths are printed;
+they do not prevent a new install from using fresh staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Where the platform or filesystem
+has no rename that refuses an existing destination (FreeBSD, an NFS mount,
+Linux before 3.15), a package directory moves with a plain rename, which can
+replace only an empty directory, and nothing but a directory moves that way.

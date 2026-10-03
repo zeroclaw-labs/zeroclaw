@@ -37,7 +37,9 @@ one.
    the first and cheapest check.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
-   containing a `manifest.toml`.
+   containing a `manifest.toml`. It skips dot-prefixed directories, including
+   the hidden staging directory `zeroclaw plugin install` builds a package in
+   before renaming it into place, so a half-written install is never loaded.
 3. **Validate shape.** Each manifest must declare at least one capability, and
    a non-skill plugin must name a confined relative `wasm_path`. Traversal and
    symlink paths are rejected. A malformed manifest is skipped with a warning,
@@ -48,9 +50,17 @@ one.
 5. **Admit executable bytes.** The host opens the confined component once,
    verifies any declared `wasm_sha256`, and retains those exact bytes. In
    `strict` mode the signed manifest must declare this digest. Adapters compile
-   the admitted buffer rather than reopening its path. This is an execution
-   identity guarantee for the retained bytes, not a claim of race-free
-   filesystem namespace resolution.
+   the admitted buffer rather than reopening its path. On Unix the host opens
+   the package directory once and reaches the component from that handle one
+   path component at a time, never following a symlink, so moving or replacing
+   a directory during admission either fails it or leaves the read inside the
+   package that was confined. The component must be a regular file, and a FIFO
+   or device fails at once instead of blocking. The package directory and the
+   manifest are still found by pathname when admission starts; in `strict`
+   mode the signed `wasm_sha256` is what binds the manifest to the bytes. Other
+   platforms keep pathname checks, which refuse a replacement still in place
+   when they run but do not make the lookup atomic or keep a FIFO from blocking
+   the open.
 6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. A plugin whose package name or tool name
    conflicts with an already registered tool is refused with a warning instead

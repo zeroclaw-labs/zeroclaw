@@ -133,6 +133,68 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+### Recovering an incomplete installation
+
+`zeroclaw plugin install` builds a package in a unique hidden transaction
+inside the plugins directory and holds an operating-system lease through
+publication. It moves the package into place without replacing an occupant
+that holds files, only after the manifest, component, and any `skills/` tree
+are written. On a filesystem without a no-replace rename, an empty directory at
+the name can be replaced. A failed or interrupted write leaves no partial package under the
+final name. Discovery ignores hidden transactions, and a later install uses
+fresh staging instead of replacing another process's stage.
+
+Earlier builds wrote straight into the final directory, creating it and then
+writing `manifest.toml` first, so an interrupted install could leave an empty
+directory, a truncated manifest, or a manifest without its component.
+Discovery skips such a directory, so it is not an installed package, yet it
+still holds the name. `zeroclaw plugin install` never overwrites anything
+already at a package name: it refuses and names
+`zeroclaw plugin remove <name>` as the recovery.
+
+For a name the host has not loaded, `plugin remove` claims the selected
+directory generation in a hidden recovery transaction and applies the same
+admission checks to those held contents. It deletes that generation in two
+cases only:
+
+- The directory is empty.
+- It holds a `manifest.toml` and fails the admission checks install and
+  discovery apply, because of its own contents: a truncated or unparsable
+  manifest, a missing component, a component that does not match its declared
+  `wasm_sha256`, or a package this host cannot accept as written, such as a
+  component over the admission size limit, a `config_schema` it cannot
+  compile, or an incomplete skill bundle.
+
+Recovery also cleans provably abandoned stages created by the lease protocol.
+Active stages and ambiguous legacy `.<name>.installing-<pid>` directories are
+retained, and the command reports their paths. A PID in a filename does not
+prove abandonment. These retained stages do not prevent a fresh install after
+the incomplete final package is recovered. If no final package exists,
+`plugin remove` does not sweep staging directories, unless it finishes a
+delete that an earlier `plugin remove` had begun.
+
+Other occupants are refused, and the command prints why: a symlink or a
+file at the name, a directory that holds files but no `manifest.toml`, a
+directory it cannot inspect or list, the directory a loaded package was loaded
+from, a package admission accepts, and a package this host rejects for its
+signature policy (unsigned, from an untrusted publisher, carrying an invalid
+signature, or without a signed `wasm_sha256` in `strict` mode). Admission
+checks the signature before it reads the component, so under `strict` a
+stranded manifest from an unsigned package, or one cut so that its signature
+no longer verifies, is refused for its signature even though its component is
+missing.
+
+A refused claimed package is restored without replacing any concurrent
+occupant that holds files. On a filesystem without a no-replace rename, an
+empty directory at the name can be replaced. If restoration cannot finish, its bytes remain at the reported
+hidden location; the original name is not necessarily untouched. Retrying
+`plugin remove` restores a retained recovery transaction before checking
+admission again. A delete that `plugin remove` had begun is finished instead:
+once it starts deleting a package it judged incomplete, a retry completes that
+delete. Resolve the reported destination conflict or filesystem
+error before retrying; do not delete hidden transactions merely because they
+look like leftovers.
+
 ## Execution model
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) owns one async
