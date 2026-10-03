@@ -1614,6 +1614,8 @@ mod tests {
                 key,
                 &[
                     ("tool", "TOOL"),
+                    ("target", "TARGET"),
+                    ("caller", "CALLER"),
                     ("yes_command", "TKN yes"),
                     ("no_command", "TKN no"),
                     ("approve_command", "TKN approve"),

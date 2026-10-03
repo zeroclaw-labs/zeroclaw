@@ -196,6 +196,28 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
 
+### Independent delegate approvals
+
+An independent agentic target can send tool approval requests to the operator selected by its own risk profile's `approval_route`. Set both `approver_channel` and a non-blank `approver_recipient`, and keep that channel enabled and registered in the running daemon. The caller must already authorize that named target in independent mode; an approval route does not grant delegation reach or additional tools.
+
+For example, a target using the `worker` risk profile can route its approvals to a configured operations channel:
+
+```toml
+[risk_profiles.worker.approval_route]
+approver_channel = "telegram.ops"
+approver_recipient = "operations-room"
+on_no_approver = "deny"
+timeout_secs = 120
+```
+
+Foreground, background, and parallel independent delegates use the same target-route approval gate. The prompt identifies the target and caller, keeps the real tool name and argument summary, and uses the configured recipient. A real approval allows the target-owned call subject to its existing tool and command policy. A denial, missing channel, unsupported approval surface, disconnection, or timeout leaves the tool unexecuted. The child execution timeout also bounds the approval wait and can expire before the route timeout.
+
+Each child run has a fresh approval manager. An "Always" answer applies only within that child run; it cannot approve the caller's calls, later delegate runs, or parallel siblings. Tools in `always_ask` still require a decision for every call, including under Full autonomy. Explicitly auto-approved tools otherwise retain their target-profile behavior.
+
+Delegates do not inherit the caller's CLI, ACP, RPC, or dashboard approval session. Even `on_no_approver = "inherit-originator"` denies when the configured approver cannot answer, because an independent child has no originating approval channel to fall back to. Pending approval is process-local and is abandoned on child cancellation or timeout; restarting a daemon does not resume that request or restore child approval grants.
+
+Without a complete target route, independent targets with non-empty `always_ask` are refused before execution, including background and parallel admission. Other prompt-required calls still fail closed at tool dispatch. Bounded agentic delegates keep their existing no-operator behavior and caller-owned command policy.
+
 ### `delegate`: output strings the model sees
 
 User-visible failure strings are localized Fluent messages. Their English source
@@ -224,7 +246,7 @@ them as Fluent keys.
 9. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 10. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
-12. Target whose risk profile has `always_ask` entries: an independent target returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
+12. Target whose risk profile has `always_ask` entries: an independent target without a complete explicit approval route returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
 13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
 14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
@@ -259,4 +281,4 @@ them as Fluent keys.
 3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope.
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
-6. **`delegate` targets with `always_ask`.** Independent delegation and bounded agentic delegation are blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools. This blocker remains until approval forwarding for child agent loops is supported by a future ZeroClaw version.
+6. **Origin-session approval forwarding and bounded approvals.** Independent delegates can use an explicit target-owned [approval route](#independent-delegate-approvals), but cannot forward approval to the caller's originating CLI, ACP, RPC, or dashboard session. Bounded agentic targets with non-empty `always_ask` remain blocked before execution, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools.

@@ -1368,6 +1368,7 @@ cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 # always) stay hardcoded ASCII in Rust — only the surrounding prose is
 # localized here.
 channel-approval-heading = Tool approval required
+channel-approval-independent-delegate = Independent delegate {$target} from {$caller}
 channel-approval-heading-shout = APPROVAL REQUIRED
 channel-approval-tool-label = Tool
 channel-approval-args-label = Args
