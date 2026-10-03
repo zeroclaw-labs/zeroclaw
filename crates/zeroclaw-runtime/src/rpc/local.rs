@@ -2585,6 +2585,7 @@ mod tests {
         let ctx1 = RpcContext::for_persistence_tests(
             config1,
             sessions1,
+            None,
             Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             None,
         );
@@ -2698,6 +2699,7 @@ mod tests {
             let ctx2 = RpcContext::for_persistence_tests(
                 config2,
                 sessions2,
+                None,
                 Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
                 None,
             );

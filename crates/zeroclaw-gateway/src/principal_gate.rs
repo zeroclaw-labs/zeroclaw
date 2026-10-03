@@ -990,6 +990,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_agent_delete_retry_requires_current_delete_authority() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let idp = introspection_idp(&["ops"]).await;
+        for (verbs, paths) in [
+            (vec![Verb::Update], vec!["agents.*"]),
+            (vec![Verb::Delete], vec!["agents.other"]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = editor_config(&tmp, &idp.uri(), &verbs, &paths);
+            config.memory.backend = "none".to_string();
+            config.gateway.session_persistence = false;
+            config.channels.session_persistence = false;
+            config.knowledge.db_path = tmp.path().join("knowledge.db").to_string_lossy().into();
+            // The config deletion already committed, but owned rows remain.
+            assert!(!config.agents.contains_key("retired"));
+            let graph = KnowledgeGraph::new(&config.knowledge.resolved_db_path(), 100).unwrap();
+            let scope = KnowledgeScope::for_agent("retired", Vec::new());
+            let node = graph
+                .add_node(&scope, NodeType::Pattern, "retained", "retry", &[], None)
+                .unwrap();
+            let router = router_for(config);
+            let path = "/api/config/map-key?path=agents&key=retired";
+            let (status, body) = send(&router, "DELETE", path, SCOPED.0, SCOPED.1, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(graph.get_node(&scope, &node).unwrap().is_some());
+
+            let (status, body) = send(&router, "DELETE", path, OPERATOR.0, OPERATOR.1, None).await;
+            assert_eq!(status, StatusCode::OK, "authorized recovery: {body}");
+            assert!(graph.get_node(&scope, &node).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn verbs_follow_the_effect_of_the_mutation_not_the_http_method() {
         let tmp = tempfile::tempdir().unwrap();
         let idp = introspection_idp(&["ops"]).await;

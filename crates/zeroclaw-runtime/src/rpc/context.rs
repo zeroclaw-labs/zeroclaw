@@ -626,6 +626,7 @@ impl RpcContext {
     pub fn for_persistence_tests(
         config: Config,
         sessions: Arc<SessionStore>,
+        memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
@@ -638,7 +639,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend,
-            memory: None,
+            memory,
             cost_tracker: None,
             event_tx: None,
             event_history: None,

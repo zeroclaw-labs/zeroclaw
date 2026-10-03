@@ -1469,7 +1469,22 @@ pub async fn handle_delete_map_key(
 /// or live ACP sessions), else scrub config refs + remove the entry via
 /// `delete_with_cascade`, archive the workspace, run the owned-state cascade
 /// (export-then-delete memory/cron/acp + clear session attribution), and persist.
-async fn delete_agent_cascade(
+fn delete_agent_cascade<'a>(
+    state: &'a AppState,
+    principal: &'a RequestPrincipal,
+    alias: &'a str,
+    lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
+    // Keep the heavy retained transaction off the 2 MiB handler stack.
+    Box::pin(delete_agent_cascade_inner(
+        state,
+        principal,
+        alias,
+        lifecycle_lease,
+    ))
+}
+
+async fn delete_agent_cascade_inner(
     state: &AppState,
     principal: &RequestPrincipal,
     alias: &str,
@@ -1477,20 +1492,51 @@ async fn delete_agent_cascade(
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
+    if let Err(message) = alias_refs::validate_agent_alias(alias) {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+                .with_path(format!("agents.{alias}")),
+        );
+    }
     let preflight_config = state.config.read().clone();
     let preflight_alias = alias.to_string();
     let live_acp = tokio::task::spawn_blocking(move || {
-        crate::agent_owned_state::live_acp_session_count(&preflight_config, &preflight_alias)
-            .map_err(|error| error.to_string())
+        zeroclaw_runtime::agent_owned_state::live_acp_session_count(
+            &preflight_config,
+            &preflight_alias,
+        )
+        .map_err(|error| error.to_string())
     })
     .await
     .unwrap_or_else(|error| Err(format!("ACP preflight task failed: {error}")));
     let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
-    let preflight = zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
-        &working, alias, live_acp,
-    );
-    if !preflight.allowed {
+    if let Err(denied) = authorize_config_write(
+        principal,
+        ConfigWriteSet::default().with(format!("agents.{alias}"), Verb::Delete),
+        &guard,
+    ) {
+        return denied.into_response();
+    }
+    let configured = working.agents.contains_key(alias);
+    let resume = !configured
+        && zeroclaw_runtime::agent_owned_state::committed_delete_residue_exists(
+            &working,
+            Some(&state.mem),
+            state.session_backend.as_ref(),
+            alias,
+        )
+        .await;
+    let preflight = if configured {
+        zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
+            &working, alias, live_acp,
+        )
+    } else {
+        zeroclaw_runtime::agent_lifecycle::plan_agent_delete_recovery_with_acp_count(
+            &working, alias, live_acp,
+        )
+    };
+    if !preflight.allowed || (!configured && !resume) {
         let code = if working.agents.contains_key(alias) {
             ConfigApiCode::ValidationFailed
         } else {
@@ -1508,31 +1554,33 @@ async fn delete_agent_cascade(
         );
     }
 
-    let workspace = preflight
-        .workspace
-        .expect("an allowed configured agent has a workspace path");
+    let workspace = working.agent_workspace_dir(alias);
 
     // Config cascade: scrub soft refs + remove the agents entry.
-    let cascade = match alias_refs::delete_with_cascade(
-        &mut working,
-        &AliasKind::Agent,
-        alias,
-        CascadePolicy::RefuseOnHard,
-    ) {
-        Ok(report) => report,
-        Err(e) => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    format!("agent config cascade failed: {e}"),
-                )
-                .with_path(format!("agents.{alias}")),
-            );
-        }
-    };
+    let retirement =
+        zeroclaw_runtime::agent_owned_state::prepare_knowledge_retirement(&working, alias);
+    if configured {
+        let cascade = match alias_refs::delete_with_cascade(
+            &mut working,
+            &AliasKind::Agent,
+            alias,
+            CascadePolicy::RefuseOnHard,
+        ) {
+            Ok(report) => report,
+            Err(e) => {
+                return error_response(
+                    ConfigApiError::new(
+                        ConfigApiCode::ValidationFailed,
+                        format!("agent config cascade failed: {e}"),
+                    )
+                    .with_path(format!("agents.{alias}")),
+                );
+            }
+        };
 
-    for path in cascade.dirty_paths() {
-        working.mark_dirty(&path);
+        for path in cascade.dirty_paths() {
+            working.mark_dirty(&path);
+        }
     }
     // The complete write set is known only now: the entry itself plus every
     // reference the cascade scrubbed elsewhere. Authorized before the
@@ -1569,14 +1617,18 @@ async fn delete_agent_cascade(
             // Save the prepared config and install the matching live snapshot;
             // a true pre-commit save error rolls back disk state and ends this
             // task with the reservation uncommitted and generations unchanged.
-            let prepared = persist_and_swap_prepared(
-                live_config,
-                pending_reload.clone(),
-                reload_controls,
-                working.clone(),
-                authorization,
-            )
-            .await?;
+            let prepared = if configured {
+                persist_and_swap_prepared(
+                    live_config,
+                    pending_reload.clone(),
+                    reload_controls,
+                    working.clone(),
+                    authorization,
+                )
+                .await?
+            } else {
+                None
+            };
             // Committed: advance the alias generation exactly once.
             // Synchronous — no await between the live swap and this commit.
             lifecycle_lease.commit_destructive_mutation();
@@ -1585,20 +1637,21 @@ async fn delete_agent_cascade(
             finish_prepared_channel_generation(prepared, pending_reload).await;
             // Release the gateway-wide config write lock before slow cleanup.
             drop(guard);
-            let archive = crate::agent_owned_state::archive_agent_workspace(
+            let archive = zeroclaw_runtime::agent_owned_state::archive_agent_workspace(
                 &working,
                 &cleanup_alias,
                 &workspace,
             )
             .await;
-            let archive_dir = archive.archive_dir;
+            let archive_dir = archive.path;
             let mut warnings = archive.warnings;
-            let owned = crate::agent_owned_state::cascade_owned_state(
+            let owned = zeroclaw_runtime::agent_owned_state::cascade_owned_state_with_retirement(
                 &working,
-                &memory,
+                Some(&memory),
                 session_backend.as_ref(),
                 &cleanup_alias,
                 &archive_dir,
+                retirement,
             )
             .await;
             warnings.extend(owned.warnings.iter().cloned());
@@ -1874,7 +1927,7 @@ pub async fn handle_delete_plan(
     // For agents the live-ACP gate also blocks; it fails closed (an error
     // counting sessions ⇒ "not allowed"), matching the real delete.
     let live_acp = if is_agent {
-        crate::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
+        zeroclaw_runtime::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
     } else {
         None
     };
@@ -2161,18 +2214,67 @@ fn rename_write_set(
     .with(format!("{}.{}", body.path, body.to), Verb::Create)
 }
 
+/// Move a renamed agent's workspace, reporting whether anything moved.
+///
+/// `Ok(true)` means the directory was relocated, `Ok(false)` that there was
+/// nothing to relocate, and `Err` carries the operator-visible warning. An
+/// unreadable source is an `Err`, never a "nothing to move": collapsing a
+/// metadata failure into absence would let a committed rename report a clean
+/// result while the retired workspace is still on disk, and recreating the old
+/// alias would then resolve to the previous incarnation's files. The shared
+/// runtime probe decides which of the three answers applies, so the distinction
+/// does not depend on how a given platform spells a metadata failure.
 async fn move_renamed_workspace(
     old_ws: &std::path::Path,
     new_ws: &std::path::Path,
-) -> Option<String> {
-    if old_ws == new_ws || !old_ws.exists() {
-        return None;
+) -> Result<bool, String> {
+    if old_ws == new_ws {
+        return Ok(false);
     }
-    if let Some(parent) = new_ws.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+    match zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(old_ws).await {
+        zeroclaw_runtime::agent_owned_state::PathPresence::Absent => return Ok(false),
+        zeroclaw_runtime::agent_owned_state::PathPresence::Uninspectable(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "old": old_ws.display().to_string(),
+                        "new": new_ws.display().to_string(),
+                        "err": err.clone()
+                    })),
+                "agent rename: workspace inspection failed"
+            );
+            return Err(format!(
+                "workspace inspection failed for {}: {err}",
+                old_ws.display()
+            ));
+        }
+        zeroclaw_runtime::agent_owned_state::PathPresence::Present => {}
+    }
+    if let Some(parent) = new_ws.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "old": old_ws.display().to_string(),
+                    "new": new_ws.display().to_string(),
+                    "err": err.to_string()
+                })),
+            "agent rename: workspace move parent creation failed"
+        );
+        return Err(format!(
+            "workspace move {} -> {} failed: destination parent {} could not be created: {err}",
+            old_ws.display(),
+            new_ws.display(),
+            parent.display()
+        ));
     }
     match tokio::fs::rename(old_ws, new_ws).await {
-        Ok(()) => None,
+        Ok(()) => Ok(true),
         Err(err) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2185,7 +2287,7 @@ async fn move_renamed_workspace(
                     })),
                 "agent rename: workspace move failed"
             );
-            Some(format!(
+            Err(format!(
                 "workspace move {} -> {} failed: {err}",
                 old_ws.display(),
                 new_ws.display()
@@ -2194,52 +2296,25 @@ async fn move_renamed_workspace(
     }
 }
 
+/// Committed-rename recovery probe for the gateway surface.
+///
+/// Delegates to the shared runtime contract so gateway, CLI, and RPC agree on
+/// what counts as residue. That contract fails toward residue whenever a store
+/// or a path cannot be inspected, which is what keeps a committed rename over
+/// an unreadable workspace retryable instead of reporting convergence while the
+/// retired state is still there.
 async fn rename_residue_exists(
     state: &AppState,
     working: &zeroclaw_config::schema::Config,
     from: &str,
 ) -> bool {
-    // Workspace: the default per-alias dir for `from`. A custom/alias-independent
-    // path is not moved by the cascade, so it is not residue.
-    if working.agent_workspace_dir(from).exists() {
-        return true;
-    }
-
-    // Short-lived clone for the DB-backed stores - never hold the lock across an
-    // `.await`.
-    let cfg = state.config.read().clone();
-
-    // Cron jobs still owned by `from`.
-    if zeroclaw_runtime::cron::list_jobs_by_agent(&cfg, from)
-        .map(|jobs| !jobs.is_empty())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // ACP sessions (live OR killed) still owned by `from`.
-    if let Ok(store) = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&cfg.data_dir)
-        && store
-            .list_sessions_by_agent(from)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Memory rows still attributed to `from`.
-    if state.mem.count_agent(from).await.unwrap_or(0) > 0 {
-        return true;
-    }
-
-    // Session-metadata attribution still pointing at `from`.
-    if let Some(backend) = state.session_backend.as_ref()
-        && backend.count_agent_attribution(from).unwrap_or(0) > 0
-    {
-        return true;
-    }
-
-    false
+    zeroclaw_runtime::agent_owned_state::committed_rename_residue_exists(
+        working,
+        Some(&state.mem),
+        state.session_backend.as_ref(),
+        from,
+    )
+    .await
 }
 
 async fn rename_agent_cascade(
@@ -2252,6 +2327,15 @@ async fn rename_agent_cascade(
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind};
     let (from, to) = (&body.from, &body.to);
+
+    for alias in [from, to] {
+        if let Err(message) = alias_refs::validate_agent_alias(alias) {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+                    .with_path(format!("{}.{alias}", body.path)),
+            );
+        }
+    }
 
     // The rename's own intent is authorized before anything happens at
     // all, the residue re-run included (it writes no config but moves the
@@ -2309,7 +2393,6 @@ async fn rename_agent_cascade(
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
-    let ws_existed = old_ws != new_ws && old_ws.exists();
     let memory = Arc::clone(&state.mem);
     let session_backend = state.session_backend.clone();
     let live_config = Arc::clone(&state.config);
@@ -2345,10 +2428,15 @@ async fn rename_agent_cascade(
         finish_prepared_channel_generation(prepared, pending_reload).await;
         // Release the gateway-wide config write lock before slow cleanup.
         drop(guard);
-        let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
-        let workspace_moved = ws_existed && move_warning.is_none();
-        let mut warnings: Vec<String> = move_warning.into_iter().collect();
-        let owned = crate::agent_owned_state::cascade_rename_agent(
+        let mut warnings = Vec::new();
+        let workspace_moved = match move_renamed_workspace(&old_ws, &new_ws).await {
+            Ok(moved) => moved,
+            Err(warning) => {
+                warnings.push(warning);
+                false
+            }
+        };
+        let owned = zeroclaw_runtime::agent_owned_state::cascade_rename_agent(
             &working,
             Some(&memory),
             session_backend.as_ref(),
@@ -2376,9 +2464,9 @@ async fn rename_agent_cascade(
     // re-runnable) - escalate to WARN so that degraded outcome is visible
     // operationally instead of buried at INFO.
     if warnings.is_empty() {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count})), "agent renamed with owned-state cascade");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "knowledge": owned.knowledge_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count})), "agent renamed with owned-state cascade");
     } else {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count, "warnings": warnings})), "agent rename persisted but a post-persist side-effect did not follow; re-issue the rename to converge");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "knowledge": owned.knowledge_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count, "warnings": warnings})), "agent rename persisted but a post-persist side-effect did not follow; re-issue the rename to converge");
     }
 
     // Persisted rename. `warnings` carries any post-persist side-effect that did
@@ -3305,6 +3393,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_lifecycle_recovery_rejects_unsafe_aliases_before_filesystem_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.agents.insert(
+            "target".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let absolute_root = tmp.path().join("absolute_escape");
+        let traversal_root = tmp.path().join("traversal_escape");
+        let reserved_root = config.data_dir.join("agents/default");
+        let cases = [
+            (absolute_root.to_string_lossy().into_owned(), absolute_root),
+            ("../../traversal_escape".to_string(), traversal_root),
+            ("default".to_string(), reserved_root),
+        ];
+        let state = test_state(config);
+
+        for (alias, outside_root) in cases {
+            let marker = outside_root.join("workspace/marker.txt");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "must remain untouched").unwrap();
+
+            let delete = delete_agent_cascade(
+                &state,
+                &None,
+                &alias,
+                test_agent_delete_lease(&state, &alias),
+            )
+            .await;
+            assert_eq!(delete.status(), StatusCode::BAD_REQUEST, "alias: {alias}");
+            assert!(marker.exists(), "delete touched unsafe path for `{alias}`");
+
+            let working = state.config.read().clone();
+            let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+            let rename = rename_agent_cascade(
+                &state,
+                &None,
+                working,
+                &RenameMapKeyBody {
+                    path: "agents".to_string(),
+                    from: alias.clone(),
+                    to: "target".to_string(),
+                },
+                guard,
+                vec![
+                    test_agent_delete_lease(&state, &alias),
+                    test_agent_delete_lease(&state, "target"),
+                ],
+            )
+            .await;
+            assert_eq!(rename.status(), StatusCode::BAD_REQUEST, "alias: {alias}");
+            assert!(marker.exists(), "rename touched unsafe path for `{alias}`");
+        }
+
+        assert!(state.config.read().agents.contains_key("target"));
+    }
+
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         test_state_from_authority(&authority)
@@ -4192,6 +4338,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_map_key_handler_cascades_model_provider_and_persists() {
+        assert_delete_map_key_handler_cascades_model_provider_and_persists().await;
+    }
+
+    async fn assert_delete_map_key_handler_cascades_model_provider_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config
@@ -4291,6 +4441,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_map_key_handler_cascades_channel_and_persists() {
+        assert_delete_map_key_handler_cascades_channel_and_persists().await;
+    }
+
+    async fn assert_delete_map_key_handler_cascades_channel_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config.create_map_key("channels.discord", "main").unwrap();
@@ -4336,6 +4490,27 @@ mod tests {
         drop(cfg);
         let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         assert!(!written.contains("discord.main"));
+    }
+
+    #[test]
+    fn delete_map_key_cascades_on_two_mib_stack() {
+        std::thread::Builder::new()
+            .name("map-key-delete-small-stack".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                // Neither the fixture nor the actual handler future is boxed
+                // here: only the production boundary bounds its stack usage.
+                runtime
+                    .block_on(assert_delete_map_key_handler_cascades_model_provider_and_persists());
+                runtime.block_on(assert_delete_map_key_handler_cascades_channel_and_persists());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4452,18 +4627,35 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let new_ws = blocker.join("to-ws");
 
-        let warning = move_renamed_workspace(&old_ws, &new_ws).await;
-        assert!(
-            warning.is_some(),
-            "a failed workspace move must surface a warning"
-        );
-        assert!(warning.unwrap().contains("workspace move"));
+        let warning = move_renamed_workspace(&old_ws, &new_ws)
+            .await
+            .expect_err("a failed workspace move must surface a warning");
+        assert!(warning.contains("workspace move"));
         assert!(old_ws.exists(), "source dir stays put when the move fails");
 
-        // Nothing-to-move paths return None (no spurious warning).
-        assert!(move_renamed_workspace(&old_ws, &old_ws).await.is_none());
+        // Nothing-to-move paths report "nothing moved" (no spurious warning).
+        assert_eq!(move_renamed_workspace(&old_ws, &old_ws).await, Ok(false));
         let missing = tmp.path().join("does-not-exist");
-        assert!(move_renamed_workspace(&missing, &new_ws).await.is_none());
+        assert_eq!(move_renamed_workspace(&missing, &new_ws).await, Ok(false));
+
+        // An unreadable source is residue, not absence: a metadata failure must
+        // not be reported as a clean rename.
+        let unreadable_parent = tmp.path().join("unreadable-parent");
+        std::fs::write(&unreadable_parent, b"blocks child metadata").unwrap();
+        let unreadable = unreadable_parent.join("from-ws");
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&unreadable)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the source uninspectable, not absent"
+        );
+        let inspection = move_renamed_workspace(&unreadable, &new_ws)
+            .await
+            .expect_err("an unreadable source must surface a warning");
+        assert!(
+            inspection.contains("workspace inspection failed"),
+            "unexpected warning: {inspection}"
+        );
     }
 
     #[tokio::test]
@@ -4481,6 +4673,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         // Agent under `from` with a resolvable risk_profile + an allowed cron
         // command, so cron::add_job accepts a job tied to the agent.
         let from_agent = zeroclaw_config::schema::AliasedAgentConfig {
@@ -4504,6 +4701,22 @@ mod tests {
                 .len(),
             1
         );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("from", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "rename failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let body = RenameMapKeyBody {
@@ -4544,6 +4757,13 @@ mod tests {
         // In-memory config was never swapped: still names `from`.
         assert!(state.config.read().agents.contains_key("from"));
         assert!(!state.config.read().agents.contains_key("to"));
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(knowledge.count_owner("from").unwrap(), 1);
+        assert_eq!(knowledge.count_owner("to").unwrap(), 0);
     }
 
     #[tokio::test]
@@ -4555,6 +4775,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         // Agent under `from` with a resolvable risk_profile + an allowed cron
         // command, so cron::add_job accepts a job tied to the agent.
         let from_agent = zeroclaw_config::schema::AliasedAgentConfig {
@@ -4573,6 +4798,22 @@ mod tests {
         std::fs::create_dir_all(&old_ws).unwrap();
         zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
             .expect("seed cron job");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("from", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "rename success proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let body = RenameMapKeyBody {
@@ -4614,6 +4855,13 @@ mod tests {
             "workspace moved to `to`"
         );
         assert!(!old_ws.exists(), "old workspace no longer present");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(knowledge.count_owner("from").unwrap(), 0);
+        assert_eq!(knowledge.count_owner("to").unwrap(), 1);
         // (MockMemory.rename_agent is unsupported, so the response `warnings`
         // carries that one known memory line - cron + workspace prove the move.)
     }
@@ -4705,6 +4953,113 @@ mod tests {
         // Config still names `to` and never regained `from` (no double-rename).
         assert!(state.config.read().agents.contains_key("to"));
         assert!(!state.config.read().agents.contains_key("from"));
+    }
+
+    /// Committed-rename recovery, gateway surface. A workspace whose metadata
+    /// cannot be read is residue, not absence: reporting it as a clean rename
+    /// would leave the retired directory on disk, and recreating the old alias
+    /// would then resolve to the previous incarnation's files (ADR-011).
+    #[tokio::test]
+    async fn agent_rename_retries_unreadable_workspace_before_alias_reuse() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+
+        let old_ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        std::fs::write(old_ws.join("retired-marker.txt"), b"prior incarnation").unwrap();
+
+        // Committed-`to` shape: the config rename already persisted, so only the
+        // workspace still lags at `alpha`.
+        config.agents.remove("alpha");
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let new_ws = config.agent_workspace_dir("beta");
+
+        // Make the retired workspace unreadable rather than absent: its parent
+        // becomes a file, so metadata lookups fail with an error.
+        let workspace_root = old_ws.parent().unwrap().parent().unwrap().to_path_buf();
+        let saved_workspace_root = workspace_root.with_extension("saved");
+        std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
+        std::fs::write(&workspace_root, b"blocks child metadata").unwrap();
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&old_ws)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the workspace uninspectable, not absent"
+        );
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "alpha".to_string(),
+            to: "beta".to_string(),
+        };
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let blocked = rename_agent_cascade(
+            &state,
+            &None,
+            config.clone(),
+            &body,
+            guard,
+            test_agent_rename_leases(&state, &body),
+        )
+        .await;
+        assert_eq!(blocked.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(blocked.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            json["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("workspace inspection failed"))),
+            "the retry must surface unreadable workspace residue: {json}"
+        );
+
+        std::fs::remove_file(&workspace_root).unwrap();
+        std::fs::rename(&saved_workspace_root, &workspace_root).unwrap();
+        assert!(old_ws.join("retired-marker.txt").exists());
+
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let repaired = rename_agent_cascade(
+            &state,
+            &None,
+            config.clone(),
+            &body,
+            guard,
+            test_agent_rename_leases(&state, &body),
+        )
+        .await;
+        assert_eq!(repaired.status(), axum::http::StatusCode::OK);
+        assert!(
+            new_ws.join("retired-marker.txt").exists(),
+            "the restored workspace must converge onto the new alias"
+        );
+        assert!(!old_ws.exists());
+
+        std::fs::create_dir_all(&old_ws).unwrap();
+        assert!(
+            !old_ws.join("retired-marker.txt").exists(),
+            "reusing the old alias must not expose the retired workspace"
+        );
     }
 
     #[tokio::test]
@@ -5318,6 +5673,187 @@ mod tests {
         );
     }
 
+    struct HeldPurgeMemory {
+        inner: Arc<dyn zeroclaw_api::memory_traits::Memory>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for HeldPurgeMemory {
+        fn alias(&self) -> &str {
+            self.inner.alias()
+        }
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            self.inner.role()
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::memory_traits::Memory for HeldPurgeMemory {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn store(
+            &self,
+            k: &str,
+            v: &str,
+            c: zeroclaw_api::memory_traits::MemoryCategory,
+            s: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.store(k, v, c, s).await
+        }
+        async fn recall(
+            &self,
+            q: &str,
+            n: usize,
+            s: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.inner.recall(q, n, s, since, until).await
+        }
+        async fn get(
+            &self,
+            k: &str,
+        ) -> anyhow::Result<Option<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.inner.get(k).await
+        }
+        async fn list(
+            &self,
+            c: Option<&zeroclaw_api::memory_traits::MemoryCategory>,
+            s: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.inner.list(c, s).await
+        }
+        async fn forget(&self, k: &str) -> anyhow::Result<bool> {
+            self.inner.forget(k).await
+        }
+        async fn forget_for_agent(&self, k: &str, a: &str) -> anyhow::Result<bool> {
+            self.inner.forget_for_agent(k, a).await
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn export_agent(
+            &self,
+            a: &str,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.inner.export_agent(a).await
+        }
+        async fn store_with_agent(
+            &self,
+            k: &str,
+            v: &str,
+            c: zeroclaw_api::memory_traits::MemoryCategory,
+            session: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+            agent: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .store_with_agent(k, v, c, session, namespace, importance, agent)
+                .await
+        }
+        async fn recall_for_agents(
+            &self,
+            agents: &[&str],
+            query: &str,
+            limit: usize,
+            session: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_api::memory_traits::MemoryEntry>> {
+            self.inner
+                .recall_for_agents(agents, query, limit, session, since, until)
+                .await
+        }
+        async fn purge_agent(&self, a: &str) -> anyhow::Result<usize> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.purge_agent(a).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_delete_retains_lease_through_actual_memory_purge() {
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.knowledge.db_path = tmp.path().join("graph.db").to_string_lossy().into_owned();
+        config.agents.insert("victim".into(), Default::default());
+        let inner: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("test", &config.data_dir).unwrap());
+        let agent_id = inner.ensure_agent_uuid("victim").await.unwrap();
+        inner
+            .store_with_agent(
+                "retained",
+                "private-retirement-marker",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&agent_id),
+            )
+            .await
+            .unwrap();
+        let memory = Arc::new(HeldPurgeMemory {
+            inner: Arc::clone(&inner),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let mut state = crate::api::test_state(config);
+        state.mem = memory.clone();
+        let state = Arc::new(state);
+        let task_state = Arc::clone(&state);
+        let request = zeroclaw_spawn::spawn!(async move {
+            delete_agent_cascade(
+                &task_state,
+                &None,
+                "victim",
+                test_agent_delete_lease(&task_state, "victim"),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), memory.entered.notified())
+            .await
+            .unwrap();
+        assert!(!state.config.read().agents.contains_key("victim"));
+        drop(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                state.config_write_lock.lock(),
+            )
+            .await
+            .expect("slow purge must release writer"),
+        );
+        assert_eq!(inner.export_agent("victim").await.unwrap().len(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(state.agent_lifecycle.reserve_admission("victim").is_err());
+        assert!(state.agent_lifecycle.begin_delete("victim").is_err());
+        let archive_root = state.config.read().data_dir.join("agents/_deleted");
+        let archives: Vec<_> = std::fs::read_dir(archive_root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(archives.len(), 1);
+        let archived = std::fs::read_to_string(archives[0].join("cascade/memory.json")).unwrap();
+        assert!(archived.contains("private-retirement-marker"));
+        memory.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.agent_lifecycle.delete_blocker("victim").is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(inner.export_agent("victim").await.unwrap().is_empty());
+        assert!(state.agent_lifecycle.reserve_admission("victim").is_ok());
+    }
+
     #[tokio::test]
     async fn agent_delete_leaves_owned_state_intact_when_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5329,6 +5865,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         // Real default-workspace dir for the agent so the archive step has
         // something to act on (and so a buggy pre-fix run would visibly move
         // it under `agents/_deleted/`).
@@ -5354,6 +5895,22 @@ mod tests {
                 .len(),
             1
         );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "delete failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let generation_before = state.agent_lifecycle.alias_generation("victim");
@@ -5390,6 +5947,12 @@ mod tests {
         );
         // In-memory config was never swapped: still names `victim`.
         assert!(state.config.read().agents.contains_key("victim"));
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(knowledge.count_owner("victim").unwrap(), 1);
         // The reservation rolled back: the old generation stays usable.
         assert_eq!(
             state.agent_lifecycle.alias_generation("victim"),
@@ -5465,6 +6028,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
             risk_profile: "default".into(),
             ..Default::default()
@@ -5480,6 +6048,22 @@ mod tests {
         std::fs::create_dir_all(&old_ws).unwrap();
         zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
             .expect("seed cron job");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "delete success proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let generation_before = state.agent_lifecycle.alias_generation("victim");
@@ -5528,6 +6112,13 @@ mod tests {
                 .starts_with("victim-"),
             "archive entry name must start with `victim-`"
         );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(knowledge.count_owner("victim").unwrap(), 0);
+        assert!(archived_ws.path().join("cascade/knowledge.json").exists());
     }
 
     #[tokio::test]
@@ -5541,6 +6132,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
             risk_profile: "default".into(),
             ..Default::default()
@@ -5563,6 +6159,22 @@ mod tests {
         std::fs::write(old_ws.join("marker.txt"), b"hi").unwrap();
         zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
             .expect("seed cron job");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "archive failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let resp = delete_agent_cascade(
@@ -5599,6 +6211,516 @@ mod tests {
         assert!(
             joined.contains("archive"),
             "warnings should mention archive-side failures, got: {joined}"
+        );
+        assert!(
+            joined.contains("knowledge purge skipped"),
+            "the response must say the knowledge purge was skipped, got: {joined}"
+        );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            1,
+            "knowledge rows must remain when the recovery archive cannot be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_delete_skips_knowledge_purge_when_export_fails() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "export failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
+
+        // Leave the ownership columns readable while breaking the export's
+        // selected shape. KnowledgeGraph::new still opens this database, but
+        // export_owner fails before the deletion gate can be crossed.
+        let conn = rusqlite::Connection::open(&knowledge_path).unwrap();
+        conn.execute_batch("ALTER TABLE nodes RENAME COLUMN title TO broken_title;")
+            .unwrap();
+        drop(conn);
+
+        let state = crate::api::test_state(config.clone());
+        let resp = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let joined = json
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .expect("export failure must be surfaced through warnings")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("knowledge purge skipped"),
+            "the response must say the knowledge purge was skipped, got: {joined}"
+        );
+
+        let conn = rusqlite::Connection::open(&knowledge_path).unwrap();
+        let owned_rows: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE owner_agent = 'victim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            owned_rows, 1,
+            "knowledge rows must remain when their export fails"
+        );
+    }
+
+    /// Committed-delete recovery, gateway surface. The first delete commits the
+    /// config removal and then fails its knowledge cascade, so the rows stay
+    /// stamped with the deleted alias. Retrying the delete against the now-absent
+    /// config key must RE-ENTER the cascade and converge instead of returning
+    /// "agents.victim is not configured" and stranding the rows forever.
+    #[tokio::test]
+    async fn agent_delete_retry_after_cascade_failure_converges_on_the_gateway() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        // Block archive creation so the FIRST delete commits config but cannot
+        // cross the export-then-purge gate.
+        let agents_dir = config.data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("_deleted"), b"").expect("seed _deleted blocker file");
+
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "committed-delete retry proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
+
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory_from_config(&config, None)
+                .expect("open memory backend for deletion retry proof"),
+        );
+        let victim_id = memory.ensure_agent_uuid("victim").await.unwrap();
+        memory
+            .store_with_agent(
+                "victim-memory",
+                "private memory from the retired agent",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&victim_id),
+            )
+            .await
+            .unwrap();
+
+        let mut state = crate::api::test_state(config.clone());
+        state.mem = Arc::clone(&memory);
+
+        // ── attempt 1: config commits, knowledge cascade is refused ──────────
+        let first = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let joined = json
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .expect("the refused cascade must be surfaced through warnings")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("knowledge purge skipped"),
+            "attempt 1 must refuse the purge, got: {joined}"
+        );
+        assert!(
+            !state.config.read().agents.contains_key("victim"),
+            "attempt 1 commits the config removal"
+        );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            1,
+            "attempt 1 leaves the rows stamped with the deleted alias"
+        );
+        drop(knowledge);
+        assert_eq!(
+            memory.export_agent("victim").await.unwrap().len(),
+            1,
+            "memory rows must remain when their durable archive cannot be written"
+        );
+
+        // ── repair the archive blocker, then retry the SAME delete ──────────
+        std::fs::remove_file(agents_dir.join("_deleted")).unwrap();
+        let working = state.config.read().clone();
+        assert!(
+            !working.agents.contains_key("victim"),
+            "the retry runs against a config that no longer has the key"
+        );
+        let second = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::OK,
+            "the retry must re-enter the cascade, not report `not configured`"
+        );
+
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            0,
+            "the retry converges: no rows may stay stamped with the deleted alias"
+        );
+        assert!(
+            memory.export_agent("victim").await.unwrap().is_empty(),
+            "the retry purges memory only after its archive succeeds"
+        );
+    }
+
+    /// Gateway startup may retain a `NoneMemory` placeholder when the configured
+    /// durable backend cannot be opened. Agent deletion must treat that handle as
+    /// unavailable, not as proof that the real store is empty, and converge once
+    /// the backend is reachable again.
+    #[tokio::test]
+    async fn agent_delete_reopens_configured_memory_after_gateway_fallback() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory_from_config(&config, None)
+                .expect("seed configured memory backend"),
+        );
+        let victim_id = memory.ensure_agent_uuid("victim").await.unwrap();
+        memory
+            .store_with_agent(
+                "retired-secret",
+                "must not survive alias reuse",
+                zeroclaw_memory::MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&victim_id),
+            )
+            .await
+            .unwrap();
+        drop(memory);
+
+        // Preserve the real database while making its configured path
+        // temporarily impossible to open, reproducing the gateway boot
+        // fallback without relying on platform-specific permissions.
+        let memory_dir = config.data_dir.join("memory");
+        let saved_memory_dir = config.data_dir.join("memory.saved");
+        std::fs::rename(&memory_dir, &saved_memory_dir).unwrap();
+        std::fs::write(&memory_dir, b"backend unavailable").unwrap();
+
+        let mut state = crate::api::test_state(config.clone());
+        state.mem = Arc::new(zeroclaw_memory::NoneMemory::new("gateway-fallback"));
+
+        let first = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let warnings = json
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .expect("unavailable configured memory must be surfaced");
+        assert!(
+            warnings
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|warning| warning.contains("memory backend unavailable")),
+            "the placeholder must not hide the configured backend failure: {warnings:?}"
+        );
+        assert!(
+            !state.config.read().agents.contains_key("victim"),
+            "the first attempt commits the config removal"
+        );
+
+        std::fs::remove_file(&memory_dir).unwrap();
+        std::fs::rename(&saved_memory_dir, &memory_dir).unwrap();
+        let probe = zeroclaw_memory::create_memory_from_config(&config, None)
+            .expect("restore configured memory backend");
+        assert_eq!(
+            probe.export_agent("victim").await.unwrap().len(),
+            1,
+            "the unavailable first attempt must retain the retired agent's memory"
+        );
+        drop(probe);
+
+        let second = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::OK,
+            "the restored backend must let committed-delete recovery converge"
+        );
+
+        let probe = zeroclaw_memory::create_memory_from_config(&config, None)
+            .expect("reopen memory after recovery");
+        assert!(
+            probe.export_agent("victim").await.unwrap().is_empty(),
+            "a recreated alias must not inherit memory from the retired agent"
+        );
+    }
+
+    /// A delete for an alias that was never configured and has NO owned-state
+    /// residue must still be rejected — committed-delete recovery is a retry
+    /// path, not a way to make bogus deletes succeed.
+    #[tokio::test]
+    async fn agent_delete_without_residue_still_reports_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        let state = crate::api::test_state(config.clone());
+        let resp = delete_agent_cascade(
+            &state,
+            &None,
+            "ghost",
+            test_agent_delete_lease(&state, "ghost"),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// ADR-011 boundary: after a failed cascade, recreating the SAME alias must
+    /// not silently inherit the stranded rows. Registration binds scope directly
+    /// from the alias, so the retry-converged state is what makes reuse safe.
+    #[tokio::test]
+    async fn recreated_alias_does_not_inherit_rows_from_a_converged_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        let agents_dir = config.data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("_deleted"), b"").expect("seed _deleted blocker file");
+
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let stranded = knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "secret from the previous incarnation",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
+
+        let state = crate::api::test_state(config.clone());
+        let _ = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+
+        // Retry after repairing the blocker — this is the convergence step.
+        std::fs::remove_file(agents_dir.join("_deleted")).unwrap();
+        let retry = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
+        assert_eq!(retry.status(), axum::http::StatusCode::OK);
+
+        // Recreate the alias and read the graph through ITS scope.
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let reused_scope =
+            zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new());
+        assert!(
+            knowledge
+                .get_node(&reused_scope, &stranded)
+                .unwrap()
+                .is_none(),
+            "a recreated alias must not inherit rows from the deleted incarnation"
+        );
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            0,
+            "no rows may remain stamped with the reused alias"
         );
     }
 
