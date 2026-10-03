@@ -6569,6 +6569,24 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             )
         );
     }
+    if config.schema_version_inferred {
+        let path = config.config_path.display().to_string();
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION.to_string();
+        let fallback = format!(
+            "warning: {path} has no `schema_version`. Its sections are in the current format, \
+             so it was read as schema_version {version}. Add `schema_version = {version}` as the \
+             first line of the file: without it, a future change to this check could read the \
+             file as an old version and migrate it."
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-schema-version-inferred",
+                &[("path", &path), ("version", &version)],
+                &fallback,
+            )
+        );
+    }
     if config.retired_node_transport_config {
         eprintln!(
             "{}",

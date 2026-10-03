@@ -162,6 +162,12 @@ pub struct Config {
     /// CLI surfaces upgrade guidance without retaining the retired secret.
     #[serde(skip)]
     pub retired_node_transport_config: bool,
+    /// Whether the file had no `schema_version` and was read as the current
+    /// version because its shape leaves no doubt
+    /// ([`crate::migration::schema_version_inferred`]). Never serialized; the
+    /// CLI warns that the key should be added.
+    #[serde(skip)]
+    pub schema_version_inferred: bool,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -21029,6 +21035,7 @@ impl Default for Config {
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            schema_version_inferred: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -22736,11 +22743,14 @@ impl Config {
             // line when the daemon auto-migrates an older config in memory:
             // the disk file is left untouched and the user is advised to lock
             // the migration in with `zeroclaw config migrate`.
-            let stale_version = toml::from_str::<toml::Value>(&contents)
-                .ok()
+            let parsed = toml::from_str::<toml::Value>(&contents).ok();
+            let stale_version = parsed
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
+            let schema_version_inferred = parsed
+                .as_ref()
+                .is_some_and(crate::migration::schema_version_inferred);
             // Daemon load must never hard-fail on a malformed config — the
             // operator needs the process up to repair it. The resilient path
             // degrades (dropping invalid blocks to defaults); security-critical
@@ -22752,6 +22762,21 @@ impl Config {
             config.degraded_sections = salvage.dropped;
             config.retired_wati_config_sections = retired_wati_config_sections;
             config.retired_node_transport_config = retired_node_transport_config;
+            config.schema_version_inferred = schema_version_inferred;
+            if schema_version_inferred {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Config at {} has no schema_version; its shape is current, so it was \
+                         read as schema_version {}. Add `schema_version = {}` to the file.",
+                        config_path.display().to_string(),
+                        crate::migration::CURRENT_SCHEMA_VERSION,
+                        crate::migration::CURRENT_SCHEMA_VERSION
+                    )
+                );
+            }
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -32676,6 +32701,7 @@ auto_save = true
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            schema_version_inferred: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -33991,6 +34017,7 @@ default_temperature = 0.7
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            schema_version_inferred: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),

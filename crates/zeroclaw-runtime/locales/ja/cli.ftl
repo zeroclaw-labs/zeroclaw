@@ -828,6 +828,7 @@ cli-plugin-list-entry-no-component = {$name} v{$version} — {$description}（�
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-config-section-retired-wati = 警告: 廃止された WATI チャネル設定セクション `{$section}` は、WATI のサポートが削除されたため無視されます。Cloud API または WhatsApp Web を使用して `[channels.whatsapp.<alias>]` に移行し、未使用の WATI API トークンを失効させてください。
 cli-config-section-retired-node-transport = 警告: 廃止された `[node_transport]` 設定は、レガシー HMAC ノードトランスポートが削除されたため無視されます。config.toml からこのセクションを削除してください。
+cli-config-schema-version-inferred = 警告: {$path} に `schema_version` がありません。セクションが現在の形式のため、schema_version {$version} として読み込みました。ファイルの先頭行に `schema_version = {$version}` を追加してください。これがないと、この判定が将来変わった場合に古いバージョンとして読み込まれ、移行される可能性があります。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-removed-grant-kept = 設定エントリ '{$key}' は送信許可 ({$grants}) とともに残ります。後で '{$name}' としてインストールされるパッケージはこれを引き継ぎます。許可を取り消すには '{$key}' という名前の [[plugins.entries]] 行を削除してください。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
