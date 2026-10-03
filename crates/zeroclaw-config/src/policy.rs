@@ -885,17 +885,35 @@ fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether `path` names a discard-only null device.
+///
+/// `/dev/null` is recognized on every host and before filesystem resolution,
+/// so the exception does not depend on the target-OS compile flag or on the
+/// device node being resolvable where policy is evaluated. A Windows session
+/// also evaluates POSIX commands (`sh -c` in Docker, cron, a pinned Posix
+/// dialect) whose discard device is `/dev/null`.
+///
+/// The Windows device names `nul` / `\\.\nul` are recognized only on Windows
+/// hosts. This helper short-circuits filesystem authorization, and on Unix
+/// those names are ordinary relative filenames that may be regular files or
+/// symlinks to forbidden targets, so they must go through normal resolution
+/// and policy checks. Whether a *shell* treats a redirect to `nul` as
+/// discard-only is a separate dialect decision
+/// (`is_safe_device_redirect_target`).
+///
+/// Matching is exact. `nul.txt`, `/dev/null/extra`, and `/dev/zero` are not the
+/// null device. On Windows the device name is case-insensitive (`NUL`,
+/// `\\.\NUL`); `/dev/null` is matched literally, as a POSIX path.
 fn is_null_device(path: &Path) -> bool {
-    #[cfg(not(target_os = "windows"))]
-    {
-        path == Path::new("/dev/null")
+    if path == Path::new("/dev/null") {
+        return true;
     }
-    #[cfg(target_os = "windows")]
-    {
+    if cfg!(windows) {
         let s = path.to_string_lossy();
         let lower = s.to_ascii_lowercase();
-        lower == "nul" || lower == r"\\.\nul"
+        return lower == "nul" || lower == r"\\.\nul";
     }
+    false
 }
 
 fn rootless_path(path: &Path) -> Option<PathBuf> {
@@ -4097,9 +4115,12 @@ impl SecurityPolicy {
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
         // Preserve the unconditional null-device exception before attempting
-        // filesystem resolution: Windows spellings such as `nul` are not
-        // canonicalizable paths.
-        if cfg!(windows) && is_null_device(resolved) {
+        // filesystem resolution. `/dev/null` may not exist or resolve on the
+        // host evaluating a POSIX command (a Windows session, or a Unix
+        // session whose `/dev` is unavailable); on Windows hosts `nul` /
+        // `\\.\nul` are not canonicalizable paths. See `is_null_device` for
+        // why the Windows names are host-gated.
+        if is_null_device(resolved) {
             return true;
         }
         // Keep the target in the same filesystem namespace as every policy
@@ -4256,7 +4277,11 @@ impl SecurityPolicy {
     /// the path cannot be resolved (a symlink cycle, or a target whose parents
     /// do not exist); the caller MUST fail closed.
     pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
-        if cfg!(windows) && is_null_device(path) {
+        // The null device is not a canonicalizable filesystem path
+        // (`/dev/null` when the device node is absent, or `nul` on Windows
+        // hosts). Return it as-is so callers that resolve before checking
+        // still see the exception instead of failing closed.
+        if is_null_device(path) {
             return Some(path.to_path_buf());
         }
         resolve_symlinked_path(path)
@@ -4274,9 +4299,10 @@ impl SecurityPolicy {
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         // Preserve the unconditional null-device exception before attempting
-        // filesystem resolution: Windows spellings such as `nul` are not
-        // canonicalizable paths.
-        if cfg!(windows) && is_null_device(resolved) {
+        // filesystem resolution. `/dev/null` may not exist or resolve on the
+        // host evaluating the command; on Windows hosts `nul` / `\\.\nul` are
+        // not canonicalizable paths. See `is_null_device`.
+        if is_null_device(resolved) {
             return true;
         }
         // See `is_resolved_path_readable`: authorization compares the target,
@@ -8532,8 +8558,210 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        assert!(policy.is_resolved_path_readable(Path::new("nul")));
-        assert!(policy.is_resolved_path_allowed(Path::new("nul")));
+        for spelling in ["nul", "NUL", "Nul", r"\\.\nul", r"\\.\NUL"] {
+            let device = Path::new(spelling);
+            assert!(
+                policy.is_path_allowed(spelling),
+                "native null device {spelling:?} must be allowed"
+            );
+            assert!(
+                policy.is_resolved_path_readable(device),
+                "native null device {spelling:?} must be readable before resolution"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(device),
+                "native null device {spelling:?} must be writable before resolution"
+            );
+            assert_eq!(
+                policy.resolve_policy_target(device),
+                Some(device.to_path_buf()),
+                "native null device {spelling:?} is not canonicalizable and is returned as-is"
+            );
+        }
+    }
+
+    /// On Unix, `nul`, `NUL`, and `\\.\nul` are ordinary filenames, not the
+    /// null device. The Windows discard spelling must not short-circuit
+    /// filesystem authorization: an alias with one of those names is resolved
+    /// like any other path and denied when its target is forbidden or outside
+    /// every allowed root. `/dev/null` and its aliases stay usable.
+    #[cfg(unix)]
+    #[test]
+    fn unix_foreign_null_spellings_get_no_filesystem_exception() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspace = root.join("ws");
+        let secret_dir = workspace.join("secret");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let secret = secret_dir.join("key");
+        let outside = outside_dir.join("key");
+        let notes = workspace.join("notes.txt");
+        for file in [&secret, &outside, &notes] {
+            std::fs::write(file, "x").unwrap();
+        }
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            // The forbidden directory sits inside the workspace, so every
+            // alias below is lexically in-workspace: only resolution of the
+            // alias to its target can deny it. `/dev` is forbidden to show
+            // the `/dev/null` exception survives a forbidden parent.
+            forbidden_paths: vec![secret_dir.to_string_lossy().into_owned(), "/dev".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Control: an ordinary in-workspace alias is authorized, so the
+        // denials below come from the target, not from the fixture location.
+        let ok_alias = workspace.join("ok-alias");
+        symlink(&notes, &ok_alias).unwrap();
+        assert!(policy.is_resolved_path_readable(&ok_alias));
+        assert!(policy.is_resolved_path_allowed(&ok_alias));
+
+        for (name, target) in [
+            ("nul", &secret),
+            ("NUL", &outside),
+            (r"\\.\nul", &secret),
+            (r"\\.\NUL", &outside),
+        ] {
+            let alias = workspace.join(name);
+            symlink(target, &alias).unwrap();
+            assert_eq!(
+                policy.resolve_policy_target(&alias),
+                Some(target.clone()),
+                "{name:?} is an ordinary Unix filename and must resolve to its target"
+            );
+            assert!(
+                !policy.is_resolved_path_readable(&alias),
+                "{name:?} alias to {target:?} must not be readable"
+            );
+            assert!(
+                !policy.is_resolved_path_allowed(&alias),
+                "{name:?} alias to {target:?} must not be writable"
+            );
+        }
+
+        // A bare foreign spelling gains nothing from its name: it is resolved
+        // against the process CWD (never returned raw) and, because that CWD
+        // is outside this workspace, authorization is denied.
+        for name in ["nul", "NUL", r"\\.\nul"] {
+            let bare = Path::new(name);
+            let target = policy.resolve_policy_target(bare);
+            assert_ne!(
+                target.as_deref(),
+                Some(bare),
+                "{name:?} must not be returned as an unresolved device spelling"
+            );
+            assert!(
+                target.as_deref().is_none_or(Path::is_absolute),
+                "{name:?} must resolve to an absolute target or fail closed, got {target:?}"
+            );
+            assert!(!policy.is_resolved_path_readable(bare), "{name:?} read");
+            assert!(!policy.is_resolved_path_allowed(bare), "{name:?} write");
+        }
+
+        // `/dev/null` and an alias to it remain usable even though `/dev` is
+        // forbidden.
+        let null_alias = workspace.join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        for device in [Path::new("/dev/null"), null_alias.as_path()] {
+            assert!(policy.is_resolved_path_readable(device), "{device:?} read");
+            assert!(policy.is_resolved_path_allowed(device), "{device:?} write");
+        }
+    }
+
+    /// `/dev/null` is a path identity, not a host-OS compile flag: it must be
+    /// allowed on every host, before filesystem resolution, even when `/dev`
+    /// is forbidden. A Windows session evaluating a POSIX command (Docker
+    /// `sh -c`, cron, a pinned Posix dialect) must also allow it. The Windows
+    /// device names are host-native and covered by
+    /// `resolved_path_checks_allow_the_windows_null_device` and
+    /// `unix_foreign_null_spellings_get_no_filesystem_exception`.
+    #[test]
+    fn null_device_exception_is_unconditional_across_hosts() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            workspace_only: true,
+            forbidden_paths: vec!["/dev".into(), "/etc".into()],
+            ..SecurityPolicy::default()
+        };
+
+        #[cfg(target_os = "windows")]
+        let spellings = ["/dev/null", "nul", "NUL", "Nul", r"\\.\nul", r"\\.\NUL"].as_slice();
+        #[cfg(not(target_os = "windows"))]
+        let spellings = ["/dev/null"].as_slice();
+
+        for &spelling in spellings {
+            assert!(
+                policy.is_path_allowed(spelling),
+                "null device {spelling:?} must be allowed regardless of host OS and forbidden_paths"
+            );
+            assert!(
+                policy.is_resolved_path_readable(Path::new(spelling)),
+                "null device {spelling:?} must stay readable before filesystem resolution"
+            );
+            assert!(
+                policy.is_resolved_path_allowed(Path::new(spelling)),
+                "null device {spelling:?} must stay writable before filesystem resolution"
+            );
+            assert_eq!(
+                policy.resolve_policy_target(Path::new(spelling)),
+                Some(PathBuf::from(spelling)),
+                "null device {spelling:?} is not a canonicalizable path and must be returned as-is"
+            );
+        }
+
+        // The exception is exact. These are absolute on every host, sit
+        // outside the workspace (and `/dev/*` is forbidden), and must not
+        // match the null device.
+        for spelling in ["/dev/zero", "/dev/null/extra", "/dev/null.txt"] {
+            assert!(
+                !policy.is_path_allowed(spelling),
+                "non-null path {spelling:?} must not inherit the null-device exception"
+            );
+            assert!(
+                !policy.is_resolved_path_allowed(Path::new(spelling)),
+                "non-null path {spelling:?} must not be writable via the null-device exception"
+            );
+        }
+
+        // A POSIX redirect to /dev/null, and a cmd.exe redirect to nul, must
+        // both pass the path scan on every host. The dialect still decides
+        // which spelling is the discard device for *that shell*.
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("ls missing 2>/dev/null", ShellDialect::Posix),
+            None,
+            "POSIX /dev/null redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                "ls missing 2>/dev/null",
+                ShellDialect::Posix,
+            ),
+            None,
+            "workspace scan must not re-block a POSIX /dev/null redirect"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>nul", ShellDialect::WindowsCmd),
+            None,
+            "cmd.exe nul redirect must be allowed on every host"
+        );
+        assert_eq!(
+            policy.forbidden_path_argument_for_shell("dir missing 2>NUL", ShellDialect::WindowsCmd),
+            None
+        );
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_for_shell(
+                r"dir missing 2>\\.\nul",
+                ShellDialect::WindowsCmd,
+            ),
+            None,
+            "workspace scan must not re-block a cmd.exe \\\\.\\\\nul redirect"
+        );
     }
 
     #[test]
