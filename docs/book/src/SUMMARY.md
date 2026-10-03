@@ -202,3 +202,4 @@
   - [Superseding PRs](./maintainers/superseding.md)
   - [Release runbook](./maintainers/release-runbook.md)
   - [Release artifact verification](./maintainers/release-verification.md)
+  - [Plugin release acceptance](./maintainers/plugin-release-acceptance.md)

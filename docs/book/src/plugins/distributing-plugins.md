@@ -116,6 +116,24 @@ A registry entry (`PluginRegistryEntry` in
 optional `description` and `author`, `capabilities`, the archive `url`, and
 an optional `sha256` digest of the zip.
 
+### Package names and Cargo features
+
+Operators install, inspect, and configure a package by its registry `name`.
+That name is not a Cargo feature, even where the two look alike. The official
+Discord channel plugin is the package `discord`, installed with
+`zeroclaw plugin install discord`. `channel-discord` is the Cargo feature that
+compiles the built-in Discord channel into the binary (see the
+[channels overview](../channels/overview.md)); no package has that name.
+[FND-001](../foundations/fnd-001-intentional-architecture.md) and
+[FND-004](../foundations/fnd-004-engineering-infrastructure.md) predate the
+package and call it `channel-discord` and `channel-discord.wasm`; read both as
+the `discord` package.
+
+Choose the name before the first release and keep it. Every instance key is
+derived from it, so a package republished under a new name starts with no
+config, no egress grants, and no stored state for the instances operators
+already set up.
+
 ### The archive contract
 
 `zeroclaw plugin install <name>` resolves the entry, downloads the zip,
