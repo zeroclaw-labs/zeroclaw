@@ -1469,6 +1469,13 @@ Examples:
         oidc_command: OidcCommands,
     },
 
+    /// Manage the local user roster ([users.<name>]) and roster passwords
+    #[cfg(feature = "agent-runtime")]
+    User {
+        #[command(subcommand)]
+        user_command: UserCommands,
+    },
+
     /// Discover and introspect USB hardware
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -5360,6 +5367,62 @@ enum OidcCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum UserCommands {
+    /// List roster entries and the credentials each carries (never a hash)
+    List,
+    /// Add a roster entry
+    Add {
+        /// Entry name: the password login name and, unless --principal-id pins
+        /// another, the durable principal id
+        name: String,
+        /// A [permission_profiles.<alias>] granting this user's permissions;
+        /// repeat the flag for several
+        #[arg(long = "profile", required = true)]
+        profiles: Vec<String>,
+        /// Unix uid accepted for this user on the local socket
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Durable principal id, when it should differ from the entry name
+        #[arg(long)]
+        principal_id: Option<String>,
+        /// Set a password, typed twice at a prompt
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: bool,
+        /// Set a password read as one line from standard input
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Set or replace a roster entry's password
+    Passwd {
+        /// Entry name
+        name: String,
+        /// Read the password as one line from standard input instead of
+        /// prompting
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Remove the password from a roster entry that also has a uid
+    DisablePassword {
+        /// Entry name
+        name: String,
+    },
+    /// Remove a roster entry
+    Remove {
+        /// Entry name
+        name: String,
+    },
+    /// Print a password hash for config managed by other tools; the hash is
+    /// the only output on stdout
+    HashPassword {
+        /// Read the password as one line from standard input instead of
+        /// prompting
+        #[arg(long)]
+        password_stdin: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache model_provider models
@@ -6233,6 +6296,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    // `user hash-password` is stdout-only too, and needs no config: loading
+    // one could fail on an unrelated section, or create one on a host that
+    // has none.
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::User {
+        user_command: UserCommands::HashPassword { password_stdin },
+    } = &cli.command
+    {
+        return print_password_hash(*password_stdin);
+    }
+
     // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
     match &cli.command {
         Commands::MarkdownHelp => {
@@ -6595,6 +6669,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             unreachable!("matched the Oidc variant above")
         };
         return handle_oidc_command(oidc_command, &config).await;
+    }
+    // Roster edits need no startup prelude: they touch only config.toml.
+    // (`user hash-password` never gets here; it runs before config loads.)
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::User { .. }) {
+        let Commands::User { user_command } = cli.command else {
+            unreachable!("matched the User variant above")
+        };
+        return Box::pin(handle_user_command(user_command, &config)).await;
     }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
@@ -8955,6 +9038,11 @@ Add pricing to the active provider profile or supply a catalog entry."
 
         #[cfg(feature = "agent-runtime")]
         Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::User { user_command } => {
+            Box::pin(handle_user_command(user_command, &config)).await
+        }
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -11853,6 +11941,464 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
     Ok(())
 }
 
+/// `zeroclaw user`: offline edits to the `[users]` roster. Each edit is
+/// checked as a complete authorization policy before a password is asked
+/// for and again before anything is written, which also makes these
+/// commands a repair path while the daemon is stopped. Like `config set`, a
+/// running daemon picks the change up at its next reload or restart.
+#[cfg(feature = "agent-runtime")]
+async fn handle_user_command(user_command: UserCommands, config: &Config) -> Result<()> {
+    use zeroclaw_config::password_hash::{Decoy, hash_password};
+
+    match user_command {
+        // Dispatched before any config is loaded; handled here too so every
+        // variant has one home.
+        UserCommands::HashPassword { password_stdin } => print_password_hash(password_stdin),
+        UserCommands::List => {
+            ensure_roster_loaded(config)?;
+            print_roster(config);
+            Ok(())
+        }
+        UserCommands::Add {
+            name,
+            profiles,
+            uid,
+            principal_id,
+            password,
+            password_stdin,
+        } => {
+            let mut edit = RosterEdit::begin(config)?;
+            if edit.config.users.contains_key(&name) {
+                bail!(ta(
+                    "cli-user-exists",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} already exists. Use `zeroclaw user passwd {name}` to change its password."
+                    ),
+                ));
+            }
+            let sets_password = password || password_stdin;
+            if uid.is_none() && !sets_password {
+                bail!(ta(
+                    "cli-user-add-needs-credential",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} needs a credential: pass --uid, --password, or --password-stdin."
+                    ),
+                ));
+            }
+            // Creating the key checks the name first.
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut edit.config, "users", &name)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let entry = roster_entry(&mut edit.config, &name)?;
+            entry.principal_id = principal_id;
+            entry.uid = uid;
+            entry.permission_profiles = profiles;
+            // Check the rest of the entry before a password is typed, with a
+            // placeholder where its hash will go.
+            entry.password_hash = sets_password.then(|| Decoy::default().as_phc().to_owned());
+            check_roster(&edit.config)?;
+            if sets_password {
+                let hash = hash_password(&read_new_password(password_stdin)?)?;
+                roster_entry(&mut edit.config, &name)?.password_hash = Some(hash);
+            }
+            mark_new_map_alias_dirty(&mut edit.config, &format!("users.{name}"));
+            let done = ta(
+                "cli-user-added",
+                &[("name", &name)],
+                format!("Added users.{name}."),
+            );
+            Box::pin(edit.save(&done, sets_password)).await
+        }
+        UserCommands::Passwd {
+            name,
+            password_stdin,
+        } => {
+            let mut edit = RosterEdit::begin(config)?;
+            // Check the policy as it will be once the password is set, before
+            // asking for it: a placeholder stands where the new hash goes, so
+            // an entry this command is repairing (no credential yet, or a
+            // hash outside the policy) is not refused for what it replaces.
+            roster_entry(&mut edit.config, &name)?.password_hash =
+                Some(Decoy::default().as_phc().to_owned());
+            check_roster(&edit.config)?;
+            let hash = hash_password(&read_new_password(password_stdin)?)?;
+            roster_entry(&mut edit.config, &name)?.password_hash = Some(hash);
+            edit.config
+                .mark_dirty(&format!("users.{name}.password_hash"));
+            let done = ta(
+                "cli-user-password-set",
+                &[("name", &name)],
+                format!("Set the password for users.{name}."),
+            );
+            Box::pin(edit.save(&done, true)).await
+        }
+        UserCommands::DisablePassword { name } => {
+            let mut edit = RosterEdit::begin(config)?;
+            let entry = roster_entry(&mut edit.config, &name)?;
+            if entry.password_hash.is_none() {
+                bail!(ta(
+                    "cli-user-no-password",
+                    &[("name", &name)],
+                    format!("users.{name} has no password."),
+                ));
+            }
+            if entry.uid.is_none() {
+                bail!(ta(
+                    "cli-user-password-only-credential",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} has no uid, so its password is its only credential. Remove the entry with `zeroclaw user remove {name}` instead."
+                    ),
+                ));
+            }
+            entry.password_hash = None;
+            edit.config
+                .mark_dirty(&format!("users.{name}.password_hash"));
+            let done = ta(
+                "cli-user-password-removed",
+                &[("name", &name)],
+                format!("Removed the password from users.{name}."),
+            );
+            Box::pin(edit.save(&done, false)).await
+        }
+        UserCommands::Remove { name } => {
+            let mut edit = RosterEdit::begin(config)?;
+            roster_entry(&mut edit.config, &name)?;
+            edit.config
+                .delete_map_key("users", &name)
+                .map_err(anyhow::Error::msg)?;
+            edit.config.mark_dirty(&format!("users.{name}"));
+            let done = ta(
+                "cli-user-removed",
+                &[("name", &name)],
+                format!("Removed users.{name}."),
+            );
+            Box::pin(edit.save(&done, false)).await
+        }
+    }
+}
+
+/// `user hash-password`: the hash of a new password, alone on stdout. It
+/// needs no configuration, so `main` runs it before any config is loaded.
+#[cfg(feature = "agent-runtime")]
+fn print_password_hash(from_stdin: bool) -> Result<()> {
+    let password = read_new_password(from_stdin)?;
+    println!(
+        "{}",
+        zeroclaw_config::password_hash::hash_password(&password)?
+    );
+    Ok(())
+}
+
+/// Environment overrides that a roster check would trust although the file
+/// does not hold them: any under `users` or `permission_profiles`, whose
+/// values the check reads; one under `oidc`, unless it is a secret of an
+/// entry the file defines (for a secret the check reads only whether it is
+/// set); and an alias under `agents` that the file does not define, since a
+/// profile may name it. `file` is the text of `config.toml`.
+#[cfg(feature = "agent-runtime")]
+fn overrides_the_check_would_trust<'a>(config: &'a Config, file: &[u8]) -> Vec<&'a str> {
+    let table = toml::from_str::<toml::Table>(&String::from_utf8_lossy(file)).ok();
+    let aliases_in = |section: &str| -> std::collections::HashSet<String> {
+        table
+            .as_ref()
+            .and_then(|table| table.get(section))
+            .and_then(toml::Value::as_table)
+            .map(|entries| entries.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let file_agents = aliases_in("agents");
+    let file_oidc = aliases_in("oidc");
+    let mut paths: Vec<&str> = config
+        .env_overridden_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            let mut parts = path.splitn(3, '.');
+            match (parts.next(), parts.next()) {
+                (Some("users" | "permission_profiles"), _) => true,
+                (Some("oidc"), Some(alias)) => {
+                    !file_oidc.contains(alias) || !Config::prop_is_secret(path)
+                }
+                (Some("agents"), Some(alias)) => !file_agents.contains(alias),
+                _ => false,
+            }
+        })
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// Refuse to read or edit a roster the file does not fully describe: the
+/// resilient loader resets a malformed section to its default, so a check of
+/// the loaded roster, profiles, or OIDC entries would not be a check of the
+/// file.
+#[cfg(feature = "agent-runtime")]
+fn ensure_roster_loaded(config: &Config) -> Result<()> {
+    let degraded: Vec<&str> = config
+        .degraded_security
+        .iter()
+        .map(String::as_str)
+        .filter(|section| {
+            *section == zeroclaw_config::migration::WHOLE_CONFIG_SENTINEL
+                || matches!(*section, "users" | "permission_profiles" | "oidc")
+        })
+        .collect();
+    if degraded.is_empty() {
+        return Ok(());
+    }
+    let sections = degraded.join(", ");
+    let path = config.config_path.display().to_string();
+    bail!(ta(
+        "cli-user-roster-degraded",
+        &[("sections", &sections), ("path", &path)],
+        format!(
+            "Part of {path} failed to load ({sections}), so the roster cannot be read or edited safely. Repair it by hand, then run the command again."
+        ),
+    ))
+}
+
+/// Prove the roster compiles into an authorization policy.
+#[cfg(feature = "agent-runtime")]
+fn check_roster(config: &Config) -> Result<()> {
+    zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(config)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn roster_entry<'a>(
+    config: &'a mut Config,
+    name: &str,
+) -> Result<&'a mut zeroclaw_config::schema::UserConfig> {
+    config.users.get_mut(name).ok_or_else(|| {
+        anyhow::Error::msg(ta(
+            "cli-user-not-found",
+            &[("name", name)],
+            format!("There is no [users.{name}] entry."),
+        ))
+    })
+}
+
+/// One roster edit: a working copy of the loaded config, and the bytes of
+/// the file it will be saved over. The policy check runs against the working
+/// copy, so a file that changes while the edit is open (a password prompt
+/// can take a while) is refused instead of merged under a check that never
+/// saw the change.
+#[cfg(feature = "agent-runtime")]
+struct RosterEdit {
+    config: Config,
+    on_disk: Vec<u8>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl RosterEdit {
+    fn begin(config: &Config) -> Result<Self> {
+        ensure_roster_loaded(config)?;
+        crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+        let on_disk = std::fs::read(&config.config_path)
+            .with_context(|| format!("reading {}", config.config_path.display()))?;
+        // An override exists only in this process, so the check would pass
+        // against values the file does not hold.
+        let overridden = overrides_the_check_would_trust(config, &on_disk);
+        if !overridden.is_empty() {
+            let paths = overridden.join(", ");
+            let path = config.config_path.display().to_string();
+            bail!(ta(
+                "cli-user-env-overrides",
+                &[("paths", &paths), ("path", &path)],
+                format!(
+                    "Environment overrides change {paths}, so the roster check would not match {path}. Unset them and run the command again."
+                ),
+            ));
+        }
+        Ok(Self {
+            config: config.clone(),
+            on_disk,
+        })
+    }
+
+    /// Check the edited roster, refuse if the file changed since the edit
+    /// began, write only the changed paths, and say that a running daemon
+    /// has not seen the change yet.
+    async fn save(mut self, done: &str, sets_password: bool) -> Result<()> {
+        check_roster(&self.config)?;
+        let path = self.config.config_path.clone();
+        let current =
+            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if current != self.on_disk {
+            let shown = path.display().to_string();
+            bail!(ta(
+                "cli-user-config-changed",
+                &[("path", &shown)],
+                format!(
+                    "{shown} changed while this command ran, so nothing was written. Run the command again."
+                ),
+            ));
+        }
+        Box::pin(self.config.save_dirty()).await?;
+        println!("{done}");
+        eprintln!(
+            "{}",
+            t(
+                "cli-user-apply-hint",
+                "The running daemon applies this change at its next reload or restart."
+            )
+        );
+        if sets_password && !self.config.security.password_auth.enabled {
+            eprintln!(
+                "{}",
+                t(
+                    "cli-user-password-auth-off",
+                    "Password sign-in is off. Set security.password_auth.enabled = true to turn it on."
+                )
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Read a password to set: typed twice at a hidden prompt, or one line from
+/// standard input. It must pass the shared new-password rule. The buffers
+/// this function holds are scrubbed when dropped; copies made inside the
+/// terminal prompt and the stdin reader are not.
+#[cfg(feature = "agent-runtime")]
+fn read_new_password(from_stdin: bool) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::IsTerminal;
+    use zeroclaw_config::password_hash::{
+        MAX_PASSWORD_BYTES, MIN_NEW_PASSWORD_CHARS, NewPasswordError, check_new_password,
+    };
+    use zeroize::{Zeroize, Zeroizing};
+
+    let password = if from_stdin {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            bail!(t(
+                "cli-user-password-stdin-terminal",
+                "--password-stdin reads a pipe or a file; typing into a terminal here would show the password. To type it at a hidden prompt, pass --password to add, or leave --password-stdin out of passwd and hash-password."
+            ));
+        }
+        // One byte past the longest password plus a CRLF is enough to tell
+        // that input is too long, without buffering all of it. The buffer is
+        // sized up front so it never reallocates and leaves a copy behind.
+        let limit = MAX_PASSWORD_BYTES + 3;
+        let cap = u64::try_from(limit).unwrap_or(u64::MAX);
+        let mut line = Zeroizing::new(Vec::with_capacity(limit));
+        stdin.lock().take(cap).read_until(b'\n', &mut line)?;
+        let end = line
+            .iter()
+            .rposition(|byte| *byte != b'\n' && *byte != b'\r')
+            .map_or(0, |last| last + 1);
+        line.truncate(end);
+        if line.len() > MAX_PASSWORD_BYTES {
+            let max = MAX_PASSWORD_BYTES.to_string();
+            bail!(ta(
+                "cli-user-password-too-long",
+                &[("max", &max)],
+                format!("The password must be at most {max} bytes long."),
+            ));
+        }
+        let text = match String::from_utf8(std::mem::take(&mut *line)) {
+            Ok(text) => Zeroizing::new(text),
+            Err(error) => {
+                error.into_bytes().zeroize();
+                bail!(t(
+                    "cli-user-password-not-utf8",
+                    "The password is not valid UTF-8."
+                ));
+            }
+        };
+        // Blank input is refused as at the prompt, which trims the same way.
+        if text.trim().is_empty() {
+            bail!(t(
+                "cli-user-password-stdin-empty",
+                "No password was read from standard input."
+            ));
+        }
+        text
+    } else {
+        let first = Zeroizing::new(secret_prompt(
+            &t("cli-user-password-prompt", "New password"),
+            false,
+        )?);
+        let second = Zeroizing::new(secret_prompt(
+            &t("cli-user-password-confirm", "Repeat the password"),
+            false,
+        )?);
+        if *first != *second {
+            bail!(t(
+                "cli-user-password-mismatch",
+                "The two passwords do not match."
+            ));
+        }
+        first
+    };
+    match check_new_password(&password) {
+        Ok(()) => Ok(password),
+        Err(NewPasswordError::TooShort) => {
+            let min = MIN_NEW_PASSWORD_CHARS.to_string();
+            bail!(ta(
+                "cli-user-password-too-short",
+                &[("min", &min)],
+                format!("The password must be at least {min} characters long."),
+            ))
+        }
+        Err(NewPasswordError::TooLong) => {
+            let max = MAX_PASSWORD_BYTES.to_string();
+            bail!(ta(
+                "cli-user-password-too-long",
+                &[("max", &max)],
+                format!("The password must be at most {max} bytes long."),
+            ))
+        }
+    }
+}
+
+/// One line per roster entry, never the hash itself.
+#[cfg(feature = "agent-runtime")]
+fn print_roster(config: &Config) {
+    if config.users.is_empty() {
+        println!(
+            "{}",
+            t("cli-user-list-empty", "No [users] entries are configured.")
+        );
+        return;
+    }
+    let no_uid = t("cli-user-list-no-uid", "none");
+    let no_password = t("cli-user-list-no-password", "none");
+    let set = t("cli-user-list-password-set", "set");
+    let mut names: Vec<&String> = config.users.keys().collect();
+    names.sort();
+    for name in names {
+        let user = &config.users[name];
+        let principal = user.effective_principal_id(name);
+        let uid = user
+            .uid
+            .map_or_else(|| no_uid.clone(), |uid| uid.to_string());
+        let password = if user.password_hash.is_some() {
+            set.as_str()
+        } else {
+            no_password.as_str()
+        };
+        let profiles = user.permission_profiles.join(", ");
+        println!(
+            "{}",
+            ta(
+                "cli-user-list-row",
+                &[
+                    ("name", name),
+                    ("principal", principal),
+                    ("uid", &uid),
+                    ("password", password),
+                    ("profiles", &profiles),
+                ],
+                format!(
+                    "{name}: principal {principal}, uid {uid}, password {password}, profiles {profiles}"
+                ),
+            )
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -14649,6 +15195,126 @@ mod tests {
         assert_eq!(
             discover_desktop_app(&dirs).as_deref(),
             Some(high_bin.as_path())
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn user_add_parses_profiles_and_credential_flags() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "user",
+            "add",
+            "zeroclaw_user",
+            "--profile",
+            "operator",
+            "--profile",
+            "reader",
+            "--uid",
+            "1001",
+            "--password-stdin",
+        ])
+        .expect("user add should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::User {
+                user_command: UserCommands::Add {
+                    name,
+                    profiles,
+                    uid: Some(1001),
+                    principal_id: None,
+                    password: false,
+                    password_stdin: true,
+                }
+            } if name == "zeroclaw_user" && profiles == ["operator", "reader"]
+        ));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn roster_edit_refuses_a_file_changed_underneath_it() {
+        let dir = tempfile::tempdir().expect("temporary config directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 3\n").expect("write config");
+        let mut config = Config::default();
+        config.config_path = path.clone();
+
+        let mut edit = RosterEdit::begin(&config).expect("begin an edit");
+        edit.config.mark_dirty("users");
+        let changed = "schema_version = 3\n# written by another process\n";
+        std::fs::write(&path, changed).expect("concurrent write");
+
+        let refused = Box::pin(edit.save("done", false)).await;
+        assert!(
+            refused.is_err(),
+            "an edit checked against the old file must not be written over the new one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            changed,
+            "the concurrent change survives"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn only_overrides_the_roster_check_reads_are_refused() {
+        let mut config = Config::default();
+        for path in [
+            "users.zeroclaw_user.uid",
+            "permission_profiles.operator.admin",
+            "oidc.corp.issuer",
+            "oidc.corp.client_secret",
+            "oidc.zeroclaw_ghost.client_secret",
+            "security.otp.enabled",
+            "agents.zeroclaw_defined.enabled",
+            "agents.zeroclaw_from_env.enabled",
+            "gateway.port",
+        ] {
+            config.env_overridden_paths.insert(path.to_owned());
+        }
+        let file = b"schema_version = 3\n\n[agents.zeroclaw_defined]\nenabled = true\n\n\
+                     [oidc.corp]\naudience = \"zeroclaw\"\n";
+        assert_eq!(
+            overrides_the_check_would_trust(&config, file),
+            vec![
+                "agents.zeroclaw_from_env.enabled",
+                "oidc.corp.issuer",
+                "oidc.zeroclaw_ghost.client_secret",
+                "permission_profiles.operator.admin",
+                "users.zeroclaw_user.uid",
+            ],
+            "the check reads profile, roster, and non-secret OIDC values and \
+             the agent aliases profiles may name; nothing else"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn user_add_needs_a_profile_and_takes_no_password_argument() {
+        let base = ["zeroclaw", "user", "add", "zeroclaw_user"];
+        assert!(
+            Cli::try_parse_from(base).is_err(),
+            "at least one --profile is required"
+        );
+        let with_profile = [base.as_slice(), &["--profile", "operator"]].concat();
+        assert!(
+            Cli::try_parse_from(
+                [with_profile.as_slice(), &["--password", "--password-stdin"]].concat()
+            )
+            .is_err(),
+            "one password source at a time"
+        );
+        assert!(
+            Cli::try_parse_from(
+                [
+                    with_profile.as_slice(),
+                    &["--password", "zeroclaw-test-passphrase"]
+                ]
+                .concat()
+            )
+            .is_err(),
+            "a password is never read from the command line"
         );
     }
 
