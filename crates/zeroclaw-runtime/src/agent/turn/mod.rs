@@ -344,8 +344,32 @@ fn custom_native_tools_fallback_warning(target: provider_call::CustomProviderRef
         ),
         provider_call::CustomProviderRef::Url(url) => format!(
             "Native tool calling failed for custom endpoint `{}`; this turn fell back to prompt-guided tools. A bare `custom:<url>` reference has no configuration entry to opt out with: define `[providers.models.custom.<name>]` with this `uri` and `native_tools = false`, then reference `custom.<name>` to skip the failing native request next time.",
-            scrub_credentials(url)
+            redact_endpoint_url(url)
         ),
+    }
+}
+
+static URL_USERINFO_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b([a-z][a-z0-9+.\-]*://)[^/?#\s@]+@")
+        .expect("static URL userinfo regex must compile")
+});
+
+/// Redact credentials from text that may contain a bare `custom:<url>`
+/// endpoint: the URL itself, or an HTTP error that echoes it. URL userinfo
+/// (`https://user:token@host`) is not recognised by `scrub_credentials`, so it
+/// is stripped first; credential query parameters are left to
+/// `scrub_credentials`.
+fn redact_endpoint_url(text: &str) -> String {
+    scrub_credentials(&URL_USERINFO_REGEX.replace_all(text, "${1}[REDACTED]@"))
+}
+
+/// Provider name safe for logs: bare `custom:<url>` names are redacted.
+fn loggable_provider_name(model_provider_name: &str) -> String {
+    match provider_call::custom_provider_ref(model_provider_name) {
+        Some(provider_call::CustomProviderRef::Url(url)) => {
+            format!("custom:{}", redact_endpoint_url(url))
+        }
+        _ => model_provider_name.to_string(),
     }
 }
 
@@ -2047,7 +2071,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": active_model_provider_name,
+                        "model_provider": loggable_provider_name(active_model_provider_name),
                         "custom_ref": match custom_ref {
                             provider_call::CustomProviderRef::Alias(_) => "alias",
                             provider_call::CustomProviderRef::Url(_) => "url",
@@ -2055,7 +2079,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         "model": provider_request_model,
                         "iteration": iteration + 1,
                         "config_key": custom_native_tools_config_key(custom_ref),
-                        "error": scrub_credentials(&err.to_string()),
+                        "error": redact_endpoint_url(&err.to_string()),
                         "trace_id": turn_id,
                     })),
                 &warning
@@ -4300,6 +4324,36 @@ mod native_tool_fallback_tests {
         assert!(warning_text.contains("custom endpoint"));
         assert!(warning_text.contains("native_tools = false"));
         assert!(warning_text.contains("custom.<name>"));
+    }
+
+    #[test]
+    fn bare_custom_url_credentials_never_reach_warnings_or_logs() {
+        let name = "custom:https://svc:t0kenValue9@gw.example.com/v1?api_key=abcdefgh12345";
+        let Some(target) = provider_call::custom_provider_ref(name) else {
+            panic!("bare URL must be recognised");
+        };
+        for rendered in [
+            custom_native_tools_fallback_warning(target),
+            loggable_provider_name(name),
+        ] {
+            assert!(!rendered.contains("t0kenValue9"), "{rendered}");
+            assert!(!rendered.contains("abcdefgh12345"), "{rendered}");
+            assert!(!rendered.contains("svc:"), "{rendered}");
+            assert!(rendered.contains("gw.example.com"), "{rendered}");
+        }
+        assert_eq!(loggable_provider_name("custom.gw"), "custom.gw");
+        let echoed = redact_endpoint_url(
+            "error sending request for url (https://svc:t0kenValue9@gw.example.com/v1/chat/completions)",
+        );
+        assert!(!echoed.contains("t0kenValue9"), "{echoed}");
+        assert!(
+            echoed.contains("https://[REDACTED]@gw.example.com"),
+            "{echoed}"
+        );
+        assert_eq!(
+            redact_endpoint_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1"
+        );
     }
 
     #[test]
