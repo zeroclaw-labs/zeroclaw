@@ -147,7 +147,7 @@ to register. The runtime now resolves an explicitly declared
 it from the configured alias; that alias-aware construction and runtime config
 resolution landed in
 [#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). A channel can
-also opt into the generic gateway-owned POST webhook ingress described below;
+also opt into the generic GET and POST webhook ingress described below;
 vendor tunnels, polling clients, and other transports remain follow-ups. The memory bridge
 (`WasmMemory`) is in the same position one step earlier: the adapter implements
 the full `Memory` trait against the `memory-plugin` world, but the host does not
@@ -462,9 +462,11 @@ cannot publish a partial generation. Publication carries a generation lease;
 a retiring older channel supervisor cannot clear a newer route set.
 
 Webhook ingress requires the component's effective `config_read` grant. For
-each request, the gateway passes a typed `webhook-request` containing the HTTP
-method, raw query, lowercase UTF-8 headers, and exact body bytes to
-`parse-webhook` in a disposable configured store. The guest resolves
+each request, the core ingress passes a typed `webhook-request` containing the
+HTTP method, raw query, headers, and exact body bytes to `parse-webhook` in a
+disposable configured store. Header names are lowercase, and header values hold
+only visible ASCII, space, and tab: the gateway forwards those values and drops
+a header whose value has any other byte. The guest resolves
 its current scoped config and secrets in that call, verifies platform
 authenticity, and returns `webhook-response.messages`, `webhook-response.reply`,
 or a typed `unauthorized` / `bad-request` rejection. Cancelling or timing out the HTTP
@@ -482,8 +484,10 @@ methods return `405` with `Allow: GET, POST` before reaching the component.
 The unauthenticated edge remains host-governed:
 
 - The canonical trusted-forwarded-aware webhook rate limiter runs before route
-  lookup. Request bodies use the gateway's 64 KiB ceiling, each route has a
-  64-request queue, and parse plus delivery has a 10-second deadline.
+  lookup. Request bodies use the gateway's 64 KiB ceiling. The core ingress
+  service owns route lookup, each route's 64-request queue, and the 10-second
+  parse-plus-delivery deadline, counted from enqueue; the gateway adapts HTTP
+  requests to it.
 - Public responses are fixed: success is `200`; guest authentication and
   payload rejections are opaque `401` and `400`; host, component, or downstream
   failures are opaque `503`; timeout is `504`; queue or rate saturation is
@@ -495,11 +499,21 @@ The unauthenticated edge remains host-governed:
   Denied senders never reserve an idempotency key or reach the channel queue.
   The same live, default-deny gate applies to messages returned by
   `poll-message`, so every plugin inbound bridge shares one host policy.
-- Non-empty guest message IDs are deduplicated in a namespace derived from the
-  route. An in-flight duplicate waits for the owning delivery to commit or roll
-  back; generation-scoped ownership tokens prevent a stale owner from erasing
-  a replacement reservation. Failed or cancelled delivery rolls back, so a
-  provider retry can become the new owner.
+- Non-empty guest message IDs are deduplicated by the core ingress, keyed by
+  the owning plugin package, channel alias, route path, and message ID. The
+  store lives for one daemon generation: it survives gateway restarts and
+  starts empty after a reload or restart. Duplicate suppression is best
+  effort: a repeated message ID is not delivered again while its key is held,
+  which is for `gateway.idempotency_ttl_secs` or until
+  `gateway.idempotency_max_keys` newer message IDs across all plugin routes
+  displace it, and never past a reload. This collapses platform retries. It is
+  not replay protection, which stays with the guest's signature and timestamp
+  checks. The capacity is separate from the `/webhook` and `/sop/*` replay
+  store. An in-flight duplicate waits
+  for the owning delivery to commit or roll back; generation-scoped ownership
+  tokens prevent a stale owner from erasing a replacement reservation. Failed
+  or cancelled delivery rolls back, so a provider retry can become the new
+  owner.
 
 This changes the unfrozen experimental `wit/v0` channel world. Every channel
 component, including one that does not serve webhooks, must be rebuilt against

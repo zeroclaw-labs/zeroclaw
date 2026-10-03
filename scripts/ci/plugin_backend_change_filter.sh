@@ -18,6 +18,17 @@
 # same reason: `mod plugins` and the plugin registry only compile under
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
 # this job is where they run. `src/main.rs` holds the plugin CLI itself.
+# The gateway's `/plugin/{path}` ingress is listed for the same reason: its
+# handler and HTTP tests compile only under the gateway's `plugins-wasm`
+# feature, so this job is the only required one that runs them and the plugin
+# webhook golden frames that pin its public HTTP contract. The paths are the
+# handler and its tests, the router that mounts it, the manifest that defines
+# the feature, the golden harness and fixtures, the shared webhook types in
+# zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. The infra
+# crate root and manifest are listed too: the root holds the dedup limit
+# helpers and the committed-key set the ingress stores its delivered message
+# keys in, and the manifest defines the ingress's dependencies. Other gateway
+# and infra paths stay out: the default-feature Test job covers them.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -32,6 +43,14 @@ while IFS= read -r path; do
         crates/zeroclaw-config/*|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
+        crates/zeroclaw-gateway/src/plugin_webhook*|\
+        crates/zeroclaw-gateway/src/lib.rs|\
+        crates/zeroclaw-gateway/Cargo.toml|\
+        crates/zeroclaw-gateway/tests/golden*|\
+        crates/zeroclaw-api/src/webhook.rs|\
+        crates/zeroclaw-infra/src/plugin_webhook*|\
+        crates/zeroclaw-infra/src/lib.rs|\
+        crates/zeroclaw-infra/Cargo.toml|\
         src/plugins/*|src/plugin_registry.rs|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
