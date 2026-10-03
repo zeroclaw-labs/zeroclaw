@@ -37,6 +37,8 @@ The mechanism, end to end:
 
 This is the whole point of the design: per-thing logging code is zero. You impl the trait once and wrap the entry point once; every emission underneath is attributed for free.
 
+When inheriting attribution, a composite group belongs to the nearest span whose stored attribution contains any of its keys: `<prefix>`, `<prefix>_type`, or `<prefix>_alias`. Missing members of that group do not inherit from an outer span. For example, an inner `scope!(channel: "webhook", ...)` supplies only `channel_type = "webhook"`; it does not inherit an outer `channel = "telegram.outer"` or `channel_alias = "outer"`. Plain attribution fields and unrelated composite groups still inherit normally. Late field recording within one span continues to fill that span's missing fields.
+
 ### The `Attributable` trait
 
 Lives in `crates/zeroclaw-api/src/attribution.rs` so every crate can implement it without depending on `zeroclaw-log`:
