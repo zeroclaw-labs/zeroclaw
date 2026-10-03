@@ -21,9 +21,9 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
 | CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
-| RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |
+| RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | Shared live config and accepted authorization policy update before success; daemon-owned subsystems that need rebuilding still need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
-| Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Gateway-visible state updates immediately; daemon subsystems apply after reload |
+| Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Live config and accepted authorization policy update before success; shared with RPC in a supervised run; other daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
@@ -106,11 +106,20 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 `config.toml` and re-instantiates those subsystems in the same process. The PID
 stays the same, but listeners briefly rebind.
 
-Gateway config writes call `persist_and_swap()`: save to disk, then replace the
-gateway-visible in-memory config and set `pending_reload`. This makes the config
-editor reflect the write immediately, while the reload banner tells the operator
-that channels, providers, scheduler, or other daemon-owned components may still
-be running from the previous subsystem instance.
+Gateway config writes call `persist_and_swap()`: validate the staged authorization
+policy, save to disk, publish that policy, replace the live config, and set
+`pending_reload`. In a supervised run, the gateway and RPC context share the
+daemon generation's config, accepted authorization authority, and process-wide
+config write lock. A policy edit through either surface therefore reaches both
+before the write returns success, without a daemon reload. See
+[Authentication & principals](../security/authentication.md#the-model-in-one-pass)
+for connection revalidation and the separate pairing-token revocation boundary.
+
+The reload banner still tells the operator that channels, providers, scheduler,
+or other daemon-owned components may be running from the previous subsystem
+instance. Direct file edits and CLI config writes do not use that in-process
+publication path: they take effect at the next load, reload, or restart. The CLI
+does not currently trigger a daemon reload after saving.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
