@@ -14487,6 +14487,7 @@ dependencies = [
  "jsonschema",
  "rcgen",
  "ring",
+ "rustix 1.1.4",
  "rustls",
  "rustls-native-certs 0.8.4",
  "same-file",
