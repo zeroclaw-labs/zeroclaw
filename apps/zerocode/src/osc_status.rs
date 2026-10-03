@@ -420,9 +420,10 @@ fn pop_title(out: &mut impl Write) -> std::io::Result<()> {
 }
 
 /// Unicode Default_Ignorable format controls that can reorder or hide title
-/// text without being `char::is_control()`. Keep this local and dependency-free
-/// because the title path needs only a denylist, not full Unicode segmentation.
-fn is_format_control(c: char) -> bool {
+/// text without being `char::is_control()`. Kept dependency-free because the
+/// title path and the plugin catalog sanitizer need only a denylist, not full
+/// Unicode segmentation.
+pub(crate) fn is_format_control(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD
