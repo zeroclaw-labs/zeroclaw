@@ -7073,12 +7073,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
