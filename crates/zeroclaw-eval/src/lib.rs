@@ -2,6 +2,7 @@
 
 pub mod case;
 pub mod grader;
+pub mod live;
 pub mod observer;
 pub mod record;
 pub mod replay;
@@ -9,11 +10,15 @@ pub mod report;
 pub mod runner;
 pub mod tools;
 
-pub use case::{LlmTrace, ToolPayloadExpect, TraceExpects};
+pub use case::{CaseSetup, LlmTrace, ToolPayloadExpect, TraceExpects};
+pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_graders};
 pub use observer::RecordedCall;
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
-pub use runner::{run_case, run_suite};
+pub use runner::{
+    CaseOutcome, CaseProvider, RunDeps, ensure_live_provider, run_case, run_case_with_graders,
+    run_suite,
+};
 
 use std::str::FromStr;
 
@@ -22,8 +27,7 @@ use std::str::FromStr;
 pub enum Mode {
     /// Deterministic replay against scripted LLM responses — no network, no cost.
     Replay,
-    /// Live execution against a real provider. Added in a later phase; the Phase 0
-    /// runner returns a clear error so the variant can already be parsed from the CLI.
+    /// Live execution against a configured provider in an isolated case workspace.
     Live,
 }
 
