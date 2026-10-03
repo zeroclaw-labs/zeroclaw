@@ -2064,6 +2064,7 @@ impl Agent {
                 activated_tools: self.activated_tools.as_ref(),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &super::turn::TurnMeta {
                 agent_alias: Some(&self.agent_alias),

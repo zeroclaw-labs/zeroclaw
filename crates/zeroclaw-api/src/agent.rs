@@ -112,6 +112,13 @@ pub enum TurnEvent {
         /// `None` for ordinary tools.
         artifact: Option<ToolArtifact>,
     },
+    /// Temporary file contents for an admitted local client. Never project this
+    /// event into ordinary tool output, logs, or persisted conversation history.
+    LocalFileDiff {
+        /// Correlation ID of the successful file-write result.
+        id: String,
+        diff: crate::local_file_diff::LocalFileDiff,
+    },
     Plan {
         entries: Vec<PlanEntry>,
     },

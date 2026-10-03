@@ -64,6 +64,8 @@ pub struct TurnAttribution {
     pub model_provider: String,
     pub model: String,
     pub channel: &'static str,
+    /// Minted only by the native local RPC connection for transient UI delivery.
+    pub local_file_diffs: bool,
 }
 
 pub async fn execute_turn<F, Fut>(
@@ -82,6 +84,7 @@ where
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
+    let local_file_diffs = attribution.local_file_diffs;
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
@@ -102,17 +105,20 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
+            zeroclaw_api::local_file_diff::LOCAL_FILE_DIFFS_ALLOWED
                 .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
-                        )
-                        .instrument(span),
+                    local_file_diffs,
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_context,
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                None,
+                            )
+                            .instrument(span),
+                    ),
                 )
                 .await
         })
@@ -1029,6 +1035,7 @@ mod tests {
                 model_provider: "mock-provider".into(),
                 model: "test-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
             Some(cost_context),
             None,
@@ -1055,6 +1062,107 @@ mod tests {
             agent_summary.request_count, 1,
             "the agent alias must flow through to the persisted cost record"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_turn_scopes_local_file_diffs_inside_spawn_without_history_payload() {
+        for local_file_diffs in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().canonicalize().unwrap();
+            let previous = "private-old-sentinel\n";
+            let written = "replacement\n";
+            std::fs::write(workspace.join("note.txt"), previous).unwrap();
+            let security = Arc::new(crate::security::SecurityPolicy {
+                autonomy: zeroclaw_config::autonomy::AutonomyLevel::Supervised,
+                workspace_dir: workspace.clone(),
+                ..crate::security::SecurityPolicy::default()
+            });
+            let provider = TwoCallToolProvider {
+                first: ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "write-1".into(),
+                        name: "file_write".into(),
+                        arguments: serde_json::json!({"path": "note.txt", "content": written})
+                            .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                second: ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                done: std::sync::atomic::AtomicBool::new(false),
+                alias: "local-diff-test",
+            };
+            let agent = Agent::builder()
+                .model_provider(Box::new(provider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![
+                        Box::new(crate::tools::FileWriteTool::new(security.clone())),
+                        Box::new(crate::tools::FileReadTool::new(security)),
+                    ],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace)
+                .build()
+                .unwrap();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let received = events.clone();
+            // An outer true scope must not grant permission to a false
+            // attribution. Conversely the spawned task must receive true.
+            let outcome = zeroclaw_api::local_file_diff::LOCAL_FILE_DIFFS_ALLOWED
+                .scope(
+                    true,
+                    execute_turn(
+                        Arc::new(Mutex::new(agent)),
+                        "write note".into(),
+                        CancellationToken::new(),
+                        TurnAttribution {
+                            local_file_diffs,
+                            ..TurnAttribution::default()
+                        },
+                        None,
+                        None,
+                        move |event| {
+                            received.lock().unwrap().push(event);
+                            std::future::ready(())
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            let TurnOutcome::Completed { messages, .. } = outcome else {
+                panic!("file write turn must complete");
+            };
+            assert!(!format!("{messages:?}").contains("private-old-sentinel"));
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, TurnEvent::LocalFileDiff { .. }))
+                    .count(),
+                usize::from(local_file_diffs)
+            );
+            for event in events.iter() {
+                match event {
+                    TurnEvent::LocalFileDiff { diff, .. } => {
+                        assert_eq!(diff.previous(), previous);
+                        assert_eq!(diff.written(), written);
+                    }
+                    TurnEvent::ToolResult { output, .. } => {
+                        assert!(!output.contains("private-old-sentinel"))
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Regression: the drain callback must resolve `model_context_window`
@@ -1183,6 +1291,7 @@ mod tests {
                 model_provider: "openai.default".into(),
                 model: "test-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
             None,
             None,
@@ -1356,6 +1465,7 @@ mod tests {
                     model_provider: cell.provider_ref.into(),
                     model: "matrix-model".into(),
                     channel: "rpc",
+                    local_file_diffs: false,
                 },
                 None,
                 None,
@@ -1620,6 +1730,7 @@ mod tests {
                 model_provider: "openai.default".into(),
                 model: "w1-model".into(),
                 channel: "rpc",
+                local_file_diffs: false,
             },
             None,
             None,
@@ -1897,6 +2008,7 @@ mod tests {
                     model_provider: "held-provider".into(),
                     model: "test-model".into(),
                     channel: "rpc",
+                    local_file_diffs: false,
                 },
                 None,
                 Some(activity),

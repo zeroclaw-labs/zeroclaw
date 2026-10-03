@@ -52,6 +52,11 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const LOCAL_FILE_DIFF_TTL: Duration = crate::client::LOCAL_FILE_DIFF_TTL;
+// Eight sessions per pane and two panes bound the raw pair cache to 1 MiB.
+const LOCAL_FILE_DIFF_SESSION_BYTES: usize = 64 * 1024;
+const LOCAL_FILE_DIFF_SESSION_COUNT: usize = 16;
 const SESSION_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_RECOVERY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(35);
 const SESSION_RECOVERY_MAX_ATTEMPTS: u8 = 4;
@@ -1256,6 +1261,7 @@ impl Chat {
     /// The Sessions-header `-` closes the focused session; a row `✕` closes
     /// that row's session without requiring it to be focused first.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
+        self.rpc.clear_local_file_diffs(session_id);
         let was_focused = matches!(
             &self.phase,
             ChatPhase::Active(state) if state.session_id == session_id
@@ -2661,7 +2667,27 @@ impl Chat {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
-                    if let Some(update) = parse_session_update(&notif.params) {
+                    let update = if notif.params.get("type").and_then(serde_json::Value::as_str)
+                        == Some("local_file_diff_ready")
+                    {
+                        let sid = notif
+                            .params
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if self.state_for_session_mut(sid).is_some() {
+                            notif
+                                .params
+                                .get("token")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|token| self.rpc.take_local_file_diff(token, sid))
+                        } else {
+                            None
+                        }
+                    } else {
+                        parse_session_update(&notif.params)
+                    };
+                    if let Some(update) = update {
                         // Route by session id: background sessions receive
                         // their stream too, so transcripts and status dots
                         // stay current while unfocused.
@@ -2836,6 +2862,7 @@ impl Chat {
     }
 
     fn begin_session_resync(&mut self, session_id: String, mode: SessionResyncMode) {
+        self.rpc.clear_local_file_diffs(&session_id);
         // Ownership evidence exists only for `Reattach`, and only while the
         // pane's own prompt is still outstanding: read it before the prepare
         // below mutates the state.
@@ -3731,6 +3758,17 @@ impl Chat {
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
         self.maybe_refresh_git_branch();
+        let connected = matches!(
+            self.rpc.connection_state(),
+            crate::client::ConnectionState::Connected
+        );
+        let now = Instant::now();
+        if let ChatPhase::Active(state) = &mut self.phase {
+            state.expire_local_file_diffs(now, connected);
+        }
+        for state in &mut self.background {
+            state.expire_local_file_diffs(now, connected);
+        }
     }
 
     #[cfg(test)]
@@ -6824,6 +6862,56 @@ fn bounded_tool_output(raw_output: String) -> String {
     }
 }
 
+struct RecordedWriteEvidence {
+    bytes: u64,
+    previous_bytes: Option<u64>,
+}
+
+fn recorded_write_evidence(result: &str, input_json: &str) -> Option<RecordedWriteEvidence> {
+    // Consume the exact recorded path before recognizing the result suffix.
+    let (bytes, rest) = result.strip_prefix("Written ")?.split_once(" bytes to ")?;
+    let input = serde_json::from_str::<serde_json::Value>(input_json).ok()?;
+    let path = input.get("path")?.as_str()?;
+    let observation = rest.strip_prefix(path)?.strip_prefix(". Before write: ")?;
+    let observation = observation
+        .strip_suffix(". Previous contents are omitted from this result.")
+        .or_else(|| {
+            observation
+                .strip_suffix(". Content diff unavailable; previous contents were not retained.")
+        })?;
+    let previous_bytes = if observation == "file absent" {
+        None
+    } else {
+        Some(
+            observation
+                .strip_prefix("existing file, ")?
+                .strip_suffix(" bytes")?
+                .parse()
+                .ok()?,
+        )
+    };
+    Some(RecordedWriteEvidence {
+        bytes: bytes.parse().ok()?,
+        previous_bytes,
+    })
+}
+
+fn file_write_result_summary(result: &str, input_json: &str) -> Option<String> {
+    let evidence = recorded_write_evidence(result, input_json)?;
+    let bytes = evidence.bytes.to_string();
+    Some(match evidence.previous_bytes {
+        None => crate::i18n::t_args("zc-chat-tool-write-result-absent", &[("bytes", &bytes)]),
+        Some(previous_bytes) => crate::i18n::t_args(
+            "zc-chat-tool-write-result-existing",
+            &[
+                ("bytes", &bytes),
+                ("previous_bytes", &previous_bytes.to_string()),
+            ],
+        ),
+    })
+}
+
+#[cfg(test)]
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -6831,6 +6919,26 @@ fn render_tool_entry(
     result: Option<&str>,
     is_selected: bool,
     disclosure: ToolDisclosure,
+) -> Option<usize> {
+    render_tool_entry_with_diff(
+        lines,
+        name,
+        input_json,
+        result,
+        is_selected,
+        disclosure,
+        None,
+    )
+}
+
+fn render_tool_entry_with_diff(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    input_json: &str,
+    result: Option<&str>,
+    is_selected: bool,
+    disclosure: ToolDisclosure,
+    local_diff: Option<&zeroclaw_api::local_file_diff::LocalFileDiff>,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
@@ -6852,6 +6960,12 @@ fn render_tool_entry(
         }
     };
     let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        let style = if name == "file_write" && label == "result" {
+            theme::body_style()
+        } else {
+            theme::dim_style()
+        }
+        .add_modifier(sel_mod);
         for (line_idx, text_line) in text.split('\n').enumerate() {
             let prefix = if line_idx == 0 {
                 format!("  {label}: ")
@@ -6860,7 +6974,7 @@ fn render_tool_entry(
             };
             lines.push(Line::from(Span::styled(
                 format!("{prefix}{text_line}"),
-                theme::dim_style().add_modifier(sel_mod),
+                style,
             )));
         }
     };
@@ -6931,24 +7045,49 @@ fn render_tool_entry(
         "file_write" => {
             if disclosure.is_open() {
                 let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
-                let content = parsed
+                let file_input = parsed
                     .as_ref()
                     .filter(|input| valid_specialized_file_input(name, input))
-                    .and_then(|input| input.get("content"))
-                    .and_then(|value| value.as_str());
-                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    .and_then(|input| {
+                        Some((
+                            input.get("path")?.as_str()?,
+                            input.get("content")?.as_str()?,
+                        ))
+                    });
+                if let (Some(input), Some((path, content))) = (parsed.as_ref(), file_input) {
+                    let (path, path_limited) =
+                        terminal_safe_tool_text_limited(path, TOOL_EXPANDED_MAX_BYTES, 1);
+                    display_limited |= path_limited;
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(path, theme::body_style().add_modifier(sel_mod)),
+                    ]));
+                    let observation =
+                        result.and_then(|res| recorded_write_evidence(res, input_json));
+                    let overwrite = observation
+                        .as_ref()
+                        .is_some_and(|value| value.previous_bytes.is_some());
+                    if overwrite {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", crate::i18n::t("zc-chat-tool-write-overwrite")),
+                            theme::body_style().add_modifier(Modifier::BOLD | sel_mod),
+                        )));
+                    }
                     let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
-                        &semantic_tool_metadata(input, &["content"]),
+                        &semantic_tool_metadata(input, &["path", "content", "encoding"]),
                         TOOL_EXPANDED_MAX_BYTES,
                         TOOL_EXPANDED_MAX_LINES,
                     );
                     display_limited |= metadata_limited;
-                    push_text(lines, "input", &metadata);
+                    if metadata != "{}" {
+                        push_text(lines, "input", &metadata);
+                    }
                     let encoding = input
                         .get("encoding")
                         .and_then(|value| value.as_str())
                         .unwrap_or("utf8");
                     if encoding == "base64" {
+                        push_text(lines, &crate::i18n::t("zc-chat-tool-encoding"), encoding);
                         push_text(
                             lines,
                             "content",
@@ -6958,21 +7097,70 @@ fn render_tool_entry(
                             ),
                         );
                     } else {
-                        let (content, limited) = terminal_safe_tool_text_limited(
-                            content,
-                            TOOL_EXPANDED_MAX_BYTES,
-                            TOOL_EXPANDED_MAX_LINES,
-                        );
+                        let (content, limited) = if local_diff.is_some() {
+                            (String::new(), false)
+                        } else {
+                            terminal_safe_tool_text_limited(
+                                content,
+                                TOOL_EXPANDED_MAX_BYTES,
+                                TOOL_EXPANDED_MAX_LINES,
+                            )
+                        };
                         display_limited |= limited;
-                        let rendered = diff::write_lines_limited(
-                            &content,
-                            file_ext(input),
-                            matches!(disclosure, ToolDisclosure::Preview)
-                                .then_some(FILE_TOOL_PREVIEW_LINES),
-                        );
+                        // Only transient execution evidence supplies removed lines.
+                        let caption = if local_diff.is_some() {
+                            "zc-chat-tool-write-diff"
+                        } else if overwrite {
+                            "zc-chat-tool-write-preview-unavailable"
+                        } else {
+                            "zc-chat-tool-write-preview"
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", crate::i18n::t(caption)),
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        let limit = matches!(disclosure, ToolDisclosure::Preview)
+                            .then_some(FILE_TOOL_PREVIEW_LINES);
+                        let rendered = if let Some(local_diff) = local_diff
+                            && local_diff.previous() == local_diff.written()
+                        {
+                            diff::RenderedLines {
+                                lines: vec![Line::from(Span::styled(
+                                    crate::i18n::t("zc-chat-tool-write-unchanged"),
+                                    theme::dim_style(),
+                                ))],
+                                omitted: 0,
+                                total: 1,
+                            }
+                        } else if let Some(local_diff) = local_diff {
+                            diff::diff_lines_limited(
+                                local_diff.previous(),
+                                local_diff.written(),
+                                file_ext(input),
+                                None,
+                                limit,
+                            )
+                        } else {
+                            diff::content_lines_limited(&content, file_ext(input), limit)
+                        };
                         footer =
                             (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
-                        lines.extend(rendered.lines);
+                        lines.extend(rendered.lines.into_iter().map(|mut line| {
+                            if local_diff.is_some() {
+                                // Compare original bytes first, then escape terminal controls.
+                                for span in &mut line.spans {
+                                    let (safe, limited) = terminal_safe_tool_text_limited(
+                                        span.content.as_ref(),
+                                        zeroclaw_api::local_file_diff::MAX_FILE_DIFF_BYTES * 4,
+                                        1,
+                                    );
+                                    span.content = safe.into();
+                                    display_limited |= limited;
+                                }
+                            }
+                            line.spans.insert(0, Span::raw("  "));
+                            line
+                        }));
                     }
                 } else {
                     display_limited |= render_generic_input(lines);
@@ -6997,6 +7185,15 @@ fn render_tool_entry(
     }
 
     if let Some(res) = result {
+        let summary = if name == "file_write" {
+            file_write_result_summary(res, input_json)
+        } else {
+            None
+        };
+        let res = summary.as_deref().unwrap_or(res);
+        if name == "file_write" && disclosure.is_open() {
+            lines.push(Line::default());
+        }
         let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
             terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
@@ -7034,6 +7231,7 @@ fn render_entry_into(
     show_thoughts: bool,
     tool_disclosure: ToolDisclosure,
     width: u16,
+    local_diff: Option<&zeroclaw_api::local_file_diff::LocalFileDiff>,
     lines: &mut Vec<Line<'static>>,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
@@ -7105,13 +7303,14 @@ fn render_entry_into(
             result,
             ..
         } => {
-            return render_tool_entry(
+            return render_tool_entry_with_diff(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
                 is_selected,
                 tool_disclosure,
+                local_diff,
             );
         }
     }
@@ -8109,8 +8308,8 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     };
 
-    // For file_edit/file_write, strip the bulk content fields — the diff
-    // preview in the conversation already shows old/new content.
+    // For file_edit/file_write, strip bulk content fields already shown by
+    // the conversation's edit diff or supplied-content preview.
     let summary = if is_edit_tool {
         strip_content_fields(&pa.arguments_summary)
     } else {
@@ -9396,6 +9595,11 @@ pub(crate) struct QueuedMessage {
 }
 
 #[derive(Debug)]
+struct CachedLocalFileDiff {
+    diff: zeroclaw_api::local_file_diff::LocalFileDiff,
+    expires: Instant,
+}
+
 pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
@@ -9502,6 +9706,9 @@ pub struct ChatState {
     tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Per-tool disclosure overrides; file tools otherwise default to preview.
     tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
+    /// Indexed by live card occurrence, since provider IDs can recur in history.
+    local_file_diffs: BTreeMap<usize, CachedLocalFileDiff>,
+    local_diff_live_start: usize,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// URL hit segments projected from the complete wrapped transcript into
@@ -9626,6 +9833,8 @@ impl ChatState {
             tool_header_rects: Vec::new(),
             tool_footer_rects: Vec::new(),
             tool_disclosures: BTreeMap::new(),
+            local_file_diffs: BTreeMap::new(),
+            local_diff_live_start: 0,
             copy_hit_regions: Vec::new(),
             url_hit_regions: Vec::new(),
             pending_url_activation: None,
@@ -9659,6 +9868,104 @@ impl ChatState {
             todo_close_hit_rect: None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
+    }
+
+    fn invalidate_local_diff_rendering(&mut self) {
+        self.clear_transcript_selection_for_render_change();
+        self.transcript_snapshot = None;
+        self.transcript_layout.reset();
+        self.url_hit_regions.clear();
+        self.mark_dirty_full();
+    }
+
+    fn clear_local_file_diffs(&mut self) {
+        if !self.local_file_diffs.is_empty() {
+            self.local_file_diffs.clear();
+            self.invalidate_local_diff_rendering();
+        }
+    }
+
+    fn expire_local_file_diffs(&mut self, now: Instant, connected: bool) {
+        let before = self.local_file_diffs.len();
+        self.local_file_diffs.retain(|index, cached| {
+            connected && cached.expires > now && *index < self.entries.len()
+        });
+        if self.local_file_diffs.len() != before {
+            self.invalidate_local_diff_rendering();
+        }
+    }
+
+    #[cfg(test)]
+    fn retain_local_file_diff(
+        &mut self,
+        tool_call_id: &str,
+        diff: zeroclaw_api::local_file_diff::LocalFileDiff,
+    ) {
+        self.retain_local_file_diff_until(tool_call_id, diff, Instant::now() + LOCAL_FILE_DIFF_TTL);
+    }
+
+    fn retain_local_file_diff_until(
+        &mut self,
+        tool_call_id: &str,
+        diff: zeroclaw_api::local_file_diff::LocalFileDiff,
+        expires: Instant,
+    ) {
+        if expires <= Instant::now() {
+            return;
+        }
+        // Only the newest ID occurrence can receive this ordered notification.
+        // A history reload makes every loaded occurrence ineligible.
+        let Some(index) = self.entries.iter().rposition(|entry| {
+            matches!(entry,
+            ChatEntry::Tool { tool_call_id: id, .. } if id.as_ref() == tool_call_id)
+        }) else {
+            return;
+        };
+        if index < self.local_diff_live_start {
+            return;
+        }
+        let ChatEntry::Tool {
+            name,
+            input_json,
+            result,
+            ..
+        } = &self.entries[index]
+        else {
+            return;
+        };
+        if name.as_ref() != "file_write"
+            || result
+                .as_deref()
+                .and_then(|value| recorded_write_evidence(value, input_json))
+                .is_none()
+        {
+            return;
+        }
+        let Ok(input) = serde_json::from_str::<serde_json::Value>(input_json) else {
+            return;
+        };
+        if input.get("content").and_then(|v| v.as_str()) != Some(diff.written())
+            || input
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf8")
+                != "utf8"
+        {
+            return;
+        }
+        self.local_file_diffs
+            .insert(index, CachedLocalFileDiff { diff, expires });
+        while self
+            .local_file_diffs
+            .values()
+            .map(|cached| cached.diff.previous().len() + cached.diff.written().len())
+            .sum::<usize>()
+            > LOCAL_FILE_DIFF_SESSION_BYTES
+            || self.local_file_diffs.len() > LOCAL_FILE_DIFF_SESSION_COUNT
+        {
+            self.local_file_diffs.pop_first();
+        }
+        self.invalidate_local_diff_rendering();
     }
 
     fn mark_dirty_append(&mut self) {
@@ -10503,6 +10810,7 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
+        let local_file_diffs = &self.local_file_diffs;
         let inputs =
             self.entries[range.clone()]
                 .iter()
@@ -10529,6 +10837,7 @@ impl ChatState {
                         entry,
                         highlighted,
                         disclosure,
+                        local_file_diff: local_file_diffs.get(&index).map(|cached| &cached.diff),
                     }
                 });
         self.transcript_layout
@@ -11034,6 +11343,7 @@ impl ChatState {
             | SessionUpdate::AgentThoughtChunk { session_id, .. }
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::LocalFileDiff { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
@@ -11124,6 +11434,14 @@ impl ChatState {
                 if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
                     self.turn_status = TurnStatus::Working;
                 }
+            }
+            SessionUpdate::LocalFileDiff {
+                tool_call_id,
+                diff,
+                expires,
+                ..
+            } => {
+                self.retain_local_file_diff_until(&tool_call_id, diff, expires);
             }
             SessionUpdate::ApprovalRequest {
                 request_id,
@@ -11476,6 +11794,7 @@ impl ChatState {
             self.entries.get(entry_index),
             Some(ChatEntry::UserMessage { .. })
         ) {
+            self.clear_local_file_diffs();
             self.entries.remove(entry_index);
             self.first_message = self.entries.iter().find_map(|entry| {
                 let ChatEntry::UserMessage {
@@ -12047,6 +12366,7 @@ impl ChatState {
         carried: Option<(crate::client::TurnEndOutcome, Arc<str>)>,
         prompt_error: Option<String>,
     ) {
+        self.clear_local_file_diffs();
         self.entries.clear();
         self.first_message = None;
         self.transcript_layout.reset();
@@ -12095,6 +12415,7 @@ impl ChatState {
     }
 
     fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
+        self.clear_local_file_diffs();
         for m in messages {
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
@@ -12173,6 +12494,7 @@ impl ChatState {
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
         }
+        self.local_diff_live_start = self.entries.len();
         self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
@@ -12187,12 +12509,14 @@ impl ChatState {
         name: Option<String>,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
     ) {
+        self.local_diff_live_start = 0;
         self.session_id = session_id;
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
         self.input_bar.reset();
         let mut cleanup_report = self.input_bar.take_cleanup_report();
+        self.clear_local_file_diffs();
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
@@ -12489,6 +12813,7 @@ mod tests {
             false,
             ToolDisclosure::Collapsed,
             80,
+            None,
             &mut lines,
         );
         let url_span = lines[0]
@@ -25199,9 +25524,13 @@ mod tests {
         let preview_text = rendered_text(&preview_lines);
         let footer_line = footer_line.expect("long preview has a disclosure footer");
         assert!(preview_text.starts_with("▼ [tool: file_write]"));
-        assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
+        assert!(preview_text.contains("  /tmp/example.txt"));
+        assert!(!preview_text.contains("input:"));
         assert!(preview_text.contains("line 0"));
         assert!(preview_text.contains("line 5"));
+        assert!(preview_text.contains("Content preview · not a diff"));
+        assert!(preview_text.contains("  1 + line 0"));
+        assert!(!preview_text.contains("1 | "));
         assert!(!preview_text.contains("line 6"));
         assert!(preview_text.contains("4 more lines"));
         assert!(!preview_text.contains(&write_input));
@@ -25228,12 +25557,308 @@ mod tests {
         );
         let full_text = rendered_text(&full_lines);
         assert!(full_text.contains("line 9"));
+        assert!(full_text.contains("  10 + line 9"));
+        assert!(full_text.contains("Content preview · not a diff"));
         assert!(full_text.contains("first"));
         assert!(full_text.contains(&"result".repeat(60)));
         assert!(full_text.contains("[Show less]"));
         assert!(!full_text.contains(&write_input));
         assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
         assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
+    }
+
+    #[test]
+    fn recorded_file_write_results_are_compact_without_rewriting_history() {
+        let path = "demo. Before write: file absent.txt";
+        let input = serde_json::json!({"path": path, "content": "new"}).to_string();
+        for (evidence, expected) in [
+            ("file absent", "Wrote 56 bytes · file previously absent."),
+            (
+                "existing file, 22 bytes",
+                "Wrote 56 bytes · file previously 22 bytes.",
+            ),
+            (
+                "existing file, 0 bytes",
+                "Wrote 56 bytes · file previously 0 bytes.",
+            ),
+        ] {
+            // A path can itself contain status-like text; only the final evidence counts.
+            let result = format!(
+                "Written 56 bytes to {path}. Before write: {evidence}. Content diff unavailable; previous contents were not retained."
+            );
+            for disclosure in [
+                ToolDisclosure::Collapsed,
+                ToolDisclosure::Preview,
+                ToolDisclosure::Full,
+            ] {
+                let mut lines = Vec::new();
+                render_tool_entry(
+                    &mut lines,
+                    "file_write",
+                    &input,
+                    Some(&result),
+                    false,
+                    disclosure,
+                );
+                let rendered = rendered_text(&lines);
+                assert!(rendered.contains(expected));
+                assert!(!rendered.contains("previous contents were not retained"));
+            }
+            let entry = ChatEntry::Tool {
+                tool_call_id: Arc::from("tc-summary"),
+                name: Arc::from("file_write"),
+                input_json: Arc::from(input.clone()),
+                result: Some(Arc::from(result.clone())),
+            };
+            assert!(clipboard_text(&entry).contains(&result));
+        }
+        for result in ["Written 56 bytes to demo.txt", "Error: write failed"] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "file_write",
+                &input,
+                Some(result),
+                false,
+                ToolDisclosure::Preview,
+            );
+            let rendered = rendered_text(&lines);
+            assert!(rendered.contains(result));
+            assert!(!rendered.contains("file previously"));
+        }
+        let path = "demo.txt. Before write: existing file, 22 bytes. Content diff unavailable; previous contents were not retained.";
+        let input = serde_json::json!({"path": path, "content": "new"}).to_string();
+        let result = format!("Written 56 bytes to {path}");
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "file_write",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let rendered = rendered_text(&lines);
+        assert!(rendered.contains(&result));
+        assert!(!rendered.contains("file previously"));
+    }
+
+    fn local_diff_entry(id: &str, written: &str) -> ChatEntry {
+        ChatEntry::Tool {
+            tool_call_id: Arc::from(id),
+            name: Arc::from("file_write"),
+            input_json: Arc::from(
+                serde_json::json!({"path":"demo.txt", "content":written}).to_string(),
+            ),
+            result: Some(Arc::from(format!(
+                "Written {} bytes to demo.txt. Before write: existing file, 8 bytes. Previous contents are omitted from this result.",
+                written.len()
+            ))),
+        }
+    }
+
+    #[test]
+    fn local_file_diff_renders_removals_additions_and_disclosure() {
+        use zeroclaw_api::local_file_diff::LocalFileDiff;
+        let previous = (0..8).map(|i| format!("old {i}\n")).collect::<String>();
+        let written = (0..8).map(|i| format!("new {i}\n")).collect::<String>();
+        let diff = LocalFileDiff::new(previous, written.clone()).unwrap();
+        let ChatEntry::Tool {
+            input_json, result, ..
+        } = local_diff_entry("id", &written)
+        else {
+            unreachable!()
+        };
+        for disclosure in [ToolDisclosure::Preview, ToolDisclosure::Full] {
+            let mut lines = Vec::new();
+            let footer = render_tool_entry_with_diff(
+                &mut lines,
+                "file_write",
+                &input_json,
+                result.as_deref(),
+                false,
+                disclosure,
+                Some(&diff),
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains("Overwrote existing file"));
+            assert!(text.contains("Changes · temporary local view"));
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.ends_with("- ")
+                        && span.style.fg == Some(theme::SyntaxScope::DiffMinus.color()))
+            );
+            assert!(footer.is_some());
+            if disclosure == ToolDisclosure::Preview {
+                assert!(!text.contains("old 6"));
+                assert!(text.contains("10 more lines"));
+            } else {
+                assert!(text.contains("new 7"));
+                assert!(text.contains("[Show less]"));
+                assert!(
+                    lines
+                        .iter()
+                        .flat_map(|line| &line.spans)
+                        .any(|span| span.content.ends_with("+ ")
+                            && span.style.fg == Some(theme::SyntaxScope::DiffPlus.color()))
+                );
+            }
+        }
+        let mut unchanged_lines = Vec::new();
+        let unchanged = LocalFileDiff::new(written.clone(), written.clone()).unwrap();
+        let unchanged_footer = render_tool_entry_with_diff(
+            &mut unchanged_lines,
+            "file_write",
+            &input_json,
+            result.as_deref(),
+            false,
+            ToolDisclosure::Preview,
+            Some(&unchanged),
+        );
+        assert!(rendered_text(&unchanged_lines).contains("Content unchanged"));
+        assert!(unchanged_footer.is_none());
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "file_write",
+            &input_json,
+            result.as_deref(),
+            false,
+            ToolDisclosure::Preview,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.find("Overwrote existing file").unwrap() < text.find("new 0").unwrap());
+        assert!(text.contains("Content preview · diff unavailable"));
+        assert!(!text.contains("old 0"));
+    }
+
+    #[test]
+    fn local_file_diff_matches_session_content_and_completed_occurrence() {
+        use zeroclaw_api::local_file_diff::LocalFileDiff;
+        let mut s = state();
+        for (old, new) in [("private first", "first"), ("private second", "second")] {
+            s.entries.push(local_diff_entry("repeated", new));
+            s.apply_update(SessionUpdate::LocalFileDiff {
+                session_id: "sess-1".into(),
+                tool_call_id: "repeated".into(),
+                diff: LocalFileDiff::new(old.into(), new.into()).unwrap(),
+                expires: Instant::now() + LOCAL_FILE_DIFF_TTL,
+            });
+        }
+        assert_eq!(s.local_file_diffs[&0].diff.previous(), "private first");
+        assert_eq!(s.local_file_diffs[&1].diff.previous(), "private second");
+        for (session, id, content) in [
+            ("other", "repeated", "second"),
+            ("sess-1", "missing", "second"),
+            ("sess-1", "repeated", "mismatch"),
+        ] {
+            s.apply_update(SessionUpdate::LocalFileDiff {
+                session_id: session.into(),
+                tool_call_id: id.into(),
+                diff: LocalFileDiff::new("foreign".into(), content.into()).unwrap(),
+                expires: Instant::now() + LOCAL_FILE_DIFF_TTL,
+            });
+        }
+        assert_eq!(s.local_file_diffs.len(), 2);
+        assert_eq!(s.local_file_diffs[&1].diff.previous(), "private second");
+        let ChatEntry::Tool { result, .. } = &mut s.entries[1] else {
+            unreachable!()
+        };
+        *result = Some(Arc::from("Error: write failed"));
+        s.retain_local_file_diff(
+            "repeated",
+            LocalFileDiff::new("failed".into(), "second".into()).unwrap(),
+        );
+        assert_eq!(s.local_file_diffs[&1].diff.previous(), "private second");
+        assert!(!clipboard_text(&s.entries[0]).contains("private first"));
+        // Delayed private events cannot fall back to an older reused ID.
+        s.entries.push(local_diff_entry("repeated", "third"));
+        s.retain_local_file_diff(
+            "repeated",
+            LocalFileDiff::new("stale".into(), "first".into()).unwrap(),
+        );
+        assert_eq!(s.local_file_diffs[&0].diff.previous(), "private first");
+        s.load_history(Vec::new(), false);
+        s.retain_local_file_diff(
+            "repeated",
+            LocalFileDiff::new("stale".into(), "third".into()).unwrap(),
+        );
+        assert!(s.local_file_diffs.is_empty());
+    }
+
+    #[test]
+    fn local_file_diff_expiry_disconnect_and_history_clear_derived_text() {
+        use zeroclaw_api::local_file_diff::LocalFileDiff;
+        for action in 0..3 {
+            let mut s = state();
+            s.entries = vec![local_diff_entry("id", "new")];
+            s.retain_local_file_diff(
+                "id",
+                LocalFileDiff::new(
+                    "private old https://example.invalid/retired".into(),
+                    "new".into(),
+                )
+                .unwrap(),
+            );
+            s.rebuild_lines(80);
+            assert!(
+                rendered_text(&s.transcript_layout.view().cached_lines).contains("private old")
+            );
+            assert!(!s.transcript_layout.view().cached_url_regions.is_empty());
+            s.copy_hit_regions.push(CopyHitRegion {
+                rect: Rect::new(0, 0, 1, 1),
+                text: Arc::from("private old"),
+                kind: CopyHitKind::Code,
+                group: 0,
+                action: CopyHitAction::Copy,
+            });
+            match action {
+                0 => s.expire_local_file_diffs(Instant::now() + LOCAL_FILE_DIFF_TTL, true),
+                1 => s.expire_local_file_diffs(Instant::now(), false),
+                _ => s.load_history(Vec::new(), false),
+            }
+            assert!(s.local_file_diffs.is_empty());
+            assert!(s.transcript_layout.view().cached_lines.is_empty());
+            assert!(s.transcript_layout.view().cached_code_blocks.is_empty());
+            assert!(s.transcript_layout.view().cached_url_regions.is_empty());
+            assert!(s.copy_hit_regions.is_empty());
+            assert!(s.context_copy_regions.is_empty());
+            assert!(s.transcript_snapshot.is_none());
+            s.rebuild_lines(80);
+            assert!(
+                !rendered_text(&s.transcript_layout.view().cached_lines).contains("private old")
+            );
+            assert!(
+                rendered_text(&s.transcript_layout.view().cached_lines)
+                    .contains("diff unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn local_file_diff_caps_pair_count_and_bytes() {
+        use zeroclaw_api::local_file_diff::{LocalFileDiff, MAX_FILE_DIFF_BYTES};
+        let mut s = state();
+        for i in 0..=LOCAL_FILE_DIFF_SESSION_COUNT {
+            let id = i.to_string();
+            s.entries.push(local_diff_entry(&id, ""));
+            s.retain_local_file_diff(
+                &id,
+                LocalFileDiff::new(String::new(), String::new()).unwrap(),
+            );
+        }
+        assert_eq!(s.local_file_diffs.len(), LOCAL_FILE_DIFF_SESSION_COUNT);
+        assert!(!s.local_file_diffs.contains_key(&0));
+        s.clear_local_file_diffs();
+        let text = "x".repeat(MAX_FILE_DIFF_BYTES);
+        for i in 0..3 {
+            let id = format!("big-{i}");
+            s.entries.push(local_diff_entry(&id, &text));
+            s.retain_local_file_diff(&id, LocalFileDiff::new(text.clone(), text.clone()).unwrap());
+        }
+        assert_eq!(s.local_file_diffs.len(), 2);
     }
 
     #[test]
@@ -25255,7 +25880,7 @@ mod tests {
         );
         let base64_text = rendered_text(&base64_lines);
         assert!(footer_line.is_none());
-        assert!(base64_text.contains(r#""encoding":"base64""#));
+        assert!(base64_text.contains("Encoding: base64"));
         assert!(base64_text.contains("content: 4000 encoded characters"));
         assert!(!base64_text.contains(&"A".repeat(200)));
 

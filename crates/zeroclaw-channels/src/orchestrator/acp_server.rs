@@ -3295,11 +3295,9 @@ fn to_acp_raw_input(name: &str, args: &Value) -> Value {
             let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
             serde_json::json!({ "path": path, "oldText": old_text, "newText": new_text })
         }
-        "file_write" => {
-            let path = args.get("path").cloned().unwrap_or(Value::Null);
-            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
-            serde_json::json!({ "path": path, "newText": new_text })
-        }
+        // Keep write arguments as input, not an ACP creation diff. There is no
+        // oldText evidence, even when replaying a successfully completed call.
+        "file_write" => args.clone(),
         _ => args.clone(),
     }
 }
@@ -3312,11 +3310,7 @@ fn to_acp_content(name: &str, args: &Value) -> Value {
             let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
             serde_json::json!([{ "type": "diff", "path": path, "oldText": old_text, "newText": new_text }])
         }
-        "file_write" => {
-            let path = args.get("path").cloned().unwrap_or(Value::Null);
-            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
-            serde_json::json!([{ "type": "diff", "path": path, "newText": new_text }])
-        }
+        "file_write" => serde_json::json!([]),
         _ => serde_json::json!([]),
     }
 }
@@ -6168,7 +6162,7 @@ mod tests {
     }
 
     #[test]
-    fn file_write_raw_input_uses_acp_diff_field_names() {
+    fn file_write_input_does_not_claim_a_creation_diff() {
         let call = notification_for_turn_event(
             "sid",
             &TurnEvent::ToolCall {
@@ -6183,26 +6177,33 @@ mod tests {
         let v = serde_json::to_value(call.unwrap()).unwrap();
         let raw = &v["params"]["update"]["rawInput"];
         assert_eq!(raw["path"], "src/new.rs");
-        assert_eq!(raw["newText"], "fn main() {}");
+        assert_eq!(raw["content"], "fn main() {}");
         assert!(
             raw.get("oldText").is_none(),
             "oldText must not appear in file_write rawInput"
         );
         assert!(
-            raw.get("content").is_none(),
-            "content must not appear in rawInput"
+            raw.get("newText").is_none(),
+            "write input must not imply a creation diff"
         );
 
-        let content = &v["params"]["update"]["content"];
-        assert!(content.is_array(), "file_write must emit a content array");
-        let diff = &content[0];
-        assert_eq!(diff["type"], "diff");
-        assert_eq!(diff["path"], "src/new.rs");
-        assert_eq!(diff["newText"], "fn main() {}");
-        assert!(
-            diff.get("oldText").is_none(),
-            "oldText must be absent for file_write diff"
-        );
+        assert!(v["params"]["update"].get("content").is_none());
+        // History replay must make the same decision as a live pending call.
+        let history = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                id: "tc-2".into(),
+                name: "file_write".into(),
+                arguments: serde_json::json!({"path": "src/new.rs", "content": "fn main() {}"})
+                    .to_string(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        let replay = history_notifications_for_message("sid", &history);
+        let replay = serde_json::to_value(&replay[0]).unwrap();
+        assert!(replay["params"]["update"].get("content").is_none());
+        assert_eq!(replay["params"]["update"]["rawInput"], *raw);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -17,6 +17,11 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
+
+pub(crate) const LOCAL_FILE_DIFF_TTL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_FILE_DIFF_SESSION_BYTES: usize = 64 * 1024;
+const LOCAL_FILE_DIFF_SESSION_COUNT: usize = 16;
+const LOCAL_FILE_DIFF_SESSIONS: usize = 16;
 
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
@@ -271,6 +276,13 @@ pub enum SessionUpdate {
         tool_call_id: String,
         raw_output: String,
     },
+    /// Live local evidence only; never reconstructed from saved history.
+    LocalFileDiff {
+        session_id: String,
+        tool_call_id: String,
+        diff: zeroclaw_api::local_file_diff::LocalFileDiff,
+        expires: Instant,
+    },
     ApprovalRequest {
         session_id: String,
         request_id: String,
@@ -340,6 +352,7 @@ impl SessionUpdate {
             | SessionUpdate::AgentThoughtChunk { session_id, .. }
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::LocalFileDiff { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
@@ -390,6 +403,15 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
             raw_output: params.get("raw_output")?.as_str()?.to_string(),
+        }),
+        "local_file_diff" => Some(SessionUpdate::LocalFileDiff {
+            session_id: sid,
+            tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
+            diff: zeroclaw_api::local_file_diff::LocalFileDiff::new(
+                params.get("previous")?.as_str()?.to_string(),
+                params.get("written")?.as_str()?.to_string(),
+            )?,
+            expires: Instant::now() + LOCAL_FILE_DIFF_TTL,
         }),
         "approval_request" => Some(SessionUpdate::ApprovalRequest {
             session_id: sid,
@@ -473,6 +495,104 @@ pub fn spawn_notification_router(
             }
         }
     })
+}
+
+/// Private payloads never enter the generic notification broadcast ring.
+/// That ring has subscribers which may remain idle for an entire session.
+#[derive(Debug, Default)]
+struct LocalFileDiffInbox {
+    retired: bool,
+    next_token: u64,
+    pending: std::collections::VecDeque<(u64, SessionUpdate)>,
+}
+
+impl LocalFileDiffInbox {
+    fn close(&mut self) {
+        self.retired = true;
+        self.pending.clear();
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.pending.retain(|(_, update)| {
+            matches!(update,
+            SessionUpdate::LocalFileDiff { expires, .. } if *expires > now)
+        });
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending
+            .iter()
+            .filter_map(|(_, update)| match update {
+                SessionUpdate::LocalFileDiff { expires, .. } => Some(*expires),
+                _ => None,
+            })
+            .min()
+    }
+
+    fn route(&mut self, mut frame: Value) -> Option<Value> {
+        if frame.get("method").and_then(Value::as_str) != Some("session/update")
+            || frame.pointer("/params/type").and_then(Value::as_str) != Some("local_file_diff")
+        {
+            return Some(frame);
+        }
+        if self.retired {
+            return None;
+        }
+        let update = parse_session_update(frame.get("params")?)?;
+        let sid = update.session_id().to_owned();
+        self.expire(Instant::now());
+        self.next_token = self.next_token.checked_add(1)?;
+        let token = self.next_token;
+        self.pending.push_back((token, update));
+        while self
+            .pending
+            .iter()
+            .filter(|(_, update)| update.session_id() == sid)
+            .count()
+            > LOCAL_FILE_DIFF_SESSION_COUNT
+            || self
+                .pending
+                .iter()
+                .filter_map(|(_, update)| match update {
+                    SessionUpdate::LocalFileDiff {
+                        session_id, diff, ..
+                    } if session_id == &sid => Some(diff.previous().len() + diff.written().len()),
+                    _ => None,
+                })
+                .sum::<usize>()
+                > LOCAL_FILE_DIFF_SESSION_BYTES
+        {
+            let index = self
+                .pending
+                .iter()
+                .position(|(_, update)| update.session_id() == sid)?;
+            self.pending.remove(index);
+        }
+        while self
+            .pending
+            .iter()
+            .map(|(_, update)| update.session_id())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > LOCAL_FILE_DIFF_SESSIONS
+        {
+            let oldest = self.pending.front()?.1.session_id().to_owned();
+            self.pending
+                .retain(|(_, update)| update.session_id() != oldest);
+        }
+        frame["params"] =
+            serde_json::json!({"type":"local_file_diff_ready", "session_id":sid, "token":token});
+        Some(frame)
+    }
+
+    fn take(&mut self, token: u64, session_id: &str) -> Option<SessionUpdate> {
+        self.expire(Instant::now());
+        let index = self
+            .pending
+            .iter()
+            .position(|(id, update)| *id == token && update.session_id() == session_id)?;
+        self.pending.remove(index).map(|(_, update)| update)
+    }
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -721,6 +841,11 @@ fn route_inbound_frame(
         // Notification: method present, no id (or null id).
         (None, Some(method)) => {
             let params = frame.get("params").cloned().unwrap_or(Value::Null);
+            if method == "session/update"
+                && params.get("type").and_then(Value::as_str) == Some("local_file_diff")
+            {
+                return None;
+            }
             let _ = notif_tx.send(RpcNotification { method, params });
         }
         _ => {}
@@ -829,6 +954,7 @@ pub struct RpcClient {
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
+    local_file_diff_inbox: Arc<Mutex<LocalFileDiffInbox>>,
     /// Single-consumer queue for server-initiated requests that expect a
     /// response (today: `elicitation/create`). Keeping the receiver here until
     /// the app claims it preserves requests that arrive during pane startup.
@@ -1669,6 +1795,8 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
         let rpc_for_writer = Arc::downgrade(&rpc);
         let conn_state_for_writer = conn_state.clone();
+        let local_file_diff_inbox = Arc::new(Mutex::new(LocalFileDiffInbox::default()));
+        let inbox_for_writer = Arc::clone(&local_file_diff_inbox);
         let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
             while let Some(message) = writer_rx.recv().await {
@@ -1681,6 +1809,9 @@ impl RpcClient {
                             if let Some(rpc) = rpc_for_writer.upgrade() {
                                 disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
                             }
+                            if let Ok(mut inbox) = inbox_for_writer.lock() {
+                                inbox.close();
+                            }
                             break;
                         }
                     }
@@ -1692,10 +1823,23 @@ impl RpcClient {
         });
 
         let rpc_for_reader = rpc.clone();
+        let inbox_for_reader = Arc::clone(&local_file_diff_inbox);
         let (reader_control_tx, mut reader_control_rx) = mpsc::unbounded_channel::<ReaderControl>();
         let read_task = tokio::spawn(async move {
             let mut lines = BufReader::new(read_half).lines();
             loop {
+                let deadline = inbox_for_reader
+                    .lock()
+                    .ok()
+                    .and_then(|inbox| inbox.deadline());
+                let expiry = async {
+                    match deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let line = tokio::select! {
                     biased;
                     control = reader_control_rx.recv() => {
@@ -1703,7 +1847,12 @@ impl RpcClient {
                             break;
                         };
                         inbound_tx_for_reader.take();
+                        if let Ok(mut inbox) = inbox_for_reader.lock() { inbox.close(); }
                         let _ = ack.send(());
+                        continue;
+                    }
+                    () = expiry => {
+                        if let Ok(mut inbox) = inbox_for_reader.lock() { inbox.expire(Instant::now()); }
                         continue;
                     }
                     line = lines.next_line() => line,
@@ -1727,6 +1876,13 @@ impl RpcClient {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                let Some(frame) = inbox_for_reader
+                    .lock()
+                    .ok()
+                    .and_then(|mut inbox| inbox.route(frame))
+                else {
+                    continue;
+                };
                 if let Some(request) = route_inbound_frame(
                     &rpc_for_reader,
                     &notif_tx_for_reader,
@@ -1739,6 +1895,9 @@ impl RpcClient {
                         request,
                     );
                 }
+            }
+            if let Ok(mut inbox) = inbox_for_reader.lock() {
+                inbox.close();
             }
         });
 
@@ -1798,6 +1957,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox,
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses,
             connection_state: conn_state,
@@ -2092,6 +2252,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox: Arc::new(Mutex::new(LocalFileDiffInbox::default())),
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses,
             connection_state: conn_state,
@@ -2226,6 +2387,26 @@ impl RpcClient {
     /// Get a receiver for server-initiated notifications.
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
         self.notifications_bcast.subscribe()
+    }
+
+    pub(crate) fn take_local_file_diff(
+        &self,
+        token: u64,
+        session_id: &str,
+    ) -> Option<SessionUpdate> {
+        let mut inbox = self.local_file_diff_inbox.lock().ok()?;
+        if !matches!(self.connection_state(), ConnectionState::Connected) {
+            inbox.close();
+        }
+        inbox.take(token, session_id)
+    }
+
+    pub(crate) fn clear_local_file_diffs(&self, session_id: &str) {
+        if let Ok(mut inbox) = self.local_file_diff_inbox.lock() {
+            inbox
+                .pending
+                .retain(|(_, update)| update.session_id() != session_id);
+        }
     }
 
     /// Claim the sole receiver for server-initiated JSON-RPC requests that
@@ -3095,6 +3276,7 @@ impl RpcClient {
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
+            local_file_diff_inbox: Arc::new(Mutex::new(LocalFileDiffInbox::default())),
             inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
@@ -3129,6 +3311,9 @@ impl RpcClient {
     /// adopted, and on a new client whose adoption failed. It is idempotent:
     /// aborting a finished task is a no-op.
     pub fn shutdown(&self) {
+        if let Ok(mut inbox) = self.local_file_diff_inbox.lock() {
+            inbox.close();
+        }
         self.read_task.abort();
         self.router_task.abort();
         if let Some(writer) = &self.writer_task {
@@ -6292,6 +6477,71 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_inbox_keeps_idle_generic_subscribers_payload_free() {
+        let (writer_tx, _) = mpsc::channel(2);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let (notifications, mut idle_logs) = broadcast::channel(4);
+        let frame = serde_json::json!({"jsonrpc":"2.0", "method":"session/update", "params":{"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private-old-sentinel", "written":"new"}});
+        let mut inbox = LocalFileDiffInbox::default();
+        let safe = inbox.route(frame.clone()).unwrap();
+        assert!(!safe.to_string().contains("private-old-sentinel"));
+        let token = safe["params"]["token"].as_u64().unwrap();
+        route_inbound_frame(&rpc, &notifications, None, safe);
+        assert!(!format!("{:?}", idle_logs.recv().await.unwrap()).contains("private-old-sentinel"));
+        assert!(inbox.take(token, "foreign").is_none());
+        let update = inbox.take(token, "s").unwrap();
+        assert!(
+            matches!(update, SessionUpdate::LocalFileDiff { diff, .. } if diff.previous() == "private-old-sentinel")
+        );
+        assert!(inbox.take(token, "s").is_none());
+        // A remote/raw frame bypassing the local inbox must be discarded.
+        route_inbound_frame(&rpc, &notifications, None, frame);
+        assert!(idle_logs.try_recv().is_err());
+        inbox.close();
+        assert!(inbox.route(serde_json::json!({"method":"session/update", "params":{"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private", "written":"new"}})).is_none());
+        assert!(inbox.pending.is_empty());
+    }
+
+    #[test]
+    fn local_file_diff_inbox_bounds_pending_payload_and_preserves_deadline() {
+        let frame = |sid: &str, content: &str| serde_json::json!({"method":"session/update", "params":{"type":"local_file_diff", "session_id":sid, "tool_call_id":"id", "previous":content, "written":content}});
+        let mut inbox = LocalFileDiffInbox::default();
+        for _ in 0..17 {
+            inbox.route(frame("s", "")).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 16);
+        let mut inbox = LocalFileDiffInbox::default();
+        let text = "x".repeat(zeroclaw_api::local_file_diff::MAX_FILE_DIFF_BYTES);
+        for _ in 0..3 {
+            inbox.route(frame("s", &text)).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 2);
+        let mut inbox = LocalFileDiffInbox::default();
+        for i in 0..17 {
+            inbox.route(frame(&i.to_string(), "")).unwrap();
+        }
+        assert_eq!(inbox.pending.len(), 16);
+        let deadline = inbox.deadline().unwrap();
+        inbox.expire(deadline + LOCAL_FILE_DIFF_TTL);
+        assert!(inbox.pending.is_empty());
+    }
+
+    #[test]
+    fn local_file_diff_notification_is_bounded_and_debug_redacted() {
+        let mut params = serde_json::json!({"type":"local_file_diff", "session_id":"s", "tool_call_id":"id", "previous":"private-old", "written":"new"});
+        let update = parse_session_update(&params).unwrap();
+        assert_eq!(update.session_id(), "s");
+        assert!(!format!("{update:?}").contains("private-old"));
+        params["previous"] =
+            serde_json::json!("x".repeat(zeroclaw_api::local_file_diff::MAX_FILE_DIFF_BYTES + 1));
+        assert!(parse_session_update(&params).is_none());
+        params["previous"] = serde_json::json!("bad\0");
+        assert!(parse_session_update(&params).is_none());
+        params.as_object_mut().unwrap().remove("previous");
+        assert!(parse_session_update(&params).is_none());
     }
 
     #[test]
