@@ -41280,6 +41280,87 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Debouncing combines a sender's messages into one turn owned by the
+    /// first of them, so a mixed batch is answered in the first message's
+    /// modality, whatever the later ones were.
+    #[tokio::test]
+    async fn matrix_mirror_debounced_batch_answers_in_the_first_messages_modality() {
+        for (first_voice, second_voice) in [(true, false), (false, true)] {
+            let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+            let mut peer_groups = HashMap::new();
+            peer_groups.insert(
+                "family".to_string(),
+                mirror_peer_group("matrix.default", &["@alice:server"]),
+            );
+            let ctx = test_runtime_ctx_with_observer_and_tools(
+                channel_impl.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config {
+                    peer_groups,
+                    channels: zeroclaw_config::schema::ChannelsConfig {
+                        debounce_ms: 60,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                Vec::new(),
+            );
+
+            let first = zeroclaw_api::channel::ChannelMessage {
+                content: "first part".to_string(),
+                ..matrix_room_message("@alice:server", first_voice)
+            };
+            let second = zeroclaw_api::channel::ChannelMessage {
+                id: "$event-2:server".to_string(),
+                content: "second part".to_string(),
+                ..matrix_room_message("@alice:server", second_voice)
+            };
+            let history_key = conversation_history_key(&first);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+            let send_task = zeroclaw_spawn::spawn!(async move {
+                tx.send(first).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(second).await.unwrap();
+            });
+
+            run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+            send_task.await.unwrap();
+
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(
+                sent.len(),
+                1,
+                "both messages must be answered as one combined turn: {sent:?}"
+            );
+            let reply = delivered_reply(sent.as_slice(), "!room:server");
+            assert_eq!(
+                (reply.force_voice, reply.suppress_voice),
+                (first_voice, !first_voice),
+                "a batch opened by a {} message must be answered in that modality, got {reply:?}",
+                if first_voice { "voice" } else { "text" }
+            );
+            drop(sent);
+
+            let mut histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .get(&history_key)
+                .expect("the combined turn must create history");
+            assert!(
+                turns[0].content.contains("first part") && turns[0].content.contains("second part"),
+                "the batch must dispatch as one combined turn: {}",
+                turns[0].content
+            );
+        }
+    }
+
     #[tokio::test]
     async fn matrix_explicit_text_override_beats_a_mirror_voice_origin() {
         let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
