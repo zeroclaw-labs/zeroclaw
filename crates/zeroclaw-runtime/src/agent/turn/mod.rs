@@ -337,10 +337,27 @@ fn replace_tool_protocol_section(
     }
 }
 
-fn custom_native_tools_fallback_warning(alias: &str) -> String {
-    format!(
-        "Native tool calling failed for custom provider alias `{alias}`; this turn fell back to prompt-guided tools. Set `[providers.models.custom.{alias}] native_tools = false` to skip the failing native request next time."
-    )
+fn custom_native_tools_fallback_warning(target: provider_call::CustomProviderRef<'_>) -> String {
+    match target {
+        provider_call::CustomProviderRef::Alias(alias) => format!(
+            "Native tool calling failed for custom provider alias `{alias}`; this turn fell back to prompt-guided tools. Set `[providers.models.custom.{alias}] native_tools = false` to skip the failing native request next time."
+        ),
+        provider_call::CustomProviderRef::Url(url) => format!(
+            "Native tool calling failed for custom endpoint `{}`; this turn fell back to prompt-guided tools. A bare `custom:<url>` reference has no configuration entry to opt out with: define `[providers.models.custom.<name>]` with this `uri` and `native_tools = false`, then reference `custom.<name>` to skip the failing native request next time.",
+            scrub_credentials(url)
+        ),
+    }
+}
+
+fn custom_native_tools_config_key(target: provider_call::CustomProviderRef<'_>) -> String {
+    match target {
+        provider_call::CustomProviderRef::Alias(alias) => {
+            format!("[providers.models.custom.{alias}] native_tools = false")
+        }
+        provider_call::CustomProviderRef::Url(_) => {
+            "[providers.models.custom.<name>] uri = <url>, native_tools = false".to_string()
+        }
+    }
 }
 
 fn ensure_prompt_guided_tool_instructions(
@@ -2003,7 +2020,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
         if let Some(err) = provider_call_outcome.chat_result.as_ref().err()
             && request_tools.is_some()
-            && let Some(alias) = provider_call::custom_provider_alias(active_model_provider_name)
+            && let Some(custom_ref) = provider_call::custom_provider_ref(active_model_provider_name)
+            // A stream that already produced visible output must never be
+            // replayed, whatever the error text says.
+            && err
+                .downcast_ref::<outcome::StreamInterruptedAfterOutput>()
+                .is_none()
             && zeroclaw_providers::rejects_native_tool_calling(err.as_ref())
         {
             let mut fallback_messages = provider_request_messages.clone();
@@ -2013,7 +2035,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 &mut fallback_messages,
                 &iteration_tool_specs.tool_specs,
             );
-            let warning = custom_native_tools_fallback_warning(alias);
+            let warning = custom_native_tools_fallback_warning(custom_ref);
             ctx.observer
                 .record_event(&zeroclaw_api::observability_traits::ObserverEvent::Error {
                     component: "model_provider".to_string(),
@@ -2026,10 +2048,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "model_provider": active_model_provider_name,
-                        "alias": alias,
+                        "custom_ref": match custom_ref {
+                            provider_call::CustomProviderRef::Alias(_) => "alias",
+                            provider_call::CustomProviderRef::Url(_) => "url",
+                        },
                         "model": provider_request_model,
                         "iteration": iteration + 1,
-                        "config_key": format!("[providers.models.custom.{alias}] native_tools = false"),
+                        "config_key": custom_native_tools_config_key(custom_ref),
                         "error": scrub_credentials(&err.to_string()),
                         "trace_id": turn_id,
                     })),
@@ -4012,8 +4037,13 @@ mod native_tool_fallback_tests {
         }
     }
 
-    #[tokio::test]
-    async fn custom_native_tools_rejection_falls_back_to_prompt_guided_tools_with_alias_warning() {
+    /// Runs one turn against an endpoint that rejects native tool
+    /// specifications and accepts prompt-guided tools, asserting the turn
+    /// completes on the fallback with a single native attempt. Returns the
+    /// streamed warning text.
+    async fn run_native_tools_rejection_turn(
+        build_provider: impl FnOnce(std::net::SocketAddr) -> (Box<dyn ModelProvider>, String),
+    ) -> String {
         let native_attempts = Arc::new(AtomicUsize::new(0));
         let prompt_guided_attempts = Arc::new(AtomicUsize::new(0));
         let saw_prompt_guided_tools = Arc::new(AtomicBool::new(false));
@@ -4100,12 +4130,8 @@ mod native_tool_fallback_tests {
                 .await
                 .expect("serve custom compatible endpoint");
         });
-        let provider = OpenAiCompatibleModelProvider::builder("rejector")
-            .display_name("Custom")
-            .base_url(&format!("http://{addr}"))
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .build();
+        let (provider, provider_name) = build_provider(addr);
+        let provider: &dyn ModelProvider = provider.as_ref();
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 LookupStatusTool,
@@ -4124,7 +4150,7 @@ mod native_tool_fallback_tests {
             None,
             None,
             &risk_profile,
-            &provider,
+            provider,
             &tools_registry,
             &[],
             None,
@@ -4157,8 +4183,8 @@ mod native_tool_fallback_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(256);
         let exec = ResolvedAgentExecution {
             model_access: ResolvedModelAccess {
-                model_provider: &provider,
-                provider_name: "custom.rejector",
+                model_provider: provider,
+                provider_name: &provider_name,
                 model: "test-model",
                 dispatch_model: "test-model",
                 temperature: None,
@@ -4232,8 +4258,65 @@ mod native_tool_fallback_tests {
                 warning_text.push_str(&text);
             }
         }
+        warning_text
+    }
+
+    #[tokio::test]
+    async fn custom_native_tools_rejection_falls_back_to_prompt_guided_tools_with_alias_warning() {
+        let warning_text = run_native_tools_rejection_turn(|addr| {
+            let provider: Box<dyn ModelProvider> = Box::new(
+                OpenAiCompatibleModelProvider::builder("rejector")
+                    .display_name("Custom")
+                    .base_url(&format!("http://{addr}"))
+                    .credential(None)
+                    .auth_style(AuthStyle::Bearer)
+                    .build(),
+            );
+            (provider, "custom.rejector".to_string())
+        })
+        .await;
         assert!(warning_text.contains("native_tools = false"));
         assert!(warning_text.contains("rejector"));
+    }
+
+    #[tokio::test]
+    async fn bare_custom_url_native_tools_rejection_falls_back_to_prompt_guided_tools() {
+        // Built through the real `custom:<url>` factory path, which now defaults
+        // to native tools, so the fallback must cover URL references too.
+        let warning_text = run_native_tools_rejection_turn(|addr| {
+            let name = format!("custom:http://{addr}");
+            let resolved = zeroclaw_providers::create_model_provider_from_ref_with_model(
+                &zeroclaw_config::schema::Config::default(),
+                &name,
+            )
+            .expect("bare custom:<url> ref builds a provider");
+            assert!(
+                resolved.provider.supports_native_tools(),
+                "custom:<url> defaults to native tool calling"
+            );
+            (resolved.provider, name)
+        })
+        .await;
+        assert!(warning_text.contains("custom endpoint"));
+        assert!(warning_text.contains("native_tools = false"));
+        assert!(warning_text.contains("custom.<name>"));
+    }
+
+    #[test]
+    fn custom_provider_ref_recognises_aliases_and_bare_urls() {
+        use provider_call::{CustomProviderRef, custom_provider_ref};
+        assert_eq!(
+            custom_provider_ref("custom.gw"),
+            Some(CustomProviderRef::Alias("gw"))
+        );
+        assert_eq!(
+            custom_provider_ref("custom:https://gw.example.com/v1"),
+            Some(CustomProviderRef::Url("https://gw.example.com/v1"))
+        );
+        assert_eq!(custom_provider_ref("custom."), None);
+        assert_eq!(custom_provider_ref("custom:"), None);
+        assert_eq!(custom_provider_ref("openai"), None);
+        assert_eq!(custom_provider_ref("anthropic-custom:https://x"), None);
     }
 }
 

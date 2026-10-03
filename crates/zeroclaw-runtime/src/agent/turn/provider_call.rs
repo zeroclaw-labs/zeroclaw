@@ -351,7 +351,7 @@ pub(crate) async fn call_provider(
                                 scope.mark_stream_recovery_semantic_empty();
                             }
                             if request_tools.is_some()
-                                && custom_provider_alias(active_model_provider_name).is_some()
+                                && custom_provider_ref(active_model_provider_name).is_some()
                                 && zeroclaw_providers::rejects_native_tool_calling(
                                     stream_err.as_ref(),
                                 )
@@ -538,11 +538,30 @@ pub(crate) async fn call_provider(
     })
 }
 
-pub(crate) fn custom_provider_alias(model_provider_name: &str) -> Option<&str> {
-    model_provider_name
+/// A user-supplied OpenAI-compatible endpoint, which now defaults to native
+/// tool calling and therefore needs the prompt-guided fallback when the
+/// endpoint rejects tool specifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomProviderRef<'a> {
+    /// `custom.<alias>`: a configured `[providers.models.custom.<alias>]` entry.
+    Alias(&'a str),
+    /// `custom:<url>`: a bare endpoint URL with no configuration entry.
+    Url(&'a str),
+}
+
+pub(crate) fn custom_provider_ref(model_provider_name: &str) -> Option<CustomProviderRef<'_>> {
+    if let Some(alias) = model_provider_name
         .strip_prefix("custom.")
         .map(str::trim)
         .filter(|alias| !alias.is_empty())
+    {
+        return Some(CustomProviderRef::Alias(alias));
+    }
+    model_provider_name
+        .strip_prefix("custom:")
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(CustomProviderRef::Url)
 }
 
 #[cfg(test)]
