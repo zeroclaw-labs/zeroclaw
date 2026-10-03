@@ -15777,19 +15777,43 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_by_url_builds_correct_json() {
-        let mention_only = false;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let expected_body = serde_json::json!({
+            "chat_id": "123456",
+            "photo": "https://example.com/image.jpg"
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendPhoto"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
-            mention_only,
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        ch.send_photo_by_url("123456", None, "https://example.com/image.jpg", None)
+            .await
+            .expect("mock Telegram API should accept the photo URL");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body_json::<serde_json::Value>().unwrap(),
+            expected_body
         );
-
-        let result = ch
-            .send_photo_by_url("123456", None, "https://example.com/image.jpg", None)
-            .await;
-
-        assert!(result.is_err());
     }
 
     // ── File path handling tests ────────────────────────────────────

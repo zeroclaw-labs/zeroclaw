@@ -1,13 +1,15 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, SessionQuery,
+    SessionState, check_session_ownership,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -55,6 +57,55 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 }
 
 impl SqliteSessionBackend {
+    fn list_metadata_on(conn: &Connection) -> Vec<SessionMetadata> {
+        let mut stmt = match conn.prepare(
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
+             FROM session_metadata ORDER BY last_activity DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            let created_str: String = row.get(1)?;
+            let activity_str: String = row.get(2)?;
+            let count: i64 = row.get(3)?;
+            let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
+            let principal_id: Option<String> = row.get(9)?;
+
+            let created = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let activity = DateTime::parse_from_rfc3339(&activity_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(SessionMetadata {
+                key,
+                name,
+                created_at: created,
+                last_activity: activity,
+                message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
+                principal_id,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// Open or create the sessions database.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
@@ -751,6 +802,32 @@ impl SqliteSessionBackend {
                     params![key, now, now, inserted, trim_breadcrumb.map(i64::from)],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
+                if let Some(sidecar) =
+                    crate::session_store::read_metadata_sidecar(&sessions_dir, &key).with_context(
+                        || format!("Failed to read JSONL ownership sidecar for {name}"),
+                    )?
+                {
+                    tx.execute(
+                        "UPDATE session_metadata SET \
+                         name = COALESCE(?2, name), \
+                         agent_alias = COALESCE(?3, agent_alias), \
+                         channel_id = COALESCE(?4, channel_id), \
+                         room_id = COALESCE(?5, room_id), \
+                         sender_id = COALESCE(?6, sender_id) \
+                         WHERE session_key = ?1",
+                        params![
+                            key,
+                            sidecar.name,
+                            sidecar.agent_alias,
+                            sidecar.channel_id,
+                            sidecar.room_id,
+                            sidecar.sender_id
+                        ],
+                    )
+                    .with_context(|| {
+                        format!("Failed to preserve JSONL session ownership for {name}")
+                    })?;
+                }
                 tx.execute(
                     "INSERT INTO jsonl_import_receipts \
                      (source_name, session_key, source_hash, source_len, imported_at) \
@@ -826,6 +903,8 @@ impl SqliteSessionBackend {
                 archive(&staged_path, &migrated_path, &expected)
                     .with_context(|| format!("Failed to archive imported JSONL session {name}"))?;
             }
+            crate::session_store::mark_metadata_sidecar_migrated(&sessions_dir, &key)
+                .with_context(|| format!("Failed to archive JSONL ownership sidecar for {name}"))?;
             if live_path.exists() {
                 bail!(
                     "JSONL session {} reappeared during migration",
@@ -837,29 +916,41 @@ impl SqliteSessionBackend {
 
         Ok(migrated)
     }
+
+    fn load_messages(conn: &Connection, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
+    fn session_ownership(
+        conn: &Connection,
+        session_key: &str,
+    ) -> std::io::Result<Option<(Option<String>, Option<String>)>> {
+        conn.query_row(
+            "SELECT agent_alias, channel_id FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(std::io::Error::other)
+    }
 }
 
 impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
-        let mut stmt = match conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
-        {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let rows = match stmt.query_map(params![session_key], |row| {
-            Ok(ChatMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        rows.filter_map(|r| r.ok()).collect()
+        Self::load_messages(&conn, session_key).unwrap_or_default()
     }
 
     fn load_with_timestamps(
@@ -899,6 +990,118 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+    }
+
+    fn load_if_owned(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let channel_ids = channel_ids.clone();
+        self.load_with_authority(session_key, agent_alias, &move |effect| {
+            effect(&channel_ids)
+        })
+    }
+
+    fn load_with_authority(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // Reserve persisted ownership against other connections, including all
+        // SQLite admission waits, before acquiring live policy. A deferred WAL
+        // reader alone would allow ownership publication during policy admission.
+        let ownership = Self::session_ownership(&transaction, session_key)?;
+        let mut transaction = Some(transaction);
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channel_ids| {
+            result = (|| {
+                let transaction = transaction.take().ok_or_else(|| {
+                    std::io::Error::other("authority effect invoked more than once")
+                })?;
+                let Some((owner_agent, owner_channel)) = &ownership else {
+                    return Ok(ScopedSessionAccess::Missing);
+                };
+                if let Err(denial) = check_session_ownership(
+                    owner_agent.as_deref(),
+                    owner_channel.as_deref(),
+                    agent_alias,
+                    channel_ids,
+                ) {
+                    return Ok(ScopedSessionAccess::Denied(denial));
+                }
+                let messages = Self::load_messages(&transaction, session_key)?;
+                transaction.commit().map_err(std::io::Error::other)?;
+                Ok(ScopedSessionAccess::Granted(messages))
+            })();
+        });
+        result
+    }
+
+    fn append_if_owned(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let channel_ids = channel_ids.clone();
+        self.append_with_authority(session_key, message, agent_alias, &move |effect| {
+            effect(&channel_ids)
+        })
+    }
+
+    fn append_with_authority(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let mut transaction = Some(transaction);
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channel_ids| {
+            result = (|| {
+                let transaction = transaction.take().ok_or_else(|| {
+                    std::io::Error::other("authority effect invoked more than once")
+                })?;
+                let Some((owner_agent, owner_channel)) =
+                    Self::session_ownership(&transaction, session_key)?
+                else {
+                    return Ok(ScopedSessionAccess::Missing);
+                };
+                if let Err(denial) = check_session_ownership(
+                    owner_agent.as_deref(),
+                    owner_channel.as_deref(),
+                    agent_alias,
+                    channel_ids,
+                ) {
+                    return Ok(ScopedSessionAccess::Denied(denial));
+                }
+                let now = Utc::now().to_rfc3339();
+                Self::append_on(&transaction, session_key, message, &now)
+                    .map_err(std::io::Error::other)?;
+                transaction.commit().map_err(std::io::Error::other)?;
+                Ok(ScopedSessionAccess::Granted(()))
+            })();
+        });
+        result
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
@@ -1051,54 +1254,40 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    fn list_with_authority(
+        &self,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<Vec<SessionMetadata>> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let metadata = Self::list_metadata_on(&transaction);
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channels| {
+            result = Ok(metadata
+                .iter()
+                .filter(|meta| {
+                    check_session_ownership(
+                        meta.agent_alias.as_deref(),
+                        meta.channel_id.as_deref(),
+                        agent_alias,
+                        channels,
+                    )
+                    .is_ok()
+                })
+                .cloned()
+                .collect());
+        });
+        result
+    }
+
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
-             FROM session_metadata ORDER BY last_activity DESC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let rows = match stmt.query_map([], |row| {
-            let key: String = row.get(0)?;
-            let created_str: String = row.get(1)?;
-            let activity_str: String = row.get(2)?;
-            let count: i64 = row.get(3)?;
-            let name: Option<String> = row.get(4)?;
-            let agent_alias: Option<String> = row.get(5)?;
-            let channel_id: Option<String> = row.get(6)?;
-            let room_id: Option<String> = row.get(7)?;
-            let sender_id: Option<String> = row.get(8)?;
-            let principal_id: Option<String> = row.get(9)?;
-
-            let created = DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let activity = DateTime::parse_from_rfc3339(&activity_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(SessionMetadata {
-                key,
-                name,
-                created_at: created,
-                last_activity: activity,
-                message_count: count as usize,
-                agent_alias,
-                channel_id,
-                room_id,
-                sender_id,
-                principal_id,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        rows.filter_map(|r| r.ok()).collect()
+        Self::list_metadata_on(&self.conn.lock())
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
@@ -1562,6 +1751,70 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
+    fn claim_session_with_authority(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        authority: &crate::session_backend::ChannelAuthority,
+    ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
+        use crate::session_backend::SessionOwnerClaim;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let ownership = Self::session_ownership(&tx, session_key)?;
+        let mut tx = Some(tx);
+        let mut claim = SessionOwnerClaim::Foreign("unavailable authority".into());
+        let mut result = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "channel authority unavailable",
+        ));
+        authority(&mut |channels| {
+            result = (|| {
+                if agent_alias.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "empty session owner",
+                    ));
+                }
+                if let Some((owner, channel)) = &ownership
+                    && let Err(denial) = check_session_ownership(
+                        owner.as_deref().filter(|value| !value.is_empty()),
+                        channel.as_deref().filter(|value| !value.is_empty()),
+                        agent_alias,
+                        channels,
+                    )
+                {
+                    claim = SessionOwnerClaim::Foreign(format!("{denial:?}"));
+                    return Ok(());
+                }
+                let tx = tx
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("claim effect invoked more than once"))?;
+                let now = Utc::now().to_rfc3339();
+                tx.execute("INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                    VALUES (?1, ?2, ?2, 0, ?3)
+                    ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
+                    params![session_key, now, agent_alias]).map_err(std::io::Error::other)?;
+                tx.commit().map_err(std::io::Error::other)?;
+                claim = SessionOwnerClaim::Claimed;
+                Ok(())
+            })();
+        });
+        result?;
+        Ok(claim)
+    }
+
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<crate::session_backend::SessionOwnerClaim> {
+        self.claim_session_with_authority(session_key, agent_alias, &|effect| {
+            effect(&BTreeSet::new())
+        })
+    }
+
     fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let principal_val = if principal_id.is_empty() {
@@ -2006,6 +2259,40 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_ownership_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let jsonl = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+        jsonl.append("owned", &ChatMessage::user("hello")).unwrap();
+        jsonl.set_session_name("owned", "Operator chat").unwrap();
+        jsonl.set_session_agent_alias("owned", "rowan").unwrap();
+        jsonl
+            .set_session_context(
+                "owned",
+                SessionContext {
+                    channel_id: Some("discord.primary"),
+                    room_id: Some("42"),
+                    sender_id: Some("operator"),
+                },
+            )
+            .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+
+        let metadata = backend.get_session_metadata("owned").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Operator chat"));
+        assert_eq!(metadata.agent_alias.as_deref(), Some("rowan"));
+        assert_eq!(metadata.channel_id.as_deref(), Some("discord.primary"));
+        assert_eq!(metadata.room_id.as_deref(), Some("42"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("operator"));
+        assert!(
+            tmp.path()
+                .join("sessions/owned.metadata.json.migrated")
+                .exists()
+        );
     }
 
     #[test]
@@ -3279,5 +3566,207 @@ mod tests {
             backend.get_session_trim_breadcrumb("s1").unwrap(),
             Some(false)
         );
+    }
+    #[test]
+    fn live_authority_resolves_after_actual_storage_wait() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for operation in ["load", "append", "list", "claim"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            store
+                .append("legacy", &ChatMessage::user("private bytes"))
+                .unwrap();
+            store
+                .set_session_context(
+                    "legacy",
+                    crate::session_backend::SessionContext {
+                        channel_id: Some("discord.owner"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(BTreeSet::from([
+                "discord.owner".to_string()
+            ])));
+            let blocked = store.conn.lock();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let worker_store = Arc::clone(&store);
+            let worker_policy = Arc::clone(&policy);
+            let worker = std::thread::spawn(move || {
+                let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
+                    let grant = worker_policy.read();
+                    entered_tx.send(()).unwrap();
+                    effect(&grant);
+                };
+                match operation {
+                    "load" => assert!(matches!(
+                        worker_store
+                            .load_with_authority("legacy", "owner", &authority)
+                            .unwrap(),
+                        ScopedSessionAccess::Denied(_)
+                    )),
+                    "append" => assert!(matches!(
+                        worker_store
+                            .append_with_authority(
+                                "legacy",
+                                &ChatMessage::user("forbidden"),
+                                "owner",
+                                &authority
+                            )
+                            .unwrap(),
+                        ScopedSessionAccess::Denied(_)
+                    )),
+                    "list" => assert!(
+                        worker_store
+                            .list_with_authority("owner", &authority)
+                            .unwrap()
+                            .is_empty()
+                    ),
+                    "claim" => assert!(matches!(
+                        worker_store
+                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .unwrap(),
+                        crate::session_backend::SessionOwnerClaim::Foreign(_)
+                    )),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "policy must not be captured ahead of storage"
+            );
+            policy.write().clear();
+            drop(blocked);
+            worker.join().unwrap();
+            assert_eq!(store.load("legacy").len(), 1);
+            assert_eq!(store.get_session_agent_alias("legacy").unwrap(), None);
+            let grant = BTreeSet::from(["discord.owner".to_string()]);
+            assert!(matches!(
+                store.load_if_owned("legacy", "owner", &grant).unwrap(),
+                ScopedSessionAccess::Granted(_)
+            ));
+            assert!(matches!(
+                store
+                    .append_if_owned("legacy", &ChatMessage::user("allowed"), "owner", &grant)
+                    .unwrap(),
+                ScopedSessionAccess::Granted(())
+            ));
+        }
+    }
+    #[test]
+    fn live_authority_resolves_after_sqlite_transaction_wait() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for operation in ["append", "claim"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            store
+                .append("legacy", &ChatMessage::user("private bytes"))
+                .unwrap();
+            store
+                .set_session_context(
+                    "legacy",
+                    crate::session_backend::SessionContext {
+                        channel_id: Some("discord.owner"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let blocker = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(BTreeSet::from([
+                "discord.owner".to_string()
+            ])));
+            let policy_reader = Arc::clone(&policy);
+            let worker_store = Arc::clone(&store);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let authority = move |effect: &mut dyn FnMut(&BTreeSet<String>)| {
+                    let grant = policy_reader.read();
+                    entered_tx.send(()).unwrap();
+                    effect(&grant);
+                };
+                if operation == "append" {
+                    assert!(matches!(
+                        worker_store
+                            .append_with_authority(
+                                "legacy",
+                                &ChatMessage::user("forbidden"),
+                                "owner",
+                                &authority
+                            )
+                            .unwrap(),
+                        ScopedSessionAccess::Denied(_)
+                    ));
+                } else {
+                    assert!(matches!(
+                        worker_store
+                            .claim_session_with_authority("legacy", "owner", &authority)
+                            .unwrap(),
+                        crate::session_backend::SessionOwnerClaim::Foreign(_)
+                    ));
+                }
+            });
+            assert!(entered_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            policy.write().clear();
+            blocker.execute_batch("COMMIT").unwrap();
+            worker.join().unwrap();
+            assert_eq!(store.load("legacy").len(), 1);
+            assert_eq!(store.get_session_agent_alias("legacy").unwrap(), None);
+        }
+    }
+    #[test]
+    fn scoped_read_reserves_persisted_owner_through_policy_effect() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        store
+            .append("owned", &ChatMessage::user("private"))
+            .unwrap();
+        store.set_session_agent_alias("owned", "owner").unwrap();
+        let worker_store = Arc::clone(&store);
+        let (entered, ready) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let worker = std::thread::spawn(move || {
+            worker_store
+                .load_with_authority("owned", "owner", &move |effect| {
+                    entered.send(()).unwrap();
+                    wait.lock().unwrap().recv().unwrap();
+                    effect(&BTreeSet::new());
+                })
+                .unwrap()
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let writer = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        writer.busy_timeout(Duration::from_millis(50)).unwrap();
+        assert!(
+            writer
+                .execute(
+                    "UPDATE session_metadata SET agent_alias='foreign' WHERE session_key='owned'",
+                    []
+                )
+                .is_err(),
+            "persisted ownership cannot publish during the scoped read"
+        );
+        resume.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            ScopedSessionAccess::Granted(_)
+        ));
+        writer
+            .execute(
+                "UPDATE session_metadata SET agent_alias='foreign' WHERE session_key='owned'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .load_if_owned("owned", "owner", &BTreeSet::new())
+                .unwrap(),
+            ScopedSessionAccess::Denied(_)
+        ));
     }
 }

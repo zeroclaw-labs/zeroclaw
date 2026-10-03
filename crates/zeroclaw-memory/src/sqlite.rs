@@ -31,6 +31,17 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether an upsert may replace the provenance (`namespace`, `session_id`)
+/// of the row that already holds the conflicting key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvenanceGuard {
+    /// Last writer wins, the historical `store`/`store_with_metadata` shape.
+    Overwrite,
+    /// Insert when the key is free and refresh only while the stored
+    /// provenance still matches the write; otherwise leave the row alone.
+    PreserveExisting,
+}
+
 #[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
@@ -40,6 +51,43 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+}
+
+/// Runs a synchronous archive effect while retaining live policy authority.
+/// Called only after SQLite admission; must not acquire storage or await.
+pub type NamespaceAuthority = dyn Fn(&mut dyn FnMut(&[String])) + Send + Sync;
+
+#[derive(Clone)]
+enum NamespaceScope {
+    Fixed(Vec<String>),
+    Live(Arc<NamespaceAuthority>),
+}
+
+fn with_namespaces(
+    scope: Option<&NamespaceScope>,
+    effect: &mut impl FnMut(Option<&[String]>) -> anyhow::Result<Vec<MemoryEntry>>,
+) -> anyhow::Result<Vec<MemoryEntry>> {
+    match scope {
+        None => effect(None),
+        Some(NamespaceScope::Fixed(names)) => {
+            if names.is_empty() {
+                Ok(Vec::new())
+            } else {
+                effect(Some(names))
+            }
+        }
+        Some(NamespaceScope::Live(authority)) => {
+            let mut result = Err(anyhow::Error::msg("archive authority unavailable"));
+            authority(&mut |names| {
+                result = if names.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    effect(Some(names))
+                };
+            });
+            result
+        }
+    }
 }
 
 impl SqliteMemory {
@@ -393,6 +441,45 @@ impl SqliteMemory {
         options: StoreOptions,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        let stored = self
+            .upsert_row_with_metadata(
+                key,
+                content,
+                category,
+                session_id,
+                options,
+                agent_id,
+                ProvenanceGuard::Overwrite,
+            )
+            .await?;
+        // An Overwrite upsert only fails to write when the key is held by a
+        // private-plane row (the `principal_id IS NULL` guard on the shared
+        // upsert). Surface that as an error rather than a silent no-op so a
+        // shared-plane write can never quietly collide with private memory.
+        if !stored {
+            anyhow::bail!(
+                "memory key {key:?} is held by a private-plane row; the shared plane \
+                 cannot overwrite it"
+            );
+        }
+        Ok(())
+    }
+
+    /// Shared upsert for every metadata-carrying write. `guard` decides
+    /// whether a conflicting row may have its provenance replaced; the
+    /// predicate lives in the same statement as the write so no caller can
+    /// reopen a check/use race around it. Reports whether a row was inserted
+    /// or refreshed.
+    async fn upsert_row_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+        guard: ProvenanceGuard,
+    ) -> anyhow::Result<bool> {
         let embedding_bytes = match self.get_or_compute_embedding(content).await {
             Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
             Err(e) => {
@@ -426,7 +513,7 @@ impl SqliteMemory {
         let tenant_id = options.tenant_id;
         let aid = agent_id.map(String::from);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = conn.lock();
             let now = Local::now().to_rfc3339();
             let cat = Self::category_to_str(&category);
@@ -434,17 +521,16 @@ impl SqliteMemory {
 
             // Shared-plane writes never touch a private row: the reserved
             // physical-key prefix is refused outright, and the upsert only
-            // updates a row that has no owner, so a zero-row outcome means the
-            // key is held by the private plane and is refused rather than
-            // reported as stored.
+            // updates a row that has no principal owner, so a zero-row outcome
+            // means the key is held by the private plane and is refused rather
+            // than reported as stored.
             if key.starts_with(Self::PRIVATE_KEY_PREFIX) {
                 anyhow::bail!(
                     "memory keys beginning with {:?} are reserved for private principal memory",
                     Self::PRIVATE_KEY_PREFIX
                 );
             }
-            let changed = conn.execute(
-                "INSERT INTO memories (
+            let mut sql = "INSERT INTO memories (
                     id, key, content, category, embedding, created_at, updated_at,
                     session_id, namespace, importance, agent_id, kind, pinned, tenant_id
                  )
@@ -464,7 +550,17 @@ impl SqliteMemory {
                     kind = excluded.kind,
                     pinned = excluded.pinned,
                     tenant_id = excluded.tenant_id
-                 WHERE memories.principal_id IS NULL",
+                 WHERE memories.principal_id IS NULL"
+                .to_string();
+            if guard == ProvenanceGuard::PreserveExisting {
+                sql.push_str(
+                    " AND memories.namespace = excluded.namespace
+                        AND memories.session_id IS excluded.session_id",
+                );
+            }
+
+            let affected = conn.execute(
+                &sql,
                 params![
                     id,
                     key,
@@ -482,13 +578,7 @@ impl SqliteMemory {
                     tenant_id
                 ],
             )?;
-            if changed == 0 {
-                anyhow::bail!(
-                    "memory key {key:?} is held by a private-plane row; the shared plane \
-                     cannot overwrite it"
-                );
-            }
-            Ok(())
+            Ok(affected > 0)
         })
         .await?
     }
@@ -707,29 +797,7 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, None, None)
-    }
-
-    /// FTS5 BM25 search constrained to the rows a live vector-stage recall
-    /// may return for a session. Applying this predicate inside FTS keeps
-    /// excluded rows out of BM25 ranking, limiting, and normalization.
-    fn fts5_search_for_session(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, None)
-    }
-
-    fn fts5_search_for_session_and_agents(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, Some(allowed_agent_ids))
+        Self::fts5_search_scoped(conn, query, limit, None, None, None)
     }
 
     fn fts5_search_scoped(
@@ -738,6 +806,7 @@ impl SqliteMemory {
         limit: usize,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        allowed_namespaces: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
@@ -788,6 +857,19 @@ impl SqliteMemory {
                 param_values.push(Box::new(agent_id.clone()));
             }
             param_idx += allowed_agent_ids.len();
+        }
+        if let Some(allowed_namespaces) = allowed_namespaces
+            && !allowed_namespaces.is_empty()
+        {
+            let namespace_placeholders = (0..allowed_namespaces.len())
+                .map(|offset| format!("?{}", param_idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND m.namespace IN ({namespace_placeholders})");
+            for namespace in allowed_namespaces {
+                param_values.push(Box::new(namespace.clone()));
+            }
+            param_idx += allowed_namespaces.len();
         }
 
         let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
@@ -877,24 +959,14 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::vector_search_scoped(conn, query_embedding, limit, category, session_id, None)
-    }
-
-    fn vector_search_for_agents(
-        conn: &Connection,
-        query_embedding: &[f32],
-        limit: usize,
-        category: Option<&str>,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
         Self::vector_search_scoped(
             conn,
             query_embedding,
             limit,
             category,
             session_id,
-            Some(allowed_agent_ids),
+            None,
+            None,
         )
     }
 
@@ -905,6 +977,7 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        allowed_namespaces: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -943,6 +1016,19 @@ impl SqliteMemory {
             for agent_id in allowed_agent_ids {
                 param_values.push(Box::new(agent_id.clone()));
             }
+            idx += allowed_agent_ids.len();
+        }
+        if let Some(allowed_namespaces) = allowed_namespaces
+            && !allowed_namespaces.is_empty()
+        {
+            let namespace_placeholders = (0..allowed_namespaces.len())
+                .map(|offset| format!("?{}", idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND namespace IN ({namespace_placeholders})");
+            for namespace in allowed_namespaces {
+                param_values.push(Box::new(namespace.clone()));
+            }
         }
 
         let mut stmt = conn.prepare(&sql)?;
@@ -976,6 +1062,7 @@ impl SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        namespaces: Option<NamespaceScope>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
@@ -983,7 +1070,12 @@ impl SqliteMemory {
         let until_owned = until.map(String::from);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let mut locked = conn.lock();
+            let conn = locked.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            // Pin a real SQLite read snapshot before policy admission, including
+            // waits caused by another connection's database lock.
+            conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+            with_namespaces(namespaces.as_ref(), &mut |namespaces| {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
@@ -1009,6 +1101,22 @@ impl SqliteMemory {
                 let _ = write!(sql, " AND m.created_at <= ?{idx}");
                 param_values.push(Box::new(u.to_string()));
                 idx += 1;
+            }
+            if let Some(namespaces) = namespaces
+                && !namespaces.is_empty()
+            {
+                let namespace_placeholders = (0..namespaces.len())
+                    .map(|offset| format!("?{}", idx + offset))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(
+                    sql,
+                    " AND m.namespace IN ({namespace_placeholders})"
+                );
+                for namespace in namespaces {
+                    param_values.push(Box::new(namespace.clone()));
+                }
+                idx += namespaces.len();
             }
             let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
             #[allow(clippy::cast_possible_wrap)]
@@ -1043,6 +1151,7 @@ impl SqliteMemory {
                 results.push(row?);
             }
             Ok(results)
+            })
         })
         .await?
     }
@@ -1055,6 +1164,7 @@ impl SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
         allowed_agent_ids: Option<Vec<String>>,
+        allowed_namespaces: Option<NamespaceScope>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
         // Time-only query: list by time range when no keywords.
@@ -1067,7 +1177,7 @@ impl SqliteMemory {
                 self.count().await?.max(limit)
             };
             let raw = self
-                .recall_by_time_only(recall_limit, session_id, since, until)
+                .recall_by_time_only(recall_limit, session_id, since, until, allowed_namespaces)
                 .await?;
             if allowed_agent_ids.is_empty() {
                 return Ok(raw);
@@ -1102,7 +1212,12 @@ impl SqliteMemory {
         let allowed = allowed_agent_ids;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
+            let mut locked = conn.lock();
+            let conn = locked.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            // Pin a real SQLite read snapshot before policy admission, including
+            // waits caused by another connection's database lock.
+            conn.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+            with_namespaces(allowed_namespaces.as_ref(), &mut |namespace_filter| {
             let session_ref = sid.as_deref();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
@@ -1120,37 +1235,32 @@ impl SqliteMemory {
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
                 Vec::new()
-            } else if let Some(agent_filter) = agent_filter {
-                if vector_live {
-                    Self::fts5_search_for_session_and_agents(
-                        &conn,
-                        &query,
-                        limit * 2,
-                        session_ref,
-                        agent_filter,
-                    )
-                    .unwrap_or_default()
-                } else {
-                    Self::fts5_search_scoped(&conn, &query, limit * 2, None, Some(agent_filter))
-                        .unwrap_or_default()
-                }
-            } else if vector_live {
-                Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
-                    .unwrap_or_default()
             } else {
-                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+                Self::fts5_search_scoped(
+                    &conn,
+                    &query,
+                    limit * 2,
+                    vector_live.then_some(session_ref).flatten(),
+                    agent_filter,
+                    namespace_filter,
+                )
+                .unwrap_or_default()
             };
 
             // Vector similarity search (skip for BM25-only mode)
             let vector_results = if search_mode == SearchMode::Bm25 {
                 Vec::new()
             } else if let Some(ref qe) = query_embedding {
-                if let Some(agent_filter) = agent_filter {
-                    Self::vector_search_for_agents(&conn, qe, limit * 2, None, session_ref, agent_filter)
-                        .unwrap_or_default()
-                } else {
-                    Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
-                }
+                Self::vector_search_scoped(
+                    &conn,
+                    qe,
+                    limit * 2,
+                    None,
+                    session_ref,
+                    agent_filter,
+                    namespace_filter,
+                )
+                .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -1373,10 +1483,22 @@ impl SqliteMemory {
                         let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
                         param_idx += agent_filter.len();
                     }
+                    let mut namespace_conditions = String::new();
+                    if let Some(namespace_filter) = namespace_filter {
+                        let namespace_placeholders = (0..namespace_filter.len())
+                            .map(|offset| format!("?{}", param_idx + offset))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(
+                            namespace_conditions,
+                            " AND m.namespace IN ({namespace_placeholders})"
+                        );
+                        param_idx += namespace_filter.len();
+                    }
                     let sql = format!(
                         "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
-                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
+                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}{namespace_conditions}
                          ORDER BY m.updated_at DESC
                          LIMIT ?{param_idx}"
                     );
@@ -1395,6 +1517,11 @@ impl SqliteMemory {
                     if let Some(agent_filter) = agent_filter {
                         for agent_id in agent_filter {
                             param_values.push(Box::new(agent_id.clone()));
+                        }
+                    }
+                    if let Some(namespace_filter) = namespace_filter {
+                        for namespace in namespace_filter {
+                            param_values.push(Box::new(namespace.clone()));
                         }
                     }
                     #[allow(clippy::cast_possible_wrap)]
@@ -1445,8 +1572,59 @@ impl SqliteMemory {
 
             results.truncate(limit);
             Ok(results)
+            })
         })
         .await?
+    }
+
+    /// Recall only rows whose namespace is in `allowed_namespaces`.
+    ///
+    /// The namespace predicate is applied inside every SQLite search path
+    /// before ranking and limiting. This is the authorization boundary for
+    /// shared sidecar databases such as `discord.db`; callers must derive the
+    /// allowlist from trusted runtime/config identity, never request input.
+    pub async fn recall_in_namespaces(
+        &self,
+        allowed_namespaces: &[String],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            None,
+            Some(NamespaceScope::Fixed(allowed_namespaces.to_vec())),
+        )
+        .await
+    }
+
+    /// Search under live authority acquired after the blocking worker and DB
+    /// mutex wait. Namespace filtering remains inside SQL before ranking/limit.
+    pub async fn recall_with_namespace_authority(
+        &self,
+        authority: Arc<NamespaceAuthority>,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            None,
+            Some(NamespaceScope::Live(authority)),
+        )
+        .await
     }
 
     /// Replace the live embedder in place. Shared by the runtime
@@ -1664,7 +1842,7 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_scoped(query, limit, session_id, since, until, None)
+        self.recall_scoped(query, limit, session_id, since, until, None, None)
             .await
     }
 
@@ -1839,6 +2017,32 @@ impl Memory for SqliteMemory {
             let affected = conn.execute(
                 "DELETE FROM memories WHERE key = ?1 AND principal_id IS NULL",
                 params![key],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn forget_if_provenance(
+        &self,
+        key: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories
+                 WHERE key = ?1 AND namespace = ?2
+                   AND session_id IS ?3 AND agent_id IS ?4",
+                params![key, namespace, session_id, agent_id],
             )?;
             Ok(affected > 0)
         })
@@ -2625,6 +2829,84 @@ impl Memory for SqliteMemory {
         .await
     }
 
+    async fn store_preserving_provenance(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: &str,
+    ) -> anyhow::Result<bool> {
+        // Same default-agent attribution as `store_with_metadata`; the
+        // conflicting row is therefore the one this write would replace.
+        self.upsert_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: Some(namespace.to_string()),
+                ..StoreOptions::default()
+            },
+            None,
+            ProvenanceGuard::PreserveExisting,
+        )
+        .await
+    }
+
+    async fn update_content_if_provenance(
+        &self,
+        key: &str,
+        content: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(embedding) => embedding.map(|embedding| vector::vec_to_bytes(&embedding)),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": error.to_string(),
+                        })),
+                    "memory conditional update: embedding failed; persisting content without a vector"
+                );
+                None
+            }
+        };
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "UPDATE memories
+                 SET content = ?1, embedding = ?2, updated_at = ?3
+                 WHERE key = ?4 AND namespace = ?5
+                   AND session_id IS ?6 AND agent_id IS ?7",
+                params![
+                    content,
+                    embedding_bytes,
+                    Local::now().to_rfc3339(),
+                    key,
+                    namespace,
+                    session_id,
+                    agent_id,
+                ],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn store_with_options(
         &self,
         key: &str,
@@ -2776,7 +3058,7 @@ impl Memory for SqliteMemory {
         }
 
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
+        self.recall_scoped(query, limit, session_id, since, until, Some(allowed), None)
             .await
     }
 
@@ -5216,6 +5498,147 @@ mod tests {
     // ── Bulk deletion tests ───────────────────────────────────────
 
     #[tokio::test]
+    async fn store_preserving_provenance_never_transfers_a_claimed_row() {
+        let (_tmp, mem) = temp_sqlite();
+        assert!(
+            mem.store_preserving_provenance(
+                "discord_1",
+                "owner content",
+                MemoryCategory::Custom("discord".into()),
+                Some("channel-1"),
+                "discord.owner",
+            )
+            .await
+            .unwrap()
+        );
+
+        // A different namespace and a different channel are both foreign
+        // provenance; neither may take the key.
+        for (namespace, session) in [
+            ("discord.observer", Some("channel-1")),
+            ("discord.owner", Some("channel-2")),
+            ("discord.owner", None),
+        ] {
+            assert!(
+                !mem.store_preserving_provenance(
+                    "discord_1",
+                    "foreign content",
+                    MemoryCategory::Custom("discord".into()),
+                    session,
+                    namespace,
+                )
+                .await
+                .unwrap()
+            );
+        }
+
+        let entry = mem.get("discord_1").await.unwrap().unwrap();
+        assert_eq!(entry.content, "owner content");
+        assert_eq!(entry.namespace, "discord.owner");
+        assert_eq!(entry.session_id.as_deref(), Some("channel-1"));
+
+        // Scoped search visibility follows the preserved namespace.
+        let owned = mem
+            .recall_in_namespaces(&["discord.owner".to_string()], "*", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].key, "discord_1");
+        assert!(
+            mem.recall_in_namespaces(&["discord.observer".to_string()], "*", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Redelivery to the owning provenance is still an ordinary refresh.
+        assert!(
+            mem.store_preserving_provenance(
+                "discord_1",
+                "owner content (refreshed)",
+                MemoryCategory::Custom("discord".into()),
+                Some("channel-1"),
+                "discord.owner",
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "owner content (refreshed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_conditional_update_and_delete_fail_closed() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "discord_1",
+            "original",
+            MemoryCategory::Custom("discord".into()),
+            Some("channel-1"),
+            Some("discord.owner"),
+            None,
+        )
+        .await
+        .unwrap();
+        let entry = mem.get("discord_1").await.unwrap().unwrap();
+
+        assert!(
+            !mem.update_content_if_provenance(
+                "discord_1",
+                "foreign update",
+                "discord.observer",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("foreign-channel"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "original"
+        );
+
+        assert!(
+            mem.update_content_if_provenance(
+                "discord_1",
+                "owned update",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "owned update"
+        );
+        assert!(
+            mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(mem.get("discord_1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn sqlite_purge_namespace_deletes_only_all_matching_entries() {
         let (_tmp, mem) = temp_sqlite();
 
@@ -6477,6 +6900,118 @@ mod tests {
             assert_eq!(
                 again_keys, snapshot,
                 "list() must yield a deterministic order across reads"
+            );
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_authority_waits_for_real_storage_before_disclosure() {
+        for query in ["", "*", "needle"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = Arc::new(SqliteMemory::new("agent", tmp.path()).unwrap());
+            memory
+                .store_with_metadata(
+                    "private",
+                    "needle private",
+                    MemoryCategory::Core,
+                    None,
+                    Some("discord.owner"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(vec!["discord.owner".to_string()]));
+            let policy_reader = Arc::clone(&policy);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let authority: Arc<NamespaceAuthority> = Arc::new(move |effect| {
+                let grant = policy_reader.read();
+                entered_tx.send(()).unwrap();
+                effect(&grant);
+            });
+            let handle = {
+                let _conn = memory.conn.lock();
+                let worker_memory = Arc::clone(&memory);
+                let handle = zeroclaw_spawn::spawn!(async move {
+                    worker_memory
+                        .recall_with_namespace_authority(authority, query, 1, None, None, None)
+                        .await
+                        .unwrap()
+                });
+                assert!(
+                    entered_rx
+                        .recv_timeout(std::time::Duration::from_millis(50))
+                        .is_err()
+                );
+                policy.write().clear();
+                handle
+            };
+            assert!(handle.await.unwrap().is_empty());
+            let visible = memory
+                .recall_in_namespaces(&["discord.owner".to_string()], query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(visible.len(), 1);
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_authority_follows_external_sqlite_read_wait() {
+        for query in ["", "needle"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let memory = Arc::new(SqliteMemory::new("agent", tmp.path()).unwrap());
+            memory
+                .store_with_metadata(
+                    "private",
+                    "needle private",
+                    MemoryCategory::Core,
+                    None,
+                    Some("discord.owner"),
+                    None,
+                )
+                .await
+                .unwrap();
+            memory
+                .conn
+                .lock()
+                .pragma_update(None, "journal_mode", "DELETE")
+                .unwrap();
+            let blocker = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+            blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let policy = Arc::new(parking_lot::RwLock::new(vec!["discord.owner".to_string()]));
+            let reader = Arc::clone(&policy);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let authority: Arc<NamespaceAuthority> = Arc::new(move |effect| {
+                let grant = reader.read();
+                entered_tx.send(()).unwrap();
+                effect(&grant);
+            });
+            let worker_memory = Arc::clone(&memory);
+            let task = zeroclaw_spawn::spawn!(async move {
+                worker_memory
+                    .recall_with_namespace_authority(authority, query, 1, None, None, None)
+                    .await
+                    .unwrap()
+            });
+            assert!(
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err()
+            );
+            policy.write().clear();
+            blocker.execute_batch("ROLLBACK").unwrap();
+            assert!(task.await.unwrap().is_empty());
+            assert_eq!(
+                memory
+                    .recall_in_namespaces(
+                        &["discord.owner".to_string()],
+                        query,
+                        1,
+                        None,
+                        None,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                1
             );
         }
     }

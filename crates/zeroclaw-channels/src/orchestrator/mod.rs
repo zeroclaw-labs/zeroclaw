@@ -8708,19 +8708,31 @@ async fn reconcile_early_ack(
 /// nothing authorization-bearing reads this column; representing the full
 /// participant set needs a session-store schema change and is deliberately
 /// out of scope here.
+/// Claim the session for the routed agent and record routing metadata.
+///
+/// Returns `false` when another agent already owns `history_key`, and the
+/// caller must abandon the turn: routing a message to an agent is not
+/// permission to take over a transcript, and continuing would hydrate the
+/// other agent's history into this model and let the session tools pass
+/// their ownership checks against a stolen owner.
+#[must_use]
 fn stamp_session_routing_context(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
     history_key: &str,
-) {
+) -> bool {
     let Some(ref store) = ctx.session_store else {
-        return;
+        return true;
     };
 
-    let channel_id = msg
-        .channel_alias
-        .as_deref()
-        .map(|alias| format!("{}.{alias}", msg.channel));
+    let channel_id = if msg.channel.trim().is_empty() {
+        None
+    } else {
+        Some(msg.channel_alias.as_deref().map_or_else(
+            || msg.channel.clone(),
+            |alias| format!("{}.{alias}", msg.channel),
+        ))
+    };
     let room_id = msg
         .thread_ts
         .as_deref()
@@ -8738,6 +8750,56 @@ fn stamp_session_routing_context(
         room_id,
         sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
     };
+    let live = Arc::clone(&ctx.live_config);
+    let alias = ctx.agent_alias.to_string();
+    match store.claim_session_with_authority(
+        history_key,
+        ctx.agent_alias.as_str(),
+        &move |effect| {
+            let Some(config) = live.try_read() else {
+                return;
+            };
+            let channels = config
+                .channel_refs_owned_by_agent(&alias)
+                .into_iter()
+                .collect();
+            effect(&channels);
+        },
+    ) {
+        Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Claimed) => {}
+        Ok(zeroclaw_infra::session_backend::SessionOwnerClaim::Foreign(owner)) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "routed_agent": ctx.agent_alias.as_str(),
+                        "ownership_denial": owner,
+                        "error_key": "session_owner_conflict",
+                    })),
+                "Inbound message routed to an agent that does not own this session; refusing the turn"
+            );
+            return false;
+        }
+        Err(e) => {
+            // Fail closed. An unreadable ownership record is exactly the
+            // state in which an overwrite would be unrecoverable, so the
+            // turn stops rather than proceeding unattributed.
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "e": e.to_string(),
+                        "error_key": "session_owner_unreadable",
+                    })),
+                "Could not establish session ownership; refusing the turn"
+            );
+            return false;
+        }
+    }
     if let Err(e) = store.set_session_context(history_key, context) {
         ::zeroclaw_log::record!(
             WARN,
@@ -8747,6 +8809,7 @@ fn stamp_session_routing_context(
             "Failed to stamp session routing context"
         );
     }
+    true
 }
 
 fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
@@ -8931,7 +8994,12 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
+    // Before anything reads or appends to this transcript. A refused claim
+    // means the key belongs to another agent, so hydrating it here is what
+    // would leak the other agent's history into this model.
+    if !stamp_session_routing_context(ctx.as_ref(), &msg, &history_key) {
+        return;
+    }
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -13673,12 +13741,8 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
 /// When no agent declares channel bindings, collection falls back to legacy
 /// behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
-    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
-    /// explicit-binding mode: only enabled owners' bindings count.
-    enabled_bindings: HashSet<String>,
-    /// Bindings declared by all agents, including disabled owners. Their
-    /// presence prevents legacy fallback from activating disabled channels.
-    all_known_bindings: HashSet<String>,
+    /// Canonical agent-binding view shared with routing and tool assembly.
+    agent_bindings: zeroclaw_config::schema::ActiveAgentChannelBindings,
     /// `<type>.<alias>` named by an approval request, escalation route, or an
     /// active agent's risk-profile approval route. These channels are live to
     /// deliver approval replies, but remain absent from the agent ownership map
@@ -13691,15 +13755,14 @@ impl ActiveChannelAliases {
     /// route, or when no explicit agent bindings exist and legacy "accept all
     /// enabled channels" mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.all_known_bindings.is_empty()
-            || self.enabled_bindings.contains(channel_ref)
+        self.agent_bindings.contains(channel_ref)
             || self.approval_route_bindings.contains(channel_ref)
     }
 
     /// True when bindings exist somewhere in the config but every owner is
     /// `enabled = false`.
     fn disabled_owners_exist(&self) -> bool {
-        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+        self.agent_bindings.disabled_owners_exist()
     }
 
     /// Computes the canonical channel-binding view used by collection and
@@ -13753,17 +13816,7 @@ impl ActiveChannelAliases {
             .collect();
 
         Self {
-            enabled_bindings: config
-                .agents
-                .values()
-                .filter(|a| a.enabled)
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect(),
-            all_known_bindings: config
-                .agents
-                .values()
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect(),
+            agent_bindings: config.active_agent_channel_bindings(),
             approval_route_bindings,
         }
     }
@@ -13919,8 +13972,9 @@ pub fn register_channels_for_tools(
     feature = "whatsapp-web"
 ))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
-    let enabled_agents = enabled_agent_aliases(config);
-    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
+    config
+        .active_agent_channel_bindings()
+        .owner_by_channel_key()
         .get(channel_key)
         .and_then(|owner| config.agents.get(owner))
         .map(|agent| agent.transcription_provider.as_str().to_string())
@@ -14021,11 +14075,11 @@ fn build_configured_discord_channel(
 }
 
 /// Resolve the enabled agent that owns `channel_key`, for binding that agent's
-/// `tts_provider`. Shares [`build_owner_by_channel_key`] with message dispatch
-/// and with [`resolve_agent_transcription_provider`], so synthesis can never
-/// select a different owner than the one the router delivers to: with two
-/// enabled agents bound to the same channel, sorted last-writer-wins picks one
-/// answer for both.
+/// `tts_provider`. Shares [`Config::active_agent_channel_bindings`] with
+/// message dispatch and with [`resolve_agent_transcription_provider`], so
+/// synthesis can never select a different owner than the one the router
+/// delivers to. Ambiguous co-ownership fails closed to `None` in every
+/// consumer rather than letting synthesis pick a winner dispatch rejects.
 ///
 /// Returns `None` when no enabled agent owns the channel, which
 /// [`crate::tts::TtsManager::from_config_for_agent`] treats as "fall back to
@@ -14033,8 +14087,9 @@ fn build_configured_discord_channel(
 /// silently drop the fallback.
 #[cfg(feature = "channel-matrix")]
 fn resolve_agent_tts_owner(config: &Config, channel_key: &str) -> Option<String> {
-    let enabled_agents = enabled_agent_aliases(config);
-    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
+    config
+        .active_agent_channel_bindings()
+        .owner_by_channel_key()
         .get(channel_key)
         .cloned()
 }
@@ -14168,7 +14223,11 @@ fn collect_configured_channels_with_authority(
     let active_channel_aliases = ActiveChannelAliases::compute(&config);
 
     if active_channel_aliases.disabled_owners_exist() {
-        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        let skipped: Vec<&String> = active_channel_aliases
+            .agent_bindings
+            .all_known_bindings()
+            .iter()
+            .collect();
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -15729,8 +15788,8 @@ fn collect_configured_channels_with_authority(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({
-                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
-                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+                "activated_bindings": active_channel_aliases.agent_bindings.enabled_bindings().len(),
+                "bindings": active_channel_aliases.agent_bindings.enabled_bindings().iter().collect::<Vec<_>>(),
             })),
         "channel binding(s) activated from enabled agents"
     );
@@ -15890,99 +15949,6 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
-}
-
-fn enabled_agent_aliases(config: &Config) -> Vec<String> {
-    let mut aliases: Vec<String> = config
-        .agents
-        .iter()
-        .filter(|(_, agent)| agent.enabled)
-        .map(|(alias, _)| alias.clone())
-        .collect();
-    aliases.sort();
-    aliases
-}
-
-/// Canonical explicit owner decision shared by channel construction and the
-/// inbound router. Sorted aliases preserve the router's established
-/// last-writer-wins behavior for duplicate bindings.
-fn explicit_owner_by_channel_key(
-    config: &Config,
-    enabled_agents: &[String],
-) -> HashMap<String, String> {
-    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
-    for alias_str in enabled_agents {
-        let Some(agent_cfg) = config.agents.get(alias_str) else {
-            debug_assert!(
-                false,
-                "enabled agent alias missing from config.agents: {}",
-                alias_str
-            );
-            continue;
-        };
-        for ch in &agent_cfg.channels {
-            let ch_str: &str = ch.as_ref();
-            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
-            if let Some((bare, _)) = ch_str.split_once('.') {
-                owner_by_channel_key
-                    .entry(bare.to_string())
-                    .or_insert_with(|| alias_str.clone());
-            }
-        }
-    }
-    owner_by_channel_key
-}
-
-fn build_owner_by_channel_key(
-    config: &Config,
-    enabled_agents: &[String],
-    collected_channel_keys: &[String],
-) -> HashMap<String, String> {
-    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
-    // backward-compat with cron callers / singleton channels) → agent_alias.
-    // Built from each enabled agent's `agents.<alias>.channels` list — the
-    // schema treats this as the source of truth for channel ownership.
-    let mut owner_by_channel_key = explicit_owner_by_channel_key(config, enabled_agents);
-
-    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
-
-    if any_binding_declared_anywhere {
-        if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "channel bindings exist but no owning agent is enabled; \
-                 affected channels will be unbound and inbound messages dropped (#8013)"
-            );
-        }
-        return owner_by_channel_key;
-    }
-
-    // True legacy mode: no agent anywhere declares a binding. Preserve the
-    // existing deterministic fallback so on-disk session hydration and the
-    // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
-    // continue to work.
-    if !collected_channel_keys.is_empty() {
-        let fallback_owner = config
-            .resolved_runtime_agent_alias()
-            .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
-            .map(ToString::to_string)
-            .or_else(|| enabled_agents.first().cloned());
-
-        if let Some(owner_alias) = fallback_owner {
-            for channel_key in collected_channel_keys {
-                owner_by_channel_key.insert(channel_key.clone(), owner_alias.clone());
-                if let Some((bare, _)) = channel_key.split_once('.') {
-                    owner_by_channel_key
-                        .entry(bare.to_string())
-                        .or_insert_with(|| owner_alias.clone());
-                }
-            }
-        }
-    }
-
-    owner_by_channel_key
 }
 
 /// The per-agent tool registry, prompt sections, and channel/deferred-MCP handles
@@ -16148,6 +16114,74 @@ fn compose_channel_mcp_prompt_sections(
     );
     append_pinned_mcp_section(deferred_section, pinned_section);
     expose_text_tool_protocol
+}
+
+/// Restore one persisted channel session to its authoritative live owner.
+/// Explicit agent attribution takes precedence exactly as it does for scoped
+/// session access. A stale/disabled attributed agent fails closed instead of
+/// widening through a channel that may now be routed elsewhere.
+///
+/// Transcript loading, `MAX_CHANNEL_HISTORY` capping, orphan-turn closure, and
+/// trim-breadcrumb reconciliation are delegated to
+/// [`hydrate_session_transcript`], the canonical reload path, so ownership
+/// resolution here stays the only channel-specific concern. The resolved
+/// breadcrumb flag is installed alongside the transcript.
+fn hydrate_persisted_session_history(
+    store: &dyn SessionBackend,
+    metadata: &zeroclaw_infra::session_backend::SessionMetadata,
+    agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
+    owner_by_channel_key: &HashMap<String, String>,
+) -> Option<bool> {
+    // The shared backend also holds gateway and RPC chat rows. A trusted
+    // channel marker is required before channel startup may hydrate or mutate
+    // a transcript; agent attribution alone identifies the owner, not the
+    // subsystem that owns restoration.
+    if metadata.channel_id.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
+    let owner_agent = metadata.agent_alias.clone().or_else(|| {
+        metadata
+            .channel_id
+            .as_deref()
+            .and_then(|channel_id| owner_by_channel_key.get(channel_id).cloned())
+            .or_else(|| {
+                metadata
+                    .channel_id
+                    .as_deref()
+                    .and_then(|channel_id| channel_id.split_once('.').map(|(base, _)| base))
+                    .and_then(|base| owner_by_channel_key.get(base).cloned())
+            })
+    });
+    let target_ctx = owner_agent
+        .as_ref()
+        .and_then(|alias| agent_ctxs.get(alias))?;
+    // Both a missing transcript (`Ok(None)`) and a failed reconciliation
+    // (`Err`) skip startup installation: the next inbound turn retries
+    // hydration (or installs a verified durable fallback) instead of building
+    // on unconfirmed state.
+    let hydrated_session = match hydrate_session_transcript(store, &metadata.key) {
+        Ok(Some(session)) => session,
+        _ => return None,
+    };
+    let mut messages = hydrated_session.messages;
+    let orphan_closed = hydrated_session.orphan_closed;
+    let pruned =
+        zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut messages);
+    if !pruned.is_empty() {
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": metadata.channel_id.as_deref().unwrap_or(""), "session_key": metadata.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
+    }
+
+    target_ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .put(metadata.key.clone(), hydrated_session.crumb_present);
+    target_ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(metadata.key.clone(), messages);
+    Some(orphan_closed)
 }
 
 /// Result of hydrating one session's transcript at startup.
@@ -16449,10 +16483,19 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         return Ok(());
     }
 
-    let enabled_agents = enabled_agent_aliases(&config);
-    if enabled_agents.is_empty() {
-        anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
-    }
+    let enabled_agents: Vec<String> = {
+        let mut aliases: Vec<String> = config
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.enabled)
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        if aliases.is_empty() {
+            anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
+        }
+        aliases.sort();
+        aliases
+    };
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -16506,7 +16549,6 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
     let mut prepared_channels = Vec::new();
-    let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
@@ -16930,7 +16972,6 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 .iter()
                 .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
                 .collect();
-            collected_channel_keys = channel_labels.clone();
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
@@ -17097,15 +17138,22 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
     }
 
-    let owner_by_channel_key =
-        build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+    let owner_by_channel_key = config
+        .active_agent_channel_bindings()
+        .owner_by_channel_key();
 
     // Hydrate persisted session histories into the owning agent's
-    // `conversation_histories` LRU. Sessions whose channel has no enabled
-    // owner are skipped so their history doesn't end up loaded into the
-    // fallback agent (which wouldn't reply on that channel anyway).
+    // `conversation_histories` LRU. Explicit persisted agent ownership is
+    // authoritative; channel routing is only the legacy fallback for rows
+    // without an agent attribution.
     if let Some(ref store) = shared_session_store {
         let mut metadata = store.list_sessions_with_metadata();
+        metadata.retain(|session| {
+            session
+                .channel_id
+                .as_deref()
+                .is_some_and(|channel_id| !channel_id.is_empty())
+        });
         metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
         // Budget proportional to the number of agents — each gets up to
         // `MAX_CONVERSATION_SENDERS` slots, so a multi-agent install
@@ -17118,50 +17166,15 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
         for m in metadata {
-            let owner_agent = m
-                .channel_id
-                .as_deref()
-                .and_then(|cid| owner_by_channel_key.get(cid).cloned())
-                .or_else(|| {
-                    m.channel_id
-                        .as_deref()
-                        .and_then(|cid| cid.split_once('.').map(|(b, _)| b.to_string()))
-                        .and_then(|b| owner_by_channel_key.get(&b).cloned())
-                });
-            let target_ctx = match owner_agent.as_ref().and_then(|a| agent_ctxs.get(a)) {
-                Some(ctx) => ctx,
-                None => continue,
-            };
-            // Both a missing transcript (`Ok(None)`) and a failed
-            // reconciliation (`Err`) skip startup installation: the next
-            // inbound turn retries hydration (or installs a verified
-            // durable fallback) instead of building on unconfirmed state.
-            let Ok(Some(hydrated_session)) = hydrate_session_transcript(store.as_ref(), &m.key)
-            else {
-                continue;
-            };
-            let mut msgs = hydrated_session.messages;
-            if hydrated_session.orphan_closed {
-                orphans_closed += 1;
+            if let Some(orphan_closed) = hydrate_persisted_session_history(
+                store.as_ref(),
+                &m,
+                &agent_ctxs,
+                &owner_by_channel_key,
+            ) {
+                hydrated += 1;
+                orphans_closed += usize::from(orphan_closed);
             }
-            let pruned =
-                zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut msgs);
-            if !pruned.is_empty() {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": m.channel_id.as_deref().unwrap_or(""), "session_key": m.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
-            }
-            target_ctx
-                .history_crumb_flags
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .put(m.key.clone(), hydrated_session.crumb_present);
-
-            let mut histories = target_ctx
-                .conversation_histories
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            histories.push(m.key.clone(), msgs);
-            drop(histories);
-            hydrated += 1;
         }
         if hydrated > 0 {
             ::zeroclaw_log::record!(
@@ -21513,9 +21526,18 @@ temperature = 0.3
                 ..Default::default()
             },
         );
-        let enabled_agents = vec!["alpha-agent".to_string(), "beta-agent".to_string()];
-        let collected_keys = vec!["webhook.alpha".to_string(), "webhook.beta".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_keys);
+        for alias in ["alpha", "beta"] {
+            config.channels.webhook.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let router = AgentRouter::multi(
             HashMap::from([
                 ("alpha-agent".to_string(), Arc::clone(&alpha_ctx)),
@@ -21621,11 +21643,18 @@ temperature = 0.3
                 ..Default::default()
             },
         );
-        let owners = build_owner_by_channel_key(
-            &config,
-            &["shared-agent".to_string()],
-            &["webhook.alpha".to_string(), "webhook.beta".to_string()],
-        );
+        for alias in ["alpha", "beta"] {
+            config.channels.webhook.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let router = AgentRouter::multi(
             HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
             owners,
@@ -21682,6 +21711,229 @@ temperature = 0.3
         );
     }
 
+    #[tokio::test]
+    async fn inbound_legacy_collision_preserves_owner_before_model_and_passive_append() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store: Arc<dyn SessionBackend> =
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            let mut config = Config::default();
+            config.agents.clear();
+            for (agent, channel) in [("agent-a", "a"), ("agent-b", "a_b")] {
+                config.agents.insert(
+                    agent.into(),
+                    zeroclaw_config::schema::AliasedAgentConfig {
+                        enabled: true,
+                        channels: vec![format!("webhook.{channel}").into()],
+                        ..Default::default()
+                    },
+                );
+                config.channels.webhook.insert(
+                    channel.into(),
+                    zeroclaw_config::schema::WebhookConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            let provider = Arc::new(HistoryCaptureModelProvider::default());
+            let ctx = Arc::new(ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                agent_alias: Arc::new("agent-b".into()),
+                model_provider: provider.clone(),
+                max_tool_iterations: 1,
+                live_config: Arc::new(RwLock::new(config)),
+                ..(*router_test_ctx()).clone()
+            });
+            let msg = ChannelMessage {
+                id: "collision".into(),
+                sender: "alice".into(),
+                reply_target: "b".into(),
+                content: "Summarize the prior discussion".into(),
+                channel: "webhook".into(),
+                channel_alias: Some("a_b".into()),
+                thread_ts: Some("b".into()),
+                ..Default::default()
+            };
+            let key = runtime_conversation_history_key(&ctx, &msg);
+            let original_msg = ChannelMessage {
+                channel_alias: Some("a".into()),
+                reply_target: "b_b".into(),
+                ..msg.clone()
+            };
+            assert_eq!(runtime_conversation_history_key(&ctx, &original_msg), key);
+
+            store
+                .append(&key, &ChatMessage::user("A_ONLY_SECRET"))
+                .unwrap();
+            store
+                .set_session_context(
+                    &key,
+                    zeroclaw_infra::session_backend::SessionContext {
+                        channel_id: Some("webhook.a"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            for passive in [false, true] {
+                process_channel_message(
+                    Arc::clone(&ctx),
+                    ChannelMessage {
+                        passive_context: passive,
+                        ..msg.clone()
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+                assert!(provider.calls.lock().unwrap().is_empty());
+                assert_eq!(store.load(&key).len(), 1);
+                assert_eq!(store.load(&key)[0].content, "A_ONLY_SECRET");
+                let metadata = store.get_session_metadata(&key).unwrap();
+                assert_eq!(metadata.agent_alias, None);
+                assert_eq!(metadata.channel_id.as_deref(), Some("webhook.a"));
+                assert!(
+                    ctx.conversation_histories
+                        .lock()
+                        .unwrap()
+                        .peek(&key)
+                        .is_none()
+                );
+            }
+            let owner = Arc::new(ChannelRuntimeContext {
+                agent_alias: Arc::new("agent-a".into()),
+                ..(*ctx).clone()
+            });
+            for invalid in ["disabled", "ambiguous", "unknown"] {
+                let saved = owner.live_config.read().clone();
+                {
+                    let mut cfg = owner.live_config.write();
+                    match invalid {
+                        "disabled" => cfg.channels.webhook.get_mut("a").unwrap().enabled = false,
+                        "ambiguous" => cfg
+                            .agents
+                            .get_mut("agent-b")
+                            .unwrap()
+                            .channels
+                            .push("webhook.a".into()),
+                        "unknown" => {
+                            cfg.channels.webhook.remove("a");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(
+                    !stamp_session_routing_context(&owner, &msg, &key),
+                    "{invalid}"
+                );
+                assert_eq!(store.get_session_agent_alias(&key).unwrap(), None);
+                *owner.live_config.write() = saved;
+            }
+            // Non-vacuous provider control: own legacy history reaches a real turn.
+            process_channel_message(Arc::clone(&owner), original_msg, CancellationToken::new())
+                .await;
+            assert!(!provider.calls.lock().unwrap().is_empty());
+            assert!(
+                provider
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|(_, text)| text.contains("A_ONLY_SECRET"))
+            );
+            assert_eq!(
+                store.get_session_agent_alias(&key).unwrap().as_deref(),
+                Some("agent-a")
+            );
+            assert!(stamp_session_routing_context(&ctx, &msg, "genuinely-new"));
+        }
+    }
+
+    /// Two conversations can normalize onto one storage key, and an operator
+    /// reassigning a channel points the next message at a transcript another
+    /// agent owns. Routing decides which agent answers; it must not decide
+    /// who owns the history.
+    #[test]
+    fn a_routed_agent_cannot_take_over_another_agents_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+
+        // Agent A owns the transcript and has real content in it.
+        session_store
+            .append("webhook_a_b_b_b_alice", &ChatMessage::user("A_ONLY_SECRET"))
+            .unwrap();
+        session_store
+            .set_session_agent_alias("webhook_a_b_b_b_alice", "agent-a")
+            .unwrap();
+
+        // Agent B is routed onto the same computed key.
+        let ctx_b = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-b".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        let msg = ChannelMessage {
+            id: "msg-b".into(),
+            sender: "alice".into(),
+            reply_target: "b".into(),
+            content: "Summarize the prior discussion".into(),
+            channel: "webhook".into(),
+            channel_alias: Some("a_b".to_string()),
+            timestamp: 0,
+            thread_ts: Some("b".to_string()),
+            ..Default::default()
+        };
+
+        let proceeded = stamp_session_routing_context(&ctx_b, &msg, "webhook_a_b_b_b_alice");
+
+        assert!(
+            !proceeded,
+            "a foreign-owned session must abandon the turn, not continue into hydration"
+        );
+        assert_eq!(
+            session_store
+                .get_session_agent_alias("webhook_a_b_b_b_alice")
+                .unwrap()
+                .as_deref(),
+            Some("agent-a"),
+            "the durable owner must still be agent-a"
+        );
+        let transcript = session_store.load("webhook_a_b_b_b_alice");
+        assert_eq!(
+            transcript.len(),
+            1,
+            "the refused turn must not have appended to another agent's transcript"
+        );
+        assert!(
+            transcript[0].content.contains("A_ONLY_SECRET"),
+            "agent-a's content must be untouched"
+        );
+
+        // Non-vacuous in the other direction: the owner itself still proceeds,
+        // so this test fails if the claim simply refuses everyone.
+        let ctx_a = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-a".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        assert!(
+            stamp_session_routing_context(&ctx_a, &msg, "webhook_a_b_b_b_alice"),
+            "the owning agent must still be able to continue its own session"
+        );
+
+        // And an unowned key is still claimable, so ordinary first contact works.
+        let ctx_c = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            agent_alias: Arc::new("agent-c".to_string()),
+            ..(*router_test_ctx()).clone()
+        };
+        assert!(
+            stamp_session_routing_context(&ctx_c, &msg, "fresh-unowned-key"),
+            "an unowned session must still be claimable"
+        );
+    }
+
     #[test]
     fn stamp_session_routing_context_persists_message_metadata() {
         struct Case {
@@ -21734,7 +21986,7 @@ temperature = 0.3
                 thread: None,
                 reply_target: "stdin",
                 sender: "cli-user",
-                expected_channel: None,
+                expected_channel: Some("cli"),
                 expected_room: Some("stdin"),
                 expected_sender: Some("cli-user"),
             },
@@ -21764,14 +22016,264 @@ temperature = 0.3
                 ..Default::default()
             };
 
-            stamp_session_routing_context(&ctx, &msg, case.history_key);
+            assert!(stamp_session_routing_context(&ctx, &msg, case.history_key));
 
             let metadata = session_store
                 .get_session_metadata(case.history_key)
                 .unwrap();
+            assert_eq!(metadata.agent_alias.as_deref(), Some("test-agent"));
             assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
             assert_eq!(metadata.room_id.as_deref(), case.expected_room);
             assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
+        }
+    }
+
+    #[tokio::test]
+    async fn aliasless_channel_session_remains_available_to_owning_agent_tools() {
+        use zeroclaw_tools::sessions::{
+            SessionOwnershipScope, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+        };
+
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let session_store =
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            let ctx = ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&session_store)),
+                ..(*router_test_ctx()).clone()
+            };
+            let msg = ChannelMessage {
+                id: "webhook-msg".into(),
+                sender: "webhook-user".into(),
+                reply_target: "webhook-target".into(),
+                content: "private webhook turn".into(),
+                channel: "webhook".into(),
+                channel_alias: None,
+                ..Default::default()
+            };
+            // Match the real incoming-message order: claim a genuinely absent
+            // session before writing any private transcript content.
+            assert!(
+                session_store
+                    .get_session_metadata("webhook-session")
+                    .is_none()
+            );
+            assert!(stamp_session_routing_context(&ctx, &msg, "webhook-session"));
+            let metadata = session_store
+                .get_session_metadata("webhook-session")
+                .unwrap();
+            assert_eq!(metadata.agent_alias.as_deref(), Some("test-agent"));
+            assert_eq!(metadata.channel_id.as_deref(), Some("webhook"));
+            session_store
+                .append(
+                    "webhook-session",
+                    &ChatMessage::user("private webhook turn"),
+                )
+                .unwrap();
+
+            let scope = SessionOwnershipScope::for_agent("test-agent");
+            let security = Arc::new(SecurityPolicy::default());
+            let listed = SessionsListTool::for_agent(
+                Arc::clone(&session_store),
+                Arc::clone(&security),
+                scope.clone(),
+            )
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+            assert!(listed.success);
+            assert!(listed.output.contains("webhook-session"));
+
+            let history = SessionsHistoryTool::for_agent(
+                Arc::clone(&session_store),
+                Arc::clone(&security),
+                scope.clone(),
+            )
+            .execute(serde_json::json!({"session_id": "webhook-session"}))
+            .await
+            .unwrap();
+            assert!(history.success);
+            assert!(history.output.contains("private webhook turn"));
+
+            let sent = SessionsSendTool::for_agent(session_store, security, scope)
+                .execute(serde_json::json!({
+                    "session_id": "webhook-session",
+                    "message": "owned follow-up"
+                }))
+                .await
+                .unwrap();
+            assert!(sent.success);
+        }
+    }
+
+    #[test]
+    fn existing_unattributed_channel_session_refuses_claim_without_mutation() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            store
+                .append(
+                    "unattributed",
+                    &ChatMessage::user("private preexisting turn"),
+                )
+                .unwrap();
+            let before_messages = serde_json::to_value(store.load("unattributed")).unwrap();
+            let before_metadata =
+                format!("{:?}", store.get_session_metadata("unattributed").unwrap());
+            let ctx = ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                ..(*router_test_ctx()).clone()
+            };
+            let msg = ChannelMessage {
+                channel: "webhook".into(),
+                sender: "webhook-user".into(),
+                reply_target: "webhook-target".into(),
+                ..Default::default()
+            };
+            assert!(
+                !stamp_session_routing_context(&ctx, &msg, "unattributed"),
+                "{backend_name}"
+            );
+            assert_eq!(
+                serde_json::to_value(store.load("unattributed")).unwrap(),
+                before_messages
+            );
+            assert_eq!(
+                format!("{:?}", store.get_session_metadata("unattributed").unwrap()),
+                before_metadata
+            );
+            assert_eq!(store.get_session_agent_alias("unattributed").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn restart_hydration_prefers_persisted_agent_for_aliasless_and_mixed_metadata() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        {
+            let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+            for key in ["aliasless", "mixed-owner", "disabled-owner"] {
+                store
+                    .append(key, &ChatMessage::assistant(format!("history for {key}")))
+                    .unwrap();
+            }
+            for key in ["gw_browser", "rpc_chat"] {
+                store
+                    .append(key, &ChatMessage::user(format!("pending {key}")))
+                    .unwrap();
+                store.set_session_agent_alias(key, "alpha").unwrap();
+            }
+            store.set_session_agent_alias("aliasless", "alpha").unwrap();
+            store
+                .set_session_context(
+                    "aliasless",
+                    SessionContext {
+                        channel_id: Some("webhook"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .set_session_agent_alias("mixed-owner", "alpha")
+                .unwrap();
+            store
+                .set_session_context(
+                    "mixed-owner",
+                    SessionContext {
+                        channel_id: Some("discord.ops"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .set_session_agent_alias("disabled-owner", "disabled")
+                .unwrap();
+            store
+                .set_session_context(
+                    "disabled-owner",
+                    SessionContext {
+                        channel_id: Some("discord.ops"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        // Reopen the production backend to exercise startup hydration from
+        // persisted metadata rather than same-process state.
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let make_ctx = |alias: &str| {
+            Arc::new(ChannelRuntimeContext {
+                agent_alias: Arc::new(alias.to_string()),
+                conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                ))),
+                ..(*router_test_ctx()).clone()
+            })
+        };
+        let alpha = make_ctx("alpha");
+        let beta = make_ctx("beta");
+        let agent_ctxs = HashMap::from([
+            ("alpha".to_string(), Arc::clone(&alpha)),
+            ("beta".to_string(), Arc::clone(&beta)),
+        ]);
+        let owner_by_channel_key = HashMap::from([("discord.ops".to_string(), "beta".to_string())]);
+
+        for metadata in store.list_sessions_with_metadata() {
+            hydrate_persisted_session_history(
+                &store,
+                &metadata,
+                &agent_ctxs,
+                &owner_by_channel_key,
+            );
+        }
+
+        let alpha_histories = alpha
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            alpha_histories.peek("aliasless").is_some(),
+            "an alias-less channel session must hydrate from its persisted channel marker and agent owner"
+        );
+        assert!(
+            alpha_histories.peek("mixed-owner").is_some(),
+            "explicit agent attribution must win over current channel routing"
+        );
+        assert!(alpha_histories.peek("disabled-owner").is_none());
+        assert!(
+            alpha_histories.peek("gw_browser").is_none(),
+            "channel startup must not hydrate a gateway transcript"
+        );
+        assert!(
+            alpha_histories.peek("rpc_chat").is_none(),
+            "channel startup must not hydrate an RPC transcript"
+        );
+        drop(alpha_histories);
+
+        let beta_histories = beta
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            beta_histories.peek("mixed-owner").is_none(),
+            "channel fallback must not widen an explicitly attributed row"
+        );
+        assert!(
+            beta_histories.peek("disabled-owner").is_none(),
+            "a stale or disabled explicit owner must fail closed"
+        );
+        drop(beta_histories);
+
+        for key in ["gw_browser", "rpc_chat"] {
+            let messages = store.load(key);
+            assert_eq!(
+                messages.len(),
+                1,
+                "{key} must not receive a channel closure"
+            );
+            assert_eq!(messages[0].role, "user");
         }
     }
 
@@ -21906,9 +22408,16 @@ temperature = 0.3
                 ..Default::default()
             },
         );
-        let enabled_agents = vec!["legacy".to_string()];
-        let collected_channel_keys = vec!["mattermost.default".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
@@ -21921,7 +22430,7 @@ temperature = 0.3
     }
 
     #[test]
-    fn build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default() {
+    fn active_channel_owner_legacy_fallback_is_deterministic_without_default() {
         let mut config = Config::default();
         config.agents.clear();
         config.agents.insert(
@@ -21941,9 +22450,16 @@ temperature = 0.3
             },
         );
 
-        let enabled_agents = vec!["alpha".to_string(), "zeta".to_string()];
-        let collected_channel_keys = vec!["mattermost.default".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         assert_eq!(
             owners.get("mattermost.default").map(String::as_str),
@@ -25779,35 +26295,47 @@ api_key = "anthropic-key"
      {
         use zeroclaw_infra::session_backend::SessionBackend;
 
-        #[derive(Default)]
         struct FailingRewriteAndProvenanceBackend {
-            messages: std::sync::Mutex<Vec<ChatMessage>>,
+            inner: SqliteSessionBackend,
+            rewrite_attempts: std::sync::atomic::AtomicUsize,
+            provenance_attempts: std::sync::atomic::AtomicUsize,
         }
         impl SessionBackend for FailingRewriteAndProvenanceBackend {
             fn load(&self, _key: &str) -> Vec<ChatMessage> {
-                self.messages
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
+                self.inner.load(_key)
             }
             fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
-                self.messages
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(msg.clone());
-                Ok(())
+                self.inner.append(_key, msg)
             }
-            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
-                Ok(false)
+            fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+                self.inner.remove_last(key)
             }
             fn list_sessions(&self) -> Vec<String> {
-                vec![]
+                self.inner.list_sessions()
+            }
+            fn claim_session_with_authority(
+                &self,
+                key: &str,
+                agent: &str,
+                authority: &zeroclaw_infra::session_backend::ChannelAuthority,
+            ) -> std::io::Result<zeroclaw_infra::session_backend::SessionOwnerClaim> {
+                self.inner
+                    .claim_session_with_authority(key, agent, authority)
+            }
+            fn set_session_context(
+                &self,
+                key: &str,
+                context: zeroclaw_infra::session_backend::SessionContext<'_>,
+            ) -> std::io::Result<()> {
+                self.inner.set_session_context(key, context)
             }
             fn rewrite_messages(
                 &self,
                 _key: &str,
                 _messages: &[ChatMessage],
             ) -> std::io::Result<()> {
+                self.rewrite_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(std::io::Error::other("simulated transcript write failure"))
             }
             fn set_session_trim_breadcrumb(
@@ -25818,17 +26346,67 @@ api_key = "anthropic-key"
                 Err(std::io::Error::other("simulated breadcrumb write failure"))
             }
             fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                self.provenance_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(std::io::Error::other(
                     "simulated breadcrumb provenance read failure",
                 ))
             }
         }
 
+        #[derive(Default)]
+        struct ObservedFormatErrorProvider(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ModelProvider for ObservedFormatErrorProvider {
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                FormatErrorModelProvider
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                let result = FormatErrorModelProvider
+                    .chat_with_history(messages, model, temperature)
+                    .await;
+                if result.is_err() {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                result
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for ObservedFormatErrorProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&FormatErrorModelProvider)
+            }
+            fn alias(&self) -> &str {
+                "ObservedFormatErrorProvider"
+            }
+        }
+        let provider = Arc::new(ObservedFormatErrorProvider::default());
         let mut msg = message_sent_hook_test_message();
         msg.content = "trigger format error".to_string();
         let history_key = conversation_history_key(&msg);
 
-        let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(FailingRewriteAndProvenanceBackend {
+            inner: SqliteSessionBackend::new(tmp.path()).unwrap(),
+            rewrite_attempts: std::sync::atomic::AtomicUsize::new(0),
+            provenance_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        backend
+            .inner
+            .set_session_agent_alias(&history_key, "test")
+            .unwrap();
         // A whole old turn (user + assistant), so a tiny `context_token_budget`
         // forces the pre-dispatch gate to drop it before the (erroring)
         // provider call, giving the resync below something real to detect.
@@ -25846,7 +26424,7 @@ api_key = "anthropic-key"
         let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
             backend.clone() as Arc<dyn SessionBackend>,
             channel,
-            Arc::new(FormatErrorModelProvider),
+            provider.clone(),
             1, // context_token_budget: force a whole-turn drop pre-dispatch
         );
         runtime_ctx
@@ -25864,12 +26442,26 @@ api_key = "anthropic-key"
             .push(history_key.clone(), false);
 
         process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+        assert!(
+            backend
+                .rewrite_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            backend
+                .provenance_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the erroring provider path must run"
+        );
 
         assert!(
             !backend
-                .messages
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .load(&history_key)
                 .iter()
                 .any(|m| m.content.contains("Task failed")),
             "a provider error after a failed resync must not append the \
@@ -46323,8 +46915,9 @@ This is an example JSON object for profile settings."#;
             "the approval route's configured channel must be live for adapter delivery"
         );
 
-        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
-        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         assert!(
             !owners.contains_key("discord.ops"),
             "approval-route liveness must not create an agent owner"
@@ -46401,8 +46994,9 @@ This is an example JSON object for profile settings."#;
             "the risk-profile approver must be available in the routed channel registry"
         );
 
-        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
-        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         assert!(
             !owners.contains_key("discord.ops"),
             "approval-route liveness must not create an agent owner"
@@ -46476,7 +47070,7 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn build_owner_by_channel_key_skips_disabled_owners() {
+    fn active_channel_owner_skips_disabled_owners() {
         let mut config = Config::default();
         config.agents.clear();
         config.agents.insert(
@@ -46488,9 +47082,16 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        // Reload passes an empty enabled_agents slice because the only
-        // owner is disabled.
-        let owners = build_owner_by_channel_key(&config, &[], &["discord.b".to_string()]);
+        config.channels.discord.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         assert!(
             owners.is_empty(),
@@ -47018,6 +47619,13 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn resolve_agent_transcription_provider_empty_when_owner_has_no_preference() {
         let mut config = Config::default();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "wake-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47033,9 +47641,16 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "voice-wake")]
     #[test]
-    fn voice_wake_provider_uses_same_canonical_co_owner_as_router() {
+    fn voice_wake_provider_fails_closed_with_ambiguous_owners() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "zeta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47055,20 +47670,14 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let owners = build_owner_by_channel_key(
-            &config,
-            &enabled_agents,
-            &["voice_wake.frontdoor".to_string()],
-        );
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
-        assert_eq!(
-            owners.get("voice_wake.frontdoor").map(String::as_str),
-            Some("zeta")
-        );
+        assert_eq!(owners.get("voice_wake.frontdoor").map(String::as_str), None);
         assert_eq!(
             resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
-            "groq.primary"
+            ""
         );
     }
 
@@ -47094,9 +47703,9 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let collected_channel_keys = vec!["voice_wake.frontdoor".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         assert_eq!(
             owners.get("voice_wake.frontdoor").map(String::as_str),
@@ -47113,13 +47722,20 @@ This is an example JSON object for profile settings."#;
     /// `Config::agent_for_channel` takes the first match out of a `HashMap`,
     /// so with two agents bound to one Matrix alias it can name a different
     /// owner than dispatch does — silencing voice, or speaking through the
-    /// wrong agent's provider. Synthesis must go through the same sorted,
-    /// last-writer-wins decision the router uses.
+    /// wrong agent's provider. Synthesis must go through the same shared
+    /// ownership decision the router uses, which fails closed on ambiguity.
     #[cfg(feature = "channel-matrix")]
     #[test]
-    fn matrix_tts_owner_is_the_same_canonical_co_owner_as_dispatch() {
+    fn matrix_tts_owner_fails_closed_with_the_same_ambiguous_owners_as_dispatch() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "zeta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47139,16 +47755,16 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let owners =
-            build_owner_by_channel_key(&config, &enabled_agents, &["matrix.default".to_string()]);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let dispatch_owner = owners.get("matrix.default").map(String::as_str);
 
-        assert_eq!(dispatch_owner, Some("zeta"));
+        assert_eq!(dispatch_owner, None);
         assert_eq!(
             resolve_agent_tts_owner(&config, "matrix.default").as_deref(),
             dispatch_owner,
-            "synthesis must bind the same owning agent the router delivers to"
+            "synthesis must fail closed on the same ambiguous binding the router rejects"
         );
     }
 
@@ -47159,6 +47775,13 @@ This is an example JSON object for profile settings."#;
     fn matrix_tts_owner_is_the_same_legacy_fallback_owner_as_dispatch() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "legacy".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47169,9 +47792,9 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let enabled_agents = enabled_agent_aliases(&config);
-        let collected_channel_keys = vec!["matrix.default".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
 
         assert_eq!(
             owners.get("matrix.default").map(String::as_str),
@@ -47191,6 +47814,13 @@ This is an example JSON object for profile settings."#;
     fn matrix_tts_owner_is_none_when_no_enabled_agent_owns_the_channel() {
         let mut config = Config::default();
         config.agents.clear();
+        config.channels.matrix.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "off".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -49767,6 +50397,13 @@ This is an example JSON object for profile settings."#;
                 channels: vec![zeroclaw_config::providers::ChannelRef(
                     "telegram.default".to_string(),
                 )],
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
                 ..Default::default()
             },
         );
