@@ -8,6 +8,7 @@ pub mod util_helpers;
 
 pub mod a2a_client;
 pub mod ask_user;
+mod backup_codec;
 pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
