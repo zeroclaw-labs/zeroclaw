@@ -1786,8 +1786,14 @@ impl WhatsAppWebChannel {
         recipient: &str,
         content: &str,
         suppress_voice: bool,
+        force_voice: bool,
     ) -> Option<&'static str> {
-        let skip = Self::voice_queue_skip_reason(suppress_voice, content);
+        let skip = Self::voice_queue_skip_reason(suppress_voice, content).or_else(|| {
+            // The chat's own state is the default, not the rule: a producer
+            // that asked for this reply to be spoken has said something the
+            // chat history cannot say for it.
+            (!force_voice && !self.is_voice_chat(recipient)).then_some("not_a_voice_chat")
+        });
         if skip.is_none()
             && let Ok(mut pv) = self.pending_voice.lock()
         {
@@ -1797,6 +1803,16 @@ impl WhatsAppWebChannel {
             );
         }
         skip
+    }
+
+    /// Whether this chat is currently answered by voice: its last inbound
+    /// message was a voice note.
+    #[cfg(feature = "whatsapp-web")]
+    fn is_voice_chat(&self, recipient: &str) -> bool {
+        self.voice_chats
+            .lock()
+            .map(|chats| chats.contains(recipient))
+            .unwrap_or(false)
     }
 
     /// Why an outbound message must not join the automatic voice queue, or
@@ -3596,19 +3612,20 @@ impl Channel for WhatsAppWebChannel {
         // final answer. Only substantive messages (not tool outputs) are queued.
         // A debounce task waits 10s after the last substantive message, then
         // sends ONE voice note. Text in → text out. Voice in → text + voice out.
-        let is_voice_chat = self
-            .voice_chats
-            .lock()
-            .map(|vs| vs.contains(&message.recipient))
-            .unwrap_or(false);
-
-        if is_voice_chat && let Some(tts_manager) = self.tts_manager.clone() {
+        if let Some(tts_manager) = self.tts_manager.clone() {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let skip_reason =
-                self.queue_pending_voice(&message.recipient, content, message.suppress_voice);
-            if let Some(reason) = skip_reason {
+            let skip_reason = self.queue_pending_voice(
+                &message.recipient,
+                content,
+                message.suppress_voice,
+                message.force_voice,
+            );
+            // An ordinary text conversation is not an event: it declines the
+            // voice queue on every message, and saying so each time would bury
+            // the refusals that mean something.
+            if let Some(reason) = skip_reason.filter(|reason| *reason != "not_a_voice_chat") {
                 // Stable literal per the logging contract: the classification
                 // and per-event measurements ride solely in `attributes` above.
                 ::zeroclaw_log::record!(
@@ -8895,9 +8912,13 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn a_suppressed_message_never_reaches_the_voice_queue() {
         let ch = voice_channel();
+        ch.voice_chats
+            .lock()
+            .expect("lock")
+            .insert("chat".to_string());
 
         assert_eq!(
-            ch.queue_pending_voice("chat", SPOKEN_REPLY, true),
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, true, false),
             Some("suppress_voice")
         );
         assert!(
@@ -8906,7 +8927,10 @@ mod tests {
         );
 
         // Positive control: the same text, unsuppressed, is queued.
-        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, false, false),
+            None
+        );
         assert!(ch.pending_voice.lock().expect("lock").contains_key("chat"));
     }
 
@@ -8918,7 +8942,11 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn a_suppressed_notice_leaves_a_queued_reply_untouched() {
         let ch = voice_channel();
-        ch.queue_pending_voice("chat", SPOKEN_REPLY, false);
+        ch.voice_chats
+            .lock()
+            .expect("lock")
+            .insert("chat".to_string());
+        ch.queue_pending_voice("chat", SPOKEN_REPLY, false, false);
         let queued = ch
             .pending_voice
             .lock()
@@ -8927,7 +8955,7 @@ mod tests {
             .cloned()
             .expect("queued");
 
-        ch.queue_pending_voice("chat", "Approval request expired.", true);
+        ch.queue_pending_voice("chat", "Approval request expired.", true, false);
 
         let after = ch
             .pending_voice
@@ -8952,13 +8980,72 @@ mod tests {
             .expect("lock")
             .insert("chat".to_string());
 
-        ch.queue_pending_voice("chat", "Approval request expired.", true);
+        ch.queue_pending_voice("chat", "Approval request expired.", true, false);
 
         assert!(
             ch.voice_chats.lock().expect("lock").contains("chat"),
             "the chat is still a voice chat"
         );
-        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, false, false),
+            None
+        );
+    }
+
+    /// `force_voice` says this one reply is to be spoken, which the chat's own
+    /// history cannot say for it. `send_via(modality: "voice")` and a peer
+    /// group declared `voice` both arrive here.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_forced_reply_is_spoken_in_a_chat_that_never_sent_a_voice_note() {
+        let ch = voice_channel();
+
+        // Control: without the flag, a text conversation stays text.
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, false, false),
+            Some("not_a_voice_chat")
+        );
+        assert!(ch.pending_voice.lock().expect("lock").is_empty());
+
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, false, true),
+            None
+        );
+        assert!(ch.pending_voice.lock().expect("lock").contains_key("chat"));
+    }
+
+    /// Suppression outranks the force, as `SendMessage` documents: forcing is
+    /// ignored when the message also says it must not be spoken.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn suppression_outranks_a_forced_reply() {
+        let ch = voice_channel();
+
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, true, true),
+            Some("suppress_voice")
+        );
+        assert!(ch.pending_voice.lock().expect("lock").is_empty());
+    }
+
+    /// Forcing routes a turn to voice; it does not promise that anything at
+    /// all can be read aloud. A forced URL is still not spoken, which is what
+    /// keeps a tool output from being voiced through this door.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_content_heuristic_survives_a_forced_reply() {
+        let ch = voice_channel();
+
+        assert_eq!(
+            ch.queue_pending_voice(
+                "chat",
+                "https://example.com/a/rather/long/link/to/somewhere",
+                false,
+                true
+            ),
+            Some("url_prefix")
+        );
+        assert!(ch.pending_voice.lock().expect("lock").is_empty());
     }
 
     /// The content heuristic is unchanged, and still applies when nothing is
