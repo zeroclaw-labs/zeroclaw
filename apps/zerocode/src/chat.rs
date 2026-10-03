@@ -400,6 +400,20 @@ pub(crate) enum SidebarStatus {
     Errored,
 }
 
+/// Read-only projection of the session currently focused by one Code or Chat pane.
+///
+/// This stays client-local because model/provider overrides and the message queue
+/// belong to the live pane session, not to the daemon's configured agent view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FocusedRuntimeContext<'a> {
+    pub agent_alias: &'a str,
+    pub model_provider_ref: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub lifecycle_state: zeroclaw_api::lifecycle::LifecycleState,
+    pub queued_messages: usize,
+    pub queue_paused: bool,
+}
+
 /// One sidebar row: a session this pane tracks, in stable creation order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidebarSessionSummary {
@@ -5690,6 +5704,25 @@ impl Chat {
             | ChatPhase::PickChangeDirectory { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
+    }
+
+    /// Runtime context for the pane's focused live session.
+    ///
+    /// Agent-picker and directory-picker phases intentionally return `None`:
+    /// they have a tentative agent choice but no live session whose overrides,
+    /// turn state, or client queue can be reported as active context.
+    pub(crate) fn focused_runtime_context(&self) -> Option<FocusedRuntimeContext<'_>> {
+        let ChatPhase::Active(state) = &self.phase else {
+            return None;
+        };
+        Some(FocusedRuntimeContext {
+            agent_alias: &state.agent_alias,
+            model_provider_ref: state.model_provider_ref.as_deref(),
+            model: state.model.as_deref(),
+            lifecycle_state: state.terminal_status().lifecycle_state(),
+            queued_messages: state.queue_len(),
+            queue_paused: state.queue_paused(),
+        })
     }
 
     /// Working directory for the active conversation, if a session is running.
@@ -12395,6 +12428,32 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn focused_runtime_context_reads_live_overrides_and_client_queue_state() {
+        let (mut chat, _writer_rx) = test_chat();
+        let mut active = state();
+        active.set_model_identity(Some("openai.session"), Some("gpt-session"));
+        active.turn_status = TurnStatus::WaitingForApproval;
+        active
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .expect("queue has capacity");
+        assert!(active.toggle_queue_pause());
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let context = chat
+            .focused_runtime_context()
+            .expect("active session has runtime context");
+        assert_eq!(context.agent_alias, "myagent");
+        assert_eq!(context.model_provider_ref, Some("openai.session"));
+        assert_eq!(context.model, Some("gpt-session"));
+        assert_eq!(
+            context.lifecycle_state,
+            zeroclaw_api::lifecycle::LifecycleState::Blocked
+        );
+        assert_eq!(context.queued_messages, 1);
+        assert!(context.queue_paused);
     }
 
     fn url_hit(rect: Rect, url: &str, row: u16, byte_start: usize) -> UrlHitRegion {

@@ -10,6 +10,7 @@ use ratatui::{
 
 use std::sync::Arc;
 
+use crate::chat::FocusedRuntimeContext;
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
     CronTriggerResult, MemoryEntryResult, MessageEntry, OrgCost, RpcClient, SessionEntry,
@@ -436,6 +437,8 @@ impl Dashboard {
         health: Option<&serde_json::Value>,
         code_cwd: Option<&str>,
         chat_cwd: Option<&str>,
+        code_context: Option<FocusedRuntimeContext<'_>>,
+        chat_context: Option<FocusedRuntimeContext<'_>>,
     ) {
         self.drain_cron_trigger_updates();
 
@@ -463,9 +466,16 @@ impl Dashboard {
         self.draw_status_line(frame, chunks[1]);
 
         match self.tab {
-            Tab::Overview => {
-                self.draw_overview(frame, chunks[2], status, health, code_cwd, chat_cwd)
-            }
+            Tab::Overview => self.draw_overview(
+                frame,
+                chunks[2],
+                status,
+                health,
+                code_cwd,
+                chat_cwd,
+                code_context,
+                chat_context,
+            ),
             Tab::Sessions => self.draw_sessions(frame, chunks[2]),
             Tab::Agents => self.draw_agents(frame, chunks[2]),
             Tab::Memories => self.draw_memories(frame, chunks[2]),
@@ -592,9 +602,13 @@ impl Dashboard {
         health: Option<&serde_json::Value>,
         code_cwd: Option<&str>,
         chat_cwd: Option<&str>,
+        code_context: Option<FocusedRuntimeContext<'_>>,
+        chat_context: Option<FocusedRuntimeContext<'_>>,
     ) {
         let workspace_lines = workspace_lines(code_cwd, chat_cwd, overview_status_label_width());
-        let status_height = 12 + workspace_lines.len() as u16;
+        let context_lines =
+            runtime_context_lines(code_context, chat_context, overview_status_label_width());
+        let status_height = 12 + workspace_lines.len() as u16 + context_lines.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -620,6 +634,8 @@ impl Dashboard {
                 health,
                 code_cwd,
                 chat_cwd,
+                code_context,
+                chat_context,
             );
             frame.render_widget(Paragraph::new(lines), inner);
         } else {
@@ -2938,6 +2954,9 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-workspace",
     "zc-dashboard-label-code-cwd",
     "zc-dashboard-label-chat-cwd",
+    "zc-dashboard-label-context",
+    "zc-dashboard-label-code-context",
+    "zc-dashboard-label-chat-context",
     "zc-dashboard-label-daemon-memory",
     "zc-dashboard-label-daemon-cpu",
 ];
@@ -3017,6 +3036,8 @@ fn overview_status_lines(
     health: Option<&serde_json::Value>,
     code_cwd: Option<&str>,
     chat_cwd: Option<&str>,
+    code_context: Option<FocusedRuntimeContext<'_>>,
+    chat_context: Option<FocusedRuntimeContext<'_>>,
 ) -> Vec<Line<'static>> {
     let label_width = overview_status_label_width();
     let mut lines = vec![Line::from(vec![
@@ -3104,6 +3125,11 @@ fn overview_status_lines(
     }
 
     lines.extend(workspace_lines(code_cwd, chat_cwd, label_width));
+    lines.extend(runtime_context_lines(
+        code_context,
+        chat_context,
+        label_width,
+    ));
 
     if let Some(h) = health
         && let Some(process) = h.get("process")
@@ -3279,6 +3305,98 @@ fn workspace_lines(
     }
 }
 
+fn runtime_context_lines(
+    code: Option<FocusedRuntimeContext<'_>>,
+    chat: Option<FocusedRuntimeContext<'_>>,
+    label_width: usize,
+) -> Vec<Line<'static>> {
+    match (code, chat) {
+        (Some(code), Some(chat)) if code == chat => {
+            runtime_context_block("zc-dashboard-label-context", code, label_width)
+        }
+        (Some(code), Some(chat)) => {
+            let mut lines =
+                runtime_context_block("zc-dashboard-label-code-context", code, label_width);
+            lines.extend(runtime_context_block(
+                "zc-dashboard-label-chat-context",
+                chat,
+                label_width,
+            ));
+            lines
+        }
+        (Some(context), None) => {
+            runtime_context_block("zc-dashboard-label-code-context", context, label_width)
+        }
+        (None, Some(context)) => {
+            runtime_context_block("zc-dashboard-label-chat-context", context, label_width)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn runtime_context_block(
+    label_key: &str,
+    context: FocusedRuntimeContext<'_>,
+    label_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![status_row(
+        label_key,
+        &runtime_context_value(context),
+        theme::body_style(),
+        label_width,
+    )];
+    if let Some(queue) = runtime_context_queue_value(context) {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(label_width + 2)),
+            Span::styled(queue, theme::body_style()),
+        ]));
+    }
+    lines
+}
+
+fn runtime_context_queue_value(context: FocusedRuntimeContext<'_>) -> Option<String> {
+    if context.queued_messages == 0 {
+        return None;
+    }
+    let count = context.queued_messages.to_string();
+    let key = if context.queue_paused {
+        "zc-dashboard-context-client-queue-paused"
+    } else {
+        "zc-dashboard-context-client-queue"
+    };
+    Some(crate::i18n::t_args(key, &[("count", &count)]))
+}
+
+fn runtime_context_value(context: FocusedRuntimeContext<'_>) -> String {
+    let mut parts = vec![context.agent_alias.to_string()];
+    let provider = context
+        .model_provider_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let model = context
+        .model
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (provider, model) {
+        (Some(provider), Some(model)) => parts.push(format!("{provider} / {model}")),
+        (Some(provider), None) => parts.push(provider.to_string()),
+        (None, Some(model)) => parts.push(model.to_string()),
+        (None, None) => {}
+    }
+    parts.push(runtime_context_lifecycle_label(context.lifecycle_state));
+    parts.join(" · ")
+}
+
+fn runtime_context_lifecycle_label(state: zeroclaw_api::lifecycle::LifecycleState) -> String {
+    let key = match state {
+        zeroclaw_api::lifecycle::LifecycleState::Idle => "zc-dashboard-context-idle",
+        zeroclaw_api::lifecycle::LifecycleState::Working => "zc-dashboard-context-working",
+        zeroclaw_api::lifecycle::LifecycleState::Blocked => "zc-dashboard-context-blocked",
+        zeroclaw_api::lifecycle::LifecycleState::Done => "zc-dashboard-context-done",
+    };
+    crate::i18n::t(key)
+}
+
 fn status_row(label_key: &str, value: &str, style: Style, label_width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(status_label(label_key, label_width), theme::dim_style()),
@@ -3368,6 +3486,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
 
         assert!(
@@ -3395,6 +3515,8 @@ mod tests {
             "wss://zero.example.test:9781",
             true,
             &status,
+            None,
+            None,
             None,
             None,
             None,
@@ -3428,6 +3550,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         ));
 
         assert!(
@@ -3451,6 +3575,8 @@ mod tests {
             None,
             Some("/work/shared"),
             Some("/work/shared"),
+            None,
+            None,
         ));
 
         assert!(
@@ -3472,6 +3598,8 @@ mod tests {
             None,
             Some("/work/code"),
             Some("/work/chat"),
+            None,
+            None,
         ));
 
         assert!(
@@ -3484,6 +3612,102 @@ mod tests {
         );
         assert!(text.contains("/work/code"), "code cwd value: {text}");
         assert!(text.contains("/work/chat"), "chat cwd value: {text}");
+    }
+
+    #[test]
+    fn runtime_context_lines_collapse_matching_code_and_chat_sessions() {
+        let context = FocusedRuntimeContext {
+            agent_alias: "primary",
+            model_provider_ref: Some("openai.main"),
+            model: Some("gpt-5"),
+            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Working,
+            queued_messages: 1,
+            queue_paused: false,
+        };
+        let lines =
+            runtime_context_lines(Some(context), Some(context), overview_status_label_width());
+        let text = lines_text(&lines);
+
+        assert_eq!(
+            lines[0].spans[0].content.trim(),
+            crate::i18n::t("zc-dashboard-label-context"),
+            "combined context label: {text}"
+        );
+        assert!(text.contains("primary"), "agent: {text}");
+        assert!(text.contains("openai.main / gpt-5"), "route: {text}");
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-context-working")),
+            "lifecycle: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-context-client-queue",
+                &[("count", "1")],
+            )),
+            "client queue: {text}"
+        );
+    }
+
+    #[test]
+    fn runtime_context_lines_label_a_single_code_session_as_code() {
+        let context = FocusedRuntimeContext {
+            agent_alias: "primary",
+            model_provider_ref: None,
+            model: None,
+            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
+            queued_messages: 0,
+            queue_paused: false,
+        };
+        let lines = runtime_context_lines(Some(context), None, overview_status_label_width());
+        let text = lines_text(&lines);
+
+        assert_eq!(
+            lines[0].spans[0].content.trim(),
+            crate::i18n::t("zc-dashboard-label-code-context"),
+            "single Code context label: {text}"
+        );
+    }
+
+    #[test]
+    fn runtime_context_lines_keep_different_panes_and_paused_queue_distinct() {
+        let code = FocusedRuntimeContext {
+            agent_alias: "coder",
+            model_provider_ref: Some("anthropic.code"),
+            model: Some("claude-code"),
+            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Idle,
+            queued_messages: 0,
+            queue_paused: false,
+        };
+        let chat = FocusedRuntimeContext {
+            agent_alias: "support",
+            model_provider_ref: Some("openai.chat"),
+            model: Some("gpt-chat"),
+            lifecycle_state: zeroclaw_api::lifecycle::LifecycleState::Blocked,
+            queued_messages: 2,
+            queue_paused: true,
+        };
+        let lines = runtime_context_lines(Some(code), Some(chat), overview_status_label_width());
+        let text = lines_text(&lines);
+
+        assert!(text.contains(&crate::i18n::t("zc-dashboard-label-code-context")));
+        assert!(text.contains(&crate::i18n::t("zc-dashboard-label-chat-context")));
+        assert!(text.contains("coder"), "code agent: {text}");
+        assert!(text.contains("support"), "chat agent: {text}");
+        assert!(
+            text.contains(&crate::i18n::t("zc-dashboard-context-blocked")),
+            "blocked state: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::t_args(
+                "zc-dashboard-context-client-queue-paused",
+                &[("count", "2")],
+            )),
+            "paused client queue: {text}"
+        );
+        assert!(
+            lines.iter().all(|line| line.width() <= 78),
+            "runtime context rows must fit the 78-cell inner width of an 80-column status box: {text}"
+        );
     }
 
     #[test]
@@ -3501,6 +3725,8 @@ mod tests {
             false,
             &status,
             Some(&health),
+            None,
+            None,
             None,
             None,
         ));
@@ -3540,6 +3766,8 @@ mod tests {
             Some(&health),
             Some("/work/code"),
             Some("/work/chat"),
+            None,
+            None,
         );
         let value_columns = lines
             .iter()
@@ -3632,6 +3860,8 @@ mod tests {
             false,
             &status,
             Some(&health),
+            None,
+            None,
             None,
             None,
         ));
