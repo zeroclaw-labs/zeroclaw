@@ -1,14 +1,26 @@
 use std::path::{Path, PathBuf};
 
+// A second constructor or existing-only consumer must not admit a newly
+// created DB until the creating path has closed its file handle. This is not a
+// SQLite lock.
+static PREPARATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(unix)]
 fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
+    open_and_tighten_owner_only_dir(path)
+}
+
+#[cfg(unix)]
+fn open_and_tighten_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -37,6 +49,21 @@ fn tighten_directory(dir: &std::fs::File) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn admit_existing_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    open_and_tighten_owner_only_dir(path)
+}
+
+#[cfg(not(unix))]
+fn admit_existing_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "SQLite storage parent is not a directory"
+    );
     Ok(())
 }
 
@@ -114,7 +141,6 @@ fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(unix)]
 pub(crate) fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(suffix);
@@ -122,8 +148,16 @@ pub(crate) fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Inspect existing files without acquiring or closing any SQLite file handles.
-#[cfg(unix)]
 pub(crate) fn check_sqlite_storage(db_path: &Path) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    fn validate_file_metadata(metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "SQLite storage entry is not a regular file"
+        );
+        Ok(())
+    }
+
     validate_file_metadata(&std::fs::symlink_metadata(db_path)?)?;
     for suffix in ["-wal", "-shm"] {
         match std::fs::symlink_metadata(sqlite_sidecar_path(db_path, suffix)) {
@@ -135,19 +169,11 @@ pub(crate) fn check_sqlite_storage(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub(crate) fn check_sqlite_storage(_db_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 /// Prepare the two auxiliary stores, not arbitrary memory backend paths.
 pub(crate) fn prepare_sqlite_storage(
     storage_root: &Path,
     database_name: &str,
 ) -> anyhow::Result<PathBuf> {
-    // A second constructor must not admit a newly created DB until the first
-    // constructor has closed its creation handle. This is not a SQLite lock.
-    static PREPARATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     let _preparation = PREPARATION.lock();
 
     std::fs::create_dir_all(storage_root)?;
@@ -161,6 +187,37 @@ pub(crate) fn prepare_sqlite_storage(
     ensure_owner_only_file(&db_path)?;
     check_sqlite_storage(&db_path)?;
     Ok(db_path)
+}
+
+/// Admit an existing auxiliary store without creating its directory or file.
+pub(crate) fn prepare_existing_sqlite_storage(
+    storage_root: &Path,
+    database_name: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let _preparation = PREPARATION.lock();
+
+    #[cfg(unix)]
+    let storage_root = match std::fs::canonicalize(storage_root) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let memory_dir = storage_root.join("memory");
+    let db_path = memory_dir.join(database_name);
+    match std::fs::symlink_metadata(&db_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    match std::fs::symlink_metadata(&memory_dir) {
+        Ok(_) => admit_existing_owner_only_dir(&memory_dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    check_sqlite_storage(&db_path)?;
+    Ok(Some(db_path))
 }
 
 #[cfg(all(test, unix))]
@@ -358,8 +415,10 @@ mod tests {
             let db = prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(&format!("PRAGMA journal_mode = {journal}; CREATE TABLE lock_probe (value INTEGER); BEGIN IMMEDIATE;")).unwrap();
-            prepare_sqlite_storage(root.path(), "response_cache.db").unwrap();
-            check_sqlite_storage(&db).unwrap();
+            assert_eq!(
+                prepare_existing_sqlite_storage(root.path(), "response_cache.db").unwrap(),
+                Some(db.clone())
+            );
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -379,6 +438,27 @@ mod tests {
             assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
             conn.execute_batch("ROLLBACK;").unwrap();
         }
+    }
+
+    #[test]
+    fn existing_sqlite_storage_does_not_create_or_tighten_missing_entries() {
+        let root = TempDir::new().unwrap();
+        let memory_dir = root.path().join("memory");
+
+        assert_eq!(
+            prepare_existing_sqlite_storage(root.path(), "audit.db").unwrap(),
+            None
+        );
+        assert!(!memory_dir.exists());
+
+        std::fs::create_dir(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            prepare_existing_sqlite_storage(root.path(), "audit.db").unwrap(),
+            None
+        );
+        assert!(!memory_dir.join("audit.db").exists());
+        assert_eq!(mode(&memory_dir), 0o755);
     }
 
     #[test]
