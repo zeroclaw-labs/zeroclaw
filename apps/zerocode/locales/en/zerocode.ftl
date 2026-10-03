@@ -768,3 +768,14 @@ zc-config-section-peer-groups-help = Named groups that bind a channel, member ag
 zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, channel, and target.
 zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
 zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.
+
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = field details
+zc-config-field-path = Path: { $path }
+zc-config-field-current-value = Current value:
+zc-config-field-unset = <unset>
+zc-config-field-secret-set = Set (hidden)
+zc-config-field-value-unavailable = Unavailable
+zc-config-field-environment-override = Environment override is active.
+zc-config-field-precheck-timeout-secs-label = Precheck timeout (seconds)
+zc-config-field-max-cost-per-day-cents-label = Maximum cost per day (cents)
