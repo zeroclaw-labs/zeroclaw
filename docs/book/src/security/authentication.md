@@ -72,9 +72,10 @@ outside the daemon, directly in `config.toml`, through the web dashboard, or
 with `zeroclaw config set`, apply at the next daemon reload or restart.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
-Removing a token from `gateway.paired_tokens` by editing config, over RPC
-or on disk, has no effect on the running daemon, and connections using the
-token stay authorized. The removal applies at the next daemon reload or
+Removing a token from `gateway.paired_tokens` or
+`gateway.paired_token_users` by editing config, over RPC or on disk, has
+no effect on the running daemon, and connections using the token stay
+authorized. The removal applies at the next daemon reload or
 restart, unless a pairing change made through the gateway before then
 writes the live token set, that token included, back to config. Revoke
 tokens through the pairing controls.
@@ -83,7 +84,7 @@ tokens through the pairing controls.
 
 | Provider | Credential | Configured by |
 |---|---|---|
-| `native` | Gateway pairing bearer token | Gateway pairing (`/pair`); the daemon and gateway share one live token authority |
+| `native` | Gateway pairing bearer token | Gateway pairing (`/pair`); the daemon and gateway share one live token authority. An unbound token is the shared operator; a token bound to a roster user is that user (see [Binding a pairing token to a roster user](#binding-a-pairing-token-to-a-roster-user)) |
 | `peercred` | Unix peer uid on the local socket | Always on; `[users.<name>].uid` maps a uid to a named principal |
 | `oidc.<alias>` | JWT or opaque bearer from your IdP | `[oidc.<alias>]` |
 
@@ -113,8 +114,8 @@ Windows named pipes carry no peer uid. With no roster, the pipe ACL is the
 credential and a local connection is the shared operator. Once a
 `[users]` roster exists, a local client there must present a token,
 `security.trust_daemon_uid` has no effect, and the daemon's own account has
-no trusted local route. A paired gateway token still authenticates as the
-shared operator while the policy compiles, so a client that sends one, over
+no trusted local route. An unbound paired gateway token still authenticates
+as the shared operator while the policy compiles, so a client that sends one, over
 WSS or over the pipe, can repair the roster live. zerocode's local pipe
 connection sends no token, so without such a client a lockout is repaired
 by editing `config.toml` and restarting.
@@ -144,7 +145,7 @@ environment-free session can still be resumed after `admin` is removed.
 
 A remote authentication bypass is never offered: a remote connection always
 has to present a valid credential. While the authorization policy still
-compiles, a client holding a paired gateway token or an operator-level
+compiles, a client holding an unbound paired gateway token or an operator-level
 principal can repair a lockout from anywhere. Without such a credential,
 and always in the deny-all state, the route back runs on the host that runs
 the daemon. Which local route applies depends on whether the policy still
@@ -171,7 +172,7 @@ so a restart is the step that reloads it.
 
 If `security.trust_daemon_uid` is set to `false`, the trusted-uid route is
 gone. A policy that compiles can still be repaired live by a client that
-presents a paired gateway token, or by a roster principal with admin
+presents an unbound paired gateway token, or by a roster principal with admin
 grants; otherwise both states repair the same way: edit `config.toml` as
 its owner and restart. Turn the setting off only where that is acceptable.
 
@@ -185,6 +186,65 @@ and approvals are not keyed on it yet (see
 [What this layer does not do (yet)](#what-this-layer-does-not-do-yet)), but
 they will be, so to rename an entry without orphaning its data later, set
 `principal_id` to the original id in the same edit.
+
+### Binding a pairing token to a roster user
+
+A gateway pairing token normally authenticates as the shared operator. To
+give a remote person their own principal without an identity provider,
+bind the pairing code to their roster entry when you mint it:
+
+```sh
+zeroclaw gateway get-paircode --new --user alice
+```
+
+Run it on the gateway host, as the account that runs the gateway: the
+command presents the gateway's owner-only admin token. The device that
+redeems the code at `/pair` gets a token that authenticates as
+`user:alice`, with the grants of alice's `permission_profiles`, exactly as
+a peer uid listed in `[users.alice]` does. The client redeeming the code
+cannot choose or remove the binding. A code minted without `--user` still
+pairs as the shared operator, and existing tokens are unchanged.
+
+- **Where the token works.** It is accepted where the daemon resolves
+  principals: the RPC connection zerocode uses (over WSS, over the relay,
+  or on the local socket with an `auth_token`) and the gateway's
+  configuration routes. Every other gateway route that checks a pairing
+  token, the web dashboard's included, acts with the operator's full
+  authority and answers a bound token with `401`. Pair the dashboard with an
+  unbound code. Routes that trust a loopback caller without a token, such
+  as `/admin/reload` and `/admin/shutdown`, keep doing so, and a bound
+  token changes nothing there.
+- **The roster entry.** `--user` must name an existing `[users.<name>]`
+  entry. An unknown name is refused and nothing is minted. The entry still
+  needs a `uid` today. For a person who only connects remotely, choose a
+  uid that no account on the daemon host holds, because the local socket
+  accepts that uid as the same user.
+- **Storage.** The gateway stores the binding in
+  `gateway.paired_token_users`, which maps the token's SHA-256 hash to the
+  entry's principal id, and never also in `gateway.paired_tokens`. It
+  writes both fields in one save. Both are gateway-managed, so do not edit
+  them by hand. The map holds hashes, not tokens, and a hash cannot be
+  presented as a credential. Unlike `gateway.paired_tokens`, it is stored
+  in plain text, and principals granted `Config:Read` can see it through
+  the configuration APIs.
+- **Revocation and rotation.** Revoking the token (the dashboard's device
+  controls, or `zeroclaw gateway get-paircode --rotate-device <id>`) drops
+  the binding with it. Rotating a bound device mints a replacement code
+  bound to the same user. If that user's roster entry is gone, or the
+  device's token was already revoked, the rotation revokes and issues no
+  code rather than an unbound one. `--rotate` revokes every token, bound
+  or not, and mints an unbound code. Removing the user's roster entry
+  denies the token at its next operation; it never falls back to the
+  shared operator.
+- **Retiring a user.** Removing a roster entry suspends that user's tokens
+  but keeps their bindings, so re-adding an entry with the same principal
+  id revives every device still bound to it, lost ones included. Revoke
+  the user's devices when you retire the user.
+- **Downgrading.** A daemon older than this feature ignores
+  `gateway.paired_token_users`, so bound tokens stop working there instead
+  of turning into operator tokens. Entries left in the file work again
+  after a later upgrade, so delete the table when you downgrade if the
+  bound devices should stay revoked.
 
 ### OIDC
 
@@ -464,7 +524,9 @@ speaks the same principal model as the RPC path, through the same
 provider registry and resolver:
 
 - A **paired bearer** (`Authorization: Bearer zc_...`) resolves to the
-  shared operator with full access, exactly as before. Denials keep the
+  shared operator with full access, exactly as before, unless it is bound
+  to a roster user: then it resolves to that scoped user, whose `Config`
+  grants gate the request as described below. Denials keep the
   historical 401 shape.
 - An **OIDC bearer** presented with the `X-ZeroClaw-Auth-Provider:
   oidc.<alias>` header is verified by that provider and resolved to a
@@ -652,8 +714,10 @@ private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
-unlike cron history. Gateway HTTP routes keep their existing pairing
-checks, and channel identities do not resolve into this principal model.
+unlike cron history. Gateway HTTP routes outside the configuration group
+keep their existing pairing checks, so a pairing token bound to a roster
+user works on the configuration routes only, and channel identities do not
+resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a
@@ -678,7 +742,8 @@ Some config paths carry authority themselves, so treat a broad
 leaf settings. For example:
 
 - a principal that can write `permission_profiles`, `users`, `oidc`,
-  `security`, or `gateway.paired_tokens` can grant itself anything;
+  `security`, `gateway.paired_tokens`, or `gateway.paired_token_users`
+  can grant itself anything;
 - one that can write `agents`, `risk_profiles`, `cron`, `channels`, or
   provider settings can change which agents run, with which tools, and
   where they may read and write;

@@ -121,7 +121,8 @@ loop to signal.
 Local reload is allowed from loopback. Remote reload requires both:
 
 1. `gateway.allow_remote_admin = true`
-2. pairing enabled and a valid paired bearer token
+2. pairing enabled and a valid unbound (shared-operator) paired bearer
+   token; a token bound to a roster user is refused
 
 Opting into remote admin while pairing is disabled is rejected rather than
 treated as anonymous remote reload access.

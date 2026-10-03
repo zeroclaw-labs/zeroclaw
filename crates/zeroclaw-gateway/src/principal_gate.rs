@@ -6,14 +6,16 @@
 //! check (the per-handler `require_auth` convention this replaces was
 //! enforced only by reviewer vigilance).
 //!
-//! The layer also consumes the shared principal model (RFC 7141): a
-//! paired native bearer resolves to the shared operator exactly as
-//! before, while a bearer presented with the `X-ZeroClaw-Auth-Provider`
-//! header naming an `oidc.<alias>` provider is verified by that provider
-//! and resolved to a scoped principal whose Config grants gate the
-//! request. Provider selection is explicit, mirroring the RPC handshake's
-//! `auth_provider` field: the named provider's denial is authoritative,
-//! and there is no fallback between providers.
+//! The layer also consumes the shared principal model (RFC 7141): an
+//! unbound paired native bearer resolves to the shared operator exactly as
+//! before, and one the operator bound to a `[users.<name>]` entry resolves
+//! to that scoped roster principal. A bearer presented with the
+//! `X-ZeroClaw-Auth-Provider` header naming an `oidc.<alias>` provider is
+//! verified by that provider and resolved to a scoped principal. A scoped
+//! principal's Config grants gate the request. Provider selection is
+//! explicit, mirroring the RPC handshake's `auth_provider` field: the named
+//! provider's denial is authoritative, and there is no fallback between
+//! providers.
 //!
 //! Grants are enforced in two places. The route layer applies a coarse
 //! floor per HTTP method (a read needs `Read`; anything else needs some
@@ -136,7 +138,8 @@ impl GatewayInboundAuth {
     }
 
     /// Verify a native pairing bearer (the pre-existing gateway
-    /// credential) into a shared-operator principal.
+    /// credential) into its principal: the shared operator for an unbound
+    /// token, the bound roster user otherwise.
     async fn authenticate_native(&self, token: &str) -> Result<ConnectionAuth, AuthDenied> {
         self.inner
             .authenticate(TransportKind::Wss, Credential::None, Some(token), None)
@@ -602,11 +605,7 @@ mod tests {
 
     fn router_and_authority_for(config: Config) -> (Router, Arc<GatewayInboundAuth>) {
         let state = AppState {
-            pairing: Arc::new(PairingGuard::new(
-                config.gateway.require_pairing,
-                &config.gateway.paired_tokens,
-                zeroclaw_config::pairing::PairingCodePolicy::default(),
-            )),
+            pairing: Arc::new(PairingGuard::from_gateway_config(&config.gateway)),
             ..crate::api::tests::test_state(config.clone())
         };
         let auth = Arc::new(
@@ -627,11 +626,7 @@ mod tests {
         Arc<RpcInboundAuth>,
         Arc<parking_lot::RwLock<Config>>,
     ) {
-        let pairing = Arc::new(PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            zeroclaw_config::pairing::PairingCodePolicy::default(),
-        ));
+        let pairing = Arc::new(PairingGuard::from_gateway_config(&config.gateway));
         let rpc_auth = Arc::new(
             RpcInboundAuth::from_config(&config, Arc::clone(&pairing))
                 .expect("inbound auth builds from a valid config"),
@@ -907,6 +902,76 @@ mod tests {
         assert_eq!(
             body["error"],
             "Principal lacks the config grant required for this method"
+        );
+    }
+
+    /// A pairing token the operator bound to a roster user reaches the
+    /// config routes as that scoped principal: its profile's Config grants
+    /// gate the request, never the operator's full access.
+    #[tokio::test]
+    async fn roster_bound_native_bearer_is_gated_by_its_profile() {
+        let mut config = paired_config();
+        config.permission_profiles.insert(
+            "config-reader".into(),
+            PermissionProfileConfig {
+                grants: HashMap::from([(Resource::Config, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            zeroclaw_config::schema::UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["config-reader".into()],
+            },
+        );
+        config
+            .gateway
+            .paired_token_users
+            .insert(PairingGuard::token_hash("zc_bound"), "alice".into());
+        let router = router_for(config);
+
+        let (status, _) = send(
+            &router,
+            "GET",
+            "/api/quickstart/state",
+            Some("zc_bound"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the profile grants Config:Read");
+
+        let fields = serde_json::json!({"section": "channel", "type_key": "telegram"});
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/quickstart/fields",
+            Some("zc_bound"),
+            None,
+            Some(fields.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            body["error"],
+            "Principal lacks the config grant required for this method"
+        );
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/api/quickstart/fields",
+            Some("zc_paired"),
+            None,
+            Some(fields),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the unbound token keeps full access"
         );
     }
 

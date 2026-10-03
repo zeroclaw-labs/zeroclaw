@@ -6988,6 +6988,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     new,
                     rotate,
                     rotate_device,
+                    user,
                     port,
                     host,
                     json,
@@ -6999,6 +7000,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         PaircodeAction::RotateAll
                     } else if let Some(id) = rotate_device {
                         PaircodeAction::RotateDevice(id)
+                    } else if let Some(user) = user {
+                        PaircodeAction::AddUserClient(user)
                     } else if new {
                         PaircodeAction::AddClient
                     } else {
@@ -7015,18 +7018,34 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     )
                     .await;
                     if json {
-                        let (code, message) = match fetched? {
-                            PaircodeResult::Code { code, message } => (Some(code), message),
-                            PaircodeResult::NoCode { message } => (None, message),
+                        let (code, message, principal_id) = match fetched? {
+                            PaircodeResult::Code {
+                                code,
+                                message,
+                                principal_id,
+                            } => (Some(code), message, principal_id),
+                            PaircodeResult::NoCode { message }
+                            | PaircodeResult::RotationWithheld { message } => (None, message, None),
+                            PaircodeResult::BindingUnconfirmed { user } => {
+                                (None, Some(binding_unconfirmed_message(&user)), None)
+                            }
                         };
                         println!(
                             "{}",
-                            serde_json::json!({ "pairing_code": code, "message": message })
+                            serde_json::json!({
+                                "pairing_code": code,
+                                "message": message,
+                                "principal_id": principal_id,
+                            })
                         );
                         return Ok(());
                     }
                     match fetched {
-                        Ok(PaircodeResult::Code { code, message }) => {
+                        Ok(PaircodeResult::Code {
+                            code,
+                            message,
+                            principal_id,
+                        }) => {
                             println!(
                                 "{}",
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
@@ -7057,6 +7076,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     "POST /pair with header X-Pairing-Code"
                                 )
                             );
+                            // Always say who the code pairs as, so a bound code
+                            // that another mint replaced is not mistaken for it.
+                            if let Some(line) = paircode_principal_line(principal_id.as_deref()) {
+                                println!();
+                                println!("{line}");
+                            }
                         }
                         Ok(PaircodeResult::NoCode { message }) => {
                             println!(
@@ -7071,6 +7096,23 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     message.as_deref(),
                                 )
                             );
+                        }
+                        Ok(PaircodeResult::RotationWithheld { message }) => {
+                            println!(
+                                "{}",
+                                rotation_withheld_message(
+                                    &host,
+                                    port,
+                                    &config.gateway.host,
+                                    config.gateway.port,
+                                    message.as_deref(),
+                                )
+                            );
+                        }
+                        Ok(PaircodeResult::BindingUnconfirmed { user }) => {
+                            // Not a fetch failure: the gateway answered, so the
+                            // "is the gateway running" hint below would misdirect.
+                            println!("  ⚠️  {}", binding_unconfirmed_message(&user));
                         }
                         Err(e) => {
                             println!(
@@ -11104,6 +11146,9 @@ enum PaircodeAction {
     Show,
     /// Issue a fresh code for an additional client; revoke nothing.
     AddClient,
+    /// Issue a fresh code bound to this `[users.<name>]` roster entry;
+    /// revoke nothing.
+    AddUserClient(String),
     /// Revoke every paired token + clear the registry, then issue a code.
     RotateAll,
     /// Revoke a single device's token, then issue a code.
@@ -11130,7 +11175,17 @@ impl PaircodeAction {
         match self {
             PaircodeAction::RotateAll => Some("all".to_string()),
             PaircodeAction::RotateDevice(id) => Some(id.clone()),
-            PaircodeAction::Show | PaircodeAction::AddClient => None,
+            PaircodeAction::Show | PaircodeAction::AddClient | PaircodeAction::AddUserClient(_) => {
+                None
+            }
+        }
+    }
+
+    /// The `user` query value to send, if any.
+    fn user_query(&self) -> Option<&str> {
+        match self {
+            PaircodeAction::AddUserClient(user) => Some(user),
+            _ => None,
         }
     }
 }
@@ -11142,10 +11197,19 @@ enum PaircodeResult {
     Code {
         code: String,
         message: Option<String>,
+        /// Who a token paired with the code authenticates as, when the
+        /// gateway reports it (`shared-operator` or `user:<id>`).
+        principal_id: Option<String>,
     },
     /// No code is available (with an optional explanatory message from the
     /// gateway, e.g. a revoke that succeeded but could not issue a code).
     NoCode { message: Option<String> },
+    /// A code was requested for a roster user, but the gateway did not
+    /// confirm the binding, so the code it returned is withheld.
+    BindingUnconfirmed { user: String },
+    /// A device rotation succeeded, but the gateway withheld the replacement
+    /// code (with its reason), rather than failing the request.
+    RotationWithheld { message: Option<String> },
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -11169,11 +11233,7 @@ async fn fetch_paircode(
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
-        let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
-        if let Some(rotate) = action.rotate_query() {
-            url.push_str("?rotate=");
-            url.push_str(&urlencoding::encode(&rotate));
-        }
+        let url = admin_paircode_new_url(host, port, path_prefix, action);
         client
             .post(&url)
             .header(
@@ -11221,6 +11281,21 @@ async fn fetch_paircode(
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
 
+    interpret_paircode_response(status, &json, action)
+}
+
+/// Turn a pairing-code admin response into a [`PaircodeResult`].
+///
+/// A code requested for a roster user is shown only when the gateway
+/// confirms the binding. A gateway older than this CLI ignores the `user`
+/// parameter and mints an ordinary code; showing that code as the user's
+/// would hand the shared operator's authority to whoever redeems it.
+#[cfg(feature = "agent-runtime")]
+fn interpret_paircode_response(
+    status: reqwest::StatusCode,
+    json: &serde_json::Value,
+    action: &PaircodeAction,
+) -> Result<PaircodeResult> {
     if status == reqwest::StatusCode::FORBIDDEN
         && let Some(error) = json.get("error").and_then(|v| v.as_str())
     {
@@ -11245,13 +11320,87 @@ async fn fetch_paircode(
         return Ok(PaircodeResult::NoCode { message });
     }
 
+    let principal_id = json
+        .get("principal_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     match json.get("pairing_code").and_then(|v| v.as_str()) {
-        Some(code) => Ok(PaircodeResult::Code {
-            code: code.to_string(),
-            message,
-        }),
+        Some(code) => {
+            if let Some(user) = action.user_query() {
+                let confirmed = json.get("user").and_then(|v| v.as_str()) == Some(user)
+                    && principal_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("user:"));
+                if !confirmed {
+                    return Ok(PaircodeResult::BindingUnconfirmed {
+                        user: user.to_string(),
+                    });
+                }
+            }
+            Ok(PaircodeResult::Code {
+                code: code.to_string(),
+                message,
+                principal_id,
+            })
+        }
+        // `success` with no code on a device rotation: the revocation stood
+        // and the gateway chose not to issue a replacement.
+        None if matches!(action, PaircodeAction::RotateDevice(_)) => {
+            Ok(PaircodeResult::RotationWithheld { message })
+        }
         None => Ok(PaircodeResult::NoCode { message }),
     }
+}
+
+/// The line naming who a shown code pairs as, from the principal the gateway
+/// reported. `None` for a gateway that reports none (older than `--user`).
+#[cfg(feature = "agent-runtime")]
+fn paircode_principal_line(principal_id: Option<&str>) -> Option<String> {
+    match principal_id? {
+        principal if principal.starts_with("user:") => Some(ta(
+            "cli-pairing-bound-user",
+            &[("principal", principal)],
+            format!("This code pairs as {principal}"),
+        )),
+        "shared-operator" => Some(t(
+            "cli-pairing-shared-operator",
+            "This code pairs as the shared operator, with full access.",
+        )),
+        _ => None,
+    }
+}
+
+/// Why a code requested with `--user` is withheld: the gateway did not confirm
+/// the binding, most likely because it predates `--user`.
+#[cfg(feature = "agent-runtime")]
+fn binding_unconfirmed_message(user: &str) -> String {
+    ta(
+        "cli-pairing-bound-unconfirmed",
+        &[("user", user)],
+        format!(
+            "The gateway did not confirm the code is bound to user {user}, so it is not shown."
+        ),
+    )
+}
+
+/// The minting request for `action`: `rotate` or `user`, never both (the
+/// actions that carry them are distinct), each percent-encoded.
+#[cfg(feature = "agent-runtime")]
+fn admin_paircode_new_url(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    action: &PaircodeAction,
+) -> String {
+    let mut url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
+    if let Some(rotate) = action.rotate_query() {
+        url.push_str("?rotate=");
+        url.push_str(&urlencoding::encode(&rotate));
+    } else if let Some(user) = action.user_query() {
+        url.push_str("?user=");
+        url.push_str(&urlencoding::encode(user));
+    }
+    url
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -11343,6 +11492,22 @@ fn paircode_no_code_message(
                 Some("--rotate"),
             ));
         }
+        PaircodeAction::AddUserClient(user) => {
+            lines.push(ta(
+                "cli-pairing-bound-no-code",
+                &[("user", user)],
+                format!(
+                    "No code was minted for user {user}. Check that pairing is enabled and that [users.{user}] exists in the running gateway's config, then run:"
+                ),
+            ));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some(&format!("--new --user {user}")),
+            ));
+        }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
             lines.push(t(
                 "cli-pairing-rotate-no-code",
@@ -11367,6 +11532,49 @@ fn paircode_no_code_message(
     lines.push(format!(
         "    open http://{}:{port}",
         gateway_browser_host(host)
+    ));
+    indent_paircode_lines(lines)
+}
+
+/// What to do after `--rotate-device` revoked a device but the gateway
+/// withheld its replacement code, typically because it could not honor the
+/// device's roster binding. A plain `--new` would give the device the
+/// operator's authority, so it is offered last and only for a device that
+/// should have it.
+#[cfg(feature = "agent-runtime")]
+fn rotation_withheld_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    gateway_message: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
+        lines.push(format!("⚠️  {message}"));
+        lines.push(String::new());
+    }
+    lines.push(t(
+        "cli-pairing-rotate-device-no-code",
+        "No replacement code was issued. To re-pair the device as a roster user, run:",
+    ));
+    lines.push(paircode_command(
+        host,
+        port,
+        default_host,
+        default_port,
+        Some("--new --user <name>"),
+    ));
+    lines.push(t(
+        "cli-pairing-rotate-device-unbound",
+        "Mint an unbound code only for a device that should have the operator's full access:",
+    ));
+    lines.push(paircode_command(
+        host,
+        port,
+        default_host,
+        default_port,
+        Some("--new"),
     ));
     indent_paircode_lines(lines)
 }
@@ -15182,6 +15390,7 @@ mod tests {
                         new,
                         rotate,
                         rotate_device,
+                        user,
                         port,
                         host,
                         json,
@@ -15190,6 +15399,7 @@ mod tests {
                 assert!(new);
                 assert!(!rotate);
                 assert_eq!(rotate_device, None);
+                assert_eq!(user, None, "a plain --new code is unbound");
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
                 assert!(!json, "text output is the default");
@@ -15578,6 +15788,283 @@ mod tests {
             ])
             .is_err(),
             "--rotate and --rotate-device must conflict"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_user_requires_new_and_excludes_rotation() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--user",
+            "alice",
+        ])
+        .expect("--new --user should parse");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, user, .. }),
+            } => {
+                assert!(new);
+                assert_eq!(user.as_deref(), Some("alice"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        // The name is trimmed before it is sent, so the gateway's echo of the
+        // trimmed name confirms the binding.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--user",
+            " alice ",
+        ])
+        .expect("a padded name parses");
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { user, .. }),
+            } => assert_eq!(user.as_deref(), Some("alice")),
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+
+        for args in [
+            vec![
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--new",
+                "--user",
+                "  ",
+            ],
+            vec!["zeroclaw", "gateway", "get-paircode", "--user", "alice"],
+            vec![
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--rotate",
+                "--user",
+                "alice",
+            ],
+            vec![
+                "zeroclaw",
+                "gateway",
+                "get-paircode",
+                "--rotate-device",
+                "dash-1",
+                "--user",
+                "alice",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} must be refused: --user only binds a fresh --new code"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn a_user_code_is_shown_only_when_the_gateway_confirms_the_binding() {
+        let action = PaircodeAction::AddUserClient("alice".into());
+        let confirmed = serde_json::json!({
+            "success": true,
+            "pairing_code": "CODE",
+            "user": "alice",
+            "principal_id": "user:alice",
+        });
+        match interpret_paircode_response(reqwest::StatusCode::OK, &confirmed, &action) {
+            Ok(PaircodeResult::Code {
+                code, principal_id, ..
+            }) => {
+                assert_eq!(code, "CODE");
+                assert_eq!(principal_id.as_deref(), Some("user:alice"));
+            }
+            _ => panic!("a confirmed binding must show the code"),
+        }
+
+        // A gateway older than the CLI ignores `user` and mints an ordinary
+        // code: it must not be shown as the user's.
+        let older_gateway = serde_json::json!({ "success": true, "pairing_code": "CODE" });
+        let other_user = serde_json::json!({
+            "success": true,
+            "pairing_code": "CODE",
+            "user": "bob",
+            "principal_id": "user:bob",
+        });
+        let unbound = serde_json::json!({
+            "success": true,
+            "pairing_code": "CODE",
+            "user": "alice",
+            "principal_id": "shared-operator",
+        });
+        for response in [older_gateway, other_user, unbound] {
+            assert!(
+                matches!(
+                    interpret_paircode_response(reqwest::StatusCode::OK, &response, &action),
+                    Ok(PaircodeResult::BindingUnconfirmed { ref user }) if user == "alice"
+                ),
+                "an unconfirmed binding must withhold the code: {response}"
+            );
+        }
+
+        // An ordinary --new keeps accepting a response without a principal.
+        let plain = serde_json::json!({ "success": true, "pairing_code": "CODE" });
+        assert!(matches!(
+            interpret_paircode_response(
+                reqwest::StatusCode::OK,
+                &plain,
+                &PaircodeAction::AddClient
+            ),
+            Ok(PaircodeResult::Code { .. })
+        ));
+    }
+
+    /// When the gateway withholds a device's replacement code (for example
+    /// because its roster user is gone), the CLI must not steer the operator
+    /// straight to an unbound code for that device.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn a_withheld_rotation_leads_with_a_bound_code_and_errors_keep_the_generic_hint() {
+        let default = config::GatewayConfig::default();
+        let action = PaircodeAction::RotateDevice("phone".into());
+        let reason = "Revoked the bearer token for device 'phone'. It was bound to user:alice, which no longer has a [users] entry, so no replacement code was issued.";
+
+        // The gateway succeeded but issued no code: a withheld replacement.
+        let withheld = serde_json::json!({
+            "success": true,
+            "pairing_code": null,
+            "message": reason,
+        });
+        assert!(matches!(
+            interpret_paircode_response(reqwest::StatusCode::OK, &withheld, &action),
+            Ok(PaircodeResult::RotationWithheld { .. })
+        ));
+        // An error reply is not a withheld replacement.
+        let not_found = serde_json::json!({
+            "success": false,
+            "pairing_code": null,
+            "message": "Device 'phone' not found; nothing revoked.",
+        });
+        assert!(matches!(
+            interpret_paircode_response(reqwest::StatusCode::NOT_FOUND, &not_found, &action),
+            Ok(PaircodeResult::NoCode { .. })
+        ));
+        let generic_hint = t(
+            "cli-pairing-check-enabled",
+            "Check whether pairing is enabled, then request a new device code:",
+        );
+        let error_msg = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &action,
+            true,
+            Some("Device 'phone' not found; nothing revoked."),
+        );
+        assert!(
+            error_msg.contains(&generic_hint),
+            "errors keep the generic hint: {error_msg}"
+        );
+
+        let msg = rotation_withheld_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            Some(reason),
+        );
+        assert!(msg.contains("which no longer has a [users] entry"));
+        let bound = msg
+            .find("zeroclaw gateway get-paircode --new --user <name>")
+            .expect("the bound remedy is offered");
+        let unbound = msg
+            .find(&t(
+                "cli-pairing-rotate-device-unbound",
+                "Mint an unbound code only for a device that should have the operator's full access:",
+            ))
+            .expect("an unbound code is offered only with its caveat");
+        assert!(bound < unbound, "the bound remedy comes first: {msg}");
+        assert!(
+            !msg.contains(&generic_hint),
+            "the generic rotation hint must not follow a withheld replacement: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn a_user_code_request_carries_the_encoded_user_query() {
+        assert_eq!(
+            admin_paircode_new_url(
+                "127.0.0.1",
+                42617,
+                Some("/gw"),
+                &PaircodeAction::AddUserClient("alice".into())
+            ),
+            "http://127.0.0.1:42617/gw/admin/paircode/new?user=alice"
+        );
+        assert!(
+            admin_paircode_new_url(
+                "127.0.0.1",
+                42617,
+                None,
+                &PaircodeAction::AddUserClient("a&rotate=all".into())
+            )
+            .ends_with("?user=a%26rotate%3Dall"),
+            "a name cannot smuggle a second parameter"
+        );
+        assert_eq!(
+            admin_paircode_new_url("127.0.0.1", 42617, None, &PaircodeAction::AddClient),
+            "http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn a_shown_code_always_says_who_it_pairs_as() {
+        assert!(
+            paircode_principal_line(Some("user:alice"))
+                .expect("a bound code is named")
+                .contains("user:alice")
+        );
+        assert_eq!(
+            paircode_principal_line(Some("shared-operator")),
+            Some(t(
+                "cli-pairing-shared-operator",
+                "This code pairs as the shared operator, with full access.",
+            )),
+            "an unbound code is named too, so a replaced bound code stands out"
+        );
+        assert_eq!(
+            paircode_principal_line(None),
+            None,
+            "an older gateway reports no principal"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_for_user_points_at_the_roster() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddUserClient("mallory".into()),
+            true,
+            Some("No [users.mallory] entry is configured; no pairing code was minted."),
+        );
+        assert!(msg.contains("No [users.mallory] entry is configured"));
+        assert!(msg.contains("[users.mallory]"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --new --user mallory"));
+        assert!(
+            !msg.contains("--rotate"),
+            "an unknown user is not a reason to revoke pairings: {msg}"
         );
     }
 

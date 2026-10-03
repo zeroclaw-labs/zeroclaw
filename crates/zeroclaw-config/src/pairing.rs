@@ -304,26 +304,93 @@ pub enum GeneratePairingCodeError {
 /// online guesser unlimited wall-clock against a six-digit space.
 pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// The active pairing code and when it was minted. `Instant` is monotonic, so
-/// the lifetime cannot be extended by moving the system clock.
+/// Who a paired bearer token authenticates as.
+///
+/// Fixed when the token's pairing code is minted and never changed while the
+/// token lives. The operator minting the code chooses it; the client redeeming
+/// the code cannot choose or drop it. Tokens paired before roster binding
+/// existed, and every code minted without a user, are
+/// [`PairedTokenSubject::SharedOperator`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairedTokenSubject {
+    /// The trusted shared operator: full authority, no distinct identity.
+    SharedOperator,
+    /// A `[users.<name>]` roster identity. Keyed by the entry's durable
+    /// principal id (its `principal_id`, else the entry name), so renaming an
+    /// entry that pins its id keeps the binding.
+    RosterUser {
+        /// The durable roster principal id.
+        principal_id: String,
+    },
+}
+
+impl PairedTokenSubject {
+    /// The subject for a token bound to the `[users.<entry_name>]` roster
+    /// entry, or `None` when the roster has no entry by that name.
+    #[must_use]
+    pub fn for_roster_entry(
+        users: &HashMap<String, crate::schema::UserConfig>,
+        entry_name: &str,
+    ) -> Option<Self> {
+        users.get(entry_name).map(|user| Self::RosterUser {
+            principal_id: user.effective_principal_id(entry_name).to_owned(),
+        })
+    }
+
+    /// The durable roster principal id this subject is bound to, if any.
+    #[must_use]
+    pub fn roster_principal_id(&self) -> Option<&str> {
+        match self {
+            Self::SharedOperator => None,
+            Self::RosterUser { principal_id } => Some(principal_id),
+        }
+    }
+}
+
+/// The paired-token set in the shape `[gateway]` persists it.
+///
+/// Shared-operator tokens go to `paired_tokens` and roster-bound tokens to
+/// `paired_token_users`, never both. A binding lives in the same record as
+/// its token, so one cannot be written without the other, and a binary that
+/// does not know the binding field skips bound tokens instead of loading them
+/// as the shared operator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersistedPairedTokens {
+    /// Hashes of the shared-operator tokens, sorted.
+    pub paired_tokens: Vec<String>,
+    /// The hash of each roster-bound token, mapped to its durable roster
+    /// principal id.
+    pub paired_token_users: HashMap<String, String>,
+}
+
+/// The active pairing code, when it was minted, and who a token paired with
+/// it will authenticate as. `Instant` is monotonic, so the lifetime cannot be
+/// extended by moving the system clock.
 #[derive(Debug, Clone)]
 struct PendingCode {
     code: String,
     minted_at: Instant,
+    subject: PairedTokenSubject,
 }
 
 impl PendingCode {
-    fn new(code: String) -> Self {
+    fn new(code: String, subject: PairedTokenSubject) -> Self {
         Self {
             code,
             minted_at: Instant::now(),
+            subject,
         }
     }
 
-    /// Restore a previously reserved code WITHOUT refreshing its lifetime: a
-    /// failed issuance must not extend the window.
-    fn restored(code: String, minted_at: Instant) -> Self {
-        Self { code, minted_at }
+    /// Restore a previously reserved code WITHOUT refreshing its lifetime or
+    /// changing its subject: a failed issuance must neither extend the window
+    /// nor turn a user-bound code into a shared-operator one.
+    fn restored(code: String, minted_at: Instant, subject: PairedTokenSubject) -> Self {
+        Self {
+            code,
+            minted_at,
+            subject,
+        }
     }
 
     fn is_expired_at(&self, now: Instant) -> bool {
@@ -343,12 +410,19 @@ fn take_live(slot: &mut Option<PendingCode>) -> Option<PendingCode> {
 }
 
 /// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
-pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashSet<String>>);
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashMap<String, PairedTokenSubject>>);
 
 impl HeldPairedTokens<'_> {
     /// Whether `token_hash` is paired, as of this hold.
     pub fn contains_hash(&self, token_hash: &str) -> bool {
-        self.0.contains(token_hash)
+        self.0.contains_key(token_hash)
+    }
+
+    /// Who `token_hash` authenticates as, as of this hold, or `None` when it
+    /// is not paired. Revalidation under the hold rebuilds a roster-bound
+    /// connection's identity from this, as it does outside one.
+    pub fn subject_of_hash(&self, token_hash: &str) -> Option<PairedTokenSubject> {
+        self.0.get(token_hash).cloned()
     }
 }
 
@@ -359,11 +433,13 @@ pub struct PairingGuard {
     require_pairing: bool,
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<PendingCode>>>,
-    /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    /// A reader-writer lock so that a caller holding it across an effect
-    /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// SHA-256 hashed bearer tokens and who each authenticates as (persisted
+    /// across restarts). One map, so membership and subject are always read
+    /// together: a revocation can never land between the two. A
+    /// reader-writer lock so that a caller holding it across an effect (see
+    /// [`PairingGuard::hold_paired_tokens`]) delays only pairing and
     /// revocation, not other liveness checks.
-    paired_tokens: Arc<RwLock<HashSet<String>>>,
+    paired_tokens: Arc<RwLock<HashMap<String, PairedTokenSubject>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
     /// The admin token this gateway run accepts on the pairing-code admin
@@ -384,6 +460,8 @@ pub struct PairingReservation {
     /// Preserved so restoring the code on a failed issuance does not reset its
     /// lifetime.
     minted_at: Instant,
+    /// Who the committed token authenticates as, taken from the pending code.
+    subject: PairedTokenSubject,
     token: String,
     committed: bool,
 }
@@ -394,10 +472,18 @@ impl PairingReservation {
         hash_token(&self.token)
     }
 
+    /// Who the token will authenticate as once committed.
+    pub fn subject(&self) -> &PairedTokenSubject {
+        &self.subject
+    }
+
     /// Commit the reservation, consuming the one-time code and storing the token.
     pub fn commit(mut self) -> String {
         let token = self.token.clone();
-        self.guard.paired_tokens.write().insert(hash_token(&token));
+        self.guard
+            .paired_tokens
+            .write()
+            .insert(hash_token(&token), self.subject.clone());
         self.committed = true;
         token
     }
@@ -410,7 +496,11 @@ impl Drop for PairingReservation {
         }
         let mut slot = self.guard.pairing_code.lock();
         if slot.is_none() {
-            *slot = Some(PendingCode::restored(self.code.clone(), self.minted_at));
+            *slot = Some(PendingCode::restored(
+                self.code.clone(),
+                self.minted_at,
+                self.subject.clone(),
+            ));
         }
     }
 }
@@ -424,23 +514,104 @@ impl PairingGuard {
     /// `[gateway.pairing_code]` must use the new policy without a restart.
     /// Every later mint therefore takes the policy the caller resolved from
     /// live config at that moment.
+    ///
+    /// Every token in `existing_tokens` loads as the shared operator. A
+    /// gateway's persisted state goes through [`Self::from_gateway_config`],
+    /// which also loads roster-bound tokens.
     pub fn new(
         require_pairing: bool,
         existing_tokens: &[String],
         code_policy: PairingCodePolicy,
     ) -> Self {
-        let tokens: HashSet<String> = existing_tokens
+        let tokens = existing_tokens
             .iter()
-            .map(|t| {
-                if is_token_hash(t) {
-                    t.clone()
-                } else {
-                    hash_token(t)
-                }
-            })
+            .map(|t| (stored_token_hash(t), PairedTokenSubject::SharedOperator))
             .collect();
+        Self::with_tokens(require_pairing, tokens, code_policy)
+    }
+
+    /// Build the guard from a gateway's persisted `[gateway]` state:
+    /// shared-operator tokens from `paired_tokens`, roster-bound tokens from
+    /// `paired_token_users`. Production construction goes through here so no
+    /// surface loads one field without the other.
+    ///
+    /// A binding entry whose key is not a token hash, or whose value is not a
+    /// valid roster principal id, is skipped with a warning, and so are two
+    /// entries naming one hash with different principals. The token such an
+    /// entry names does not authenticate at all, even when `paired_tokens`
+    /// lists it too: a damaged binding must never leave the shared operator
+    /// behind. A hash listed in both fields with a valid binding loads as
+    /// bound. A binding to a principal the roster no longer has still loads:
+    /// the resolver refuses it.
+    pub fn from_gateway_config(gateway: &crate::schema::GatewayConfig) -> Self {
+        let mut tokens: HashMap<String, PairedTokenSubject> = gateway
+            .paired_tokens
+            .iter()
+            .map(|t| (stored_token_hash(t), PairedTokenSubject::SharedOperator))
+            .collect();
+        let mut bound: HashMap<String, String> = HashMap::new();
+        let mut rejected: HashSet<String> = HashSet::new();
+        let mut skipped = 0usize;
+        for (key, principal_id) in &gateway.paired_token_users {
+            let hash = key.to_ascii_lowercase();
+            if !is_token_hash(key) || !crate::schema::is_valid_auth_section_name(principal_id) {
+                skipped += 1;
+                // Every form under which `paired_tokens` could hold the same
+                // token: as written, as a normalized hash (also once stray
+                // whitespace is stripped), or hashed plaintext.
+                let trimmed = key.trim();
+                rejected.extend([
+                    key.clone(),
+                    hash,
+                    trimmed.to_ascii_lowercase(),
+                    hash_token(key),
+                    hash_token(trimmed),
+                ]);
+                continue;
+            }
+            if bound
+                .get(&hash)
+                .is_some_and(|existing| existing != principal_id)
+            {
+                // Two spellings of one hash naming different principals:
+                // neither can be trusted.
+                skipped += 1;
+                rejected.insert(hash);
+            } else {
+                bound.insert(hash, principal_id.clone());
+            }
+        }
+        for hash in &rejected {
+            bound.remove(hash);
+            tokens.remove(hash);
+        }
+        for (hash, principal_id) in bound {
+            tokens.insert(hash, PairedTokenSubject::RosterUser { principal_id });
+        }
+        if skipped > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "skipped": skipped })),
+                "gateway.paired_token_users has entries that are not a token hash mapped to one \
+                 valid roster principal id; those tokens will not authenticate, even if \
+                 gateway.paired_tokens lists them. Pair the affected devices again."
+            );
+        }
+        Self::with_tokens(gateway.require_pairing, tokens, gateway.pairing_code)
+    }
+
+    fn with_tokens(
+        require_pairing: bool,
+        tokens: HashMap<String, PairedTokenSubject>,
+        code_policy: PairingCodePolicy,
+    ) -> Self {
         let code = if require_pairing && tokens.is_empty() {
-            Some(PendingCode::new(code_policy.generate()))
+            Some(PendingCode::new(
+                code_policy.generate(),
+                PairedTokenSubject::SharedOperator,
+            ))
         } else {
             None
         };
@@ -481,6 +652,12 @@ impl PairingGuard {
     /// The one-time pairing code (generated only on first startup when no tokens exist).
     pub fn pairing_code(&self) -> Option<String> {
         take_live(&mut self.pairing_code.lock()).map(|p| p.code)
+    }
+
+    /// The live pairing code together with who a token paired with it will
+    /// authenticate as, read in one step.
+    pub fn pending_pairing_code(&self) -> Option<(String, PairedTokenSubject)> {
+        take_live(&mut self.pairing_code.lock()).map(|p| (p.code, p.subject))
     }
 
     /// Test-only: rewind the active code's mint time so expiry is exercisable
@@ -597,6 +774,7 @@ impl PairingGuard {
                 guard: self.clone(),
                 code: pending.code.clone(),
                 minted_at: pending.minted_at,
+                subject: pending.subject.clone(),
                 token: generate_token(),
                 committed: false,
             };
@@ -656,32 +834,54 @@ impl PairingGuard {
             .expect("failed to spawn blocking task this should not happen")
     }
 
-    /// Check if a bearer token is valid (compares against stored hashes).
+    /// Whether `token` may use the gateway's pairing-checked routes: always
+    /// when pairing is not required, otherwise only a paired shared-operator
+    /// token. Those routes act with the full operator authority, so a
+    /// roster-bound token is refused here. It carries only its roster user's
+    /// grants, which only principal-aware surfaces (the RPC handshake and the
+    /// gateway's config routes) resolve and enforce.
     pub fn is_authenticated(&self, token: &str) -> bool {
         if !self.require_pairing {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.read();
-        tokens.contains(&hashed)
+        matches!(
+            self.paired_tokens.read().get(&hashed),
+            Some(PairedTokenSubject::SharedOperator)
+        )
     }
 
     /// Strict membership check for inbound authentication: whether `token`
-    /// hashes to a currently-paired token, regardless of `require_pairing`.
+    /// hashes to a currently-paired token, shared-operator or roster-bound,
+    /// regardless of `require_pairing`.
     /// The gateway's `is_authenticated` convenience fails OPEN when pairing
     /// is disabled, which is only correct on surfaces that already treat
-    /// the transport as trusted — an auth provider must use this instead,
-    /// so an empty token set denies everything.
+    /// the transport as trusted — an auth provider must use a strict check
+    /// instead, so an empty token set denies everything. One that needs to
+    /// know who the token authenticates as uses [`Self::subject_for_token`].
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        self.paired_tokens.read().contains(&hashed)
+        self.paired_tokens.read().contains_key(&hashed)
     }
 
     /// Strict membership check by pre-computed SHA-256 hash (see
     /// [`Self::token_is_paired`]). Lets an established connection re-check
     /// liveness of its pairing without retaining the bearer itself.
     pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
-        self.paired_tokens.read().contains(token_hash)
+        self.paired_tokens.read().contains_key(token_hash)
+    }
+
+    /// Who `token` authenticates as, when it is currently paired: the strict
+    /// check of [`Self::token_is_paired`] together with the token's subject.
+    /// `None` for an unpaired token, whatever `require_pairing` says.
+    pub fn subject_for_token(&self, token: &str) -> Option<PairedTokenSubject> {
+        self.subject_for_hash(&hash_token(token))
+    }
+
+    /// [`Self::subject_for_token`] by pre-computed SHA-256 hash, for an
+    /// established connection that kept only its token's hash.
+    pub fn subject_for_hash(&self, token_hash: &str) -> Option<PairedTokenSubject> {
+        self.paired_tokens.read().get(token_hash).cloned()
     }
 
     /// Hold the paired-token set still: no token can be paired or revoked
@@ -713,22 +913,48 @@ impl PairingGuard {
         !tokens.is_empty()
     }
 
-    /// Get all paired token hashes (for persisting to config).
+    /// Every paired token hash, shared-operator and roster-bound alike.
+    /// Persistence uses [`Self::persisted_tokens`], which keeps the two apart.
     pub fn tokens(&self) -> Vec<String> {
         let tokens = self.paired_tokens.read();
-        tokens.iter().cloned().collect()
+        tokens.keys().cloned().collect()
+    }
+
+    /// The paired-token set split the way `[gateway]` persists it, read in one
+    /// step so the two fields always describe the same set.
+    pub fn persisted_tokens(&self) -> PersistedPairedTokens {
+        let tokens = self.paired_tokens.read();
+        let mut persisted = PersistedPairedTokens::default();
+        for (hash, subject) in tokens.iter() {
+            match subject {
+                PairedTokenSubject::SharedOperator => persisted.paired_tokens.push(hash.clone()),
+                PairedTokenSubject::RosterUser { principal_id } => {
+                    persisted
+                        .paired_token_users
+                        .insert(hash.clone(), principal_id.clone());
+                }
+            }
+        }
+        persisted.paired_tokens.sort_unstable();
+        persisted
     }
 
     pub fn revoke_token(&self, token: &str) -> bool {
-        let hashed = hash_token(token);
-        let mut tokens = self.paired_tokens.write();
-        tokens.remove(&hashed)
+        self.revoke_token_hash_subject(&hash_token(token)).is_some()
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
     pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
-        let mut tokens = self.paired_tokens.write();
-        tokens.remove(token_hash)
+        self.revoke_token_hash_subject(token_hash).is_some()
+    }
+
+    /// Revoke a paired token by its SHA-256 hash and return who it
+    /// authenticated as, or `None` when it was not paired. Revoking a token
+    /// drops its roster binding with it. A device rotation reads the subject
+    /// here, in the same step as the revocation, so the replacement code can
+    /// carry the same binding.
+    pub fn revoke_token_hash_subject(&self, token_hash: &str) -> Option<PairedTokenSubject> {
+        self.paired_tokens.write().remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
@@ -747,11 +973,23 @@ impl PairingGuard {
     /// operator who strengthens `[gateway.pairing_code]` sees the next code
     /// follow the new policy without a restart.
     pub fn generate_new_pairing_code(&self, code_policy: PairingCodePolicy) -> Option<String> {
+        self.generate_new_pairing_code_as(code_policy, PairedTokenSubject::SharedOperator)
+    }
+
+    /// [`Self::generate_new_pairing_code`] for a code whose token will
+    /// authenticate as `subject`. The subject travels with the pending code
+    /// into its reservation, so the client redeeming the code cannot choose
+    /// or drop it. Replaces any pending code, whatever its subject.
+    pub fn generate_new_pairing_code_as(
+        &self,
+        code_policy: PairingCodePolicy,
+        subject: PairedTokenSubject,
+    ) -> Option<String> {
         if !self.require_pairing {
             return None;
         }
         let new_code = code_policy.generate();
-        *self.pairing_code.lock() = Some(PendingCode::new(new_code.clone()));
+        *self.pairing_code.lock() = Some(PendingCode::new(new_code.clone(), subject));
         Some(new_code)
     }
 
@@ -763,6 +1001,16 @@ impl PairingGuard {
         &self,
         code_policy: PairingCodePolicy,
     ) -> Result<String, GeneratePairingCodeError> {
+        self.generate_pairing_code_if_vacant_as(code_policy, PairedTokenSubject::SharedOperator)
+    }
+
+    /// [`Self::generate_pairing_code_if_vacant`] for a code whose token will
+    /// authenticate as `subject`.
+    pub fn generate_pairing_code_if_vacant_as(
+        &self,
+        code_policy: PairingCodePolicy,
+        subject: PairedTokenSubject,
+    ) -> Result<String, GeneratePairingCodeError> {
         if !self.require_pairing {
             return Err(GeneratePairingCodeError::PairingDisabled);
         }
@@ -773,7 +1021,7 @@ impl PairingGuard {
             return Err(GeneratePairingCodeError::Pending);
         }
         let new_code = code_policy.generate();
-        *slot = Some(PendingCode::new(new_code.clone()));
+        *slot = Some(PendingCode::new(new_code.clone(), subject));
         Ok(new_code)
     }
 
@@ -783,7 +1031,8 @@ impl PairingGuard {
         hex::encode(Sha256::digest(token.as_bytes()))
     }
 
-    /// Check if a token is paired and return its hash.
+    /// Check a token the way [`Self::is_authenticated`] does and return its
+    /// hash: a roster-bound token is refused.
     pub fn authenticate_and_hash(&self, token: &str) -> Option<String> {
         if self.is_authenticated(token) {
             Some(Self::token_hash(token))
@@ -818,6 +1067,16 @@ fn generate_token() -> String {
 /// SHA-256 hash a bearer token for storage. Returns lowercase hex.
 fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+/// The stored form of a `paired_tokens` entry: already a hash, or a legacy
+/// plaintext token hashed on load.
+fn stored_token_hash(value: &str) -> String {
+    if is_token_hash(value) {
+        value.to_string()
+    } else {
+        hash_token(value)
+    }
 }
 
 /// Check if a stored value looks like a SHA-256 hash (64 hex chars)
@@ -2163,6 +2422,408 @@ mod tests {
                 .is_some(),
             "the fresh replacement must redeem"
         );
+    }
+
+    // ── Roster-bound tokens ──────────────────────────────────
+
+    fn alice() -> PairedTokenSubject {
+        PairedTokenSubject::RosterUser {
+            principal_id: "alice".into(),
+        }
+    }
+
+    fn gateway_with(
+        paired_tokens: &[&str],
+        paired_token_users: &[(&str, &str)],
+    ) -> crate::schema::GatewayConfig {
+        crate::schema::GatewayConfig {
+            paired_tokens: paired_tokens.iter().map(|t| (*t).to_string()).collect(),
+            paired_token_users: paired_token_users
+                .iter()
+                .map(|(hash, principal)| ((*hash).to_string(), (*principal).to_string()))
+                .collect(),
+            ..crate::schema::GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    async fn from_gateway_config_loads_each_token_with_its_subject() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_shared"],
+            &[(&hash_token("zc_bound"), "alice")],
+        ));
+        assert_eq!(
+            guard.subject_for_token("zc_shared"),
+            Some(PairedTokenSubject::SharedOperator)
+        );
+        assert_eq!(guard.subject_for_token("zc_bound"), Some(alice()));
+        assert_eq!(guard.subject_for_token("zc_unknown"), None);
+        assert!(
+            guard.pairing_code().is_none(),
+            "a paired gateway mints no startup code"
+        );
+    }
+
+    #[test]
+    async fn only_bound_tokens_still_withhold_the_startup_code() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &[],
+            &[(&hash_token("zc_b"), "alice")],
+        ));
+        assert!(guard.is_paired());
+        assert!(
+            guard.pairing_code().is_none(),
+            "a bound token counts as paired; no unbound startup code may appear"
+        );
+    }
+
+    #[test]
+    async fn a_hash_listed_in_both_fields_loads_as_bound() {
+        let hash = hash_token("zc_both");
+        let guard = PairingGuard::from_gateway_config(&gateway_with(&[&hash], &[(&hash, "alice")]));
+        assert_eq!(
+            guard.subject_for_token("zc_both"),
+            Some(alice()),
+            "the binding must win; the shared operator is the wider subject"
+        );
+    }
+
+    #[test]
+    async fn malformed_binding_entries_are_skipped_not_widened() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &[],
+            &[
+                ("zc_plaintext_is_not_a_hash", "alice"),
+                (&hash_token("zc_bad_principal"), "not a valid id"),
+                (&hash_token("zc_empty_principal"), ""),
+            ],
+        ));
+        for token in [
+            "zc_plaintext_is_not_a_hash",
+            "zc_bad_principal",
+            "zc_empty_principal",
+        ] {
+            assert!(
+                !guard.token_is_paired(token),
+                "{token} must not authenticate at all"
+            );
+        }
+        assert!(guard.persisted_tokens().paired_tokens.is_empty());
+    }
+
+    /// A damaged binding must not leave the token behind as the shared
+    /// operator when `paired_tokens` lists the same token: that would widen
+    /// a roster user to full authority after a bad hand edit or restore.
+    #[test]
+    async fn a_malformed_binding_fails_closed_even_when_paired_tokens_lists_the_token() {
+        let hash = hash_token("zc_both");
+        for principal in ["not a valid id", ""] {
+            let guard =
+                PairingGuard::from_gateway_config(&gateway_with(&[&hash], &[(&hash, principal)]));
+            assert!(
+                !guard.token_is_paired("zc_both"),
+                "binding {principal:?}: the token must not authenticate at all"
+            );
+            assert!(!guard.is_authenticated("zc_both"));
+        }
+
+        // The same token as a legacy plaintext entry, bound under its
+        // plaintext instead of its hash.
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_plain"],
+            &[("zc_plain", "alice")],
+        ));
+        assert!(!guard.token_is_paired("zc_plain"));
+
+        // A plaintext binding key padded with whitespace, for a token that
+        // paired_tokens lists as legacy plaintext.
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_plain"],
+            &[(" zc_plain", "alice")],
+        ));
+        assert!(!guard.token_is_paired("zc_plain"));
+
+        // A binding key damaged only by stray whitespace or case.
+        for padded in [
+            format!(" {hash}"),
+            format!("{} ", hash.to_ascii_uppercase()),
+        ] {
+            let guard =
+                PairingGuard::from_gateway_config(&gateway_with(&[&hash], &[(&padded, "alice")]));
+            assert!(
+                !guard.token_is_paired("zc_both"),
+                "key {padded:?}: the token must not stay loaded as the shared operator"
+            );
+        }
+    }
+
+    /// Two spellings of one hash naming different principals leave no way to
+    /// know who the token belongs to, so neither binding loads.
+    #[test]
+    async fn conflicting_bindings_for_one_hash_fail_closed() {
+        let lower = hash_token("zc_split");
+        let upper = lower.to_ascii_uppercase();
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &[&lower],
+            &[(&lower, "alice"), (&upper, "bob")],
+        ));
+        assert!(!guard.token_is_paired("zc_split"));
+
+        let agreeing = PairingGuard::from_gateway_config(&gateway_with(
+            &[],
+            &[(&lower, "alice"), (&upper, "alice")],
+        ));
+        assert_eq!(
+            agreeing.subject_for_token("zc_split"),
+            Some(alice()),
+            "two spellings that agree are one binding"
+        );
+    }
+
+    #[test]
+    async fn binding_keys_are_matched_case_insensitively() {
+        let upper = hash_token("zc_upper").to_ascii_uppercase();
+        let guard = PairingGuard::from_gateway_config(&gateway_with(&[], &[(&upper, "alice")]));
+        assert_eq!(guard.subject_for_token("zc_upper"), Some(alice()));
+    }
+
+    #[test]
+    async fn legacy_membership_refuses_bound_tokens() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_shared"],
+            &[(&hash_token("zc_bound"), "alice")],
+        ));
+        assert!(guard.is_authenticated("zc_shared"));
+        assert!(
+            !guard.is_authenticated("zc_bound"),
+            "operator-authority routes must refuse a roster-bound token"
+        );
+        assert_eq!(guard.authenticate_and_hash("zc_bound"), None);
+        assert!(
+            guard.token_is_paired("zc_bound"),
+            "the strict check still sees the token as paired"
+        );
+        assert!(guard.token_hash_is_paired(&hash_token("zc_bound")));
+
+        let open = PairingGuard::from_gateway_config(&crate::schema::GatewayConfig {
+            require_pairing: false,
+            ..gateway_with(&[], &[(&hash_token("zc_bound"), "alice")])
+        });
+        assert!(
+            open.is_authenticated("zc_bound"),
+            "with pairing off the open posture is unchanged"
+        );
+    }
+
+    #[test]
+    async fn a_bound_code_pairs_a_token_with_its_subject() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .expect("pairing is required");
+        assert_eq!(guard.pending_pairing_code(), Some((code.clone(), alice())));
+
+        let token = guard
+            .try_pair(&code, "client")
+            .await
+            .expect("not locked out")
+            .expect("bound code pairs");
+        assert_eq!(guard.subject_for_token(&token), Some(alice()));
+        assert_eq!(guard.subject_for_hash(&hash_token(&token)), Some(alice()));
+        assert!(!guard.is_authenticated(&token));
+    }
+
+    #[test]
+    async fn a_reservation_carries_the_pending_subject() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .unwrap();
+        let reservation = guard
+            .reserve_pair(&code, "client")
+            .await
+            .unwrap()
+            .expect("code reserves");
+        assert_eq!(reservation.subject(), &alice());
+        let token = reservation.commit();
+        assert_eq!(guard.subject_for_token(&token), Some(alice()));
+    }
+
+    /// A failed issuance restores the code for a retry. It must come back
+    /// still bound: an unbound restore would let the next redemption pair as
+    /// the shared operator.
+    #[test]
+    async fn a_dropped_bound_reservation_restores_the_code_still_bound() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .unwrap();
+        {
+            let _reservation = guard
+                .reserve_pair(&code, "client")
+                .await
+                .unwrap()
+                .expect("code reserves");
+        }
+        assert_eq!(
+            guard.pending_pairing_code(),
+            Some((code.clone(), alice())),
+            "the restored code keeps its binding"
+        );
+        let token = guard.try_pair(&code, "client").await.unwrap().unwrap();
+        assert_eq!(guard.subject_for_token(&token), Some(alice()));
+    }
+
+    #[test]
+    async fn a_new_mint_replaces_the_pending_subject_both_ways() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let bound = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .unwrap();
+        let unbound = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .unwrap();
+        assert_eq!(
+            guard.pending_pairing_code(),
+            Some((unbound.clone(), PairedTokenSubject::SharedOperator))
+        );
+        assert!(
+            guard.try_pair(&bound, "client").await.unwrap().is_none(),
+            "the superseded bound code must not redeem"
+        );
+
+        let rebound = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .unwrap();
+        assert!(
+            guard.try_pair(&unbound, "client").await.unwrap().is_none(),
+            "the superseded unbound code must not redeem"
+        );
+        let token = guard.try_pair(&rebound, "client").await.unwrap().unwrap();
+        assert_eq!(guard.subject_for_token(&token), Some(alice()));
+    }
+
+    #[test]
+    async fn if_vacant_mint_binds_the_code() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_pairing_code_if_vacant_as(PairingCodePolicy::default(), alice())
+            .expect("slot is empty once paired");
+        assert_eq!(guard.pending_pairing_code(), Some((code, alice())));
+        assert_eq!(
+            guard
+                .generate_pairing_code_if_vacant_as(
+                    PairingCodePolicy::default(),
+                    PairedTokenSubject::SharedOperator
+                )
+                .unwrap_err(),
+            GeneratePairingCodeError::Pending,
+            "a pending bound code is not replaced by the vacant-only path"
+        );
+    }
+
+    #[test]
+    async fn persisted_tokens_keep_bound_tokens_out_of_paired_tokens() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_b_shared", "zc_a_shared"],
+            &[(&hash_token("zc_bound"), "alice")],
+        ));
+        let persisted = guard.persisted_tokens();
+        let mut expected_shared = vec![hash_token("zc_a_shared"), hash_token("zc_b_shared")];
+        expected_shared.sort_unstable();
+        assert_eq!(persisted.paired_tokens, expected_shared);
+        assert_eq!(
+            persisted.paired_token_users,
+            HashMap::from([(hash_token("zc_bound"), "alice".to_string())])
+        );
+        assert_eq!(guard.tokens().len(), 3, "tokens() lists every paired hash");
+    }
+
+    /// A restart rebuilds the guard from what was persisted: the round trip
+    /// must keep every token and every binding.
+    #[test]
+    async fn persisted_tokens_round_trip_through_a_rebuilt_guard() {
+        let guard = new_guard(true, &["zc_shared".into()]);
+        let code = guard
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), alice())
+            .unwrap();
+        let bound = guard.try_pair(&code, "client").await.unwrap().unwrap();
+
+        let persisted = guard.persisted_tokens();
+        let rebuilt = PairingGuard::from_gateway_config(&crate::schema::GatewayConfig {
+            paired_tokens: persisted.paired_tokens,
+            paired_token_users: persisted.paired_token_users,
+            ..crate::schema::GatewayConfig::default()
+        });
+        assert_eq!(rebuilt.subject_for_token(&bound), Some(alice()));
+        assert_eq!(
+            rebuilt.subject_for_token("zc_shared"),
+            Some(PairedTokenSubject::SharedOperator)
+        );
+    }
+
+    #[test]
+    async fn revoking_a_bound_token_drops_its_binding() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_shared"],
+            &[(&hash_token("zc_bound"), "alice")],
+        ));
+        assert_eq!(
+            guard.revoke_token_hash_subject(&hash_token("zc_bound")),
+            Some(alice()),
+            "revocation reports the subject it removed"
+        );
+        assert!(!guard.token_is_paired("zc_bound"));
+        assert!(guard.persisted_tokens().paired_token_users.is_empty());
+        assert_eq!(
+            guard.revoke_token_hash_subject(&hash_token("zc_bound")),
+            None,
+            "a second revocation finds nothing"
+        );
+        assert!(guard.token_is_paired("zc_shared"));
+    }
+
+    #[test]
+    async fn revoke_all_tokens_drops_bound_tokens_too() {
+        let guard = PairingGuard::from_gateway_config(&gateway_with(
+            &["zc_shared"],
+            &[(&hash_token("zc_bound"), "alice")],
+        ));
+        assert_eq!(guard.revoke_all_tokens(), 2);
+        assert_eq!(guard.persisted_tokens(), PersistedPairedTokens::default());
+    }
+
+    #[test]
+    async fn roster_subject_uses_the_durable_principal_id() {
+        let mut users = HashMap::new();
+        users.insert(
+            "alice-renamed".to_string(),
+            crate::schema::UserConfig {
+                principal_id: Some("alice".into()),
+                uid: Some(4242),
+                permission_profiles: vec!["reader".into()],
+            },
+        );
+        users.insert(
+            "bob".to_string(),
+            crate::schema::UserConfig {
+                principal_id: None,
+                uid: Some(4343),
+                permission_profiles: vec!["reader".into()],
+            },
+        );
+        assert_eq!(
+            PairedTokenSubject::for_roster_entry(&users, "alice-renamed"),
+            Some(alice()),
+            "a pinned principal_id wins over the entry name"
+        );
+        assert_eq!(
+            PairedTokenSubject::for_roster_entry(&users, "bob")
+                .as_ref()
+                .and_then(PairedTokenSubject::roster_principal_id),
+            Some("bob")
+        );
+        assert_eq!(PairedTokenSubject::for_roster_entry(&users, "carol"), None);
     }
 
     /// The one-active-code model is unchanged: minting replaces an unexpired

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
+use zeroclaw_config::pairing::{PairedTokenSubject, PairingCodePolicy, PairingGuard};
 
 use crate::security::cert_ledger::{CertLedger, CertStatus, IssuanceActor, LedgerEntry};
 
@@ -276,6 +276,18 @@ impl EnrollServer {
                 }
             }
         };
+        // A code the operator bound to a roster user pairs that user's bearer
+        // token at the gateway. Enrollment would spend it on a certificate and
+        // a token no client holds, so refuse it; dropping the reservation
+        // leaves the code redeemable, still bound.
+        if *pairing.subject() != PairedTokenSubject::SharedOperator {
+            return Err((
+                409,
+                "this pairing code is bound to a roster user; redeem it at the gateway's \
+                 /pair route, not for certificate enrollment"
+                    .to_string(),
+            ));
+        }
         let token_hash = pairing.token_hash();
 
         // 2. The daemon assigns the device identity (never the client/CSR): a
@@ -887,6 +899,41 @@ mod tests {
         let fps = server.ledger.list_active().unwrap();
         assert_eq!(fps.len(), 1);
         assert_eq!(fps[0].device_id, resp.device_id);
+    }
+
+    #[tokio::test]
+    async fn process_refuses_a_user_bound_code_and_keeps_it_redeemable() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing =
+            PairingGuard::new(true, &["zc_existing".into()], PairingCodePolicy::default());
+        let bound = PairedTokenSubject::RosterUser {
+            principal_id: "alice".into(),
+        };
+        let code = pairing
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), bound.clone())
+            .expect("pairing is required");
+        let guard = pairing.clone();
+        let server = test_server(pairing, None);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let req = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: csr,
+        };
+
+        let err = server
+            .process(&req, "1.2.3.4", PeerClass::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, 409);
+        assert!(
+            server.ledger.list_active().unwrap().is_empty(),
+            "no certificate may be issued for a user-bound code"
+        );
+        assert_eq!(
+            guard.pending_pairing_code(),
+            Some((code, bound)),
+            "the code stays redeemable, still bound"
+        );
     }
 
     #[tokio::test]
