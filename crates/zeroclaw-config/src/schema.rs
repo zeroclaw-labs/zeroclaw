@@ -531,8 +531,9 @@ pub struct Config {
     pub oidc: HashMap<String, OidcConfig>,
 
     /// Local user roster (`[users.<name>]`) for credential-to-principal
-    /// mapping of local auth providers (peer credentials today). OIDC
-    /// identities are NOT listed here; they are keyed by issuer + subject.
+    /// mapping of local auth providers (peer credentials and passwords).
+    /// OIDC identities are NOT listed here; they are keyed by issuer +
+    /// subject.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub users: HashMap<String, UserConfig>,
@@ -14342,9 +14343,10 @@ impl OidcConfig {
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
-/// providers (peer credentials today; SSH keys and passwords are
-/// separately tracked extensions).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// providers: peer credentials and passwords (SSH keys are a separately
+/// tracked extension). Every credential an entry carries resolves to the
+/// same principal.
+#[derive(Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "user"]
 #[serde(default)]
@@ -14358,13 +14360,37 @@ pub struct UserConfig {
     /// new principal.
     pub principal_id: Option<String>,
     /// Unix uid accepted for this user over the local socket (peer
-    /// credential). Required today: it is the only roster credential the
-    /// accepted provider set supports.
+    /// credential). An entry needs at least one credential: this uid, a
+    /// `password_hash`, or both.
     pub uid: Option<u32>,
+    /// Hash of this user's password, as a scrypt PHC string
+    /// (`$scrypt$ln=<log2 N>,r=8,p=<p>$<salt>$<hash>`); never the password
+    /// itself. A value that is not such a hash, or whose cost falls outside
+    /// the accepted bounds, fails validation. The `password` auth provider
+    /// checks it only while `security.password_auth.enabled` is on.
+    /// Encrypted at rest.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub password_hash: Option<String>,
     /// The `[permission_profiles.<alias>]` entries granting this user's
     /// permissions, merged by deterministic union. Required; a user with
     /// no profile cannot authenticate.
     pub permission_profiles: Vec<String>,
+}
+
+impl std::fmt::Debug for UserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserConfig")
+            .field("principal_id", &self.principal_id)
+            .field("uid", &self.uid)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("permission_profiles", &self.permission_profiles)
+            .finish()
+    }
 }
 
 impl UserConfig {
@@ -14393,11 +14419,21 @@ impl UserConfig {
                 "users.{name}.principal_id {id:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
             );
         }
-        if self.uid.is_none() {
-            anyhow::bail!(
-                "users.{name}.uid is required: the peer-credential provider is the only \
-                 supported roster credential today, and an entry with no credential can \
-                 never authenticate"
+        if self.uid.is_none() && self.password_hash.is_none() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("users.{name}"),
+                "users.{name} has no credential: set uid (a local peer credential), \
+                 password_hash, or both; an entry with no credential can never authenticate",
+            );
+        }
+        if let Some(hash) = &self.password_hash
+            && let Err(reason) = crate::password_hash::validate_phc(hash)
+        {
+            validation_bail!(
+                InvalidFormat,
+                format!("users.{name}.password_hash"),
+                "users.{name}.password_hash {reason}",
             );
         }
         if self.permission_profiles.iter().all(|p| p.trim().is_empty()) {
@@ -19392,6 +19428,13 @@ pub struct SecurityConfig {
     /// `[users.<name>].uid` or present a credential.
     #[serde(default = "default_true")]
     pub trust_daemon_uid: bool,
+
+    /// Local password verification against `[users.<name>].password_hash`.
+    /// See `[security.password_auth]`.
+    #[serde(default)]
+    #[nested]
+    pub password_auth: PasswordAuthConfig,
+
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -19448,6 +19491,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             trust_daemon_uid: default_true(),
+            password_auth: PasswordAuthConfig::default(),
             audit: AuditConfig::default(),
             leak_detection: LeakDetectionConfig::default(),
             otp: OtpConfig::default(),
@@ -19518,6 +19562,23 @@ impl Default for LeakDetectionConfig {
             high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
         }
     }
+}
+
+/// Local password verification (`[security.password_auth]`).
+///
+/// Off by default. While it is off, `[users.<name>].password_hash` values
+/// are still validated, but no auth provider accepts a password.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.password_auth"]
+#[serde(default)]
+pub struct PasswordAuthConfig {
+    /// Register the `password` auth provider, which checks a roster
+    /// entry's name and password against its `password_hash`. Requires
+    /// `gateway.require_pairing`: the provider stays unregistered while
+    /// pairing is off. Default: false.
+    #[credential_class = "public_value"]
+    pub enabled: bool,
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
@@ -24323,6 +24384,18 @@ impl Config {
                 ValidationFailed,
                 "wss.enabled",
                 "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
+        }
+
+        // With pairing off the gateway serves requests that present no
+        // credential at all, so a password could never be what grants
+        // access there; an operator enabling it would believe the dashboard
+        // is protected when it is not.
+        if self.security.password_auth.enabled && !self.gateway.require_pairing {
+            validation_bail!(
+                ValidationFailed,
+                "security.password_auth.enabled",
+                "security.password_auth.enabled requires gateway.require_pairing: with pairing off the gateway accepts requests that carry no credential, so a password would protect nothing",
             );
         }
 
@@ -29494,12 +29567,84 @@ mod tests {
         );
     }
 
+    /// A PHC string inside the password policy, with filler salt and output.
+    /// Validation never hashes, so it needs no real password.
+    const POLICY_SHAPED_HASH: &str = "$scrypt$ln=15,r=8,p=3$BwcHBwcHBwcHBwcHBwcHBw$\
+                                      CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+
     #[::core::prelude::v1::test]
-    fn users_without_uid_fail_closed_at_load() {
+    fn users_without_any_credential_fail_closed_at_load() {
         let mut config = auth_config();
         config.users.get_mut("alice").unwrap().uid = None;
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("users.alice.uid"), "got: {err}");
+        let err = config.validate().unwrap_err();
+        let api_err = crate::api_error::ConfigApiError::from_validation(err);
+        assert_eq!(api_err.path.as_deref(), Some("users.alice"));
+        assert!(api_err.message.contains("no credential"), "got: {api_err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_with_only_a_password_hash_are_valid() {
+        let mut config = auth_config();
+        let user = config.users.get_mut("alice").unwrap();
+        user.uid = None;
+        user.password_hash = Some(POLICY_SHAPED_HASH.to_string());
+        config
+            .validate()
+            .expect("a password hash is a credential on its own");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_password_hash_outside_the_policy_fails_without_echoing_it() {
+        for value in [
+            "zeroclaw-plain-password",
+            "$scrypt$ln=15,r=8,p=1$BwcHBwcHBwcHBwcHBwcHBw$CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk",
+        ] {
+            let mut config = auth_config();
+            config.users.get_mut("alice").unwrap().password_hash = Some(value.to_string());
+            let err = config.validate().unwrap_err();
+            let api_err = crate::api_error::ConfigApiError::from_validation(err);
+            assert_eq!(
+                api_err.path.as_deref(),
+                Some("users.alice.password_hash"),
+                "{value}"
+            );
+            assert!(!api_err.message.contains(value), "echoed: {api_err}");
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn password_auth_is_off_by_default_via_both_paths() {
+        assert!(!SecurityConfig::default().password_auth.enabled);
+        let parsed: Config = toml::from_str("[security]\n").unwrap();
+        assert!(!parsed.security.password_auth.enabled);
+        let parsed: Config = toml::from_str("[security.password_auth]\nenabled = true\n").unwrap();
+        assert!(parsed.security.password_auth.enabled);
+    }
+
+    #[::core::prelude::v1::test]
+    fn password_auth_requires_pairing() {
+        let mut config = auth_config();
+        config.security.password_auth.enabled = true;
+        config
+            .validate()
+            .expect("pairing is on by default, so enabling is valid");
+
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err();
+        let api_err = crate::api_error::ConfigApiError::from_validation(err);
+        assert_eq!(
+            api_err.path.as_deref(),
+            Some("security.password_auth.enabled")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn user_debug_redacts_password_hash() {
+        let mut config = auth_config();
+        config.users.get_mut("alice").unwrap().password_hash = Some(POLICY_SHAPED_HASH.to_string());
+        let dbg = format!("{:?}", config.users["alice"]);
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        assert!(!dbg.contains("CQkJ"), "{dbg}");
     }
 
     #[::core::prelude::v1::test]
@@ -29531,6 +29676,7 @@ mod tests {
             UserConfig {
                 principal_id: Some("alice".to_string()),
                 uid: Some(2000),
+                password_hash: None,
                 permission_profiles: vec!["operator".to_string()],
             },
         );
@@ -45164,8 +45310,15 @@ allowed_users = []
             .storage
             .qdrant
             .insert("default".into(), QdrantStorageConfig::default());
+        config.users.insert("default".into(), UserConfig::default());
 
         let fields = config.prop_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "users.default.password_hash"),
+            "the roster fixture must reach the classification check"
+        );
         let missing: Vec<_> = fields
             .iter()
             .filter(|field| credential_shaped_prop_path(&field.name))
