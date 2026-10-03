@@ -12930,7 +12930,7 @@ pub(crate) mod connection_test_support {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use zeroclaw_api::model_provider::ChatMessage;
 
     struct SessionFactoryStubChannel;
@@ -14285,7 +14285,7 @@ mod tests {
         config
     }
 
-    fn local_peer(
+    pub(crate) fn local_peer(
         ctx: &Arc<RpcContext>,
         uid: u32,
     ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
@@ -14300,7 +14300,7 @@ mod tests {
 
     /// A connection bound as the daemon's own uid through the real
     /// handshake: the trusted local operator that edits policy.
-    async fn local_operator(
+    pub(crate) async fn local_operator(
         ctx: &Arc<RpcContext>,
     ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
         let (mut dispatcher, rx) = local_peer(
@@ -14314,7 +14314,7 @@ mod tests {
         (dispatcher, rx)
     }
 
-    async fn roster_peer(
+    pub(crate) async fn roster_peer(
         ctx: &Arc<RpcContext>,
         uid: u32,
     ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
@@ -14864,7 +14864,7 @@ mod tests {
     /// The roster closes the legacy local path, so a dispatcher stamped with
     /// `set_authenticated_for_test` does not revalidate against this config;
     /// bind principals here through `roster_peer` or `local_operator`.
-    fn session_cwd_config(
+    pub(crate) fn session_cwd_config(
         tmp: &tempfile::TempDir,
         uid: u32,
         extra_allowed_root: Option<std::path::PathBuf>,
@@ -15259,7 +15259,7 @@ mod tests {
 
     /// A persistence-backed context (chat backend and ACP store in the
     /// config's data dir) for principals bound through the real handshake.
-    fn persistence_enforcement_ctx(
+    pub(crate) fn persistence_enforcement_ctx(
         config: zeroclaw_config::schema::Config,
     ) -> (
         Arc<RpcContext>,
@@ -15286,7 +15286,7 @@ mod tests {
 
     /// Republish the accepted policy with alice entitled to no agent, keeping
     /// her session grants so a refusal is the agent selector's.
-    fn narrow_alice_to_no_agents(ctx: &Arc<RpcContext>) {
+    pub(crate) fn narrow_alice_to_no_agents(ctx: &Arc<RpcContext>) {
         let mut narrowed = ctx.config.read().clone();
         narrowed
             .permission_profiles
@@ -15301,7 +15301,7 @@ mod tests {
 
     /// Republish the accepted policy for a reason unrelated to alice, so her
     /// stamped generation goes stale while her authority stays the same.
-    fn republish_an_unrelated_profile(ctx: &Arc<RpcContext>) {
+    pub(crate) fn republish_an_unrelated_profile(ctx: &Arc<RpcContext>) {
         let mut republished = ctx.config.read().clone();
         republished.permission_profiles.insert(
             "unrelated-reader".into(),
@@ -15420,7 +15420,7 @@ mod tests {
         );
     }
 
-    fn gated_provider() -> (
+    pub(crate) fn gated_provider() -> (
         GatedProvider,
         tokio::sync::mpsc::UnboundedReceiver<()>,
         tokio::sync::oneshot::Sender<()>,
@@ -15441,7 +15441,7 @@ mod tests {
     /// config and publish it as an accepted revision. `refresh_from_config` is
     /// the direct path; this is the chain a real mutation travels, so a prompt
     /// admitted before it must still see the narrowing.
-    fn narrow_alice_to_no_agents_via_publication(ctx: &Arc<RpcContext>) {
+    pub(crate) fn narrow_alice_to_no_agents_via_publication(ctx: &Arc<RpcContext>) {
         let mut narrowed = ctx.config.read().clone();
         narrowed
             .permission_profiles
@@ -39715,7 +39715,7 @@ mod tests {
     /// is invoked, then blocks until the test releases it on `release`. Lets
     /// a test observe state that is only true while a turn is in flight,
     /// without racing a sleep against the agent loop.
-    struct GatedProvider {
+    pub(crate) struct GatedProvider {
         started: tokio::sync::mpsc::UnboundedSender<()>,
         release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
@@ -40127,7 +40127,7 @@ mod tests {
     /// invisible to it, and the test would exercise the ownership denial
     /// instead of whatever it meant to check.
     #[allow(clippy::too_many_arguments)]
-    async fn install_state_test_session_owned_at(
+    pub(crate) async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
         sid: &str,

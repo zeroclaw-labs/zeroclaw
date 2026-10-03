@@ -32,3 +32,6 @@ mod auth_boundary;
 
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;
+
+#[path = "architecture/authority_effects.rs"]
+mod authority_effects;
