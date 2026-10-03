@@ -811,6 +811,94 @@ where
     anyhow::bail!("{}", human.into())
 }
 
+/// Rows across the keyed list sections (`plugins.entries`, `mcp.servers`,
+/// ...). `config patch` creates a missing row; the daemon's property writes
+/// never do.
+#[cfg(feature = "agent-runtime")]
+fn keyed_list_rows(config: &Config) -> usize {
+    Config::map_key_sections()
+        .into_iter()
+        .filter(|section| {
+            section.kind == zeroclaw_config::traits::MapKeyKind::List
+                && section.natural_key.is_some()
+        })
+        .filter_map(|section| config.get_map_keys(section.path))
+        .map(|keys| keys.len())
+        .sum()
+}
+
+/// Whether the daemon's config methods take the write of `value` to `path`
+/// that the CLI staged on `config`. They refuse to overwrite a secret with an
+/// empty or masked value, which the CLI's own write allows; the field info is
+/// looked up the way the daemon looks it up.
+#[cfg(feature = "agent-runtime")]
+fn daemon_replays_write(config: &Config, path: &str, value: &str) -> bool {
+    let info = config.prop_fields().into_iter().find(|f| f.name == path);
+    !zeroclaw_runtime::rpc::dispatch::refuses_secret_placeholder(info.as_ref(), path, value)
+}
+
+/// Whether the daemon can commit a `config patch` as one `config/set-many`
+/// batch: every staged write is one it can replay, and the batch is neither
+/// empty nor over its cap. The CLI saves any other patch itself.
+#[cfg(feature = "agent-runtime")]
+fn patch_batch_is_delegatable(entries: usize, replayable: bool) -> bool {
+    replayable
+        && (1..=zeroclaw_runtime::rpc::dispatch::RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES)
+            .contains(&entries)
+}
+
+/// The API error for an authorization edit that failed a `config patch`, in
+/// the daemon or before a local save: a rejection as invalid params, a
+/// refusal of the principal the daemon bound, or a policy that would not
+/// compile, is a validation verdict (no code names a permission denial, and
+/// a refusal is a verdict on this edit, not a server fault); a `test` op the
+/// running daemon's live configuration could not be checked against is an
+/// unsupported op on its path; any other rejection, and an edit whose outcome
+/// is unknown (which names the property to check), is internal.
+#[cfg(feature = "agent-runtime")]
+fn daemon_commit_api_error(err: &anyhow::Error) -> ConfigApiError {
+    use config_publication::CommitFailure;
+    #[cfg(unix)]
+    use zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS;
+
+    let message = err.to_string();
+    match err.downcast_ref::<CommitFailure>() {
+        #[cfg(unix)]
+        Some(CommitFailure::Rejected { code, .. }) if *code == i64::from(INVALID_PARAMS) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        #[cfg(unix)]
+        Some(CommitFailure::Forbidden { .. }) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        Some(CommitFailure::PolicyWouldNotCompile { .. }) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        Some(CommitFailure::UncheckableTest { path }) => {
+            ConfigApiError::new(ConfigApiCode::OpNotSupported, message).with_path(path)
+        }
+        #[cfg(unix)]
+        Some(CommitFailure::Unknown { path }) => {
+            ConfigApiError::new(ConfigApiCode::InternalError, message).with_path(path)
+        }
+        _ => ConfigApiError::new(ConfigApiCode::InternalError, message),
+    }
+}
+
+/// `envelope` with a `daemon` member saying what the running daemon did with
+/// an authorization edit, or unchanged when the daemon had no part in it.
+#[cfg(feature = "agent-runtime")]
+fn with_daemon_member(
+    mut envelope: serde_json::Value,
+    publication: &config_publication::Publication,
+) -> serde_json::Value {
+    if let (Some(members), Some(daemon)) = (envelope.as_object_mut(), publication.envelope_field())
+    {
+        members.insert("daemon".to_owned(), daemon);
+    }
+    envelope
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s
         .parse()
@@ -899,11 +987,15 @@ mod rag {
 mod browse;
 mod config;
 #[cfg(feature = "agent-runtime")]
+mod config_publication;
+#[cfg(feature = "agent-runtime")]
 mod cost;
 #[cfg(feature = "agent-runtime")]
 mod cron;
 #[cfg(feature = "agent-runtime")]
 mod daemon;
+#[cfg(feature = "agent-runtime")]
+mod daemon_rpc;
 #[cfg(feature = "agent-runtime")]
 mod doctor;
 #[cfg(feature = "gateway")]
@@ -9403,6 +9495,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
+                // Taken before the map key is materialized: an edit that
+                // creates a roster or OIDC entry then counts as an
+                // authorization edit, and whether the policy compiled is
+                // judged without the entry's empty defaults.
+                let mut before = config_publication::AuthSnapshot::capture(&config)?;
                 if ensure_map_key_for_prop_path(&mut config, &path)? {
                     let known_paths: Vec<String> =
                         config.prop_fields().into_iter().map(|f| f.name).collect();
@@ -9550,7 +9647,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 };
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership =
+                let offline_ownership =
                     if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
                         match crate::alias_cli::route_agent_mutation(
                             &mut config,
@@ -9580,6 +9677,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 return Ok(());
                             }
                             crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                // The route reloaded `config` from disk once it
+                                // held ownership, so the snapshot is retaken from
+                                // that config before the edit is staged on it again.
+                                before = config_publication::AuthSnapshot::capture(&config)?;
                                 Some(ownership)
                             }
                         }
@@ -9594,8 +9695,45 @@ Add pricing to the active provider profile or supply a catalog entry."
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
                 config.set_prop_persistent(&path, &selected_value)?;
-                Box::pin(config.save_dirty()).await?;
-                if let Some(c) = comment.as_ref()
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
+                let publication = if daemon_replays_write(&config, &path, &selected_value) {
+                    let publication = Box::pin(config_publication::commit_set(
+                        &before,
+                        &config,
+                        &path,
+                        &selected_value,
+                        comment.as_deref(),
+                        holds_config_ownership,
+                    ))
+                    .await?;
+                    // A daemon that applied the edit has already saved
+                    // config.toml.
+                    if !matches!(publication, config_publication::Publication::Applied) {
+                        Box::pin(config.save_dirty()).await?;
+                    }
+                    publication
+                } else {
+                    // Classified before the save: while a daemon runs, an
+                    // edit that breaks a policy that compiles saves nothing.
+                    let publication = config_publication::classify_local_save(
+                        &before,
+                        &config,
+                        std::slice::from_ref(&path),
+                        config_publication::PendingReason::NotReplayable,
+                        true,
+                        holds_config_ownership,
+                    )?;
+                    Box::pin(config.save_dirty()).await?;
+                    publication
+                };
+                // Reported before the comment is written: the edit's outcome is
+                // settled, and a failed annotation must not hide it.
+                publication.report(json);
+                // A daemon that applied the edit wrote the comment with it.
+                if !matches!(publication, config_publication::Publication::Applied)
+                    && let Some(c) = comment.as_ref()
                     && !c.is_empty()
                 {
                     apply_comment_inline(&config.config_path, &path, c).await?;
@@ -9607,6 +9745,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let value_str = config.get_prop(&path).unwrap_or_default();
                         serde_json::json!({"path": path, "value": value_str})
                     };
+                    let envelope = with_daemon_member(envelope, &publication);
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else {
                     println!(
@@ -9618,7 +9757,7 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             ConfigCommands::Init { section, json } => {
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if let Some(("agents", alias)) = section
+                let offline_ownership = if let Some(("agents", alias)) = section
                     .as_deref()
                     .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
                 {
@@ -9672,6 +9811,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     None
                 };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                let before = config_publication::AuthSnapshot::capture(&config)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
@@ -9689,11 +9829,29 @@ Add pricing to the active provider profile or supply a catalog entry."
                     mark_new_map_alias_dirty(&mut config, &created);
                     initialized.push(created);
                 }
+                // `config init` has no daemon path for a roster, profile or
+                // OIDC entry: one it creates waits for the running daemon's
+                // next reload. It is classified before the save, so while a
+                // daemon runs an entry that breaks a policy that compiles
+                // saves nothing. An offline agent route already holds the
+                // configuration's ownership lock.
+                let publication = config_publication::classify_local_save(
+                    &before,
+                    &config,
+                    &initialized,
+                    config_publication::PendingReason::OfflineCommand,
+                    true,
+                    offline_ownership.is_some(),
+                )?;
                 if !initialized.is_empty() {
                     Box::pin(config.save_dirty()).await?;
                 }
+                publication.report(json);
                 if json {
-                    let envelope = serde_json::json!({"initialized": initialized});
+                    let envelope = with_daemon_member(
+                        serde_json::json!({"initialized": initialized}),
+                        &publication,
+                    );
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else if initialized.is_empty() {
                     println!(
@@ -9866,7 +10024,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if ops.iter().any(|op| {
+                let offline_ownership = if ops.iter().any(|op| {
                     let op_name = op.get("op").and_then(|value| value.as_str());
                     let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
                         path.strip_prefix('/')
@@ -9894,8 +10052,22 @@ Add pricing to the active provider profile or supply a catalog entry."
                 };
 
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                // Taken before any op is staged, so an op that creates a roster,
+                // profile or OIDC entry counts as an authorization edit.
+                let before = config_publication::AuthSnapshot::capture(&config)?;
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
+                // The staged writes in order, which the daemon replays as one
+                // `config/set-many` batch when the patch writes or changes the
+                // authorization inputs. A patch it cannot replay (one that
+                // clears or masks a secret or creates a keyed list row) is
+                // saved here instead.
+                let mut sets: Vec<(String, String)> = Vec::with_capacity(ops.len());
+                let mut replayable = true;
+                // The properties the patch's `test` ops checked, on this copy
+                // of config.toml. A daemon that commits the batch applies its
+                // writes to its live configuration instead.
+                let mut tested: Vec<String> = Vec::new();
 
                 for (idx, op) in ops.iter().enumerate() {
                     let object = match op.as_object() {
@@ -9941,6 +10113,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     } else {
                         raw_path.to_string()
                     };
+                    let list_rows = keyed_list_rows(&config);
                     if matches!(op_name, "add" | "replace")
                         && config.ensure_map_or_list_key_for_path(&path)
                     {
@@ -9955,6 +10128,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         );
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
+                    replayable &= keyed_list_rows(&config) == list_rows;
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -10019,6 +10193,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     config_patch_fail_json_or_human(json, api_err, human)?;
                                 }
                             }
+                            sets.push((path.clone(), value_str.clone()));
+                            replayable &= daemon_replays_write(&config, &path, &value_str);
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -10045,6 +10221,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     config_patch_fail_json_or_human(json, api_err, human)?;
                                 }
                             }
+                            // The daemon reads an empty value as a reset to the
+                            // default, the same as the write above.
+                            sets.push((path.clone(), String::new()));
+                            replayable &= daemon_replays_write(&config, &path, "");
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -10122,6 +10302,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 );
                                 config_patch_fail_json_or_human(json, err, human)?;
                             }
+                            tested.push(path.clone());
                             serde_json::json!({
                                 "op": "test",
                                 "path": path,
@@ -10160,7 +10341,59 @@ Add pricing to the active provider profile or supply a catalog entry."
                     );
                     config_patch_fail_json_or_human(json, api_err, human)?;
                 }
-                Box::pin(config.save_dirty()).await?;
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
+                let publication = if patch_batch_is_delegatable(sets.len(), replayable) {
+                    let publication = match Box::pin(config_publication::commit_set_many(
+                        &before,
+                        &config,
+                        &sets,
+                        &tested,
+                        holds_config_ownership,
+                    ))
+                    .await
+                    {
+                        Ok(publication) => publication,
+                        // The daemon's verdict, or a `test` op that cannot be
+                        // checked where the daemon would apply the batch,
+                        // fails the whole patch, in the same envelope its
+                        // other failures use.
+                        Err(err) => config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?,
+                    };
+                    // A daemon that applied the batch has already saved
+                    // config.toml.
+                    if !matches!(publication, config_publication::Publication::Applied) {
+                        Box::pin(config.save_dirty()).await?;
+                    }
+                    publication
+                } else {
+                    let touched: Vec<String> = sets.iter().map(|(path, _)| path.clone()).collect();
+                    // Classified before the save: while a daemon runs, a patch
+                    // that breaks a policy that compiles fails whole, in the
+                    // envelope the delegated branch's verdict uses.
+                    let publication = match config_publication::classify_local_save(
+                        &before,
+                        &config,
+                        &touched,
+                        config_publication::PendingReason::NotReplayable,
+                        false,
+                        holds_config_ownership,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(err) => config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?,
+                    };
+                    Box::pin(config.save_dirty()).await?;
+                    publication
+                };
 
                 // Report the withheld tool when this patch is what enabled the
                 // section. The helper returns early while it stays disabled, so
@@ -10174,8 +10407,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     warn_verifiable_intent_withheld(&config);
                 }
 
+                publication.report(json);
                 if json {
-                    let body = serde_json::json!({"saved": true, "results": results});
+                    let body = with_daemon_member(
+                        serde_json::json!({"saved": true, "results": results}),
+                        &publication,
+                    );
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 } else {
                     println!(
@@ -16541,6 +16778,169 @@ mod tests {
                 .bot_token
                 .as_str(),
             "test-token"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_keeps_clearing_a_secret_off_the_daemon() {
+        let mut config = Config::default();
+        assert!(
+            !config.ensure_map_key_for_path("oidc.corp.client_secret"),
+            "an OIDC entry is not a reserved alias"
+        );
+        for masked in ["", zeroclaw_config::traits::MASKED_SECRET, "****"] {
+            assert!(
+                !daemon_replays_write(&config, "oidc.corp.client_secret", masked),
+                "the daemon refuses to overwrite a secret with {masked:?}"
+            );
+        }
+        assert!(daemon_replays_write(
+            &config,
+            "oidc.corp.client_secret",
+            "rotated"
+        ));
+        assert!(
+            daemon_replays_write(&config, "users.me.permission_profiles", ""),
+            "an empty value resets a plain field on both sides"
+        );
+        assert!(
+            daemon_replays_write(&config, "oidc.corp.issuer", "****"),
+            "only a secret refuses a masked-looking value"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_reports_a_daemon_verdict_with_the_matching_api_error() {
+        #[cfg(unix)]
+        {
+            use zeroclaw_api::jsonrpc::error_codes::{INTERNAL_ERROR, INVALID_PARAMS};
+
+            let rejected = |code: i32| -> anyhow::Error {
+                config_publication::CommitFailure::Rejected {
+                    message: "users.bob.permission_profiles is required".into(),
+                    code: i64::from(code),
+                    suggest_patch: false,
+                }
+                .into()
+            };
+            let invalid = daemon_commit_api_error(&rejected(INVALID_PARAMS));
+            assert_eq!(invalid.code, ConfigApiCode::ValidationFailed);
+            assert!(
+                invalid
+                    .message
+                    .contains("users.bob.permission_profiles is required"),
+                "{}",
+                invalid.message
+            );
+            assert_eq!(invalid.path, None);
+            assert_eq!(
+                daemon_commit_api_error(&rejected(INTERNAL_ERROR)).code,
+                ConfigApiCode::InternalError,
+                "a rejection for another reason than the edit's validity is internal"
+            );
+
+            let unknown: anyhow::Error = config_publication::CommitFailure::Unknown {
+                path: "users.bob.uid".into(),
+            }
+            .into();
+            let unknown = daemon_commit_api_error(&unknown);
+            assert_eq!(unknown.code, ConfigApiCode::InternalError);
+            assert_eq!(
+                unknown.path.as_deref(),
+                Some("users.bob.uid"),
+                "an unknown outcome names the property to check"
+            );
+
+            let forbidden: anyhow::Error = config_publication::CommitFailure::Forbidden {
+                message: "Principal is not granted config:update".into(),
+            }
+            .into();
+            let forbidden = daemon_commit_api_error(&forbidden);
+            assert_eq!(
+                forbidden.code,
+                ConfigApiCode::ValidationFailed,
+                "a refusal of the bound principal is a verdict on the edit, not a server fault"
+            );
+            assert!(
+                forbidden
+                    .message
+                    .contains("Principal is not granted config:update"),
+                "{}",
+                forbidden.message
+            );
+        }
+
+        let uncheckable: anyhow::Error = config_publication::CommitFailure::UncheckableTest {
+            path: "users.bob.permission_profiles".into(),
+        }
+        .into();
+        let uncheckable = daemon_commit_api_error(&uncheckable);
+        assert_eq!(uncheckable.code, ConfigApiCode::OpNotSupported);
+        assert_eq!(
+            uncheckable.path.as_deref(),
+            Some("users.bob.permission_profiles"),
+            "the error names the `test` op's property"
+        );
+
+        let uncompilable: anyhow::Error =
+            config_publication::CommitFailure::PolicyWouldNotCompile {
+                error: "users.bob.permission_profiles is required".into(),
+                suggest_patch: false,
+            }
+            .into();
+        assert_eq!(
+            daemon_commit_api_error(&uncompilable).code,
+            ConfigApiCode::ValidationFailed
+        );
+        assert_eq!(
+            daemon_commit_api_error(&anyhow::Error::msg("encoding failed")).code,
+            ConfigApiCode::InternalError
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_delegates_only_batches_the_daemon_can_replay() {
+        let cap = zeroclaw_runtime::rpc::dispatch::RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES;
+        assert!(patch_batch_is_delegatable(1, true));
+        assert!(patch_batch_is_delegatable(cap, true));
+        assert!(
+            !patch_batch_is_delegatable(0, true),
+            "the daemon refuses an empty batch"
+        );
+        assert!(
+            !patch_batch_is_delegatable(cap + 1, true),
+            "the daemon refuses a batch over its cap"
+        );
+        assert!(
+            !patch_batch_is_delegatable(1, false),
+            "a write the daemon cannot replay keeps the whole patch local"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_counts_only_the_keyed_list_rows_it_creates() {
+        let mut config = Config::default();
+        let rows = keyed_list_rows(&config);
+
+        assert!(!config.ensure_map_or_list_key_for_path("users.alice.uid"));
+        assert_eq!(
+            keyed_list_rows(&config),
+            rows,
+            "a roster entry is a map key, which the daemon creates too"
+        );
+
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        assert!(
+            !config.ensure_map_or_list_key_for_path(&format!("plugins.entries.{key}.egress_hosts"))
+        );
+        assert_eq!(
+            keyed_list_rows(&config),
+            rows + 1,
+            "a plugin row is a keyed list row, which only the CLI creates"
         );
     }
 
