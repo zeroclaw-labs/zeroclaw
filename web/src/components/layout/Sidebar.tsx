@@ -419,6 +419,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         loading={loading}
         checkUpdatesEnabled={checkUpdates}
         allowSelfUpgrade={status?.allow_self_upgrade === true}
+        desktopBundled={status?.desktop_bundled === true}
         restartMode={status?.restart_mode}
         restartHint={status?.restart_hint}
         onRefetch={refetch}
