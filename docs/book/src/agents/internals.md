@@ -5,7 +5,7 @@ section: how the runtime enforces per-agent permissions, scopes memory, and
 attributes logs. For configuring and running agents, start at
 [Agents](./overview.md); for the schema-level field reference, see
 [Config](../reference/config.md); for live setup steps, see
-[Multi-agent setup](../contributing/multi-agent-setup.md).
+[Multi-agent setup](./multi-agent-setup.md).
 
 ## Permissions model
 
@@ -42,7 +42,7 @@ Both operations make the config change durable before running owned-state side e
 
 The post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. Rename warnings call for retrying the same gateway API rename to converge residue left under the old alias. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
 
-See [Multi-agent setup walkthrough](../contributing/multi-agent-setup.md#rename-an-agent) for the current controls, blockers, archive layout, and operator checks.
+See [Multi-agent setup walkthrough](./multi-agent-setup.md#rename-an-agent) for the current controls, blockers, archive layout, and operator checks.
 
 ## Not supported today
 
