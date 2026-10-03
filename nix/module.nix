@@ -31,12 +31,23 @@
 #   services.zeroclaw.instances.me = {
 #     environmentFile = "/run/agenix/zeroclaw-bot-token";
 #     settings = {
-#       default_provider = "anthropic";
-#       default_model = "claude-sonnet-4-6";
-#       channels.telegram = {
+#       schema_version = 4;   # always set it; see the `settings` option
+#       providers.models.anthropic.default.model = "claude-sonnet-4-6";
+#       agents.default = {
+#         model_provider = "anthropic.default";
+#         risk_profile = "default";
+#         runtime_profile = "default";
+#       };
+#       risk_profiles.default = { };
+#       runtime_profiles.default = { };
+#       channels.telegram.default = {
 #         enabled = true;
 #         bot_token = "$BOT_TOKEN";   # systemd $VAR — substituted at load
-#         allowed_users = [ "12345" ];
+#       };
+#       peer_groups.telegram_default = {
+#         channel = "telegram";
+#         agents = [ "default" ];
+#         external_peers = [ "12345" ];
 #       };
 #     };
 #   };
@@ -167,17 +178,34 @@ let
           default = { };
           example = literalExpression ''
             {
-              default_provider = "anthropic";
-              default_model = "claude-sonnet-4-6";
-              channels.telegram = {
+              schema_version = 4;
+              providers.models.anthropic.default.model = "claude-sonnet-4-6";
+              agents.default = {
+                model_provider = "anthropic.default";
+                risk_profile = "default";
+                runtime_profile = "default";
+              };
+              risk_profiles.default = { };
+              runtime_profiles.default = { };
+              channels.telegram.default = {
                 enabled = true;
                 bot_token = "$BOT_TOKEN";
-                allowed_users = [ "12345" ];
+              };
+              peer_groups.telegram_default = {
+                channel = "telegram";
+                agents = [ "default" ];
+                external_peers = [ "12345" ];
               };
             }
           '';
           description = ''
-            ZeroClaw configuration as a Nix attrset. Rendered to TOML in the
+            ZeroClaw configuration as a Nix attrset. Set `schema_version` to
+            the version the attrset is written for (`3` for the current
+            shape). The module renders the attrset as written and does not add
+            it: a file without it is read as the oldest schema and migrated,
+            unless its sections are plainly in the current shape.
+
+            Rendered to TOML in the
             Nix store at build time, then `envsubst`'d into
             `''${dataDir}/config.toml` (mode `0600`) by the unit's
             `ExecStartPre`.

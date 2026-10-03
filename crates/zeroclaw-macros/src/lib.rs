@@ -2952,7 +2952,7 @@ mod tests {
         // must not be enumerated as a settable property.
         let field: syn::Field = parse_quote! {
             #[serde(default, skip_serializing, deserialize_with = "f")]
-            pub nevis: Option<serde_json::Value>
+            pub retired: Option<serde_json::Value>
         };
         assert!(has_serde_skip(&field));
 

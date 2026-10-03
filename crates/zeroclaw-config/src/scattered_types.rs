@@ -340,9 +340,6 @@ pub struct ContextCompressionConfig {
     /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
-    /// DEPRECATED bare model id retained as a compatibility fallback.
-    #[serde(default)]
-    pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
     pub identifier_policy: String,
     #[serde(default = "default_tool_result_retrim_chars")]
@@ -363,7 +360,6 @@ impl Default for ContextCompressionConfig {
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
             summary_provider: crate::providers::ModelProviderRef::default(),
-            summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
             tool_result_trim_exempt: Vec::new(),

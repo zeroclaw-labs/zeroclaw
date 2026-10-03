@@ -170,7 +170,7 @@ fn seed_config_dir(dir: &std::path::Path) {
     fs::write(
         dir.join("config.toml"),
         format!(
-            "schema_version = 3\n\n\
+            "schema_version = 4\n\n\
              [plugins]\n\
              enabled = true\n\
              auto_discover = true\n\
