@@ -75,6 +75,46 @@ Conditionally registered:
 | Hardware probes | `--features hardware`: GPIO reads/writes, device discovery, firmware flashing |
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
+| `claude_code`, `codex_cli`, `gemini_cli`, `agy_cli`, `opencode_cli` | `enabled = true` in the matching `[<tool>]` section. Delegate a coding task to an external coding-agent CLI; see [Antigravity CLI](#antigravity-cli-agy_cli) for `agy_cli` |
+
+### Antigravity CLI (`agy_cli`)
+
+`agy_cli` delegates a coding task to Google's Antigravity CLI (`agy`), the
+successor of Gemini CLI for Google AI subscription accounts. Use `gemini_cli`
+only if you still have Gemini CLI access through Gemini Code Assist or a
+Gemini API key.
+
+Install `agy` and sign in once interactively, then enable the tool:
+
+```toml
+[agy_cli]
+enabled = true
+model = "gemini-3.8-flash-high"   # optional; omit to use agy's default
+timeout_secs = 600
+```
+
+ZeroClaw runs `agy --output-format=json --disable-slash-commands
+--print-timeout=<timeout_secs - 10>s [--model=<id>] --print=<prompt>` in the
+validated `working_directory`, and decides success from agy's JSON result:
+the run succeeds only when `status` is `SUCCESS` and no tool permission was
+auto-denied. agy exits 0 in both of those failure cases, so the exit code
+alone is not trusted.
+
+**What ZeroClaw does and does not control.** ZeroClaw authorizes the call,
+checks that the starting directory is inside the workspace, bounds the run
+time and output size, and passes only the canonical environment plus
+`env_passthrough`. What the delegated agent may then do is decided by agy's
+own permission settings (`permissions.allow` in agy's `settings.json`):
+
+- In print mode agy cannot prompt, so any tool without an allow rule is
+  auto-denied, and `agy_cli` reports the denied actions as a failure.
+- An allowed shell command can write outside the starting directory, for
+  example into agy's own app-data scratch directory. The workspace check
+  limits where agy starts, not where its tools write.
+- `extra_args = ["--sandbox"]` restricts agy's terminal access; in print mode
+  every shell command is then denied, which blocks most coding tasks.
+  `--dangerously-skip-permissions` and `--add-dir` widen access, and config
+  validation warns when either is set.
 
 ## Extension protocols
 

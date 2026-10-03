@@ -1,3 +1,4 @@
+use crate::agy_cli::AgyCliTool;
 use crate::claude_code::ClaudeCodeTool;
 use crate::claude_code_runner::ClaudeCodeRunnerTool;
 use crate::codex_cli::CodexCliTool;
@@ -14,7 +15,8 @@ use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    ClaudeCodeConfig, ClaudeCodeRunnerConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
+    AgyCliConfig, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CodexCliConfig, GeminiCliConfig,
+    OpenCodeCliConfig,
 };
 
 #[derive(Debug)]
@@ -25,7 +27,9 @@ impl CodingCliExecutor for SuccessfulExecutor {
     async fn output(&self, _command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
         Ok(Output {
             status: successful_exit_status(),
-            stdout: b"ok".to_vec(),
+            // A completed agy JSON result; the other adapters pass stdout
+            // through unchanged, so one success payload serves every tool.
+            stdout: br#"{"status":"SUCCESS","response":"ok"}"#.to_vec(),
             stderr: Vec::new(),
         })
     }
@@ -129,6 +133,19 @@ fn coding_agent_cases(
             GeminiCliTool::new_with_executor(
                 security.clone(),
                 GeminiCliConfig::default(),
+                executor.clone(),
+            ),
+            security,
+        ),
+    ));
+
+    let security = policy(autonomy, max_actions_per_hour, workspace);
+    cases.push((
+        security.clone(),
+        wrapped_tool(
+            AgyCliTool::new_with_executor(
+                security.clone(),
+                AgyCliConfig::default(),
                 executor.clone(),
             ),
             security,

@@ -45,6 +45,10 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 ///   a known Codex CLI argument that can change sandbox, approval, policy,
 ///   workspace, feature, trust, or executable-integration boundaries. The
 ///   argument remains allowed.
+/// - `agy_cli_extra_args_security_boundary`: `agy_cli.extra_args` contains a
+///   known Antigravity CLI argument that can auto-approve agy's tool
+///   permissions or add directories to its workspace. The argument remains
+///   allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
 /// - `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of
