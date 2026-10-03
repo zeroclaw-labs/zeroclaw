@@ -63,6 +63,8 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
         }],
         input_tokens: observed.input_tokens,
         output_tokens: observed.output_tokens,
+        duration_ms: observed.duration_ms,
+        llm_calls: observed.llm_calls,
     };
     let failures: Vec<String> = evaluate_expects(&trace.expects, &repaired)
         .into_iter()
@@ -96,6 +98,8 @@ async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
             tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            duration_ms: 0,
+            llm_calls: 0,
         };
         let grades = evaluate_expects(&trace.expects, &idle);
         assert!(
