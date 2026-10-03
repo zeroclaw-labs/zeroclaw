@@ -10,6 +10,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
