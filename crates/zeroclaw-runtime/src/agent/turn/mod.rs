@@ -44,9 +44,10 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
-    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
-    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
-    terminal_completion_error_message,
+    ContextWindowExceeded, TurnFailureReport, append_safeguard_fallback_notice,
+    context_window_exceeded_from_error, is_semantic_empty_terminal_completion,
+    semantic_empty_terminal_completion_message, terminal_completion_error_message,
+    turn_failure_report,
 };
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,

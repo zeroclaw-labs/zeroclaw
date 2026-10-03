@@ -3,7 +3,7 @@
 use super::context::{ConfigWriteGuard, RpcContext};
 use super::session::DurableSession;
 use super::transport::RpcTransport;
-use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
+use super::turn::{TurnAttribution, TurnOutcome, execute_admitted_turn};
 use super::types::*;
 
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -33,8 +33,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +52,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +88,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +103,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -499,7 +226,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -588,6 +315,30 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
         return None;
     }
     Some(grants.allowed_tools.clone())
+}
+
+/// The `clientCapabilities.client_kind` a connection declared, kept only for
+/// a kind the core knows. `tui/list` reports it so a listing can tell a
+/// gateway's connections from terminals; nothing authorizes on it.
+/// The additive extensions this core advertises on `initialize`, each
+/// listed only beside the behaviour it names and the test that proves it:
+///
+/// - `tui.client_kind`: `tui/list` reports the kind a connection declared
+///   (`tui_list_labels_only_a_declared_gateway_connection`).
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::SESSION_CANCEL_CHAT_KEY,
+    zeroclaw_rpc_proto::feature::SESSION_NEW_VALIDATES_AGENT,
+    zeroclaw_rpc_proto::feature::SESSION_TURN_ERRORS,
+    zeroclaw_rpc_proto::feature::SESSION_APPROVAL_UNREACHABLE,
+];
+
+fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
+    capabilities?
+        .get("client_kind")?
+        .as_str()
+        .filter(|kind| *kind == CLIENT_KIND_GATEWAY)
+        .map(str::to_owned)
 }
 
 fn not_yet_implemented(method: Method) -> RpcResult {
@@ -1136,6 +887,31 @@ fn write_personality_file(
 }
 
 impl RpcDispatcher {
+    fn cancel_target_id(params: &SessionCancelParams) -> Result<&str, JsonRpcError> {
+        match params.session_key.as_deref() {
+            Some(key) => key
+                .strip_prefix("rpc_")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    rpc_err(
+                        SESSION_NOT_FOUND,
+                        "No active RPC chat for this exact row key",
+                    )
+                }),
+            None => Ok(&params.session_id),
+        }
+    }
+
+    fn session_emission_authority(&self) -> super::session_emission::SessionEmissionAuthority {
+        super::session_emission::SessionEmissionAuthority::new(
+            &self.ctx,
+            self.auth.clone(),
+            self.connection_cancel.clone(),
+            self.access_policy == RpcAccessPolicy::RemoteSessionOwner,
+            self.tui_id.clone(),
+        )
+    }
+
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
         Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
     }
@@ -1389,7 +1165,7 @@ impl RpcDispatcher {
 }
 
 /// Record one authorization denial for the connection bound to `auth`.
-fn audit_denial(
+pub(crate) fn audit_denial(
     auth: Option<&crate::rpc::auth::ConnectionAuth>,
     method: Method,
     denied: &crate::rpc::auth::AuthDenied,
@@ -1417,16 +1193,6 @@ fn audit_denial(
     );
 }
 
-/// Whether the credential behind `auth` is still live: not expired, not
-/// past its revalidation deadline, and, for a native pairing token, still
-/// paired.
-fn credential_is_live(
-    inbound: &crate::rpc::auth::RpcInboundAuth,
-    auth: &crate::rpc::auth::ConnectionAuth,
-) -> Result<(), crate::rpc::auth::AuthDenied> {
-    inbound.credential_is_live(auth)
-}
-
 /// The authority `auth` holds for `method` under the accepted policy in force
 /// now: a live credential, a fresh resolution, a generation that did not move
 /// underneath that resolution, and the method's coarse grant.
@@ -1452,7 +1218,7 @@ fn current_authority(
 /// decision stays in force until the lease is dropped.
 ///
 /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
-fn current_authority_under(
+pub(crate) fn current_authority_under(
     lease: &crate::rpc::auth::AuthorityLease<'_>,
     auth: &crate::rpc::auth::ConnectionAuth,
     method: Method,
@@ -2716,6 +2482,12 @@ impl RpcDispatcher {
         ) {
             return Ok(());
         }
+        if method == Method::SessionCancel {
+            let req: SessionCancelParams = parse_params(params)?;
+            return self
+                .ensure_session_access(Self::cancel_target_id(&req)?)
+                .await;
+        }
         let session_id = params
             .get("session_id")
             .and_then(Value::as_str)
@@ -3427,7 +3199,9 @@ impl RpcDispatcher {
                 let is_notif = is_notification;
                 self.prompt_tasks.retain(|task| !task.is_finished());
                 let task = zeroclaw_spawn::spawn!(async move {
-                    let result = handle.handle_session_prompt(&params_clone).await;
+                    let result =
+                        super::session_emission::scope(handle.handle_session_prompt(&params_clone))
+                            .await;
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
@@ -3606,6 +3380,7 @@ impl RpcDispatcher {
             .and_then(|c| c.get("elicitation"));
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+        let client_kind = declared_client_kind(req.client_capabilities.as_ref());
 
         // Authenticate FIRST: bind a principal or reject, before any
         // registry mutation. The tui_id/tui_sig continuity below grants no
@@ -3665,6 +3440,7 @@ impl RpcDispatcher {
                     .to_string(),
                 peer_label: self.peer_label.clone(),
                 env,
+                client_kind,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -3726,6 +3502,10 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
+            features: ADVERTISED_FEATURES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         })
     }
 
@@ -4003,6 +3783,7 @@ impl RpcDispatcher {
                     connected_at_unix: e.connected_at.timestamp(),
                     peer_label: e.peer_label,
                     transport: e.transport,
+                    client_kind: e.client_kind,
                 })
                 .collect(),
         })
@@ -4063,13 +3844,16 @@ impl RpcDispatcher {
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
     ) -> Result<(), JsonRpcError> {
-        let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id,
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_channel = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id,
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
             // Live channel refresh uses this mutex, not session admission.
             // Keep eligibility and registration under the same Agent guard.
@@ -4201,6 +3985,19 @@ impl RpcDispatcher {
             None => None,
         };
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
+        // An agent that is not configured cannot run a session: refuse it as
+        // invalid input now, rather than as an internal error once building
+        // the agent fails. A caller the selector already refused learns
+        // nothing more here.
+        if !self.ctx.config.read().agents.contains_key(&req.agent_alias) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured.",
+                    alias = req.agent_alias
+                ),
+            ));
+        }
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
         let mut authorized_resume = None;
@@ -4735,13 +4532,16 @@ impl RpcDispatcher {
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id.clone(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id.clone(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         // Align agent.channel_name with the registered back-channel key so
         // ask_user/poll/escalate default to this conversation (not an arbitrary
         // external channel from the seeded channel map).
@@ -5818,13 +5618,16 @@ impl RpcDispatcher {
         };
         agent.set_interaction_context(interaction_context);
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            sid.to_string(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                sid.to_string(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_emission_authority(self.session_emission_authority()),
+        );
         // See session/new: channel_name must match the registered back-channel
         // key so interactive tools default to this conversation.
         agent.set_channel_name("rpc".to_string());
@@ -6110,6 +5913,11 @@ impl RpcDispatcher {
         }
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
+        let output = super::session_emission::SessionOutput {
+            authority: self.session_emission_authority(),
+            generation: live_generation_at_entry,
+        };
+        super::session_emission::bind(output.clone());
         if live_generation_at_entry.is_some() {
             self.capture_session_access(sid).await?;
         }
@@ -6512,27 +6320,6 @@ impl RpcDispatcher {
                 .await);
         }
 
-        // The grants were re-resolved after admission, so apply that posture
-        // to this session's static and already-activated deferred tools. It is
-        // judged by those fresh grants rather than the connection's stamped
-        // copy, so a prompt that queued before its principal was narrowed
-        // executes under the narrowed ceiling. It runs on the canonical
-        // handle, not the pre-reconciliation one, so a replaced incarnation
-        // cannot carry a stale ceiling, and it runs before any prompt-side
-        // effect. Direct unit handlers bind no connection and keep their
-        // fixture semantics.
-        if let Some(grants) = grants.as_ref() {
-            // Owner isolation (this slice) replaced the parent's blanket
-            // refusal of a constrained principal here: the session is stamped
-            // with its owner and every resume/rehydration is owner-predicated,
-            // so a constrained principal's grants can only ever re-narrow ITS
-            // OWN session's Agent, never a shared victim's. A prompt whose
-            // principal was narrowed since creation therefore executes under
-            // the narrowed ceiling, applied on the canonical handle here.
-            let mut guard = agent.lock().await;
-            self.apply_principal_grants_to_agent(grants, &mut guard);
-        }
-
         // Mark the durable row running only after every preflight wait has
         // passed. The generation waits and the canonical Agent lookup above
         // can all still fail this prompt (SESSION_BUSY / SESSION_NOT_FOUND)
@@ -6559,9 +6346,6 @@ impl RpcDispatcher {
         let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
         let session_key = format!("rpc_{sid}");
         let turn_id = uuid::Uuid::new_v4().to_string();
-        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
-            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
-        }
 
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
@@ -6616,21 +6400,12 @@ impl RpcDispatcher {
         // (Master's precomputed `max_context_tokens` injection is
         // deliberately NOT carried over: the route-aware contract resolves
         // capacity from the serving provider/model at call time.)
-        let (agent_alias, model_provider, model) = {
-            let alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .unwrap_or_default();
-            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                let (_, model_provider, model) = agent.lock().await.attribution_fields();
-                (model_provider, model)
-            } else {
-                (String::new(), String::new())
-            };
-            (alias, mp, m)
-        };
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .unwrap_or_default();
 
         let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
@@ -6647,8 +6422,6 @@ impl RpcDispatcher {
             None
         };
         let attribution_agent_alias = agent_alias.clone();
-        let attribution_model_provider = model_provider.clone();
-        let attribution_model = model.clone();
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
@@ -6662,67 +6435,150 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let turn = execute_turn(
-            agent,
-            prompt.clone(),
-            cancel.clone(),
-            TurnAttribution {
-                session_key: Some(sid.to_string()),
-                agent_alias,
-                model_provider,
-                model,
-                channel: "rpc",
-            },
-            cost_context,
-            self.connection_activity.clone(),
-            move |event| {
-                let rpc = rpc.clone();
-                let sid = sid_owned.clone();
-                let acp_token_store = acp_token_store.clone();
-                let sessions_for_plan = sessions_for_plan.clone();
-                let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
-                let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
-                let checkpoint_cancel = checkpoint_cancel.clone();
-                async move {
-                    if let (
-                        Some(store),
-                        TurnEvent::Usage {
-                            input_tokens,
-                            accepted,
-                            ..
-                        },
-                    ) = (acp_token_store.as_ref(), &event)
-                    {
-                        let store = store.clone();
-                        let sid = sid.clone();
-                        let (tokens, is_accepted) = (*input_tokens, *accepted);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
-                        })
-                        .await;
-                    }
-                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
-                        .await;
-                    // Usage already carries the serving call's context limits.
-                    // Keep checkpoint persistence ahead of the same projection.
-                    if checkpoint_error.lock().await.is_some() {
-                        return;
-                    }
-                    if let Err(error) = persist_checkpoint_event_before_notification(
-                        acp_token_store.as_ref(),
-                        checkpoint_turn_id.as_deref(),
-                        &sid,
-                        &event,
-                        &rpc,
-                    )
-                    .await
-                    {
-                        *checkpoint_error.lock().await = Some(error);
-                        checkpoint_cancel.cancel();
-                    }
+        // Acquire the last Agent guard before resolving authority. No
+        // stamped grants or unchecked Agent acquisition reaches execution.
+        let mut agent_guard = agent.lock_owned().await;
+        self.revalidate_admitted_session(sid, authorized.as_ref())
+            .await?;
+        let effect_guard = self.ctx.sessions.effect_guard().await;
+        let admitted = {
+            let lease = self.ctx.auth.hold_authority();
+            (|| {
+                let live = effect_guard
+                    .session(sid)
+                    .filter(|session| Some(session.generation) == live_generation_at_entry)
+                    .ok_or_else(|| self.stale_session_incarnation_error())?;
+                let current_grants = self
+                    .auth
+                    .as_ref()
+                    .map(|auth| {
+                        current_authority_under(&lease, auth, Method::SessionPrompt).map_err(
+                            |denied| {
+                                self.audit_auth_denial(Method::SessionPrompt, &denied);
+                                rpc_err(denied.code, denied.message)
+                            },
+                        )
+                    })
+                    .transpose()?;
+                if let (Some(auth), Some(grants)) = (self.auth.as_ref(), current_grants.as_ref())
+                    && !grants.admin
+                    && auth.principal.is_authenticated()
+                    && live.owner_principal_id.as_deref() != Some(auth.principal.id.as_str())
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "Session not found or not owned by this principal",
+                    ));
                 }
-            },
-        );
+                self.authorize_live_session_binding(
+                    Method::SessionPrompt,
+                    current_grants.as_ref(),
+                    &self.ctx.config.read(),
+                    &live.agent_alias,
+                    &live.workspace_dir,
+                )?;
+                self.authorize_session_environment(
+                    Method::SessionPrompt,
+                    current_grants.as_ref(),
+                    live.has_forwarded_environment(),
+                )?;
+                if self.access_policy != RpcAccessPolicy::TrustedLocal {
+                    self.ensure_session_agent_channel_access(&agent_guard)?;
+                }
+                if let Some(grants) = current_grants.as_ref() {
+                    self.apply_principal_grants_to_agent(grants, &mut agent_guard);
+                }
+                let (_, model_provider, model) = agent_guard.attribution_fields();
+                let attribution_model_provider = model_provider.clone();
+                let attribution_model = model.clone();
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+                }
+                Ok((
+                    execute_admitted_turn(
+                        agent_guard,
+                        prompt.clone(),
+                        cancel.clone(),
+                        TurnAttribution {
+                            live_generation: live_generation_at_entry,
+                            client_turn_generation: req.client_turn_generation,
+                            session_key: Some(sid.to_string()),
+                            agent_alias,
+                            model_provider,
+                            model,
+                            channel: "rpc",
+                        },
+                        cost_context,
+                        self.connection_activity.clone(),
+                        move |event| {
+                            let rpc = rpc.clone();
+                            let output = output.clone();
+                            let sid = sid_owned.clone();
+                            let acp_token_store = acp_token_store.clone();
+                            let sessions_for_plan = sessions_for_plan.clone();
+                            let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
+                            let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
+                            let checkpoint_cancel = checkpoint_cancel.clone();
+                            async move {
+                                if let (
+                                    Some(store),
+                                    TurnEvent::Usage {
+                                        input_tokens,
+                                        accepted,
+                                        ..
+                                    },
+                                ) = (acp_token_store.as_ref(), &event)
+                                {
+                                    let store = store.clone();
+                                    let sid = sid.clone();
+                                    let (tokens, is_accepted) = (*input_tokens, *accepted);
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                                    })
+                                    .await;
+                                }
+                                persist_plan_if_any(
+                                    &sessions_for_plan,
+                                    acp_token_store.as_ref(),
+                                    &sid,
+                                    &event,
+                                )
+                                .await;
+                                // Usage already carries the serving call's context limits.
+                                // Keep checkpoint persistence ahead of the same projection.
+                                if checkpoint_error.lock().await.is_some() {
+                                    return;
+                                }
+                                if let Err(error) = persist_checkpoint_event_before_notification(
+                                    acp_token_store.as_ref(),
+                                    checkpoint_turn_id.as_deref(),
+                                    &sid,
+                                    &event,
+                                    &rpc,
+                                    Some(&output),
+                                )
+                                .await
+                                {
+                                    *checkpoint_error.lock().await = Some(error);
+                                    checkpoint_cancel.cancel();
+                                }
+                            }
+                        },
+                    ),
+                    attribution_model_provider,
+                    attribution_model,
+                ))
+            })()
+        };
+        drop(effect_guard);
+        let (turn, attribution_model_provider, attribution_model) = match admitted {
+            Ok(turn) => turn,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
         tokio::pin!(turn);
         let mut outcome = tokio::select! {
             biased;
@@ -7039,7 +6895,7 @@ impl RpcDispatcher {
                         })),
                     "turn failed; emitting TurnComplete so the client exits the working state"
                 );
-                self.emit_turn_complete(
+                self.emit_turn_complete_reporting(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     user_message
@@ -7047,6 +6903,7 @@ impl RpcDispatcher {
                         .unwrap_or_else(|| format!("turn failed: {e}")),
                     req.client_turn_generation,
                     message_count,
+                    Some(e.failure_report()),
                 )
                 .await;
                 Err(rpc_err(
@@ -7092,17 +6949,58 @@ impl RpcDispatcher {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     ) {
+        self.emit_turn_complete_reporting(
+            session_id,
+            outcome,
+            content,
+            client_turn_generation,
+            message_count,
+            None,
+        )
+        .await;
+    }
+
+    /// [`Self::emit_turn_complete`] for a turn whose failure the agent
+    /// reported: the terminal event also carries that report's code and
+    /// message, which a chat client shows as its error.
+    async fn emit_turn_complete_reporting(
+        &self,
+        session_id: &str,
+        outcome: crate::rpc::types::TurnCompletionOutcome,
+        content: String,
+        client_turn_generation: Option<u64>,
+        message_count: Option<usize>,
+        failure: Option<crate::agent::TurnFailureReport>,
+    ) {
+        let (error_code, error_message) = match failure {
+            Some(report) => (Some(report.code.to_string()), Some(report.message)),
+            None => (None, None),
+        };
+        let is_data = !matches!(outcome, crate::rpc::types::TurnCompletionOutcome::Failed)
+            || error_code.is_some();
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
             client_turn_generation,
             message_count,
+            error_code,
+            error_message,
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
+                let output = match super::session_emission::current() {
+                    Some(output) => output,
+                    None => super::session_emission::SessionOutput {
+                        authority: self.session_emission_authority(),
+                        generation: self.ctx.sessions.get_generation(session_id).await,
+                    },
+                };
+                let _ = output
+                    .authority
+                    .send(&self.rpc, session_id, output.generation, is_data, s)
+                    .await;
             }
         }
     }
@@ -7298,26 +7196,30 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_owner(&req.session_id, Method::SessionCancel)
-            .await?;
-        let owner = self
-            .ctx
-            .sessions
-            .session_owner_tui_id(&req.session_id)
-            .await;
-        let expected_generation = match self.capture_session_access(&req.session_id).await {
+        let req: SessionCancelParams = parse_params(params)?;
+        let session_id = Self::cancel_target_id(&req)?.to_owned();
+        if req.session_key.is_none() {
+            self.authorize_session_owner(&session_id, Method::SessionCancel)
+                .await?;
+        }
+        let owner = self.ctx.sessions.session_owner_tui_id(&session_id).await;
+        let expected_generation = match self.capture_session_access(&session_id).await {
             Ok(generation) => generation,
             Err(error) => {
+                // A running turn holds the agent. The refusal must not wait
+                // for that turn to end just to label its log line.
                 let (agent_alias, model_provider, model) =
-                    match self.ctx.sessions.get_agent(&req.session_id).await {
-                        Some(agent) => agent.lock().await.attribution_fields(),
+                    match self.ctx.sessions.get_agent(&session_id).await {
+                        Some(agent) => agent
+                            .try_lock()
+                            .map(|agent| agent.attribution_fields())
+                            .unwrap_or_default(),
                         None => (String::new(), String::new(), String::new()),
                     };
                 let span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
                     "zeroclaw_scope",
-                    session_key = %req.session_id,
+                    session_key = %session_id,
                     agent_alias = %agent_alias,
                     model_provider = %model_provider,
                     model = %model,
@@ -7342,27 +7244,58 @@ impl RpcDispatcher {
                 return Err(error);
             }
         };
-        match self
-            .ctx
-            .sessions
-            .signal_cancellation_for_incarnation(
-                &req.session_id,
-                expected_generation,
-                crate::rpc::session::CancelCause::ClientRpc,
-            )
-            .await
+        let guard = self.ctx.sessions.effect_guard().await;
+        let live = guard.session(&session_id);
+        if live.map(|s| s.generation) != expected_generation {
+            return Err(self.stale_session_incarnation_error());
+        }
+        if req.session_key.is_some() && !live.is_some_and(|s| matches!(s.chat_mode, ChatMode::Chat))
         {
-            None => return Err(self.stale_session_incarnation_error()),
-            Some(true) => {}
-            Some(false) => {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active RPC chat for this exact row key",
+            ));
+        }
+        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+            && !matches!(live.and_then(|s| s.owner_tui_id.as_deref()), Some(owner) if self.tui_id.as_deref() == Some(owner))
+        {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Caller does not own this session",
+            ));
+        }
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, Method::SessionCancel)
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+            if !grants.admin
+                && auth.principal.is_authenticated()
+                && live.and_then(|s| s.owner_principal_id.as_deref())
+                    != Some(auth.principal.id.as_str())
+            {
                 return Err(rpc_err(
-                    SESSION_NOT_FOUND,
-                    "No active turn for this session",
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
                 ));
             }
         }
+        let cancelled = guard
+            .signal_cancel(
+                &session_id,
+                expected_generation,
+                crate::rpc::session::CancelCause::ClientRpc,
+            )
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        drop(lease);
+        drop(guard);
+        if !cancelled {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            ));
+        }
         to_result(SessionCancelResult {
-            session_id: req.session_id,
+            session_id: session_id.clone(),
             cancelled: true,
         })
     }
@@ -7672,16 +7605,17 @@ impl RpcDispatcher {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|row| MessageEntry {
+                        role: row.message.role,
+                        content: row.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: row.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -7967,6 +7901,36 @@ impl RpcDispatcher {
         if let Some(bound_session) = self.ctx.approval_pending.session_for(&p.request_id) {
             self.authorize_session_owner(&bound_session, Method::SessionApprove)
                 .await?;
+        }
+
+        if p.decision == "unreachable" {
+            let generation = p.client_turn_generation.ok_or_else(|| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    "unreachable requires client_turn_generation",
+                )
+            })?;
+            let lease = self.ctx.auth.hold_authority();
+            if let Some(auth) = self.auth.as_ref() {
+                current_authority_under(&lease, auth, Method::SessionApprove).map_err(
+                    |denied| {
+                        self.audit_auth_denial(Method::SessionApprove, &denied);
+                        rpc_err(denied.code, denied.message)
+                    },
+                )?;
+            }
+            let acknowledged = self.ctx.approval_pending.unreachable(
+                &p.request_id,
+                &p.session_id,
+                &self.rpc,
+                generation,
+            );
+            drop(lease);
+            return to_result(SessionApproveResult {
+                session_id: p.session_id,
+                request_id: p.request_id,
+                acknowledged,
+            });
         }
 
         let response = match p.decision.as_str() {
@@ -11838,6 +11802,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: None,
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -11851,6 +11816,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: None,
                     });
                 }
 
@@ -11871,6 +11837,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: None,
                     });
                 }
             }
@@ -11908,6 +11875,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: None,
                         });
                     }
                 }
@@ -11993,19 +11961,19 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         .ok()
     };
     let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+    let mut authorized = |lease: &crate::rpc::auth::AuthorityLease<'_>| {
+        still_authorized_under(lease, binding.as_ref(), method, &mut checked_generation)
+    };
 
     'deliver: {
         // The client's numbers belong to another epoch: nothing it saw can be
         // matched here. Everything before `cursor` in this epoch is gone; from
         // `cursor` on, every buffered frame is replayed.
         if epoch_changed {
-            if !still_authorized(&inbound, binding.as_ref(), method, &mut checked_generation) {
-                break 'deliver;
-            }
             let Some(json) = lagged(1, cursor, true) else {
                 break 'deliver;
             };
-            if !rpc.send_raw(json).await {
+            if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                 break 'deliver;
             }
         }
@@ -12019,18 +11987,10 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                     from_seq,
                     resume_seq,
                 } => {
-                    if !still_authorized(
-                        &inbound,
-                        binding.as_ref(),
-                        method,
-                        &mut checked_generation,
-                    ) {
-                        break 'deliver;
-                    }
                     let Some(json) = lagged(from_seq, resume_seq, false) else {
                         break 'deliver;
                     };
-                    if !rpc.send_raw(json).await {
+                    if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                         break 'deliver;
                     }
                     cursor = resume_seq;
@@ -12038,16 +11998,6 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                 }
                 Read::Frames(frames) if !frames.is_empty() => {
                     for (seq, frame) in frames {
-                        if cancel.is_cancelled()
-                            || !still_authorized(
-                                &inbound,
-                                binding.as_ref(),
-                                method,
-                                &mut checked_generation,
-                            )
-                        {
-                            break 'deliver;
-                        }
                         let mut params = (*frame).clone();
                         if let Some(object) = params.as_object_mut() {
                             object.insert(
@@ -12060,7 +12010,7 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
                         let Ok(json) = serde_json::to_string(&notification) else {
                             break 'deliver;
                         };
-                        if !rpc.send_raw(json).await {
+                        if !deliver_frame(&rpc, &cancel, &inbound, &mut authorized, json).await {
                             break 'deliver;
                         }
                         cursor = seq + 1;
@@ -12079,6 +12029,53 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
         }
     }
     registry.lock().remove(&subscription_id);
+}
+
+/// Enqueue one subscription line, unless the feed was cancelled or the caller
+/// lost its authority while the writer was full. Every subscription forwarder
+/// sends through this, in this order:
+///
+/// 1. Wait for room on the writer. This is the only wait, and a cancel or a
+///    closed writer ends it, so a feed blocked on a slow reader is still
+///    released at once. Nothing is held during the wait, so a policy
+///    publication never waits on a slow reader.
+/// 2. Hold the connection's authority still
+///    ([`RpcInboundAuth::hold_authority`]) and check `still_allowed` against
+///    the held state, so a grant withdrawn while the writer was full stops
+///    the line.
+/// 3. Enqueue in the reserved room, which cannot wait, then release the
+///    hold. A withdrawal that arrives after the check completes after the
+///    enqueue, so no line is enqueued once a withdrawal has completed.
+///
+/// `still_allowed` runs while both the writer room and the hold are taken,
+/// so it must stay synchronous and cheap. It answers from the lease it is
+/// given and must not call [`RpcInboundAuth`]'s own accessors, which would
+/// wait behind a publication queued on that lease. `false` ends the feed.
+///
+/// [`RpcInboundAuth`]: crate::rpc::auth::RpcInboundAuth
+/// [`RpcInboundAuth::hold_authority`]: crate::rpc::auth::RpcInboundAuth::hold_authority
+pub(crate) async fn deliver_frame(
+    rpc: &RpcOutbound,
+    cancel: &CancellationToken,
+    authority: &crate::rpc::auth::RpcInboundAuth,
+    still_allowed: impl FnOnce(&crate::rpc::auth::AuthorityLease<'_>) -> bool,
+    json: String,
+) -> bool {
+    let slot = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return false,
+        slot = rpc.reserve() => slot,
+    };
+    let Some(slot) = slot else {
+        return false;
+    };
+    let lease = authority.hold_authority();
+    if !still_allowed(&lease) {
+        return false;
+    }
+    slot.send(json);
+    drop(lease);
+    true
 }
 
 /// The daemon-wide log and event streams, and the event history, carry
@@ -12101,12 +12098,12 @@ const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the dae
      streams and the event history are limited to administrators and the shared operator";
 
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
-/// authority. The credential must still be live, and whenever the accepted
-/// policy generation has moved, the principal is resolved again against
-/// `method`. A refusal is audited. An unbound dispatcher (the direct
-/// unit-test handlers) has nothing to recheck.
-fn still_authorized(
-    inbound: &crate::rpc::auth::RpcInboundAuth,
+/// authority, answered from `lease`. The credential must still be live, and
+/// whenever the accepted policy generation has moved, the principal is
+/// resolved again against `method`. A refusal is audited. An unbound
+/// dispatcher (the direct unit-test handlers) has nothing to recheck.
+fn still_authorized_under(
+    lease: &crate::rpc::auth::AuthorityLease<'_>,
     binding: Option<&crate::rpc::auth::ConnectionAuth>,
     method: Method,
     checked_generation: &mut Option<u64>,
@@ -12114,14 +12111,14 @@ fn still_authorized(
     let Some(auth) = binding else {
         return true;
     };
-    let generation = inbound.generation();
+    let generation = lease.generation();
     // A moved policy generation re-resolves the principal: it must still
     // hold `method`'s grant and still see every principal, so narrowing or
     // demoting a principal ends its stream.
     let authority = if *checked_generation == Some(generation) {
-        credential_is_live(inbound, auth)
+        lease.credential_is_live(auth)
     } else {
-        current_authority(inbound, auth, method).and_then(|grants| {
+        current_authority_under(lease, auth, method).and_then(|grants| {
             if sees_every_principal(auth, &grants) {
                 Ok(())
             } else {
@@ -12447,6 +12444,7 @@ async fn persist_checkpoint_event_before_notification(
     session_id: &str,
     event: &TurnEvent,
     rpc: &Arc<RpcOutbound>,
+    output: Option<&super::session_emission::SessionOutput>,
 ) -> Result<(), String> {
     let notification = notification_for_turn_event(session_id, event);
     let checkpoint_write = async {
@@ -12517,17 +12515,33 @@ async fn persist_checkpoint_event_before_notification(
         }
         Ok(())
     };
-    send_after_checkpoint_write(checkpoint_write, notification, Arc::clone(rpc)).await
+    send_after_checkpoint_write(
+        checkpoint_write,
+        notification,
+        Arc::clone(rpc),
+        session_id,
+        output,
+    )
+    .await
 }
 
 async fn send_after_checkpoint_write(
     checkpoint_write: impl std::future::Future<Output = Result<(), String>>,
     notification: Option<String>,
     rpc: Arc<RpcOutbound>,
+    session_id: &str,
+    output: Option<&super::session_emission::SessionOutput>,
 ) -> Result<(), String> {
     checkpoint_write.await?;
     if let Some(notification) = notification {
-        let _ = rpc.send_raw(notification).await;
+        if let Some(output) = output {
+            let _ = output
+                .authority
+                .send(&rpc, session_id, output.generation, true, notification)
+                .await;
+        } else {
+            let _ = rpc.send_raw(notification).await;
+        }
     }
     Ok(())
 }
@@ -12619,6 +12633,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             arguments_summary,
             timeout_secs,
         } => SessionUpdateEvent::ApprovalRequest {
+            client_turn_generation: super::approval_channel::current_turn_generation(),
             session_id: session_id.to_string(),
             request_id: request_id.clone(),
             tool_name: tool_name.clone(),
@@ -15547,6 +15562,107 @@ mod tests {
             let created = result.expect("an unchanged principal is still admitted");
             assert_eq!(created["session_id"], json!("s-parked"));
         });
+    }
+
+    #[tokio::test]
+    async fn session_output_rechecks_after_writer_wait_and_refuses_a_replaced_incarnation() {
+        for replace in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = session_cwd_config(&tmp, 4242, None);
+            let workspace = config.agent_workspace_dir("test-agent");
+            let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+            let (provider, _started, _release) = gated_provider();
+            let sid = "writer-held-session";
+            install_state_test_session_owned_at(
+                &ctx.sessions,
+                &backend,
+                sid,
+                provider,
+                None,
+                Some("user:alice"),
+                &workspace,
+            )
+            .await;
+            let (alice, _wire) = roster_peer(&ctx, 4242).await;
+            let generation = ctx.sessions.get_generation(sid).await;
+            let authority = alice.session_emission_authority();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let rpc = RpcOutbound::new(tx);
+            assert!(rpc.send_raw("held".into()).await);
+            let send = authority.send(&rpc, sid, generation, true, "private-frame".into());
+            tokio::pin!(send);
+            tokio::select! {
+                biased;
+                _ = &mut send => panic!("writer capacity must be awaited"),
+                () = std::future::ready(()) => {}
+            }
+            if replace {
+                let (provider, _started, _release) = gated_provider();
+                install_state_test_session_owned_at(
+                    &ctx.sessions,
+                    &backend,
+                    sid,
+                    provider,
+                    None,
+                    Some("user:alice"),
+                    &workspace,
+                )
+                .await;
+                assert_ne!(ctx.sessions.get_generation(sid).await, generation);
+            } else {
+                narrow_alice_to_no_agents(&ctx);
+            }
+            assert_eq!(rx.recv().await.as_deref(), Some("held"));
+            assert!(
+                !send.await,
+                "authority/incarnation must be checked after capacity arrives"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a refused frame must not occupy the returned room"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rechecks_agent_entitlement_after_the_final_agent_wait() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started, _release) = gated_provider();
+        let sid = "final-agent-entitlement";
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let agent = ctx.sessions.get_agent(sid).await.unwrap();
+        let held = agent.lock().await;
+        send_prompt(&mut alice, 7, sid, 3).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.sessions.session_queue.queue_depth(sid).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the prompt holds admission while waiting for the Agent");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        narrow_alice_to_no_agents(&ctx);
+        drop(held);
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started.try_recv().is_err(),
+            "the narrowed principal must never reach the provider"
+        );
     }
 
     #[tokio::test]
@@ -18503,6 +18619,7 @@ mod tests {
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+                client_kind: None,
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
     }
@@ -18710,6 +18827,7 @@ mod tests {
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
         let response = rpc(
@@ -18783,6 +18901,7 @@ mod tests {
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
         for id in [1, 2] {
@@ -23419,6 +23538,167 @@ mod tests {
         );
     }
 
+    /// The global streams, each with the hub source that feeds it.
+    const GLOBAL_STREAMS: [(&str, crate::rpc::subscription::Source); 2] = [
+        ("logs/subscribe", crate::rpc::subscription::Source::Logs),
+        ("events/subscribe", crate::rpc::subscription::Source::Events),
+    ];
+
+    /// A subscriber to `method` whose writer has room for one line: an
+    /// administrator with `Logs:Read` on a roster connection, its subscribe
+    /// reply already read. Returns the context (for policy changes), the
+    /// policy it started with, the connection, its writer, the hub and the
+    /// subscription id.
+    async fn subscriber_on_a_one_line_writer(
+        method: &str,
+    ) -> (
+        Arc<RpcContext>,
+        zeroclaw_config::schema::Config,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+        String,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        grant_global_log_reads(&mut config);
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_subscription_hub(
+            config.clone(),
+            sessions,
+            event_tx,
+            Arc::clone(&hub),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:uid=4242".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        let opened = rpc(&mut dispatcher, &mut rx, 1, method, json!({})).await;
+        let id = opened["result"]["subscription_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{method} opens: {opened}"))
+            .to_string();
+        (ctx, config, dispatcher, rx, hub, id)
+    }
+
+    /// Publish a frame that takes the writer's only room and one more, and
+    /// return once the first is enqueued and delivery of the second is
+    /// waiting for room.
+    async fn block_delivery_on_a_full_writer(
+        hub: &crate::rpc::subscription::SubscriptionHub,
+        source: crate::rpc::subscription::Source,
+        rx: &tokio::sync::mpsc::Receiver<String>,
+    ) {
+        hub.publish(
+            source,
+            json!({"source": "observability", "tool": "SENTINEL-FILL"}),
+        );
+        hub.publish(
+            source,
+            json!({"source": "observability", "tool": "SENTINEL-PENDING"}),
+        );
+        // Both frames are published before the forwarder runs, so it reads
+        // them in one batch. On the test's single-threaded runtime it then
+        // enqueues the first and reaches the wait for room for the second in
+        // the same poll: once the first is visible, the second is waiting.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rx.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first frame takes the room"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A grant withdrawn while delivery waits for writer room ends the
+    /// stream before the waiting frame is enqueued: authority is checked at
+    /// the enqueue boundary, after the wait, not before it.
+    #[tokio::test]
+    async fn a_grant_withdrawn_while_the_writer_is_full_delivers_nothing_more() {
+        use zeroclaw_api::grants::Resource;
+        for (method, source) in GLOBAL_STREAMS {
+            let (ctx, config, dispatcher, mut rx, hub, id) =
+                subscriber_on_a_one_line_writer(method).await;
+            block_delivery_on_a_full_writer(&hub, source, &rx).await;
+
+            let mut narrowed = config;
+            let reader = narrowed
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the fixture profile exists");
+            reader.grants.remove(&Resource::Logs);
+            reader.admin = false;
+            ctx.auth
+                .refresh_from_config(&narrowed)
+                .expect("the narrowed policy compiles");
+            let fill = rx.recv().await.expect("the frame that took the room");
+            assert!(fill.contains("SENTINEL-FILL"), "{method}: {fill}");
+
+            assert!(
+                !next_frame_containing(
+                    &mut rx,
+                    "SENTINEL-PENDING",
+                    std::time::Duration::from_millis(500)
+                )
+                .await,
+                "{method}: a frame waiting for room must not be enqueued after the grant is gone"
+            );
+            assert!(
+                !dispatcher.subscriptions.lock().contains_key(&id),
+                "{method}: the refused stream ends"
+            );
+        }
+    }
+
+    /// Cancelling a subscription whose delivery waits for writer room
+    /// releases the feed at once. It does not wait for the reader to drain,
+    /// and the waiting frame is never enqueued.
+    #[tokio::test]
+    async fn a_cancel_releases_a_feed_blocked_on_a_full_writer() {
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, hub, id) =
+                subscriber_on_a_one_line_writer(method).await;
+            // The delivery task holds the connection's writer while it runs.
+            let delivering = Arc::strong_count(&dispatcher.rpc);
+            block_delivery_on_a_full_writer(&hub, source, &rx).await;
+
+            let cancelled = dispatcher
+                .handle_subscription_cancel(&json!({"subscription_id": id}))
+                .expect("cancel");
+            assert_eq!(cancelled["cancelled"], json!(true), "{method}");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while Arc::strong_count(&dispatcher.rpc) == delivering {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{method}: a cancelled feed is released while the writer is still full"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let fill = rx.recv().await.expect("the frame that took the room");
+            assert!(fill.contains("SENTINEL-FILL"), "{method}: {fill}");
+            assert!(
+                !next_frame_containing(
+                    &mut rx,
+                    "SENTINEL-PENDING",
+                    std::time::Duration::from_millis(500)
+                )
+                .await,
+                "{method}: a cancelled feed enqueues nothing more"
+            );
+        }
+    }
+
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -26063,7 +26343,7 @@ mod tests {
             *context_token_budget = Some(max_ctx);
             *model_context_window = Some(model_ctx);
         }
-        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc)
+        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc, None)
             .await
             .unwrap();
         let json = rx.try_recv().expect("usage must reach the RPC writer");
@@ -26730,6 +27010,7 @@ mod tests {
             commands: vec![],
             auth_methods: Vec::new(),
             principal_id: None,
+            features: Vec::new(),
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -26924,6 +27205,59 @@ mod tests {
         assert!(!dispatcher.client_elicitation_caps.url);
     }
 
+    /// `tui/list` labels a connection that declared itself a gateway on
+    /// `initialize`, and only that kind: a terminal, or a kind the core does
+    /// not know, is listed without a label.
+    #[tokio::test]
+    async fn tui_list_labels_only_a_declared_gateway_connection() {
+        let (lister, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&lister.ctx);
+        let mut registered = std::collections::HashMap::new();
+        for (peer, capabilities) in [
+            (
+                "unix:gateway",
+                serde_json::json!({ "client_kind": CLIENT_KIND_GATEWAY }),
+            ),
+            (
+                "unix:terminal",
+                serde_json::json!({ "elicitation": { "form": {} } }),
+            ),
+            (
+                "unix:unknown",
+                serde_json::json!({ "client_kind": "relay" }),
+            ),
+        ] {
+            let (writer_tx, _writer_rx) = mpsc::channel(8);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), writer_tx, peer.to_string());
+            client
+                .handle_initialize(&serde_json::json!({
+                    "protocol_version": RPC_PROTOCOL_VERSION,
+                    "clientCapabilities": capabilities,
+                }))
+                .await
+                .expect(peer);
+            let (id, _) = client.tui_registration().expect("registered");
+            registered.insert(id.to_string(), peer);
+        }
+
+        let listed: TuiListResult =
+            serde_json::from_value(lister.handle_tui_list().expect("tui/list")).unwrap();
+        let kinds: std::collections::HashMap<&str, Option<&str>> = listed
+            .tuis
+            .iter()
+            .map(|tui| (registered[&tui.tui_id], tui.client_kind.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashMap::from([
+                ("unix:gateway", Some(CLIENT_KIND_GATEWAY)),
+                ("unix:terminal", None),
+                ("unix:unknown", None),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn remote_initialize_fails_closed_without_identity_signing() {
         let (dispatcher, _sessions) =
@@ -26968,6 +27302,33 @@ mod tests {
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
                 {"id": "model", "name": "model"}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_every_feature_this_core_supports() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["features"], serde_json::json!(ADVERTISED_FEATURES));
+        for name in ADVERTISED_FEATURES {
+            assert!(
+                zeroclaw_rpc_proto::feature::KNOWN.contains(name),
+                "{name} is advertised but the protocol does not define it"
+            );
+        }
+        assert!(
+            result["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("tui.client_kind")),
+            "the core reports client_kind on tui/list: {result}"
         );
     }
 
@@ -29523,6 +29884,8 @@ mod tests {
             checkpoint_write,
             Some(r#"{"type":"ready"}"#.into()),
             Arc::clone(&rpc),
+            "test-session",
+            None
         ));
         started_rx.await.unwrap();
         assert!(
@@ -29578,6 +29941,7 @@ mod tests {
                 session_id,
                 event,
                 &rpc,
+                None,
             )
             .await
             .unwrap();
@@ -29696,6 +30060,7 @@ mod tests {
                 delta: "must-not-emit".into(),
             },
             &rpc,
+            None,
         )
         .await
         .expect_err("a stale turn ID must fail the checkpoint append");
@@ -29755,6 +30120,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                None,
             )
             .await
             .expect_err("stale identity must reject the write");
@@ -29769,6 +30135,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                None,
             )
             .await
             .unwrap();
@@ -29791,6 +30158,7 @@ mod tests {
                 delta: "later progress".into(),
             },
             &rpc,
+            None,
         )
         .await
         .unwrap();
@@ -37772,6 +38140,69 @@ mod tests {
              distinct Failed verdict. Folding it into Cancelled would lie \
              about whether the user pressed Esc."
         );
+        assert!(
+            v["params"].get("error_code").is_none(),
+            "a prompt refused before its turn ran carries no turn failure report: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_refuses_an_unconfigured_agent_as_invalid_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, _rx, _sessions) = make_dispatcher_with_capture(make_acp_test_config(&tmp));
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "nobody"}))
+            .await
+            .expect_err("an unconfigured agent is refused");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("nobody"), "{}", error.message);
+    }
+
+    /// A turn the agent ran and failed reports the code and message a chat
+    /// client shows, from the same classifier the in-process chat socket
+    /// uses.
+    #[tokio::test]
+    async fn a_failed_turn_reports_its_error_on_turn_complete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "session_id": "failing-turn",
+            }))
+            .await
+            .expect("session/new");
+        assert_eq!(created["session_id"], "failing-turn");
+
+        // The provider listens nowhere, so the turn fails in the agent.
+        let error = dispatcher
+            .handle_session_prompt(&json!({"session_id": "failing-turn", "prompt": "hello"}))
+            .await
+            .expect_err("the turn fails");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        let complete = loop {
+            let raw = rx.try_recv().expect("the turn's terminal event was queued");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["params"]["type"] == "turn_complete" {
+                break frame;
+            }
+        };
+        assert_eq!(complete["params"]["outcome"], "failed", "{complete}");
+        let code = complete["params"]["error_code"].as_str().expect("a code");
+        assert!(
+            ["PROVIDER_ERROR", "AUTH_ERROR", "AGENT_ERROR"].contains(&code),
+            "{complete}"
+        );
+        assert!(
+            complete["params"]["error_message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{complete}"
+        );
     }
 
     #[tokio::test]
@@ -37806,6 +38237,34 @@ mod tests {
             "the owner's cancel token must remain un-fired — the rightful \
              owner's turn must survive a mis-targeted cancel from another TUI"
         );
+    }
+
+    /// A running turn holds its session's agent. Refusing a cancel from a
+    /// connection that does not own the session must not wait for that turn.
+    #[tokio::test]
+    async fn a_refused_cancel_does_not_wait_for_the_running_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+        let (session_id, token) =
+            create_session_with_owner(&mut dispatcher_a, &sessions, "tui-A").await;
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("the session has an agent");
+        let _running_turn = agent.lock().await;
+
+        dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatcher_b.handle_session_cancel(&json!({ "session_id": session_id })),
+        )
+        .await
+        .expect("the refusal answers while the turn still runs")
+        .expect_err("a non-owner's cancel is refused");
+        assert_eq!(refused.code, SESSION_NOT_OWNED);
+        assert!(!token.is_cancelled());
     }
 
     #[tokio::test]
@@ -42749,5 +43208,487 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    /// [`subscriber_on_a_one_line_writer`] with its own subscription's
+    /// delivery stopped, so a test can drive one delivery itself.
+    async fn idle_subscriber_on_a_one_line_writer(
+        method: &str,
+    ) -> (
+        Arc<RpcContext>,
+        zeroclaw_config::schema::Config,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) {
+        let (ctx, config, dispatcher, rx, hub, original) =
+            subscriber_on_a_one_line_writer(method).await;
+        let remaining = Arc::strong_count(&dispatcher.rpc) - 1;
+        dispatcher
+            .handle_subscription_cancel(&json!({"subscription_id": original}))
+            .expect("cancel the subscription the fixture opened");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&dispatcher.rpc) > remaining {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fixture's own delivery stops");
+        (ctx, config, dispatcher, rx, hub)
+    }
+
+    /// A delivery of `source` on `dispatcher`'s connection from `cursor`,
+    /// registered as `test-subscription`.
+    fn delivery_from(
+        dispatcher: &RpcDispatcher,
+        hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+        source: crate::rpc::subscription::Source,
+        cursor: u64,
+        epoch_changed: bool,
+    ) -> SubscriptionDelivery {
+        let (method, notification_method) = match source {
+            crate::rpc::subscription::Source::Logs => {
+                (Method::LogsSubscribe, notification::LOGS_EVENT)
+            }
+            crate::rpc::subscription::Source::Events => {
+                (Method::EventsSubscribe, notification::EVENTS_EVENT)
+            }
+        };
+        let subscription_id = "test-subscription".to_string();
+        let cancel = CancellationToken::new();
+        dispatcher
+            .subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        SubscriptionDelivery {
+            hub,
+            source,
+            subscription_id,
+            cursor,
+            epoch_changed,
+            rpc: Arc::clone(&dispatcher.rpc),
+            cancel,
+            notification_method,
+            method,
+            inbound: Arc::clone(&dispatcher.ctx.auth),
+            binding: dispatcher.auth.clone(),
+            registry: Arc::clone(&dispatcher.subscriptions),
+        }
+    }
+
+    /// Poll `future` once and require it to be waiting.
+    fn assert_waiting<F: std::future::Future>(future: std::pin::Pin<&mut F>, what: &str) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut cx).is_pending(), "{what} must be waiting");
+    }
+
+    /// Withdraw the reader profile's log grant and administrator role.
+    fn withdraw_reader_grant(config: &mut zeroclaw_config::schema::Config) {
+        let reader = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists");
+        reader.grants.remove(&zeroclaw_api::grants::Resource::Logs);
+        reader.admin = false;
+    }
+
+    /// Every line a feed sends (a frame, a ring-gap notice, an epoch-change
+    /// notice) waits for writer room, then stops if the grant was withdrawn
+    /// or the feed cancelled meanwhile: nothing is enqueued, the feed ends,
+    /// and the room is handed back.
+    #[tokio::test]
+    async fn every_line_a_feed_sends_stops_on_a_withdrawal_or_cancel_while_the_writer_is_full() {
+        for (method, source) in GLOBAL_STREAMS {
+            for path in ["data", "ring-gap", "epoch-gap"] {
+                for action in ["withdraw", "cancel"] {
+                    let case = format!("{method}/{path}/{action}");
+                    let (ctx, mut config, dispatcher, mut rx, hub) =
+                        idle_subscriber_on_a_one_line_writer(method).await;
+                    if path == "ring-gap" {
+                        hub.note_loss(source, 2);
+                    }
+                    hub.publish(source, json!({"test_payload": "must-not-enqueue"}));
+                    let delivery = delivery_from(&dispatcher, hub, source, 1, path == "epoch-gap");
+                    let cancel = delivery.cancel.clone();
+                    assert!(dispatcher.rpc.send_raw("writer-occupied".into()).await);
+                    let mut pending = Box::pin(deliver_subscription(delivery));
+                    assert_waiting(pending.as_mut(), &case);
+                    if action == "withdraw" {
+                        withdraw_reader_grant(&mut config);
+                        ctx.auth
+                            .refresh_from_config(&config)
+                            .expect("the narrowed policy compiles");
+                        assert_eq!(rx.recv().await.as_deref(), Some("writer-occupied"));
+                    } else {
+                        cancel.cancel();
+                    }
+                    tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                        .await
+                        .unwrap_or_else(|_| panic!("{case}: the feed stayed attached"));
+                    assert!(
+                        !dispatcher
+                            .subscriptions
+                            .lock()
+                            .contains_key("test-subscription"),
+                        "{case}: the feed ends"
+                    );
+                    if action == "cancel" {
+                        assert_eq!(rx.recv().await.as_deref(), Some("writer-occupied"));
+                    }
+                    assert!(rx.try_recv().is_err(), "{case}: a line was enqueued");
+                    let room = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        dispatcher.rpc.reserve(),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the room is handed back"))
+                    .expect("the writer is open");
+                    drop(room);
+                }
+            }
+        }
+    }
+
+    /// Authority is checked once there is room, not before the wait, and a
+    /// refusal hands the room back.
+    #[tokio::test]
+    async fn authority_is_checked_once_there_is_room_and_a_refusal_returns_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let authority = crate::rpc::auth::RpcInboundAuth::for_tests(
+            &zeroclaw_config::schema::Config::default(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = RpcOutbound::new(tx);
+        let cancel = CancellationToken::new();
+        let calls = AtomicUsize::new(0);
+        let allowed = AtomicBool::new(true);
+        assert!(rpc.send_raw("occupied".into()).await);
+        let mut pending = Box::pin(deliver_frame(
+            &rpc,
+            &cancel,
+            &authority,
+            |_lease| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                allowed.load(Ordering::SeqCst)
+            },
+            "pending".into(),
+        ));
+        assert_waiting(pending.as_mut(), "a frame on a full writer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing is checked before there is room"
+        );
+        allowed.store(false, Ordering::SeqCst);
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        assert!(!pending.await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rpc.reserve())
+                .await
+                .expect("the refused frame hands its room back")
+                .is_some()
+        );
+    }
+
+    /// A cancel and room that arrive together end the feed without a check
+    /// or a send.
+    #[tokio::test]
+    async fn a_cancel_wins_over_room_that_arrives_with_it() {
+        let authority = crate::rpc::auth::RpcInboundAuth::for_tests(
+            &zeroclaw_config::schema::Config::default(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = RpcOutbound::new(tx);
+        let cancel = CancellationToken::new();
+        assert!(rpc.send_raw("occupied".into()).await);
+        let mut pending = Box::pin(deliver_frame(
+            &rpc,
+            &cancel,
+            &authority,
+            |_lease| panic!("a cancelled feed checks nothing"),
+            "pending".into(),
+        ));
+        assert_waiting(pending.as_mut(), "a frame on a full writer");
+        cancel.cancel();
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        assert!(!pending.await);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rpc.reserve())
+                .await
+                .expect("the cancelled frame takes no room")
+                .is_some()
+        );
+    }
+
+    /// A writer that closes while a line waits for room ends the feed, on
+    /// every send path.
+    #[tokio::test]
+    async fn a_closed_writer_ends_the_feed_on_every_send_path() {
+        for (method, source) in GLOBAL_STREAMS {
+            for path in ["data", "ring-gap", "epoch-gap"] {
+                let case = format!("{method}/{path}");
+                let (_ctx, _config, dispatcher, rx, hub) =
+                    idle_subscriber_on_a_one_line_writer(method).await;
+                if path == "ring-gap" {
+                    hub.note_loss(source, 2);
+                }
+                hub.publish(source, json!({"test_payload": "pending"}));
+                let delivery = delivery_from(&dispatcher, hub, source, 1, path == "epoch-gap");
+                assert!(dispatcher.rpc.send_raw("occupied".into()).await);
+                let mut pending = Box::pin(deliver_subscription(delivery));
+                assert_waiting(pending.as_mut(), &case);
+                drop(rx);
+                tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: the feed stayed attached"));
+                assert!(
+                    !dispatcher
+                        .subscriptions
+                        .lock()
+                        .contains_key("test-subscription"),
+                    "{case}: the feed ends"
+                );
+            }
+        }
+    }
+
+    /// Frames reach the writer in order and numbered, across several read
+    /// batches.
+    #[tokio::test]
+    async fn a_feed_keeps_its_order_across_read_batches() {
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, hub) =
+                idle_subscriber_on_a_one_line_writer(method).await;
+            for i in 1..=160 {
+                assert_eq!(hub.publish(source, json!({"test_index": i})), i);
+            }
+            let delivery = delivery_from(&dispatcher, hub, source, 1, false);
+            let expected_method = delivery.notification_method;
+            let cancel = delivery.cancel.clone();
+            let pending = zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+            for expected in 1..=160 {
+                let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("{method}: frame {expected} arrives"))
+                    .expect("the writer is open");
+                let frame: Value = serde_json::from_str(&line).expect("a JSON line");
+                assert_eq!(frame["method"], expected_method, "{method}");
+                assert_eq!(frame["params"]["subscription_id"], "test-subscription");
+                assert_eq!(frame["params"]["seq"], expected, "{method}");
+                assert_eq!(frame["params"]["test_index"], expected, "{method}");
+            }
+            cancel.cancel();
+            pending.await.expect("the delivery task ends");
+            assert!(rx.try_recv().is_err(), "{method}");
+            assert!(
+                !dispatcher
+                    .subscriptions
+                    .lock()
+                    .contains_key("test-subscription"),
+                "{method}"
+            );
+        }
+    }
+
+    /// An epoch-change notice, then the replay, then a ring-gap notice and
+    /// the frame after it, in that order on the wire, each numbered where the
+    /// client resumes.
+    #[tokio::test]
+    async fn lag_notices_keep_their_wire_order_and_resume_point() {
+        use crate::rpc::subscription::{RingLimits, SubscriptionHub};
+        for (method, source) in GLOBAL_STREAMS {
+            let (_ctx, _config, dispatcher, mut rx, _fixture_hub) =
+                idle_subscriber_on_a_one_line_writer(method).await;
+            let hub = Arc::new(SubscriptionHub::with_limits(
+                RingLimits {
+                    max_frames: 2,
+                    max_bytes: 1024 * 1024,
+                },
+                2 * 1024 * 1024,
+            ));
+            for i in 1..=4 {
+                hub.publish(source, json!({"test_index": i}));
+            }
+            let delivery = delivery_from(&dispatcher, Arc::clone(&hub), source, 3, true);
+            let expected_method = delivery.notification_method;
+            let cancel = delivery.cancel.clone();
+            let pending = zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+            let first: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(
+                first["method"],
+                notification::SUBSCRIPTION_LAGGED,
+                "{method}"
+            );
+            assert_eq!(
+                first["params"],
+                json!({"subscription_id": "test-subscription", "from_seq": 1, "resume_seq": 3, "epoch_changed": true}),
+                "{method}"
+            );
+            for seq in [3, 4] {
+                let frame: Value =
+                    serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+                assert_eq!(frame["method"], expected_method, "{method}");
+                assert_eq!(frame["params"]["seq"], seq, "{method}");
+                assert_eq!(frame["params"]["test_index"], seq, "{method}");
+            }
+            hub.note_loss(source, 2);
+            assert_eq!(hub.publish(source, json!({"test_index": 7})), 7);
+            let gap: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(gap["method"], notification::SUBSCRIPTION_LAGGED, "{method}");
+            assert_eq!(
+                gap["params"],
+                json!({"subscription_id": "test-subscription", "from_seq": 5, "resume_seq": 7, "epoch_changed": false}),
+                "{method}"
+            );
+            let resumed: Value =
+                serde_json::from_str(&rx.recv().await.expect("a line")).expect("a JSON line");
+            assert_eq!(resumed["method"], expected_method, "{method}");
+            assert_eq!(resumed["params"]["seq"], 7, "{method}");
+            cancel.cancel();
+            pending.await.expect("the delivery task ends");
+            assert!(rx.try_recv().is_err(), "{method}");
+        }
+    }
+
+    /// A grant withdrawal that starts after the final check, while the line
+    /// is between that check and the enqueue, completes only after the
+    /// enqueue. Before the authority was held from the check through the
+    /// send, the withdrawal could complete first and the line was enqueued
+    /// after it.
+    #[tokio::test]
+    async fn a_withdrawal_after_the_final_check_completes_only_after_the_enqueue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (wire, _source) in GLOBAL_STREAMS {
+            let (ctx, mut config, dispatcher, mut rx, _hub) =
+                idle_subscriber_on_a_one_line_writer(wire).await;
+            let method = if wire == "logs/subscribe" {
+                Method::LogsSubscribe
+            } else {
+                Method::EventsSubscribe
+            };
+            withdraw_reader_grant(&mut config);
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let publishing = Arc::clone(&ctx.auth);
+            let published = Arc::clone(&finished);
+            let publisher = std::thread::spawn(move || {
+                start_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the check starts the withdrawal");
+                publishing
+                    .refresh_from_config(&config)
+                    .expect("the narrowed policy compiles");
+                published.store(true, Ordering::SeqCst);
+            });
+            let binding = dispatcher.auth.as_ref().expect("a bound subscriber");
+            let mut generation = Some(binding.generation);
+            let cancel = CancellationToken::new();
+            assert!(dispatcher.rpc.send_raw("occupied".into()).await);
+            let line = json!({
+                "jsonrpc": "2.0",
+                "method": if wire == "logs/subscribe" { "logs/event" } else { "events/event" },
+                "params": {"subscription_id": "test-subscription", "seq": 1, "test": "checked-before-the-withdrawal"},
+            })
+            .to_string();
+            let mut pending = Box::pin(deliver_frame(
+                &dispatcher.rpc,
+                &cancel,
+                &ctx.auth,
+                |lease| {
+                    let allowed =
+                        still_authorized_under(lease, Some(binding), method, &mut generation);
+                    assert!(allowed, "{wire}: the grant is in force at the final check");
+                    // The withdrawal starts now, between the final check and
+                    // the enqueue, and gets as far as it can.
+                    start_tx.send(()).expect("the publisher waits");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !ctx.auth.publication_queued_behind_a_lease() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{wire}: the withdrawal queues behind the hold"
+                        );
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        !finished.load(Ordering::SeqCst),
+                        "{wire}: the withdrawal cannot complete before the enqueue"
+                    );
+                    allowed
+                },
+                line,
+            ));
+            assert_waiting(pending.as_mut(), wire);
+            assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+            assert!(
+                pending.await,
+                "{wire}: the line checked under the grant is enqueued"
+            );
+            publisher.join().expect("the publisher finishes");
+            assert!(finished.load(Ordering::SeqCst), "{wire}");
+            assert!(
+                current_authority(&ctx.auth, binding, method).is_err(),
+                "{wire}: the withdrawal really happened"
+            );
+            let enqueued = rx.try_recv().expect("the line was enqueued");
+            assert!(
+                enqueued.contains("checked-before-the-withdrawal"),
+                "{wire}: {enqueued}"
+            );
+        }
+    }
+
+    /// The authority lease orders a publication after an effect performed
+    /// under it: the publication queues, and completes once the lease is
+    /// dropped.
+    #[tokio::test]
+    async fn an_authority_lease_orders_a_publication_after_the_enqueue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (wire, _source) in GLOBAL_STREAMS {
+            let (ctx, mut config, dispatcher, mut rx, _hub) =
+                idle_subscriber_on_a_one_line_writer(wire).await;
+            let method = if wire == "logs/subscribe" {
+                Method::LogsSubscribe
+            } else {
+                Method::EventsSubscribe
+            };
+            withdraw_reader_grant(&mut config);
+            let slot = dispatcher.rpc.reserve().await.expect("the writer is open");
+            let finished = Arc::new(AtomicBool::new(false));
+            let publishing = Arc::clone(&ctx.auth);
+            let published = Arc::clone(&finished);
+            let lease = ctx.auth.hold_authority();
+            let binding = dispatcher.auth.as_ref().expect("a bound subscriber");
+            let grants = current_authority_under(&lease, binding, method).expect("in force");
+            assert!(sees_every_principal(binding, &grants), "{wire}");
+            let publisher = std::thread::spawn(move || {
+                publishing
+                    .refresh_from_config(&config)
+                    .expect("the narrowed policy compiles");
+                published.store(true, Ordering::SeqCst);
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ctx.auth.publication_queued_behind_a_lease() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{wire}: the publication queues"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!finished.load(Ordering::SeqCst), "{wire}");
+            slot.send("enqueued-before-the-withdrawal".into());
+            assert!(!finished.load(Ordering::SeqCst), "{wire}");
+            drop(lease);
+            publisher.join().expect("the publisher finishes");
+            assert!(finished.load(Ordering::SeqCst), "{wire}");
+            assert_eq!(
+                rx.recv().await.as_deref(),
+                Some("enqueued-before-the-withdrawal")
+            );
+        }
     }
 }

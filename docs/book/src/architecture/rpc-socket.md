@@ -261,6 +261,16 @@ explicitly stopped.
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
+- Clients built on `zeroclaw-rpc-client` verify the endpoint before sending a
+  credential. When `initialize` would carry an `auth_token`, a TUI signature
+  or forwarded environment, the kernel's peer uid for the connected socket
+  must be the expected account (the client's own by default, or a uid the
+  launcher passes), and the socket's directory must belong to that account
+  with no group or other write access. A sticky shared directory such as
+  `/tmp` does not qualify. The check runs on every dial. On Windows,
+  credential-bearing dials are refused until the client can check the pipe
+  server's account. Dials that carry none of these are not gated. The only
+  other public constructor runs over the daemon's in-process duplex.
 
 ## Quick test
 
@@ -298,17 +308,33 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |

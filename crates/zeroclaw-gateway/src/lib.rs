@@ -33,11 +33,16 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod chat_core;
+#[cfg(test)]
+mod core_parity_tests;
+pub mod core_rpc;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
+pub mod preview;
 pub mod principal_gate;
 pub mod security_headers;
 pub mod session_queue;
@@ -1065,6 +1070,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         ),
         None => (None, None, None),
     };
+
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1720,6 +1726,20 @@ pub async fn run_gateway_with_plugin_webhooks(
             config.gateway.pairing_code,
         )
     }));
+    // The in-process RPC seam: when a supervised run provides the daemon's
+    // connector, routes that migrate onto RPC reach the core through it, each
+    // request on a connection bound to its caller's own credential. Nothing
+    // is dialed until such a request arrives, and never without a credential.
+    let core_rpc = match reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        Some(connector) => {
+            let pairing = Arc::clone(&pairing);
+            core_rpc::CoreRpc::inproc(connector, move || pairing.require_pairing())
+        }
+        None => core_rpc::CoreRpc::default(),
+    };
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -2297,7 +2317,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort_request))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -2430,7 +2450,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -4802,8 +4824,20 @@ fn require_gateway_admin_token(
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+) -> Response {
+    admin_shutdown(&peer, &state.shutdown_tx)
+}
+
+/// The `/admin/shutdown` answer to a caller at `peer`: refused unless it is
+/// on loopback, otherwise a stop request on `shutdown`. The separate
+/// gateway answers with this too, so both stop the same way.
+pub(crate) fn admin_shutdown(
+    peer: &SocketAddr,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+) -> Response {
+    if let Err(refusal) = require_localhost(peer) {
+        return refusal.into_response();
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -4815,9 +4849,9 @@ async fn handle_admin_shutdown(
         message: "Gateway shutdown initiated".to_string(),
     };
 
-    let _ = state.shutdown_tx.send(true);
+    let _ = shutdown.send(true);
 
-    Ok((StatusCode::OK, Json(body)))
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Authorization decision for `POST /admin/reload`, derived purely from the

@@ -260,6 +260,45 @@ fn reliable_provider_terminal_failure_message_with_renderer(
     }
 }
 
+/// How a failed turn is reported to a chat client: a stable code and the
+/// message to show. The in-process chat socket and the core's `TurnComplete`
+/// both build theirs here, so a client sees the same report either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFailureReport {
+    /// `PROVIDER_ERROR`, `AUTH_ERROR` or `AGENT_ERROR`.
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Report a failed turn from its diagnostic and, for a terminal-delivery
+/// failure, the localized message [`terminal_completion_error_message`]
+/// produced. The diagnostic is sanitized before it is shown or classified;
+/// the localized message never changes the classification.
+pub fn turn_failure_report(
+    diagnostic: &str,
+    user_message: Option<&str>,
+    is_terminal_provider_failure: bool,
+) -> TurnFailureReport {
+    let sanitized = zeroclaw_providers::sanitize_api_error(diagnostic);
+    let lower = sanitized.to_lowercase();
+    let code = if is_terminal_provider_failure {
+        "PROVIDER_ERROR"
+    } else if lower.contains("api key")
+        || lower.contains("authentication")
+        || lower.contains("unauthorized")
+    {
+        "AUTH_ERROR"
+    } else if lower.contains("model_provider") || lower.contains("model") {
+        "PROVIDER_ERROR"
+    } else {
+        "AGENT_ERROR"
+    };
+    TurnFailureReport {
+        code,
+        message: user_message.map_or(sanitized, str::to_owned),
+    }
+}
+
 /// Map typed terminal-delivery failures to their Fluent user-facing message.
 pub fn terminal_completion_error_message(
     err: &anyhow::Error,

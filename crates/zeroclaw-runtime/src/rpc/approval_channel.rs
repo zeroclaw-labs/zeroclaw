@@ -23,6 +23,34 @@ use zeroclaw_api::jsonrpc::RpcOutbound;
 
 use super::context::ApprovalPendingMap;
 
+tokio::task_local! {
+    static TURN_GENERATION: (Option<u64>, Option<u64>);
+}
+
+pub(crate) async fn scope_turn_generation<T>(
+    generation: Option<u64>,
+    live_generation: Option<u64>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TURN_GENERATION
+        .scope((generation, live_generation), future)
+        .await
+}
+
+pub(crate) fn current_turn_generation() -> Option<u64> {
+    TURN_GENERATION
+        .try_with(|generation| generation.0)
+        .ok()
+        .flatten()
+}
+
+fn current_live_generation() -> Option<u64> {
+    TURN_GENERATION
+        .try_with(|generation| generation.1)
+        .ok()
+        .flatten()
+}
+
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct RpcApprovalChannel {
@@ -32,9 +60,18 @@ pub struct RpcApprovalChannel {
     pending: Arc<ApprovalPendingMap>,
     approval_timeout: Duration,
     client_caps: ElicitationCapabilities,
+    emission: Option<super::session_emission::SessionEmissionAuthority>,
 }
 
 impl RpcApprovalChannel {
+    pub(crate) fn with_emission_authority(
+        mut self,
+        authority: super::session_emission::SessionEmissionAuthority,
+    ) -> Self {
+        self.emission = Some(authority);
+        self
+    }
+
     pub fn new(
         name: impl Into<String>,
         session_id: impl Into<String>,
@@ -49,6 +86,7 @@ impl RpcApprovalChannel {
             pending,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             client_caps,
+            emission: None,
         }
     }
 }
@@ -175,23 +213,50 @@ impl RpcApprovalChannel {
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
-        let mut pending_request =
-            self.pending
-                .register(request_id.clone(), self.session_id.clone(), tx);
+        let generation = current_turn_generation();
+        let mut pending_request = self.pending.register_for_connection(
+            request_id.clone(),
+            self.session_id.clone(),
+            &self.rpc,
+            generation,
+            tx,
+        );
 
-        self.rpc
-            .notify(
+        let params = json!({
+            "type": "approval_request",
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "client_turn_generation": generation,
+            "tool_name": request.tool_name,
+            "arguments_summary": request.arguments_summary,
+            "timeout_secs": timeout.as_secs(),
+        });
+        if let Some(authority) = self.emission.as_ref() {
+            let packet = serde_json::to_string(&zeroclaw_api::jsonrpc::JsonRpcNotification::new(
                 "session/update",
-                json!({
-                    "type": "approval_request",
-                    "session_id": self.session_id,
-                    "request_id": request_id,
-                    "tool_name": request.tool_name,
-                    "arguments_summary": request.arguments_summary,
-                    "timeout_secs": timeout.as_secs(),
-                }),
-            )
-            .await;
+                params,
+            ))?;
+            if !authority
+                .send(
+                    &self.rpc,
+                    &self.session_id,
+                    current_live_generation(),
+                    true,
+                    packet,
+                )
+                .await
+            {
+                drop(pending_request);
+                return Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ),
+                ));
+            }
+        } else {
+            self.rpc.notify("session/update", params).await;
+        }
 
         // Only the answered arm is an operator decision. The other two deny
         // because the client went away or never answered, and say so.
@@ -341,6 +406,62 @@ mod tests {
                 url: false,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn viewer_disconnect_is_unreachable_and_preserves_other_turns_and_connections() {
+        let (rpc, mut wire) = make_rpc();
+        let (other_rpc, _other_wire) = make_rpc();
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "synthetic approval".into(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            scope_turn_generation(
+                Some(71),
+                None,
+                ch.request_approval_attributed_with_timeout("", &request, Duration::from_secs(60)),
+            )
+            .await
+        });
+        let frame: serde_json::Value = serde_json::from_str(&wire.recv().await.unwrap()).unwrap();
+        assert_eq!(frame["params"]["client_turn_generation"], 71);
+        let id = frame["params"]["request_id"].as_str().unwrap();
+        assert!(!pending.unreachable(id, "sess-1", &rpc, 72));
+        assert!(!pending.unreachable(id, "sess-1", &other_rpc, 71));
+        assert!(!pending.unreachable(id, "other-session", &rpc, 71));
+        assert!(pending.contains(id));
+        let (other_tx, mut other_rx) = tokio::sync::oneshot::channel();
+        let _other = pending.register_for_connection(
+            "other".into(),
+            "sess-1".into(),
+            &rpc,
+            Some(72),
+            other_tx,
+        );
+        assert!(pending.unreachable(id, "sess-1", &rpc, 71));
+        let answer = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            answer.source,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        );
+        assert!(pending.contains("other"));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(pending.resolve("other", "sess-1", ChannelApprovalResponse::Approve));
+        assert_eq!(other_rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]

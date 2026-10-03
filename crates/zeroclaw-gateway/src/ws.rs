@@ -46,9 +46,9 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 const WS_CHANNEL_KEY: &str = "wss";
 
 #[derive(Debug, Deserialize)]
-struct ConnectParams {
+pub(crate) struct ConnectParams {
     #[serde(rename = "type")]
-    msg_type: String,
+    pub(crate) msg_type: String,
     /// Client-chosen session ID for memory persistence
     #[serde(default)]
     session_id: Option<String>,
@@ -60,11 +60,11 @@ struct ConnectParams {
     capabilities: Vec<String>,
     /// Project root / working directory for this session.
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
-const WS_PROTOCOL: &str = "zeroclaw.v1";
+pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -86,7 +86,10 @@ pub struct WsQuery {
     pub workspace_dir: Option<String>,
 }
 
-fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
+pub(crate) fn extract_ws_token<'a>(
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+) -> Option<&'a str> {
     // 1. Authorization header
     if let Some(t) = headers
         .get(header::AUTHORIZATION)
@@ -1337,7 +1340,7 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
-fn history_trimmed_ws_frame(
+pub(crate) fn history_trimmed_ws_frame(
     dropped_messages: usize,
     dropped_turns: usize,
     kept_turns: usize,
@@ -1426,7 +1429,7 @@ fn needs_onboarding_ws_error(
     }))
 }
 
-fn first_chat_message_content(text: &str) -> Option<String> {
+pub(crate) fn first_chat_message_content(text: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
     (parsed["type"].as_str() == Some("message"))
         .then(|| parsed["content"].as_str().unwrap_or("").to_string())
@@ -2415,25 +2418,15 @@ fn ws_turn_failure_frame(
     user_message: Option<&str>,
     is_terminal_provider_failure: bool,
 ) -> serde_json::Value {
-    let sanitized = zeroclaw_providers::sanitize_api_error(diagnostic);
-    let error_code = if is_terminal_provider_failure {
-        "PROVIDER_ERROR"
-    } else if sanitized.to_lowercase().contains("api key")
-        || sanitized.to_lowercase().contains("authentication")
-        || sanitized.to_lowercase().contains("unauthorized")
-    {
-        "AUTH_ERROR"
-    } else if sanitized.to_lowercase().contains("model_provider")
-        || sanitized.to_lowercase().contains("model")
-    {
-        "PROVIDER_ERROR"
-    } else {
-        "AGENT_ERROR"
-    };
+    let report = zeroclaw_runtime::agent::turn_failure_report(
+        diagnostic,
+        user_message,
+        is_terminal_provider_failure,
+    );
     serde_json::json!({
         "type": "error",
-        "message": user_message.unwrap_or(&sanitized),
-        "code": error_code,
+        "message": report.message,
+        "code": report.code,
     })
 }
 
