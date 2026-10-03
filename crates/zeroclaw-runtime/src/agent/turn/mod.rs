@@ -5398,7 +5398,7 @@ mod active_route_context_tests {
         // route (ratio 0.9 -> 7.2k budget) served by the mock endpoint.
         let config: Config = toml::from_str(&format!(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.text]
 model = "text-model"
 context_window = 200000

@@ -228,10 +228,7 @@ RUN for b in zeroclaw zerocode; do \
 # /zeroclaw-data mount point) so a bind mount on /zeroclaw-data cannot shadow them.
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'api_key = ""' \
-        'default_provider = "openrouter"' \
-        'default_model = "anthropic/claude-sonnet-4-20250514"' \
-        'default_temperature = 0.7' \
+        'schema_version = 4' \
         '' \
         '[gateway]' \
         'port = 42617' \
@@ -239,6 +236,18 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
         'allow_public_bind = true' \
         'require_pairing = false' \
         'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
+        '' \
+        '[providers.models.openrouter.default]' \
+        'api_key = ""' \
+        'model = "anthropic/claude-sonnet-4-20250514"' \
+        'temperature = 0.7' \
+        '' \
+        '[agents.default]' \
+        'model_provider = "openrouter.default"' \
+        'risk_profile = "default"' \
+        'runtime_profile = "default"' \
+        '' \
+        '[runtime_profiles.default]' \
         '' \
         '[risk_profiles.default]' \
         'level = "supervised"' \

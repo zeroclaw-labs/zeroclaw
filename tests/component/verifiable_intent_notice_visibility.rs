@@ -284,7 +284,7 @@ fn enabling_the_section_through_config_patch_records_the_notice_once() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
     std::fs::write(
         dir.path().join("config.toml"),
-        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+        "schema_version = 4\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
          [verifiable_intent]\nenabled = false\n",
     )
     .expect("write config.toml");
@@ -347,7 +347,7 @@ fn a_patch_that_does_not_enable_the_section_adds_no_second_record() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
     std::fs::write(
         dir.path().join("config.toml"),
-        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+        "schema_version = 4\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
          [verifiable_intent]\nenabled = true\n",
     )
     .expect("write config.toml");

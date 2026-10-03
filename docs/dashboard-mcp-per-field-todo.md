@@ -64,7 +64,6 @@ at the field declaration site:
 - `Vec<EmbeddingRouteConfig>` — natural key is `name`.
 - `Vec<GoogleWorkspaceAllowedOperation>` — natural key is `name`.
 - `Vec<ModelRouteConfig>` — natural key is `name`.
-- `Vec<NevisRoleMappingConfig>` — natural key is `name`.
 - `Vec<PeripheralBoardConfig>` — natural key is `name`.
 - `Vec<ToolFilterGroup>` — natural key is `name`.
 
