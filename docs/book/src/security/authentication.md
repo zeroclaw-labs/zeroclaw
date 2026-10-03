@@ -531,6 +531,83 @@ layer in follow-ups.
   preserves the TUI's registry identity and grants **no** authority. Every
   `initialize` re-presents a credential.
 
+## Denial audit records
+
+When the per-operation check (credential liveness, policy re-resolution, and
+the method's grant) or one of the selectors above refuses an RPC request, the
+daemon writes one `WARN` log record with the message `RPC authorization
+denied` and these attributes:
+
+| Attribute | Value |
+|---|---|
+| `method` | The JSON-RPC method refused. |
+| `reason` | A stable identifier for the refusal, from the table below. |
+| `denial_message` | The refusal text, rendered in the daemon's locale. |
+| `code` | The JSON-RPC error code of the refusal: `-32010` (`AUTH_REQUIRED`), `-32012` (`FORBIDDEN`), or `-32602` (`INVALID_PARAMS`). |
+| `principal_id` | The principal the connection was bound to, or `null` when it was not bound. |
+| `auth_provider` | The provider that verified that principal, such as `peercred` or `oidc.<alias>`, or `null` when the connection was not bound. |
+
+Group and alert on `reason`, not `denial_message`. The identifier does not
+change with wording or locale, while a message names the path, agent, or grant
+involved, so one cause yields many texts and two causes can share one
+(`policy_generation_moved` carries the `revalidation_due` text). Identifiers
+are only ever added, never renamed or reused, so treat one you do not
+recognize as a generic refusal.
+
+Some cases read differently:
+
+- `cron_job_agent_not_entitled` is recorded while the client is told the job
+  was not found, the answer a missing job gets, so the response does not
+  confirm that the job exists. The record's `denial_message` names the owning
+  agent and the job, and its `code` is the `-32602` the client received.
+- Records are operator data. `logs/query` and `logs/get` return persisted
+  records, these included, only to administrators and the shared operator,
+  the same principals the log and event streams serve. A scoped principal
+  is refused with `global_stream_scoped`, even with `Logs:Read`.
+- When a policy change leaves an established connection unable to re-resolve,
+  as when its credential no longer verifies, it loses its binding and must
+  initialize again. That record still carries the principal and provider the
+  binding held; later requests on the connection are recorded as
+  `not_initialized` with no principal or provider until it initializes.
+- An open `logs/subscribe` or `events/subscribe` stream is rechecked on every
+  delivery. A refused recheck ends the stream without an error response, and
+  its record names the method that opened the stream.
+- Some refusals are answered but not recorded: a refused `initialize`
+  handshake (so a missing or rejected credential leaves no record), the
+  not-found-or-not-owned session refusal outside chunked uploads, a scoped
+  principal's request for the shared memory plane, an SOP decision the
+  approval policy does not authorize, a failed TUI signature check, and the
+  `sops/run-detail` and `sops/rename` refusals over remote WSS.
+
+The table below lists the identifiers records carry today. The code also defines
+`no_credential`, `mfa_required`, `unknown_provider`, `local_roster_required`,
+and `remote_token_required` for refused handshakes, which are not recorded
+yet, and `alias_not_entitled`, which nothing produces today.
+
+| `reason` | `code` | Meaning |
+|---|---|---|
+| `not_initialized` | `-32010` | The connection has no binding: it has not completed `initialize`, or it lost its binding after a policy change. |
+| `token_expired` | `-32010` | The credential expired. |
+| `revalidation_due` | `-32010` | The credential's revalidation deadline passed. |
+| `pairing_revoked` | `-32010` | The native pairing token the connection used was revoked. |
+| `policy_generation_moved` | `-32010` | A new authorization policy was published while the request was being checked. |
+| `bad_credential` | `-32010` | After a policy change, the connection's credential no longer verifies, for example a local uid whose `[users]` entry was removed. An OIDC connection gets this after every policy change, since its bearer is not kept. |
+| `not_entitled` | `-32012` | The current policy assigns the principal no permission profile. |
+| `misconfigured` | `-32012` | The policy is inconsistent for the principal (an OIDC mapping or a profile it depends on is missing, or the issuer differs), so the daemon fails closed. |
+| `grant_missing` | `-32012` | The principal lacks the resource and verb grant the method requires. |
+| `config_path_not_granted` | `-32012` | The config path is outside the principal's `config_write_paths`. |
+| `agent_not_entitled` | `-32012` | The principal may not use the named agent. |
+| `cron_job_agent_not_entitled` | `-32602` | The cron job belongs to an agent the principal may not use. |
+| `session_workspace_not_authorized` | `-32012` | The session workspace is not a directory the agent may both read and write, or a live session holds it under an alias such as a symlink. |
+| `fs_listing_not_granted` | `-32012` | The `fs/list_dir` path is not an absolute local path that an enabled agent the principal may use can read. An administrator gets this only for a path that does not resolve. |
+| `attachment_source_not_granted` | `-32012` | An attachment sent by local path names a file the destination agent may not read. |
+| `session_environment_retained` | `-32012` | The session holds a local operator environment this connection may not use. |
+| `session_environment_mismatch` | `-32012` | The session's environment differs from the one this connection would give it. |
+| `global_stream_scoped` | `-32012` | A scoped principal (neither an administrator nor the shared operator) asked for a daemon-wide log or event stream, the event history, or persisted log records (`logs/query`, `logs/get`), or held such a stream open when it lost administrator rights. |
+| `sop_tool_selector_constrained` | `-32012` | `sops/run` or `sops/decide` came from a principal that is not an administrator and whose tool selector is not `"*"`. |
+| `sop_definition_unreadable` | `-32012` | The procedure to replace or delete cannot be loaded to check which agents it runs as. |
+| `session_not_owned` | `-32012` | A chunked upload names a session the principal does not own. The client is told the session was not found or is not owned. |
+
 ## Session isolation
 
 Every session a scoped principal creates is stamped with that principal's

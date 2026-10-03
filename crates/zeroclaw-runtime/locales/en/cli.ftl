@@ -1428,6 +1428,20 @@ rpc-auth-remote-token-required = Remote connections must present auth_token in i
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
+# Values such as $path, $agent, $workspace, $job and $name arrive already quoted and escaped; keep them as they are.
+rpc-auth-grant-missing = Principal is not granted { $resource }:{ $verb } (required by { $method })
+rpc-auth-config-path-not-granted = Principal is not granted config write access to { $path }
+rpc-auth-agent-not-entitled = Principal is not entitled to agent { $agent }
+rpc-auth-cron-job-agent-not-entitled = Principal is not entitled to agent { $agent }, which owns cron job { $job }
+rpc-auth-session-workspace-not-authorized = Session workspace { $workspace } is not an existing directory agent { $agent } may both read and write; add it to the agent's risk profile allowed_roots to authorize it
+rpc-auth-fs-listing-not-granted = Principal is not granted a listing of { $path }: only absolute local paths that an enabled agent it may use can read can be listed
+rpc-auth-attachment-source-not-granted = Principal is not granted attachment source { $path }: only an absolute local path that agent { $agent } may read can be attached by path
+rpc-auth-session-environment-retained = Session retains a local operator environment; create a new session on this connection
+rpc-auth-session-environment-mismatch = Session environment differs from this connection; create a new session
+rpc-auth-global-stream-scoped = Scoped principals cannot read the daemon-wide logs and events: their records are not attributed to an owning principal, so the log and event streams, the event history, and the persisted log are limited to administrators and the shared operator
+rpc-auth-sop-tool-selector-constrained = Principal has a constrained tool selector; procedures run outside per-session tool narrowing and are refused to it
+rpc-auth-sop-definition-unreadable = Principal may not replace or delete procedure { $name }: its definition cannot be loaded to check which agents it runs as
+rpc-auth-session-not-owned = Session not found or not owned by this principal
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 

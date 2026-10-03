@@ -1299,18 +1299,14 @@ impl RpcDispatcher {
             .as_secs();
         {
             let Some(auth) = self.auth.as_ref() else {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-first-call-initialize",
-                ));
+                let denied = AuthDenied::not_initialized();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             };
             if let Some(expires_at) = auth.principal.expires_at
                 && expires_at <= now
             {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-credential-expired",
-                ));
+                let denied = AuthDenied::token_expired();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
@@ -1320,18 +1316,14 @@ impl RpcDispatcher {
                 // Fail closed at the revalidation deadline. The client
                 // holds the credential and revalidates by re-initializing,
                 // which re-verifies against the live authority.
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-revalidation-due",
-                ));
+                let denied = AuthDenied::revalidation_due();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
             if let Some(hash) = auth.native_token_hash.as_deref()
                 && !self.ctx.auth.pairing().token_hash_is_paired(hash)
             {
-                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                    "rpc-auth-pairing-revoked",
-                ));
+                let denied = AuthDenied::pairing_revoked();
                 self.audit_auth_denial(method, &denied);
                 return Err(denied);
             }
@@ -1340,13 +1332,12 @@ impl RpcDispatcher {
         // the retained identity so profile/mapping/roster changes reach
         // this established connection now, not at reconnect.
         let current_generation = self.ctx.auth.generation();
-        let stale_identity = self
+        let stale_auth = self
             .auth
             .as_ref()
             .filter(|auth| auth.generation != current_generation)
-            .map(|auth| auth.identity.clone());
-        if stale_identity.is_some() {
-            let stale_auth = self.auth.as_ref().expect("stale auth exists").clone();
+            .cloned();
+        if let Some(stale_auth) = stale_auth {
             match self.ctx.auth.revalidate_and_resolve(&stale_auth) {
                 Ok(resolved) => {
                     if let Some(auth) = self.auth.as_mut() {
@@ -1356,27 +1347,23 @@ impl RpcDispatcher {
                     }
                 }
                 Err(reason) => {
-                    // The current policy grants this identity nothing:
-                    // drop the binding entirely.
+                    // The current policy grants this identity nothing: drop the
+                    // binding entirely, but attribute the denial to the principal
+                    // that held it.
                     self.auth = None;
                     let denied = AuthDenied::from_deny_reason(reason);
-                    self.audit_auth_denial(method, &denied);
+                    audit_denial(Some(&stale_auth), method, &denied);
                     return Err(denied);
                 }
             }
         }
         let Some(auth) = self.auth.as_ref() else {
-            let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-first-call-initialize",
-            ));
+            let denied = AuthDenied::not_initialized();
             self.audit_auth_denial(method, &denied);
             return Err(denied);
         };
         if !auth.grants.permits(resource, verb) {
-            let denied = AuthDenied::forbidden(format!(
-                "Principal is not granted {resource}:{verb} (required by {})",
-                method.wire_name()
-            ));
+            let denied = AuthDenied::grant_missing(resource, verb, method.wire_name());
             self.audit_auth_denial(method, &denied);
             return Err(denied);
         }
@@ -1386,6 +1373,13 @@ impl RpcDispatcher {
     fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
         audit_denial(self.auth.as_ref(), method, denied);
     }
+
+    /// Audit `denied` against this connection and turn it into the error the
+    /// client receives.
+    fn refuse(&self, method: Method, denied: crate::rpc::auth::AuthDenied) -> JsonRpcError {
+        self.audit_auth_denial(method, &denied);
+        rpc_err(denied.code, denied.message)
+    }
 }
 
 /// Record one authorization denial for the connection bound to `auth`.
@@ -1394,25 +1388,11 @@ fn audit_denial(
     method: Method,
     denied: &crate::rpc::auth::AuthDenied,
 ) {
-    let (principal_id, auth_provider) = auth
-        .map(|auth| {
-            (
-                Some(auth.principal.id.as_str()),
-                Some(auth.principal.auth_provider_label()),
-            )
-        })
-        .unwrap_or((None, None));
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
             .with_category(::zeroclaw_log::EventCategory::System)
-            .with_attrs(::serde_json::json!({
-                "method": method.wire_name(),
-                "reason": denied.message,
-                "code": denied.code,
-                "principal_id": principal_id,
-                "auth_provider": auth_provider,
-            })),
+            .with_attrs(denied.audit_attrs(method.wire_name(), auth)),
         "RPC authorization denied"
     );
 }
@@ -1440,10 +1420,11 @@ fn current_authority(
     if let MethodAuthz::Requires(resource, verb) = method.authz()
         && !grants.permits(resource, verb)
     {
-        return Err(AuthDenied::forbidden(format!(
-            "Principal is not granted {resource}:{verb} (required by {})",
-            method.wire_name()
-        )));
+        return Err(AuthDenied::grant_missing(
+            resource,
+            verb,
+            method.wire_name(),
+        ));
     }
     Ok(grants)
 }
@@ -1461,10 +1442,11 @@ fn current_authority_under(
     if let MethodAuthz::Requires(resource, verb) = method.authz()
         && !grants.permits(resource, verb)
     {
-        return Err(crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted {resource}:{verb} (required by {})",
-            method.wire_name()
-        )));
+        return Err(crate::rpc::auth::AuthDenied::grant_missing(
+            resource,
+            verb,
+            method.wire_name(),
+        ));
     }
     Ok(grants)
 }
@@ -1474,23 +1456,15 @@ impl RpcDispatcher {
     /// `Config` grant the gate already enforced: both are required.
     fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         if auth.grants.may_write_config(path) {
             Ok(())
         } else {
-            let denied = rpc_err(
-                FORBIDDEN,
-                format!("Principal is not granted config write access to {path:?}"),
-            );
-            self.audit_auth_denial(
+            Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            Err(denied)
+                crate::rpc::auth::AuthDenied::config_path_not_granted(path),
+            ))
         }
     }
 
@@ -1499,7 +1473,7 @@ impl RpcDispatcher {
     /// [`Self::principal_tool_narrowing`] at agent assembly.
     fn selector_session_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(grants) = self.stamped_grants() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         self.selector_session_agent_with_grants(method, grants, alias)
     }
@@ -1521,18 +1495,10 @@ impl RpcDispatcher {
         alias: &str,
     ) -> Result<(), JsonRpcError> {
         if !grants.may_use_agent(alias) {
-            let denied = rpc_err(
-                FORBIDDEN,
-                format!("Principal is not entitled to agent {alias:?}"),
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::agent_not_entitled(alias),
+            ));
         }
         Ok(())
     }
@@ -1594,10 +1560,7 @@ impl RpcDispatcher {
         };
         current_authority(&self.ctx.auth, auth, method)
             .map(Some)
-            .map_err(|denied| {
-                self.audit_auth_denial(method, &denied);
-                rpc_err(denied.code, denied.message)
-            })
+            .map_err(|denied| self.refuse(method, denied))
     }
 
     /// Re-establish the caller's authority to write `path` after the config
@@ -1623,21 +1586,13 @@ impl RpcDispatcher {
     ) -> Result<(), JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
-        let refuse = |denied: AuthDenied| -> JsonRpcError {
-            self.audit_auth_denial(method, &denied);
-            rpc_err(denied.code, denied.message)
-        };
         let Some(grants) = self.recheck_authority_after_admission(method)? else {
-            return Err(refuse(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
-            )));
+            return Err(self.refuse(method, AuthDenied::not_initialized()));
         };
         if let Some(path) = path
             && !grants.may_write_config(path)
         {
-            return Err(refuse(AuthDenied::forbidden(format!(
-                "Principal is not granted config write access to {path:?}"
-            ))));
+            return Err(self.refuse(method, AuthDenied::config_path_not_granted(path)));
         }
         Ok(())
     }
@@ -1676,7 +1631,7 @@ impl RpcDispatcher {
         require_configured: bool,
     ) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         self.check_agent_selector_with_grants(method, &auth.grants, alias, require_configured)
     }
@@ -1696,18 +1651,10 @@ impl RpcDispatcher {
         if configured && grants.may_use_agent(alias) {
             return Ok(());
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            format!("Principal is not entitled to agent {alias:?}"),
-        );
-        self.audit_auth_denial(
+        Err(self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+            crate::rpc::auth::AuthDenied::agent_not_entitled(alias),
+        ))
     }
 
     /// Resolve a cron job and confirm the caller is entitled to its owning
@@ -1727,28 +1674,21 @@ impl RpcDispatcher {
         id: &str,
     ) -> Result<crate::cron::CronJob, JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::not_initialized()));
         };
         let job = crate::cron::get_job(config, id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
-        let denied = rpc_err(
-            INVALID_PARAMS,
-            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
-        );
         self.audit_auth_denial(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: format!(
-                    "Principal is not entitled to agent {:?}, which owns cron job {id:?}",
-                    job.agent_alias
-                ),
-            },
+            &crate::rpc::auth::AuthDenied::cron_job_agent_not_entitled(&job.agent_alias, id),
         );
-        Err(denied)
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
+        ))
     }
 
     /// Confine a session workspace to a directory the agent's own policy lets
@@ -1828,22 +1768,10 @@ impl RpcDispatcher {
         alias: &str,
         workspace: &str,
     ) -> JsonRpcError {
-        let denied = rpc_err(
-            FORBIDDEN,
-            format!(
-                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
-                 may both read and write; add it to the agent's risk profile allowed_roots to \
-                 authorize it",
-            ),
-        );
-        self.audit_auth_denial(
+        self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        denied
+            crate::rpc::auth::AuthDenied::session_workspace_not_authorized(workspace, alias),
+        )
     }
 
     /// Hold one session binding, its agent and its workspace, to `grants`:
@@ -1930,7 +1858,10 @@ impl RpcDispatcher {
         params: &Value,
     ) -> Result<super::fs::ListingAuthorization, JsonRpcError> {
         let Some(grants) = self.stamped_grants() else {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+            return Err(self.refuse(
+                Method::FsListDir,
+                crate::rpc::auth::AuthDenied::not_initialized(),
+            ));
         };
         let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
         let requested = std::path::Path::new(&req.path);
@@ -1956,13 +1887,10 @@ impl RpcDispatcher {
         if let Some(auth) = allowed {
             return Ok(auth);
         }
-        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-            "Principal is not granted a listing of {:?}: only absolute local paths that an \
-             enabled agent it may use can read can be listed",
-            req.path
-        ));
-        self.audit_auth_denial(Method::FsListDir, &denied);
-        Err(rpc_err(denied.code, denied.message))
+        Err(self.refuse(
+            Method::FsListDir,
+            crate::rpc::auth::AuthDenied::fs_listing_not_granted(&req.path),
+        ))
     }
 
     /// Hold path-mode attachment sources to the destination agent's policy.
@@ -2030,12 +1958,10 @@ impl RpcDispatcher {
                 }
             });
             if !allowed {
-                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal is not granted attachment source {raw:?}: only an absolute local \
-                     path that agent {alias:?} may read can be attached by path"
+                return Err(self.refuse(
+                    method,
+                    crate::rpc::auth::AuthDenied::attachment_source_not_granted(raw, alias),
                 ));
-                self.audit_auth_denial(method, &denied);
-                return Err(rpc_err(denied.code, denied.message));
             }
         }
         Ok(resolved)
@@ -2140,18 +2066,10 @@ impl RpcDispatcher {
         has_forwarded_environment: bool,
     ) -> Result<(), JsonRpcError> {
         if has_forwarded_environment && !self.may_use_forwarded_environment(grants) {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session retains a local operator environment; create a new session on this connection",
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::session_environment_retained(),
+            ));
         }
         Ok(())
     }
@@ -2175,18 +2093,10 @@ impl RpcDispatcher {
             .filter(|env| !env.is_empty());
         let current = current.as_ref().filter(|env| !env.is_empty());
         if retained != current {
-            let denied = rpc_err(
-                FORBIDDEN,
-                "Session environment differs from this connection; create a new session",
-            );
-            self.audit_auth_denial(
+            return Err(self.refuse(
                 Method::SessionNew,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            return Err(denied);
+                crate::rpc::auth::AuthDenied::session_environment_mismatch(),
+            ));
         }
         Ok(())
     }
@@ -7164,6 +7074,21 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
+        #[cfg(test)]
+        let _config_write_guard = {
+            let mut lock = Box::pin(Arc::clone(&self.ctx.config_write_lock).lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(lock.as_mut(), cx);
+                if result.is_pending() && !notified {
+                    self.ctx.sessions.configure_writer_waiting.notify_one();
+                    notified = true;
+                }
+                result
+            })
+            .await
+        };
+        #[cfg(not(test))]
         let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
 
         // Capture the session generation /before/ acquiring the per-session
@@ -10411,11 +10336,10 @@ impl RpcDispatcher {
         };
         let denied = match current_authority(&self.ctx.auth, auth, method) {
             Ok(grants) if sees_every_principal(auth, &grants) => return Ok(()),
-            Ok(_) => crate::rpc::auth::AuthDenied::forbidden(GLOBAL_STREAM_SCOPED_DENIAL),
+            Ok(_) => crate::rpc::auth::AuthDenied::global_stream_scoped(),
             Err(denied) => denied,
         };
-        audit_denial(Some(auth), method, &denied);
-        Err(rpc_err(denied.code, denied.message))
+        Err(self.refuse(method, denied))
     }
 
     fn open_subscription(
@@ -10777,19 +10701,13 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
-        let grants = current_authority_under(lease, auth, method).map_err(|denied| {
-            self.audit_auth_denial(method, &denied);
-            rpc_err(denied.code, denied.message)
-        })?;
+        let grants = current_authority_under(lease, auth, method)
+            .map_err(|denied| self.refuse(method, denied))?;
         if !grants.admin
             && auth.principal.is_authenticated()
             && target.owner.as_deref() != Some(auth.principal.id.as_str())
         {
-            let denied = crate::rpc::auth::AuthDenied::forbidden(
-                "Session not found or not owned by this principal",
-            );
-            self.audit_auth_denial(method, &denied);
-            return Err(rpc_err(denied.code, denied.message));
+            return Err(self.refuse(method, crate::rpc::auth::AuthDenied::session_not_owned()));
         }
         self.check_agent_selector_with_grants(method, &grants, &target.agent_alias, true)
     }
@@ -11018,19 +10936,10 @@ impl RpcDispatcher {
         {
             return Ok(());
         }
-        let denied = rpc_err(
-            FORBIDDEN,
-            "Principal has a constrained tool selector; procedures run outside per-session tool \
-             narrowing and are refused to it",
-        );
-        self.audit_auth_denial(
+        Err(self.refuse(
             method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
+            crate::rpc::auth::AuthDenied::sop_tool_selector_constrained(),
+        ))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -11079,12 +10988,10 @@ impl RpcDispatcher {
                 if !exists || grants.admin {
                     return Ok(());
                 }
-                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
-                    "Principal may not replace or delete procedure {name:?}: its definition \
-                     cannot be loaded to check which agents it runs as"
-                ));
-                self.audit_auth_denial(method, &denied);
-                Err(rpc_err(denied.code, denied.message))
+                Err(self.refuse(
+                    method,
+                    crate::rpc::auth::AuthDenied::sop_definition_unreadable(name),
+                ))
             }
         }
     }
@@ -12096,10 +12003,6 @@ fn sees_every_principal(
     grants.admin || !auth.principal.is_authenticated()
 }
 
-const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
-     and event streams: their frames are not attributed to an owning principal, so these \
-     streams and the event history are limited to administrators and the shared operator";
-
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
 /// authority. The credential must still be live, and whenever the accepted
 /// policy generation has moved, the principal is resolved again against
@@ -12125,9 +12028,7 @@ fn still_authorized(
             if sees_every_principal(auth, &grants) {
                 Ok(())
             } else {
-                Err(crate::rpc::auth::AuthDenied::forbidden(
-                    GLOBAL_STREAM_SCOPED_DENIAL,
-                ))
+                Err(crate::rpc::auth::AuthDenied::global_stream_scoped())
             }
         })
     };
@@ -13963,6 +13864,45 @@ mod tests {
         config
     }
 
+    /// `roster_config` with its user renamed, so a test that reads the
+    /// process-wide audit log binds a principal (`user:<user>`) that no
+    /// concurrently running test emits records for.
+    fn roster_config_as(user: &str, uid: u32) -> zeroclaw_config::schema::Config {
+        rename_alice_to(roster_config(uid), user)
+    }
+
+    /// `config` with its roster user `alice` renamed to `user`.
+    fn rename_alice_to(
+        mut config: zeroclaw_config::schema::Config,
+        user: &str,
+    ) -> zeroclaw_config::schema::Config {
+        let entry = config
+            .users
+            .remove("alice")
+            .expect("the fixture roster binds alice");
+        config.users.insert(user.to_string(), entry);
+        config
+    }
+
+    /// `roster_config_as` with the user's profile granting `resource:verb`
+    /// and nothing else.
+    fn roster_config_granting(
+        user: &str,
+        uid: u32,
+        resource: zeroclaw_api::grants::Resource,
+        verb: zeroclaw_api::grants::Verb,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = roster_config_as(user, uid);
+        config.permission_profiles.insert(
+            "reader".into(),
+            zeroclaw_config::schema::PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(resource, vec![verb])]),
+                ..zeroclaw_config::schema::PermissionProfileConfig::default()
+            },
+        );
+        config
+    }
+
     #[tokio::test]
     async fn wss_initialize_without_a_token_is_denied() {
         let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
@@ -14043,6 +13983,269 @@ mod tests {
         assert_eq!(
             denied.code,
             zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+    }
+
+    /// Take the log writer and hook locks, then subscribe to the process-wide
+    /// log broadcast and drain its backlog. Keep all three for the whole
+    /// test: the locks stop another test from swapping the broadcast sender
+    /// while this one reads denial records from it.
+    fn capture_denials() -> (
+        impl Drop,
+        impl Drop,
+        tokio::sync::broadcast::Receiver<Value>,
+    ) {
+        let writer = zeroclaw_log::__private_test_writer_lock();
+        let hook = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut records = zeroclaw_log::subscribe_or_install();
+        while records.try_recv().is_ok() {}
+        (writer, hook, records)
+    }
+
+    /// The attributes of the first "RPC authorization denied" record in
+    /// `records` attributed to `principal` for `method`.
+    ///
+    /// Other tests in this binary emit denial records into the same
+    /// process-wide broadcast concurrently, so every other frame is skipped.
+    /// The gate emits its record synchronously, so the frame is already
+    /// buffered once the dispatch that produced it has returned.
+    fn denial_record(
+        records: &mut tokio::sync::broadcast::Receiver<Value>,
+        principal: &str,
+        method: &str,
+    ) -> Value {
+        use tokio::sync::broadcast::error::TryRecvError;
+        // Who the skipped denials of `method` were attributed to, so a failure
+        // tells a misattributed record apart from a missing one.
+        let mut skipped = Vec::new();
+        loop {
+            match records.try_recv() {
+                Ok(mut frame) => {
+                    if frame["message"] != "RPC authorization denied" {
+                        continue;
+                    }
+                    let attributes = &mut frame["attributes"];
+                    if attributes["method"] != method {
+                        continue;
+                    }
+                    if attributes["principal_id"] == principal {
+                        return attributes.take();
+                    }
+                    skipped.push(attributes["principal_id"].take());
+                }
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(TryRecvError::Empty) => panic!(
+                    "no \"RPC authorization denied\" record attributed to {principal} \
+                     for {method} reached the log broadcast; its other denials of \
+                     {method} were attributed to {}",
+                    Value::Array(skipped)
+                ),
+                Err(TryRecvError::Closed) => panic!(
+                    "the log broadcast closed before a denial record attributed to \
+                     {principal} for {method} arrived"
+                ),
+            }
+        }
+    }
+
+    /// Assert that `response` refuses with `code`, and that `record`, its
+    /// audit record, carries `reason`, the same code and message, and the
+    /// peercred roster principal `principal`.
+    fn assert_refusal_audited(
+        response: &Value,
+        record: &Value,
+        code: i32,
+        reason: &str,
+        principal: &str,
+    ) {
+        assert_eq!(response["error"]["code"], json!(code), "{response}");
+        assert_eq!(record["reason"], reason, "{record}");
+        assert_eq!(record["code"], json!(code), "{record}");
+        assert_eq!(record["principal_id"], principal, "{record}");
+        assert_eq!(record["auth_provider"], "peercred", "{record}");
+        assert_eq!(
+            record["denial_message"], response["error"]["message"],
+            "{record}"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn denial_after_failed_revalidation_keeps_the_principal_it_dropped() {
+        let (_writer, _hook, mut records) = capture_denials();
+        let ctx = enforcement_ctx(roster_config_as("revalidation-audit", 4242));
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Removing the roster moves the generation; the gate's revalidation
+        // of the stale binding then fails and drops it.
+        ctx.auth
+            .refresh_from_config(&zeroclaw_config::schema::Config::default())
+            .expect("the default config is a valid refresh");
+        let response = rpc(&mut peer, &mut rx, 1, "session/list", json!({})).await;
+
+        // The record names the principal whose binding was just dropped, not
+        // the unbound connection left behind.
+        let record = denial_record(&mut records, "user:revalidation-audit", "session/list");
+        assert_refusal_audited(
+            &response,
+            &record,
+            AUTH_REQUIRED,
+            "bad_credential",
+            "user:revalidation-audit",
+        );
+        assert!(
+            peer.auth.is_none(),
+            "a failed revalidation still drops the binding"
+        );
+        let next = peer
+            .authorize(
+                Method::SessionList,
+                zeroclaw_api::grants::Resource::Sessions,
+                zeroclaw_api::grants::Verb::Read,
+            )
+            .expect_err("the connection must initialize again");
+        assert_eq!(
+            next.reason(),
+            crate::rpc::auth::RpcDenialReason::NotInitialized,
+            "later requests on the connection are refused as not initialized"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn missing_grant_denial_is_audited_as_grant_missing() {
+        let (_writer, _hook, mut records) = capture_denials();
+        // A write the gate failed to refuse must land in the tempdir, not in
+        // the default config path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config_as("grant-missing-audit", 4242);
+        config.config_path = tmp.path().join("config.toml");
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"prop": "gateway.port", "value": 1});
+        let response = rpc(&mut peer, &mut rx, 1, "config/set", params).await;
+        let record = denial_record(&mut records, "user:grant-missing-audit", "config/set");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "grant_missing",
+            "user:grant-missing-audit",
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn ungranted_config_path_denial_is_audited_as_config_path_not_granted() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config =
+            roster_config_granting("config-path-audit", 4242, Resource::Config, Verb::Update);
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .config_write_paths = vec!["cron.*".into()];
+        let ctx = enforcement_ctx(config);
+        let port = ctx.config.read().gateway.port;
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"prop": "gateway.port", "value": 1});
+        let response = rpc(&mut peer, &mut rx, 1, "config/set", params).await;
+        let record = denial_record(&mut records, "user:config-path-audit", "config/set");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "config_path_not_granted",
+            "user:config-path-audit",
+        );
+        assert_eq!(ctx.config.read().gateway.port, port, "nothing changed");
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing was persisted"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unentitled_agent_denial_is_audited_as_agent_not_entitled() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let config = roster_config_granting("agent-audit", 4242, Resource::Cost, Verb::Read);
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let params = json!({"agent": "main"});
+        let response = rpc(&mut peer, &mut rx, 1, "cost/query", params).await;
+        let record = denial_record(&mut records, "user:agent-audit", "cost/query");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "agent_not_entitled",
+            "user:agent-audit",
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scoped_global_stream_denial_is_audited_as_global_stream_scoped() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (_writer, _hook, mut records) = capture_denials();
+        let config =
+            roster_config_granting("global-stream-audit", 4242, Resource::Logs, Verb::Read);
+        let ctx = enforcement_ctx(config);
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(&mut peer, &mut rx, 1, "logs/subscribe", json!({})).await;
+        let record = denial_record(&mut records, "user:global-stream-audit", "logs/subscribe");
+        assert_refusal_audited(
+            &response,
+            &record,
+            FORBIDDEN,
+            "global_stream_scoped",
+            "user:global-stream-audit",
+        );
+    }
+
+    /// The client is answered exactly as for a missing job, so the refusal is
+    /// no existence oracle; only the audit record names the owning agent.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn foreign_cron_job_denial_is_audited_with_its_owner_but_answered_as_not_found() {
+        let (_writer, _hook, mut records) = capture_denials();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = rename_alice_to(cron_roster_config_in(&tmp, 4242), "cron-owner-audit");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(&mut peer, &mut rx, 1, "cron/get", json!({"id": beta.id})).await;
+        crate::cron::remove_job(&config, &beta.id).expect("the fixture job is removable");
+        let missing = rpc(&mut peer, &mut rx, 2, "cron/get", json!({"id": beta.id})).await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert_eq!(refused["error"], missing["error"], "{refused} vs {missing}");
+
+        let record = denial_record(&mut records, "user:cron-owner-audit", "cron/get");
+        assert_eq!(record["reason"], "cron_job_agent_not_entitled", "{record}");
+        assert_eq!(record["code"], json!(INVALID_PARAMS), "{record}");
+        assert_eq!(record["principal_id"], "user:cron-owner-audit", "{record}");
+        assert_eq!(record["auth_provider"], "peercred", "{record}");
+        assert_ne!(
+            record["denial_message"], refused["error"]["message"],
+            "{record}"
+        );
+        assert!(
+            record["denial_message"]
+                .as_str()
+                .is_some_and(|message| message.contains("beta")),
+            "the record names the owning agent: {record}"
         );
     }
 
@@ -20725,9 +20928,12 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting.notified())
+                .await
+                .expect("configure captured the generation and waits on the update lock");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
@@ -20747,6 +20953,51 @@ mod tests {
                 .and_then(|o| o.temperature),
             None,
             "bob's successor keeps its own overrides"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_refuses_replacement_before_generation_capture() {
+        use crate::rpc::types::ChatMode;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let writer = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let operation = alice.handle_session_configure(&params);
+        let replace = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sessions.configure_writer_waiting.notified(),
+            )
+            .await
+            .expect("configure passed initial authorization and is waiting before capture");
+            assert!(sessions.remove("cfg").await);
+            let successor =
+                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
+                    .await;
+            drop(writer);
+            successor
+        };
+        let (result, successor) = tokio::join!(operation, replace);
+        let err = result.expect_err("current foreign owner must be refused before capture");
+        assert_eq!(err.code, FORBIDDEN);
+        assert_eq!(
+            err.message,
+            "Session not found or not owned by this principal"
+        );
+        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+        assert_eq!(
+            sessions
+                .get_overrides("cfg")
+                .await
+                .and_then(|o| o.temperature),
+            None
         );
     }
 
