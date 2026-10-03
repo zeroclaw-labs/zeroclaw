@@ -9,8 +9,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
+use zeroclaw_rpc_client::Method;
+
+use crate::core_rpc::{CoreAccess, CoreError};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1209,6 +1214,7 @@ pub async fn handle_api_memory_delete(
 /// Query parameters for `GET /api/cost`. When `agent` is set, the
 /// returned summary filters to records attributed to that alias.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Clone, Default))]
 pub struct CostQuery {
     #[serde(default)]
     pub agent: Option<String>,
@@ -1229,7 +1235,20 @@ pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CostQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return match core
+            .request(Method::CostQuery, cost_query_params(&query))
+            .await
+        {
+            Ok(summary) => Json(serde_json::json!({ "cost": summary })).into_response(),
+            Err(CoreError::Rpc(error)) if cost_tracking_disabled(&error) => {
+                Json(empty_cost_response()).into_response()
+            }
+            Err(error) => error.into_response(),
+        };
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1256,19 +1275,63 @@ pub async fn handle_api_cost(
                 .into_response(),
         }
     } else {
-        Json(serde_json::json!({
-            "cost": {
-                "session_cost_usd": 0.0,
-                "daily_cost_usd": 0.0,
-                "monthly_cost_usd": 0.0,
-                "total_tokens": 0,
-                "request_count": 0,
-                "by_model": {},
-                "by_agent": {},
-            }
-        }))
-        .into_response()
+        Json(empty_cost_response()).into_response()
     }
+}
+
+/// The body this route answers with when cost tracking is disabled.
+fn empty_cost_response() -> serde_json::Value {
+    serde_json::json!({
+        "cost": {
+            "session_cost_usd": 0.0,
+            "daily_cost_usd": 0.0,
+            "monthly_cost_usd": 0.0,
+            "total_tokens": 0,
+            "request_count": 0,
+            "by_model": {},
+            "by_agent": {},
+        }
+    })
+}
+
+/// Lower bound that selects every cost record. No record predates it.
+const ALL_TIME_FROM: &str = "0000-01-01T00:00:00Z";
+
+/// The core's refusal when this daemon has no cost tracker.
+const COST_TRACKING_UNAVAILABLE: &str = "Cost tracking is not available";
+
+fn cost_tracking_disabled(error: &JsonRpcError) -> bool {
+    error.code == INTERNAL_ERROR && error.message == COST_TRACKING_UNAVAILABLE
+}
+
+/// The `cost/query` params that reproduce this route's summary.
+///
+/// This route reads a bound it cannot parse as absent and, with neither
+/// bound, sums every record kept. `cost/query` refuses an unparsable bound
+/// and, with neither, reports the current day and month instead. So only
+/// bounds that parse are forwarded, and a request with none forwards
+/// [`ALL_TIME_FROM`]. An agent selects that agent's summary and no window,
+/// as it does here.
+fn cost_query_params(query: &CostQuery) -> serde_json::Value {
+    if let Some(agent) = query.agent.as_deref().filter(|s| !s.is_empty()) {
+        return serde_json::json!({ "agent": agent });
+    }
+    let parsed = |raw: &Option<String>| {
+        raw.clone()
+            .filter(|raw| chrono::DateTime::parse_from_rfc3339(raw).is_ok())
+    };
+    let (from, to) = match (parsed(&query.from), parsed(&query.to)) {
+        (None, None) => (Some(ALL_TIME_FROM.to_owned()), None),
+        bounds => bounds,
+    };
+    let mut params = serde_json::Map::new();
+    if let Some(from) = from {
+        params.insert("from".into(), from.into());
+    }
+    if let Some(to) = to {
+        params.insert("to".into(), to.into());
+    }
+    serde_json::Value::Object(params)
 }
 
 /// GET /api/cli-tools — discovered CLI tools
@@ -1459,7 +1522,14 @@ pub async fn handle_api_channel_relink(
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return match core.request(Method::TuiList, serde_json::json!({})).await {
+            Ok(list) => Json(tuis_response(list)).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1470,6 +1540,7 @@ pub async fn handle_api_tuis(
         .map(|r| {
             r.list()
                 .into_iter()
+                .filter(|e| !is_gateway_connection(&e.peer_label))
                 .map(|e| {
                     serde_json::json!({
                         "tui_id": e.tui_id,
@@ -1483,6 +1554,35 @@ pub async fn handle_api_tuis(
         .unwrap_or_default();
 
     Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+/// This route's body from the core's `tui/list` result, which also reports
+/// each connection time as a Unix timestamp.
+fn tuis_response(mut list: serde_json::Value) -> serde_json::Value {
+    if let Some(tuis) = list
+        .get_mut("tuis")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        tuis.retain(|tui| {
+            !tui.get("peer_label")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_gateway_connection)
+        });
+        for tui in tuis {
+            if let Some(entry) = tui.as_object_mut() {
+                entry.remove("connected_at_unix");
+            }
+        }
+    }
+    list
+}
+
+/// Whether a registered client is one of this gateway's own core
+/// connections. The core registers every connection it initializes,
+/// including the ones the gateway opens for its callers; those are not
+/// terminals and this route never listed them.
+fn is_gateway_connection(peer_label: &str) -> bool {
+    peer_label == zeroclaw_runtime::rpc::inproc::PEER_LABEL
 }
 
 fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
@@ -1707,13 +1807,29 @@ fn normalized_webhook_path(path: Option<&str>) -> String {
 pub async fn handle_api_health(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return match core.request(Method::Health, serde_json::json!({})).await {
+            Ok(health) => Json(health_response(health)).into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
     let snapshot = zeroclaw_runtime::health::snapshot();
     Json(serde_json::json!({"health": snapshot})).into_response()
+}
+
+/// This route's body from the core's `health` result. The core adds the
+/// process stats that `/api/status` reports; this route never carried them.
+fn health_response(mut health: serde_json::Value) -> serde_json::Value {
+    if let Some(snapshot) = health.as_object_mut() {
+        snapshot.remove("process");
+    }
+    serde_json::json!({ "health": health })
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
