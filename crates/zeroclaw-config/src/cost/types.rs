@@ -306,6 +306,7 @@ pub enum BudgetCheck {
 
 /// Cost summary for reporting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CostSummary {
     /// Total cost for the session
     pub session_cost_usd: f64,
@@ -327,6 +328,7 @@ pub struct CostSummary {
 
 /// Statistics for a specific agent alias.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct AgentCostStats {
     /// Agent alias (HashMap key in `config.agents`).
     pub agent_alias: String,
@@ -351,6 +353,7 @@ pub struct AgentCostStats {
 
 /// Statistics for a specific model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelStats {
     /// Model name (upstream resource id from usage telemetry).
     pub model: String,

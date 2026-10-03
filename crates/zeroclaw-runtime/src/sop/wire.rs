@@ -12,6 +12,7 @@ use super::types::Sop;
 const MAX_SWITCH_PORTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WireOp {
     /// Create the edge, overwriting any previous target of the same role.
@@ -21,6 +22,7 @@ pub enum WireOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// One editor gesture. `role` picks which routing field is mutated; `port`
 /// is required for `Switch` (index into `routing.switch`) and ignored
 /// otherwise. Accepted over RPC (`sops/wire-draft`) and HTTP.

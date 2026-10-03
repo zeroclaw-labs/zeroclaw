@@ -27,6 +27,7 @@ fn canonicalize_provider_ref(provider_name: &str) -> String {
 // ── Diagnostic item ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Ok,
@@ -36,6 +37,7 @@ pub enum Severity {
 
 /// Structured diagnostic result for programmatic consumption (web dashboard, API).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DiagResult {
     pub severity: Severity,
     pub category: String,

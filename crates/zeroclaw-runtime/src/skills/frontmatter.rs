@@ -9,6 +9,7 @@ use super::SkillSlashOption;
 // whose `min`/`max` bounds are `f64` (no total ordering). `PartialEq` is all the
 // surfaces (tests, change detection) need.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SkillFrontmatter {
     pub name: String,
     pub description: String,

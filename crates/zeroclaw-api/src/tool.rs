@@ -270,6 +270,7 @@ impl ToolSpec {
 /// where live config is visible (the runtime), so surfaces render real
 /// selectable choices instead of free-text guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OptionDomain {
     /// Configured channel refs the agent listens on (e.g. `telegram.prod`).
@@ -289,6 +290,7 @@ pub enum OptionDomain {
 
 /// One resolved choice for a domain-typed parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OptionEntry {
     /// The literal value to store in the argument.
     pub value: String,

@@ -241,6 +241,7 @@ pub fn slash_option_kinds() -> Vec<SlashOptionKindDescriptor> {
 /// slash-capable channel maps `kind` to its wire option type. Declared in
 /// SKILL.toml under `[[skill.slash_options]]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SkillSlashOption {
     pub name: String,
     pub description: String,
@@ -273,6 +274,7 @@ pub struct SkillSlashOption {
 
 /// A predefined choice for a typed slash option.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SkillSlashChoice {
     pub name: String,
     pub value: String,
