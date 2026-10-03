@@ -54,6 +54,27 @@ How the daemon comes back after a refusal depends on what was running it:
 
 Conversation memory and session state are written to SQLite incrementally during operation, not buffered until shutdown, so a clean stop does not depend on a flush step. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean channel teardown but does not corrupt already-committed memory; only an agent turn that was mid-write is lost.
 
+## Service control during an agent request
+
+`service stop`, `service restart`, and `service uninstall` refuse to run inside a
+scoped agent tool process. The existing `ZEROCLAW_SESSION_ID` environment marker
+identifies that context; the check runs before service-manager commands or
+service-file deletion. Finish and report the current operation first, then have
+an independent operator run the service command after active work settles.
+Status, logs, and ordinary independent operator service control remain available.
+This prevents accidental self-interruption, not every possible daemon termination:
+it is not a security boundary or proof of daemon ancestry and does not intercept
+raw service-manager commands. Do not clear the marker to work around it.
+
+When a channel transcript is restored with a trailing user request and no durable
+final answer, recovery appends one interruption record while preserving the
+original request. The record explains that tool effects may already have occurred
+and that current state and operation receipts must be checked before any repeated
+mutation. Repeated hydration does not append another record for that same turn;
+a subsequent request remains a separate turn. Recovery neither automatically
+replays tools nor proves that an interruption notice reached Discord or another
+channel. A missing final answer is not evidence that the external action failed.
+
 ## Manual start for debugging
 
 Skip the service and run the daemon directly:
