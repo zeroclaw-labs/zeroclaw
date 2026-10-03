@@ -373,6 +373,8 @@ channel-wecom-ws-stop-ack = 已停止当前消息处理。
 channel-wecom-ws-voice-unavailable = 我现在无法处理语音消息 {$emoji}
 channel-wecom-ws-unsupported-message = 暂不支持该消息类型。
 channel-wecom-ws-welcome = 你好，欢迎来找我聊天 {$emoji}
+channel-wecom-ws-media-failed =
+    {"["}媒体未发送] {$detail}
 channel-wecom-ws-supplemental-message =
     {"["}补充消息]
     {$extra}

@@ -372,6 +372,8 @@ channel-wecom-ws-stop-ack = 現在のメッセージを停止しました。
 channel-wecom-ws-voice-unavailable = 現在、音声メッセージを処理できません {$emoji}
 channel-wecom-ws-unsupported-message = このメッセージタイプはまだサポートされていません。
 channel-wecom-ws-welcome = こんにちは、チャットへようこそ {$emoji}
+channel-wecom-ws-media-failed =
+    {"["}メディアを送信できませんでした] {$detail}
 channel-wecom-ws-supplemental-message =
     {"["}補足メッセージ]
     {$extra}
