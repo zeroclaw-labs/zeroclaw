@@ -2108,14 +2108,29 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 while IFS= read -r line; do :; done
 "#;
 
+        /// Every fixture starts here. The provider never passes `--warm-up`.
+        const FAKE_GROK_PROLOGUE: &str = r#"#!/bin/sh
+set -eu
+if [ "${1-}" = --warm-up ]; then exit 0; fi
+"#;
+
         fn fake_grok(temp: &TempDir, body: &str) -> PathBuf {
             let path = temp.path().join("fake-grok");
-            std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write fake Grok");
+            std::fs::write(&path, format!("{FAKE_GROK_PROLOGUE}{body}")).expect("write fake Grok");
             let mut permissions = std::fs::metadata(&path)
                 .expect("fake Grok metadata")
                 .permissions();
             permissions.set_mode(0o700);
             std::fs::set_permissions(&path, permissions).expect("chmod fake Grok");
+            // On macOS the first exec of a newly written file can wait for a malware scan, and
+            // those scans queue, so in a parallel suite a new fixture can take seconds to start.
+            // Provider timeouts count from spawn, so run the fixture once before any of them
+            // starts; later execs of the unchanged file skip the scan.
+            let warm_up = std::process::Command::new(&path)
+                .arg("--warm-up")
+                .status()
+                .expect("run fake Grok warm-up");
+            assert!(warm_up.success(), "fake Grok warm-up failed: {warm_up}");
             path
         }
 
@@ -2180,6 +2195,17 @@ while IFS= read -r line; do :; done
                 assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
                 sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        /// Reads a PID file once the request has returned, when nothing can still write it.
+        fn recorded_pid(path: &Path) -> i32 {
+            let value = std::fs::read_to_string(path).unwrap_or_else(|error| {
+                panic!("fixture must record {path:?} before the provider kills it: {error}")
+            });
+            value
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{path:?} must hold a PID, found {value:?}"))
         }
 
         fn process_exists(pid: i32) -> bool {
@@ -2447,20 +2473,15 @@ printf '%s\n' "$!" > descendant.pid
 sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 1);
-            let leader_path = temp.path().join("leader.pid");
-            let descendant_path = temp.path().join("descendant.pid");
-            let task = ::zeroclaw_spawn::spawn!(async move {
-                model_provider.invoke_acp("hello", "default").await
-            });
-            let leader = wait_for_pid(&leader_path).await;
-            let descendant = wait_for_pid(&descendant_path).await;
-            let result = task.await.expect("provider task");
-            assert!(
-                result
-                    .expect_err("timeout expected")
-                    .to_string()
-                    .contains("timed out")
-            );
+            let error = model_provider
+                .invoke_acp("hello", "default")
+                .await
+                .expect_err("timeout expected");
+            assert!(error.to_string().contains("timed out"), "error: {error}");
+
+            // invoke_acp kills the process group before it returns, so the PID files are final.
+            let leader = recorded_pid(&temp.path().join("leader.pid"));
+            let descendant = recorded_pid(&temp.path().join("descendant.pid"));
             assert_process_exits(leader).await;
             assert_process_exits(descendant).await;
         }
