@@ -1,6 +1,7 @@
 //! Structured error type for the gateway HTTP CRUD surface and its CLI peer.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Stable error code consumed by HTTP / CLI / dashboard. Add codes here as new
 /// failure cases land — never invent codes ad-hoc at call sites.
@@ -133,6 +134,20 @@ impl ConfigApiError {
         let code = classify_validation_message(&msg);
         Self::new(code, msg)
     }
+
+    pub fn touches_any_path(&self, paths: &HashSet<String>) -> bool {
+        let Some(error_path) = self.path.as_deref().filter(|path| !path.is_empty()) else {
+            return false;
+        };
+        paths.iter().any(|path| {
+            error_path == path || is_child_path(error_path, path) || is_child_path(path, error_path)
+        })
+    }
+}
+
+fn is_child_path(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|suffix| suffix.starts_with(['.', '[']))
 }
 
 pub fn classify_validation_message(msg: &str) -> ConfigApiCode {
@@ -206,6 +221,7 @@ macro_rules! validation_bail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn code_str_round_trip() {
@@ -278,5 +294,47 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("path_not_found"));
         assert!(s.contains("foo.bar"));
+    }
+
+    #[test]
+    fn validation_error_path_intersects_dirty_paths_bidirectionally() {
+        let dirty = HashSet::from(["agents.worker".to_string()]);
+        assert!(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, "invalid")
+                .with_path("agents.worker.model_provider")
+                .touches_any_path(&dirty)
+        );
+
+        let dirty = HashSet::from(["agents.worker.model_provider".to_string()]);
+        assert!(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, "invalid")
+                .with_path("agents.worker")
+                .touches_any_path(&dirty)
+        );
+    }
+
+    #[test]
+    fn validation_error_array_element_intersects_dirty_array_path() {
+        let dirty = HashSet::from(["agents.worker.channels".to_string()]);
+
+        assert!(
+            ConfigApiError::new(ConfigApiCode::DanglingReference, "invalid")
+                .with_path("agents.worker.channels[0]")
+                .touches_any_path(&dirty)
+        );
+    }
+
+    #[test]
+    fn validation_error_without_or_outside_dirty_path_does_not_intersect() {
+        let dirty = HashSet::from(["agents.worker.model_provider".to_string()]);
+        assert!(
+            !ConfigApiError::new(ConfigApiCode::ValidationFailed, "invalid")
+                .touches_any_path(&dirty)
+        );
+        assert!(
+            !ConfigApiError::new(ConfigApiCode::ValidationFailed, "invalid")
+                .with_path("agents.worker.risk_profile")
+                .touches_any_path(&dirty)
+        );
     }
 }

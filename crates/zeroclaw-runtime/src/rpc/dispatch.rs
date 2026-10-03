@@ -3468,9 +3468,15 @@ impl RpcDispatcher {
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
+            // Heap-pinned like `SessionNew` below: this handler's future is
+            // one of the largest in this match (see the stack-regression
+            // test in `tests`), and an exhaustive `match` sizes its state
+            // machine to the largest inline branch regardless of which arm
+            // actually runs. Boxing keeps that branch off this function's
+            // own stack frame.
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
-            Method::ConfigValidate => self.handle_config_validate(),
+            Method::ConfigValidate => self.handle_config_validate(params),
             Method::ConfigReload => self.handle_config_reload(),
             Method::ConfigList => self.handle_config_list(params),
             Method::ConfigDelete => Box::pin(self.handle_config_delete(params)).await,
@@ -8430,7 +8436,7 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
-        Self::stage_config_set(&mut config, &req.prop, &req.value)?;
+        Self::stage_config_set_validated(&mut config, &req.prop, &req.value, true)?;
         let config_path = config.config_path.clone();
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
@@ -8587,19 +8593,20 @@ impl RpcDispatcher {
         )?;
         let mut config = Box::new(old_config.clone());
         for (index, entry) in req.sets.iter().enumerate() {
-            Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
-            })?;
+            Self::stage_config_set_validated(&mut config, &entry.prop, &entry.value, false)
+                .map_err(|e| {
+                    rpc_err(
+                        e.code,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "rpc-config-set-many-entry-rejected",
+                            &[
+                                ("index", &index.to_string()),
+                                ("prop", &entry.prop),
+                                ("reason", &e.message),
+                            ],
+                        ),
+                    )
+                })?;
         }
         // The request paths describe the affected live views; the candidate
         // config remains their canonical source. Prepare all affected sessions
@@ -8644,10 +8651,11 @@ impl RpcDispatcher {
     /// coerce the polymorphic value, refuse a masked or empty secret, and
     /// apply the persistent write. Never touches the live config or disk;
     /// the caller commits the working copy, or drops it on error.
-    fn stage_config_set(
+    fn stage_config_set_validated(
         config: &mut Config,
         prop: &str,
         value: &Value,
+        validate: bool,
     ) -> Result<(), JsonRpcError> {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
@@ -8685,9 +8693,15 @@ impl RpcDispatcher {
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        if validate {
+            config
+                .set_prop_persistent_validated(prop, &value_str)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        } else {
+            config
+                .set_prop_persistent(prop, &value_str)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        }
     }
 
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
@@ -8973,9 +8987,14 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    fn handle_config_validate(&self) -> RpcResult {
+    fn handle_config_validate(&self, params: &Value) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        match config.validate() {
+        let validation = match params.get("agent") {
+            None | Some(Value::Null) => config.validate(),
+            Some(Value::String(alias)) => config.validate_agent(alias),
+            Some(_) => return Err(rpc_err(INVALID_PARAMS, "agent must be a string")),
+        };
+        match validation {
             Ok(()) => to_result(ConfigValidateResult {
                 valid: true,
                 error: None,
@@ -33613,6 +33632,35 @@ mod tests {
     // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
 
+    #[test]
+    fn config_validate_scopes_to_requested_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config.create_map_key("risk_profiles", "standard").unwrap();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                risk_profile: "standard".into(),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        let scoped = dispatcher
+            .handle_config_validate(&json!({ "agent": "worker" }))
+            .unwrap();
+        assert_eq!(scoped["valid"], true);
+
+        let whole = dispatcher.handle_config_validate(&json!({})).unwrap();
+        assert_eq!(whole["valid"], false);
+        assert!(whole["error"].as_str().unwrap().contains("agents.alpha"));
+    }
+
     #[tokio::test]
     async fn config_delete_refuses_agent_alias_under_destructive_lease_without_live_or_disk_mutation()
      {
@@ -34467,6 +34515,53 @@ mod tests {
                 .agents
                 .contains_key("referenced")
         );
+    }
+
+    #[tokio::test]
+    async fn config_set_allows_staged_agent_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("providers.models.openai", "primary")
+            .expect("create openai.primary");
+        cfg.create_map_key("risk_profiles", "standard")
+            .expect("create standard risk profile");
+        cfg.save().await.expect("seed config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "agents",
+                "key": "worker"
+            }))
+            .await
+            .unwrap();
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.model_provider",
+                "value": "openai.primary"
+            }))
+            .await
+            .unwrap();
+
+        let staged = dispatcher.ctx.config.read().clone();
+        assert_eq!(staged.agents["worker"].model_provider, "openai.primary");
+        assert!(staged.validate().is_err());
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.risk_profile",
+                "value": "standard"
+            }))
+            .await
+            .unwrap();
+        dispatcher.ctx.config.read().validate().unwrap();
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.agents["worker"].model_provider, "openai.primary");
+        assert_eq!(reloaded.agents["worker"].risk_profile, "standard");
     }
 
     #[tokio::test]
