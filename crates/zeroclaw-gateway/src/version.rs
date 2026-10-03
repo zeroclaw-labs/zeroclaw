@@ -2,10 +2,10 @@
 //! upgrade affordance (RFC: In-app upgrade with optional supervised restart).
 //!
 //! Phase 1 (read-only): `GET /api/version/check` reports whether a newer
-//! release exists, plus release notes, by shelling out to
-//! `zeroclaw update --check --json` — keeping a single source of truth for
-//! update logic. Results are cached for an hour to stay well under GitHub's
-//! unauthenticated rate limit.
+//! release exists, plus release notes, from the core's
+//! `system/version-check`: the core runs its own `zeroclaw update --check
+//! --json` and caches a latest-release result for an hour (see
+//! `zeroclaw_runtime::update_check`).
 //!
 //! Restart classification is advisory only here: it tells the dashboard which
 //! restart command to show after an upgrade. The gateway never restarts itself
@@ -13,23 +13,20 @@
 
 use super::AppState;
 use super::api::require_auth;
-use anyhow::Context;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::SystemVersionCheckParams;
 use zeroclaw_runtime::i18n::get_required_cli_string;
-
-/// How long a successful version check is reused before re-querying GitHub.
-const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
-/// Upper bound on the `zeroclaw update --check` subprocess.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
@@ -157,19 +154,9 @@ fn detect_restart_uncached() -> RestartInfo {
 
 // ── Version check ────────────────────────────────────────────────
 
-/// Parsed output of `zeroclaw update --check --json`. Field names must match
-/// the JSON emitted in `src/main.rs`.
-#[derive(Debug, Clone, Deserialize)]
-struct CliCheck {
-    current_version: String,
-    latest_version: String,
-    is_newer: bool,
-    release_url: Option<String>,
-    release_notes: Option<String>,
-    published_at: Option<String>,
-}
+pub use zeroclaw_rpc_proto::types::VersionCheckResponse;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CheckQuery {
     /// Bypass the 1h cache and re-query GitHub.
     #[serde(default)]
@@ -179,111 +166,44 @@ pub struct CheckQuery {
     pub version: Option<String>,
 }
 
-/// Cache for the latest-version check. Specific-version queries are not cached.
-static CHECK_CACHE: Mutex<Option<(Instant, CliCheck)>> = Mutex::new(None);
-
-/// Response body for `GET /api/version/check`. On success every field except
-/// `error` is populated; on a soft failure the handler returns
-/// `{ current_version, latest_version: null, is_newer: false, error }` so the
-/// dashboard version badge degrades gracefully. This is the single source of
-/// truth the generated web client derives from — see [`crate::openapi`].
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct VersionCheckResponse {
-    pub current_version: String,
-    /// Latest release version, or `null` when the check could not complete.
-    pub latest_version: Option<String>,
-    pub is_newer: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub release_url: Option<String>,
-    /// Release notes body (Markdown).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub release_notes: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<String>,
-    /// Set only when the check failed; absent on success.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl From<&CliCheck> for VersionCheckResponse {
-    fn from(info: &CliCheck) -> Self {
-        Self {
-            current_version: info.current_version.clone(),
-            latest_version: Some(info.latest_version.clone()),
-            is_newer: info.is_newer,
-            release_url: info.release_url.clone(),
-            release_notes: info.release_notes.clone(),
-            published_at: info.published_at.clone(),
-            error: None,
-        }
-    }
-}
-
-async fn run_cli_check(version: Option<&str>) -> anyhow::Result<CliCheck> {
-    let exe = std::env::current_exe().context("cannot determine current executable path")?;
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("update").arg("--check").arg("--json");
-    if let Some(v) = version {
-        cmd.arg("--version").arg(v);
-    }
-    cmd.stdin(std::process::Stdio::null());
-
-    let output = tokio::time::timeout(CHECK_TIMEOUT, cmd.output())
-        .await
-        .context("version check timed out")?
-        .context("failed to spawn `zeroclaw update --check`")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("update --check failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<CliCheck>(stdout.trim())
-        .context("failed to parse `update --check --json` output")
-}
-
 /// `GET /api/version/check[?force=true][&version=X]`
 ///
 /// Never fails the dashboard: on any error it returns 200 with
-/// `{ is_newer: false, error }` so the version tag degrades gracefully.
+/// `{ is_newer: false, error }` so the version tag degrades gracefully. The
+/// check is the core's, `system/version-check`, whichever process serves
+/// the route; in-process it runs here, in the core's own process.
 pub async fn handle_version_check(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<CheckQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return version_check_through_core(&core, &q)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let use_cache = !q.force && q.version.is_none();
-    if use_cache {
-        if let Some((ts, cached)) = lock_recover(&CHECK_CACHE).as_ref() {
-            if ts.elapsed() < CHECK_CACHE_TTL {
-                return Json(VersionCheckResponse::from(cached)).into_response();
-            }
-        }
-    }
+    Json(zeroclaw_runtime::update_check::check(q.force, q.version.as_deref()).await).into_response()
+}
 
-    match run_cli_check(q.version.as_deref()).await {
-        Ok(info) => {
-            if use_cache {
-                *lock_recover(&CHECK_CACHE) = Some((Instant::now(), info.clone()));
-            }
-            Json(VersionCheckResponse::from(&info)).into_response()
-        }
-        Err(e) => Json(VersionCheckResponse {
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
-            latest_version: None,
-            is_newer: false,
-            release_url: None,
-            release_notes: None,
-            published_at: None,
-            error: Some(e.to_string()),
-        })
-        .into_response(),
-    }
+/// `GET /api/version/check` through the core, the body every router serves
+/// for it.
+pub(crate) async fn version_check_through_core(
+    core: &CoreCall,
+    query: &CheckQuery,
+) -> Result<Response, CoreError> {
+    let params = SystemVersionCheckParams {
+        force: query.force,
+        version: query.version.clone(),
+    };
+    let checked: VersionCheckResponse = core
+        .call(Method::SystemVersionCheck, serde_json::json!(params))
+        .await?;
+    Ok(Json(checked).into_response())
 }
 
 // ── Upgrade (Phase 2/3) ──────────────────────────────────────────
@@ -870,29 +790,6 @@ mod tests {
                 "missing Fluent string for {key}: {resolved}"
             );
         }
-    }
-
-    #[test]
-    fn cli_check_json_roundtrips() {
-        let json = r#"{
-            "current_version": "0.7.3",
-            "latest_version": "0.7.4",
-            "is_newer": true,
-            "release_url": "https://example.com/r",
-            "release_notes": "- fix things",
-            "published_at": "2026-06-20T00:00:00Z"
-        }"#;
-        let parsed: CliCheck = serde_json::from_str(json).unwrap();
-        assert!(parsed.is_newer);
-        assert_eq!(parsed.latest_version, "0.7.4");
-        let resp = VersionCheckResponse::from(&parsed);
-        assert_eq!(resp.latest_version.as_deref(), Some("0.7.4"));
-        assert!(resp.is_newer);
-        let out = serde_json::to_value(&resp).unwrap();
-        assert_eq!(out["latest_version"], "0.7.4");
-        assert_eq!(out["is_newer"], true);
-        // `error` is skipped on the success path, never serialized as null.
-        assert!(out.get("error").is_none());
     }
 
     #[test]
