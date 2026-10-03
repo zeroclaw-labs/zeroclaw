@@ -1,0 +1,36 @@
+# Synthetic saved V3 installation shape from before OIDC/user-roster setup.
+# This is a compatibility fixture, not a reproduction of an identified commit.
+schema_version = 3
+
+[providers.models.custom.acceptance]
+api_key = "acceptance-placeholder"
+uri = "@MODEL_URL@"
+model = "acceptance-model"
+wire_api = "chat_completions"
+native_tools = true
+
+[agents.acceptance]
+model_provider = "custom.acceptance"
+risk_profile = "acceptance"
+runtime_profile = "acceptance"
+[agents.acceptance.workspace]
+path = "@WORKSPACE@"
+
+[risk_profiles.acceptance]
+level = "supervised"
+
+[runtime_profiles.acceptance]
+max_tool_iterations = 8
+
+[gateway]
+host = "127.0.0.1"
+port = @GATEWAY_PORT@
+require_pairing = true
+
+[memory]
+backend = "sqlite"
+embedding_provider = "none"
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0

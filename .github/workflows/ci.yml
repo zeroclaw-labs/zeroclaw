@@ -3,6 +3,13 @@ name: Quality Gate
 on:
   pull_request:
     branches: [master]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      acceptance_cost:
+        description: Measure acceptance cost only (does not run or satisfy Quality Gate)
+        type: boolean
+        default: false
   push:
     branches: [master]
   # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
@@ -10,11 +17,14 @@ on:
   # branch or queued PRs stall, so the full gate runs here too.
   merge_group:
 
+# Event conditions are generated from scope.py's canonical risk labels by
+# tests/system/runtime_acceptance/workflow_policy.py --write. Unrelated label
+# events allocate no runners and cannot cancel or replace required CI evidence.
 concurrency:
   # Merge-queue runs key on the unique queue ref (github.ref →
   # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
   # never cancel each other; PRs still key on the PR number.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && 'quality' || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -69,6 +79,42 @@ env:
 # and is not an exposure.
 
 jobs:
+  # Explicit opt-in only: paired builds from identical restored cache snapshots.
+  # This job cannot produce CI Required Gate and never writes trusted caches.
+  acceptance-cost:
+    name: Measure acceptance cost
+    if: github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-unknown-linux-gnu
+      - uses: ./.github/actions/rust-cache
+        id: rust-cache
+        with:
+          use-blacksmith: 'true'
+          shared-key: build
+          save-if: 'false'
+      - name: Install Linux system dependencies
+        run: bash scripts/ci/apt_install.sh mold libasound2-dev tmux openssl python3
+      - name: Measure paired builds and both suites
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+        run: python3 tests/system/runtime_acceptance/measure_cost.py --artifacts-dir "$RUNNER_TEMP/acceptance-cost"
+      - name: Upload cost evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-cost
+          path: ${{ runner.temp }}/acceptance-cost
+          if-no-files-found: error
+          retention-days: 7
+
   # ── Master-push debounce ─────────────────────────────────────────────────
   # Master pushes arrive in bursts (median gap ~10 min, many under 5), and the
   # run-level `cancel-in-progress` cancels each superseded push only after its
@@ -102,6 +148,7 @@ jobs:
   # scheduling during a GitHub-hosted runner shortage.
 
   fmt:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Format
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
@@ -115,6 +162,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   history-guard:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Common Ancestor
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -131,6 +179,7 @@ jobs:
 
   # Guards the approved submodule layout introduced in PR #8516; see the bespoke gate registry in README.md.
   repo-structure:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Repository Structure
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -209,6 +258,7 @@ jobs:
         run: python3 scripts/docs/promote_stable_test.py
 
   relay-container-smoke-changes:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Detect Relay Container Smoke changes
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
@@ -259,7 +309,7 @@ jobs:
   relay-container-smoke:
     name: Relay Container Fresh-Volume Smoke
     needs: [relay-container-smoke-changes]
-    if: needs.relay-container-smoke-changes.outputs.run == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.relay-container-smoke-changes.outputs.run == 'true') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     steps:
@@ -282,7 +332,7 @@ jobs:
   lint:
     name: Lint
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
@@ -334,7 +384,7 @@ jobs:
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -378,7 +428,7 @@ jobs:
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
     needs: [windows-clippy-tools-changes]
-    if: ${{ !cancelled() && needs.windows-clippy-tools-changes.result == 'success' && needs.windows-clippy-tools-changes.outputs.run == 'true' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.windows-clippy-tools-changes.result == 'success' && needs.windows-clippy-tools-changes.outputs.run == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -408,6 +458,7 @@ jobs:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
   windows-service-smoke-changes:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Detect Windows Service Smoke changes
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -447,7 +498,7 @@ jobs:
   windows-service-smoke:
     name: Windows Service Smoke
     needs: [windows-service-smoke-changes]
-    if: needs.windows-service-smoke-changes.outputs.run == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.windows-service-smoke-changes.outputs.run == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
@@ -498,9 +549,9 @@ jobs:
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && 60 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -519,6 +570,17 @@ jobs:
             label: Check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+      # Application acceptance provenance and retirement: README.md gate registry.
+      - name: Select application acceptance suite
+        if: runner.os == 'Linux'
+        id: acceptance
+        run: |
+          mkdir -p "$RUNNER_TEMP/runtime-acceptance"
+          python3 tests/system/runtime_acceptance/test_contracts.py
+          python3 tests/system/runtime_acceptance/workflow_policy.py
+          python3 tests/system/runtime_acceptance/scope.py | tee "$RUNNER_TEMP/runtime-acceptance/selection.json"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
@@ -531,7 +593,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh mold libasound2-dev
+        run: bash scripts/ci/apt_install.sh mold libasound2-dev tmux openssl python3
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -541,7 +603,11 @@ jobs:
           set +e
           cargo_log="${RUNNER_TEMP}/cargo-build-${{ matrix.target }}.log"
           SECONDS=0
-          cargo ${{ matrix.cmd }} --profile ci --locked --target ${{ matrix.target }} 2>&1 | tee "$cargo_log"
+          packages=()
+          if [[ "${{ runner.os }}" == Linux && "${ACCEPTANCE_SUITE:-full}" != skip ]]; then
+            packages=(-p zeroclaw -p zerocode --bins)
+          fi
+          cargo ${{ matrix.cmd }} --profile ci --locked --target ${{ matrix.target }} "${packages[@]}" 2>&1 | tee "$cargo_log"
           cargo_status=${PIPESTATUS[0]}
           duration_seconds=$SECONDS
           set -e
@@ -569,9 +635,32 @@ jobs:
 
           exit "$cargo_status"
         env:
+          ACCEPTANCE_SUITE: ${{ steps.acceptance.outputs.suite }}
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Run application acceptance
+        if: runner.os == 'Linux' && steps.acceptance.outputs.suite != 'skip'
+        env:
+          ACCEPTANCE_SUITE: ${{ steps.acceptance.outputs.suite }}
+        run: |
+          scripts/ci/runtime_acceptance.sh --suite "${ACCEPTANCE_SUITE:-full}" \
+            --bin-dir "target/${{ matrix.target }}/ci" \
+            --artifacts-dir "$RUNNER_TEMP/runtime-acceptance/scenarios"
+      - name: Prove acceptance failure detection
+        if: runner.os == 'Linux' && steps.acceptance.outputs.suite == 'full'
+        run: |
+          python3 tests/system/runtime_acceptance/test_faults.py \
+            --bin-dir "target/${{ matrix.target }}/ci" \
+            --artifacts-dir "$RUNNER_TEMP/runtime-acceptance/negative-controls"
+      - name: Upload application acceptance evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-acceptance
+          path: ${{ runner.temp }}/runtime-acceptance
+          if-no-files-found: error
+          retention-days: 7
       - name: Check voice-wake
         if: runner.os != 'Linux'
         shell: bash
@@ -592,7 +681,7 @@ jobs:
   windows-task-owner-recovery:
     name: Test Windows task-owner recovery
     needs: [path-changes, master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.path-changes.result == 'success' && needs.path-changes.outputs.windows_recovery != 'false' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure' && needs.path-changes.result == 'success' && needs.path-changes.outputs.windows_recovery != 'false') }}
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -628,7 +717,7 @@ jobs:
   check:
     name: Check (${{ matrix.name }})
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
@@ -679,7 +768,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     strategy:
@@ -792,7 +881,7 @@ jobs:
     needs: [installer-drift]
     # Explicit status check: an implicit success() would be skipped on PRs,
     # because the skipped push-only master-debounce is a transitive ancestor.
-    if: ${{ !cancelled() && needs.installer-drift.result == 'success' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.installer-drift.result == 'success') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -835,7 +924,7 @@ jobs:
   check-32bit:
     name: Check (32-bit)
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -866,7 +955,7 @@ jobs:
     # measurement slice for #7108 rather than as coverage. Master, merge-queue
     # and manual runs still execute it, so benches cannot rot undetected before
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -922,7 +1011,7 @@ jobs:
   test:
     name: Test
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -998,7 +1087,7 @@ jobs:
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
@@ -1041,7 +1130,7 @@ jobs:
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     services:
@@ -1090,7 +1179,7 @@ jobs:
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -1138,7 +1227,7 @@ jobs:
   parallel-runtime-test:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
-    if: ${{ !cancelled() && needs.parallel-runtime-test-changes.result == 'success' && needs.parallel-runtime-test-changes.outputs.run == 'true' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.parallel-runtime-test-changes.result == 'success' && needs.parallel-runtime-test-changes.outputs.run == 'true') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -1167,7 +1256,7 @@ jobs:
   test-landlock:
     name: Test (Landlock)
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1195,6 +1284,7 @@ jobs:
   # ── Security checks ───────────────────────────────────────────────────────
 
   security:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Security
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
@@ -1252,6 +1342,7 @@ jobs:
   # Gate` green (it only trips on failure/cancelled), and this detector is never
   # skipped, so a job that should run never is.
   path-changes:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Detect changed paths
     # Ordering note: this detector runs cheap path fixtures and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
@@ -1321,7 +1412,7 @@ jobs:
   nix-eval:
     name: Nix Module Eval
     needs: [path-changes]
-    if: needs.path-changes.outputs.nix == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.path-changes.outputs.nix == 'true') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -1337,7 +1428,7 @@ jobs:
   nix-hash-drift:
     name: Nix Hash Drift
     needs: [path-changes]
-    if: needs.path-changes.outputs.nix_hash == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.path-changes.outputs.nix_hash == 'true') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
@@ -1350,7 +1441,7 @@ jobs:
   docs-style:
     name: Docs Style
     needs: [path-changes]
-    if: needs.path-changes.outputs.docs == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.path-changes.outputs.docs == 'true') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
@@ -1375,6 +1466,7 @@ jobs:
 
   # Guards Zerocode's RPC-only dependency boundary established in PR #7850; see the bespoke gate registry in README.md.
   zerocode-rpc-boundary:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Zerocode RPC Boundary
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -1403,7 +1495,7 @@ jobs:
   installer-drift:
     name: Installer Drift
     needs: [master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (!cancelled() && needs.master-debounce.result != 'failure') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -1439,7 +1531,7 @@ jobs:
   web-permission-tests:
     name: Web Permission Tests
     needs: [path-changes]
-    if: needs.path-changes.outputs.web == 'true'
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (needs.path-changes.outputs.web == 'true') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -1486,6 +1578,7 @@ jobs:
   # tokenless check the stable release repeats before the GitHub Release.
   # Other changes skip it; the static publish contract still runs in `test`.
   crates-preflight-changes:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name)) }}
     name: Detect crates.io version bump
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -1520,13 +1613,17 @@ jobs:
       runner: blacksmith-8vcpu-ubuntu-2404
 
   gate:
-    name: CI Required Gate
-    if: always()
+    name: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && 'CI Required Gate' || 'Quality Gate not requested' }}
+    if: ${{ (!(github.event_name == 'workflow_dispatch' && inputs.acceptance_cost == true) && (github.event_name != 'pull_request' || !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || !github.event.label.name || contains(fromJSON('["domain:security","priority:p0","priority:p1","risk:high"]'), github.event.label.name))) && (always()) }}
     needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
         run: |
+          if [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "::error::Build and application acceptance must succeed; skipped builds cannot pass"
+            exit 1
+          fi
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "::error::One or more CI jobs failed or were cancelled"
             exit 1
