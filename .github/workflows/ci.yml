@@ -773,6 +773,15 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # Channel WebSocket lifecycle proof. A root target for the same
+      # crate-graph reason as the two steps above: it drives the production
+      # configured-channel path against a loopback WebSocket server and asserts
+      # on what the server saw (one socket across polls, one redial after a
+      # server close, a closed socket and released lease on shutdown, and no
+      # packet at all when the destination is not granted).
+      - name: Run channel WebSocket lifecycle e2e
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: cargo test --locked --features plugins-wasm-cranelift --test channel_websocket_e2e
       # The root binary's tests with plugin support compiled in. `mod plugins`,
       # the plugin registry and the plugin CLI's tests in `main.rs` only
       # compile under `plugins-wasm`, so the default-feature Test job never sees
