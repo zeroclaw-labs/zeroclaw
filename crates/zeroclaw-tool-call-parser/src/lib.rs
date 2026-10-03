@@ -1585,9 +1585,10 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         .map(|(_, suffix)| suffix)
         .unwrap_or(tool_name);
     match tool_name {
-        // Shell variations (including GLM aliases that map to shell)
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
-        | "web_search" => "shell",
+        // Only shell aliases may enter the legacy URL-to-curl conversion.
+        // Browser and search calls must retain their own tool boundaries.
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        "web_search" => "web_search_tool",
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations
@@ -4836,14 +4837,16 @@ Done."#;
         let response = "browser_open/url>https://example.com";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(
+            calls[0].1,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]
-    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
-        let calls =
-            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+    fn parse_glm_style_shell_quotes_url_apostrophes_and_metacharacters() {
+        let calls = parse_glm_style_tool_calls("shell/url>https://example.com/it's;still=one");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert_eq!(
@@ -4906,14 +4909,18 @@ browser_open/url>https://example.com"#;
         let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].name, "browser_open");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
     }
 
     #[test]
-    fn parse_glm_style_rejects_non_http_url_param() {
-        let response = "browser_open/url>javascript:alert(1)";
+    fn parse_glm_style_shell_rejects_non_http_url_param() {
+        let response = "shell/url>javascript:alert(1)";
         let calls = parse_glm_style_tool_calls(response);
         assert!(calls.is_empty());
     }
@@ -5142,14 +5149,13 @@ Let me check the result."#;
     }
 
     #[test]
-    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
-        // browser_open aliases to shell, and shortened calls must still emit
-        // shell's canonical "command" argument.
+    fn parse_glm_shortened_body_browser_open_preserves_url() {
         let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
+        assert_eq!(call.name, "browser_open");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]
