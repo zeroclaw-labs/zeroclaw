@@ -15,11 +15,19 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api_config::{persist_and_swap, try_compute_drift};
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS;
+use zeroclaw_rpc_client::Method;
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
-pub async fn handle_catalog(State(state): State<AppState>) -> Response {
+pub async fn handle_catalog(State(state): State<AppState>, access: CoreAccess) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return catalog_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let _ = state;
 
     let model_providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
@@ -32,6 +40,14 @@ pub async fn handle_catalog(State(state): State<AppState>) -> Response {
         .collect();
 
     axum::Json(CatalogResponse { model_providers }).into_response()
+}
+
+/// `GET /api/config/catalog` through the core.
+pub(crate) async fn catalog_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let catalog = core
+        .request(Method::ConfigCatalog, serde_json::json!({}))
+        .await?;
+    Ok(axum::Json(catalog).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +81,14 @@ impl ModelsQuery {
 
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
+    access: CoreAccess,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return catalog_models_through_core(&core, &q)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
     let catalog_provider_ref = q.catalog_provider_ref();
     // Snapshot config so the catalog resolves the alias credential and can reach
@@ -96,6 +118,33 @@ pub async fn handle_catalog_models(
         live,
     })
     .into_response()
+}
+
+/// `GET /api/config/catalog/models` through the core. The selected alias
+/// travels as the dotted `<family>.<alias>` reference in `model_provider`,
+/// which every core resolves to that profile, so a core that predates any
+/// newer catalog parameter still lists the selected endpoint instead of the
+/// family's catalog. The answer names the bare family, as the in-process
+/// route's does. A catalog the core cannot list is refused as invalid
+/// params, answered as the in-process route does.
+pub(crate) async fn catalog_models_through_core(
+    core: &CoreCall,
+    q: &ModelsQuery,
+) -> Result<Response, CoreError> {
+    let params = serde_json::json!({ "model_provider": q.catalog_provider_ref() });
+    match core
+        .call::<CatalogModelsResult>(Method::ConfigCatalogModels, params)
+        .await
+    {
+        Ok(mut catalog) => {
+            catalog.model_provider = q.model_provider.clone();
+            Ok(axum::Json(catalog).into_response())
+        }
+        Err(CoreError::Rpc(error)) if error.code == INVALID_PARAMS => Ok(error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.message),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 fn error_response(err: ConfigApiError) -> Response {
