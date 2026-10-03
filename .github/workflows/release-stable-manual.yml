@@ -1177,7 +1177,7 @@ jobs:
       - name: Prepare Docker context with pre-built binaries
         run: bash scripts/ci/prepare_docker_context.sh from-artifacts docker-ctx artifacts
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
