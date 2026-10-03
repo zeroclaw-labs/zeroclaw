@@ -79,6 +79,7 @@ use crate::wecom_ws::WeComWsRuntimePolicy;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
     Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, SendMessage,
+    TypingEvent,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -7463,8 +7464,10 @@ fn scrub_typing_error(error: &anyhow::Error) -> String {
 
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
-    recipient: String,
+    message: SendMessage,
+    turn_id: String,
     cancellation_token: CancellationToken,
+    finished: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
     let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
@@ -7474,16 +7477,22 @@ fn spawn_scoped_typing_task(
 
         loop {
             tokio::select! {
+                biased;
                 () = stop_signal.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(e) = channel.start_typing(&recipient).await {
+                    if let Err(e) = channel.update_typing(&message, &turn_id, TypingEvent::Active).await {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})), "failed to start typing");
                     }
                 }
             }
         }
 
-        if let Err(e) = channel.stop_typing(&recipient).await {
+        let event = if finished.load(Ordering::Acquire) {
+            TypingEvent::Finished
+        } else {
+            TypingEvent::Paused
+        };
+        if let Err(e) = channel.update_typing(&message, &turn_id, event).await {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7636,30 +7645,58 @@ struct ScopedTypingTask {
 
 struct ScopedTypingController {
     channel: Arc<dyn Channel>,
-    recipient: String,
+    message: SendMessage,
+    turn_id: String,
+    started: AtomicBool,
+    finished: Arc<AtomicBool>,
     task: tokio::sync::Mutex<Option<ScopedTypingTask>>,
 }
 
 impl ScopedTypingController {
-    fn new(channel: Arc<dyn Channel>, recipient: String) -> Self {
+    fn new(channel: Arc<dyn Channel>, message: SendMessage) -> Self {
         Self {
             channel,
-            recipient,
+            message,
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            started: AtomicBool::new(false),
+            finished: Arc::new(AtomicBool::new(false)),
             task: tokio::sync::Mutex::new(None),
         }
     }
 
     async fn resume(&self) {
         let mut task = self.task.lock().await;
-        if task.is_some() {
+        if task.is_some() || self.finished.load(Ordering::Acquire) {
             return;
+        }
+
+        // Register before spawning so task scheduling cannot reverse ownership.
+        // Approval resume refreshes the same generation, never reclaims it.
+        let event = if self.started.swap(true, Ordering::AcqRel) {
+            TypingEvent::Resumed
+        } else {
+            TypingEvent::Started
+        };
+        if let Err(e) = self
+            .channel
+            .update_typing(&self.message, &self.turn_id, event)
+            .await
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                "failed to register typing"
+            );
         }
 
         let cancellation_token = CancellationToken::new();
         let handle = spawn_scoped_typing_task(
             Arc::clone(&self.channel),
-            self.recipient.clone(),
+            self.message.clone(),
+            self.turn_id.clone(),
             cancellation_token.clone(),
+            Arc::clone(&self.finished),
         );
         *task = Some(ScopedTypingTask {
             cancellation_token,
@@ -7668,22 +7705,114 @@ impl ScopedTypingController {
     }
 
     async fn pause(&self) {
-        let task = self.task.lock().await.take();
-        if let Some(task) = task {
+        let mut task = self.task.lock().await;
+        if let Some(task) = task.take() {
             task.cancellation_token.cancel();
             log_worker_join_result(task.handle.await);
+        }
+    }
+
+    async fn finish(&self) {
+        let mut task = self.task.lock().await;
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(task) = task.take() {
+            task.cancellation_token.cancel();
+            log_worker_join_result(task.handle.await);
+        } else if self.started.load(Ordering::Acquire) {
+            // Hand cleanup off before awaiting it, including when approval left
+            // no keepalive task. Aborting this caller must not cancel the clear.
+            log_worker_join_result(self.spawn_finish().await);
+        }
+    }
+
+    fn spawn_finish(&self) -> tokio::task::JoinHandle<()> {
+        let channel = Arc::clone(&self.channel);
+        let message = self.message.clone();
+        let turn_id = self.turn_id.clone();
+        zeroclaw_spawn::spawn!(async move {
+            if let Err(e) = channel
+                .update_typing(&message, &turn_id, TypingEvent::Finished)
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                    "failed to finish typing"
+                );
+            }
+        })
+    }
+}
+
+impl Drop for ScopedTypingController {
+    fn drop(&mut self) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(task) = self.task.get_mut().take() {
+            // Let an issued refresh drain before the task performs its final
+            // clear; aborting its HTTP future would lose request ordering.
+            task.cancellation_token.cancel();
+        } else if self.started.load(Ordering::Acquire)
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            self.spawn_finish();
+        }
+    }
+}
+
+enum ApprovalTypingScope {
+    Typing(Arc<ScopedTypingController>),
+    Draft {
+        channel: Arc<dyn Channel>,
+        recipient: String,
+        message_id: String,
+    },
+}
+
+impl ApprovalTypingScope {
+    async fn update(&self, event: TypingEvent) {
+        match self {
+            Self::Typing(typing) => match event {
+                TypingEvent::Paused => typing.pause().await,
+                TypingEvent::Resumed => typing.resume().await,
+                _ => {}
+            },
+            Self::Draft {
+                channel,
+                recipient,
+                message_id,
+            } => {
+                if let Err(e) = channel
+                    .update_draft_typing(recipient, message_id, event)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                        "failed to update approval draft status"
+                    );
+                }
+            }
         }
     }
 }
 
 struct ApprovalTypingChannel {
     inner: Arc<dyn Channel>,
-    typing: Arc<ScopedTypingController>,
+    typing: ApprovalTypingScope,
 }
 
 impl ApprovalTypingChannel {
     fn new(inner: Arc<dyn Channel>, typing: Arc<ScopedTypingController>) -> Self {
-        Self { inner, typing }
+        Self {
+            inner,
+            typing: ApprovalTypingScope::Typing(typing),
+        }
     }
 }
 
@@ -7739,7 +7868,7 @@ impl Channel for ApprovalTypingChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        self.typing.pause().await;
+        self.typing.update(TypingEvent::Paused).await;
         let response = self
             .inner
             .request_approval_attributed(recipient, request)
@@ -7755,7 +7884,7 @@ impl Channel for ApprovalTypingChannel {
                 )
             })
         }) {
-            self.typing.resume().await;
+            self.typing.update(TypingEvent::Resumed).await;
         }
         response
     }
@@ -9799,22 +9928,13 @@ async fn process_channel_message_body(
         target_channel.as_ref().map(|channel| {
             Arc::new(ScopedTypingController::new(
                 Arc::clone(channel),
-                msg.reply_target.clone(),
+                SendMessage::reply_to(&msg, ""),
             ))
         })
     };
     if let Some(typing) = typing_controller.as_ref() {
         typing.resume().await;
     }
-    let approval_channel: Option<Arc<dyn Channel>> =
-        match (target_channel.as_ref(), typing_controller.as_ref()) {
-            (Some(channel), Some(typing)) => Some(Arc::new(ApprovalTypingChannel::new(
-                Arc::clone(channel),
-                Arc::clone(typing),
-            ))),
-            (Some(channel), None) => Some(Arc::clone(channel)),
-            (None, _) => None,
-        };
     let active_risk_profile = ctx
         .prompt_config
         .risk_profile_for_agent(ctx.agent_alias.as_str());
@@ -9822,8 +9942,27 @@ async fn process_channel_message_body(
         &ctx.approval_manager,
         active_risk_profile,
         ctx.channels_by_name.as_ref(),
-        approval_channel,
+        target_channel.clone(),
     );
+    // Pause the origin's status even when another channel handles approval.
+    let approval_channel = approval_channel.map(|channel| -> Arc<dyn Channel> {
+        if let Some(typing) = typing_controller.as_ref() {
+            Arc::new(ApprovalTypingChannel::new(channel, Arc::clone(typing)))
+        } else if let (Some(origin), Some(message_id)) =
+            (target_channel.as_ref(), draft_message_id.as_ref())
+        {
+            Arc::new(ApprovalTypingChannel {
+                inner: channel,
+                typing: ApprovalTypingScope::Draft {
+                    channel: Arc::clone(origin),
+                    recipient: msg.reply_target.clone(),
+                    message_id: message_id.clone(),
+                },
+            })
+        } else {
+            channel
+        }
+    });
 
     // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
@@ -10267,7 +10406,7 @@ async fn process_channel_message_body(
         stop_matrix_single_message_typing_scope(scope).await;
     }
     if let Some(typing) = typing_controller.as_ref() {
-        typing.pause().await;
+        typing.finish().await;
     }
 
     let reaction_done_emoji = match &llm_result {
@@ -23989,6 +24128,9 @@ api_key = "anthropic-key"
         final_send_calls: AtomicUsize,
         start_typing_calls: AtomicUsize,
         stop_typing_calls: AtomicUsize,
+        typing_events: tokio::sync::Mutex<Vec<(SendMessage, String, TypingEvent)>>,
+        typing_finish_release: Option<Arc<tokio::sync::Notify>>,
+        drafts: bool,
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
@@ -24983,6 +25125,52 @@ api_key = "anthropic-key"
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn update_typing(
+            &self,
+            message: &SendMessage,
+            turn_id: &str,
+            event: TypingEvent,
+        ) -> anyhow::Result<()> {
+            self.typing_events
+                .lock()
+                .await
+                .push((message.clone(), turn_id.to_string(), event));
+            if event == TypingEvent::Finished
+                && let Some(release) = &self.typing_finish_release
+            {
+                release.notified().await;
+            }
+            match event {
+                TypingEvent::Active => self.start_typing(&message.recipient).await,
+                TypingEvent::Paused | TypingEvent::Finished => {
+                    self.stop_typing(&message.recipient).await
+                }
+                TypingEvent::Started | TypingEvent::Resumed => Ok(()),
+            }
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            self.drafts
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(self.drafts.then(|| "draft-typing".to_string()))
+        }
+
+        async fn update_draft_typing(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            event: TypingEvent,
+        ) -> anyhow::Result<()> {
+            self.typing_events.lock().await.push((
+                SendMessage::new("", recipient),
+                message_id.to_string(),
+                event,
+            ));
             Ok(())
         }
 
@@ -34790,7 +34978,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
-                thread_ts: None,
+                thread_ts: Some("thread-typing".into()),
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
@@ -34805,6 +34993,187 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+        let events = channel_impl.typing_events.lock().await;
+        assert_eq!(events.first().unwrap().2, TypingEvent::Started);
+        assert_eq!(events.last().unwrap().2, TypingEvent::Finished);
+        assert!(events.iter().all(|(message, token, _)| {
+            message.recipient == "chat-typing"
+                && message.thread_ts.as_deref() == Some("thread-typing")
+                && token == &events[0].1
+        }));
+    }
+
+    #[tokio::test]
+    async fn scoped_typing_preserves_turn_through_paced_pause_resume_and_drop() {
+        let recorded = Arc::new(RecordingChannel::default());
+        let cfg = zeroclaw_config::schema::SlackConfig {
+            reply_min_interval_secs: 3600,
+            ..Default::default()
+        };
+        let channel = crate::paced_channel::PacedChannel::wrap(recorded.clone(), &cfg);
+        let typing = ScopedTypingController::new(
+            channel,
+            SendMessage::new("", "channel").in_thread(Some("thread".into())),
+        );
+        typing.resume().await;
+        wait_for_typing_events(&recorded, 2).await;
+        typing.pause().await;
+        typing.resume().await;
+        wait_for_typing_events(&recorded, 5).await;
+        drop(typing);
+        wait_for_typing_events(&recorded, 6).await;
+
+        let events = recorded.typing_events.lock().await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, _, event)| *event)
+                .collect::<Vec<_>>(),
+            [
+                TypingEvent::Started,
+                TypingEvent::Active,
+                TypingEvent::Paused,
+                TypingEvent::Resumed,
+                TypingEvent::Active,
+                TypingEvent::Finished
+            ]
+        );
+        assert!(events.iter().all(|(message, token, _)| {
+            message.recipient == "channel"
+                && message.thread_ts.as_deref() == Some("thread")
+                && token == &events[0].1
+        }));
+    }
+
+    async fn wait_for_typing_events(channel: &RecordingChannel, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while channel.typing_events.lock().await.len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("typing transition should reach the wrapped channel");
+    }
+
+    #[tokio::test]
+    async fn scoped_typing_paused_finish_survives_caller_abort() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let recorded = Arc::new(RecordingChannel {
+            typing_finish_release: Some(release.clone()),
+            ..Default::default()
+        });
+        let typing = Arc::new(ScopedTypingController::new(
+            recorded.clone(),
+            SendMessage::new("", "channel"),
+        ));
+        typing.resume().await;
+        wait_for_typing_events(&recorded, 2).await;
+        typing.pause().await;
+        let finisher = typing.clone();
+        let caller = zeroclaw_spawn::spawn!(async move { finisher.finish().await });
+        wait_for_typing_events(&recorded, 4).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        drop(typing);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while recorded.stop_typing_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the handed-off finish must survive caller cancellation");
+    }
+
+    #[test]
+    fn channel_turn_routed_approval_pauses_origin_status_with_and_without_drafts() {
+        run_channel_dispatch_test(|| async {
+            for drafts in [false, true] {
+                let origin = Arc::new(RecordingChannel {
+                    drafts,
+                    ..Default::default()
+                });
+                let approver = Arc::new(PendingApprovalChannel::new(
+                    PendingApprovalOutcome::Response(Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                            zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+                        ),
+                    )),
+                ));
+                let profile = zeroclaw_config::schema::RiskProfileConfig {
+                    always_ask: vec!["mock_price".into()],
+                    approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                        approver_channel: "ops.default".into(),
+                        approver_recipient: Some("ops-room".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+                    risk_profile: "approval".into(),
+                    ..Default::default()
+                };
+                agent.precheck.enabled = false;
+                let mut config = zeroclaw_config::schema::Config::default();
+                config.agents.insert("test-agent".into(), agent.clone());
+                config
+                    .risk_profiles
+                    .insert("approval".into(), profile.clone());
+                let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                    origin.clone(),
+                    Arc::new(ToolCallingModelProvider),
+                    config,
+                    agent,
+                    "test-provider",
+                    None,
+                    Arc::new(NoopObserver),
+                    vec![Box::new(NamedMockTool("mock_price"))],
+                );
+                let inner = Arc::get_mut(&mut ctx).unwrap();
+                inner.approval_manager = Arc::new(channel_approval_manager(&profile));
+                Arc::get_mut(&mut inner.channels_by_name)
+                    .unwrap()
+                    .insert("ops.default".into(), approver.clone());
+                let turn = process_channel_message(
+                    ctx,
+                    ChannelMessage {
+                        id: "routed-typing".into(),
+                        sender: "user".into(),
+                        reply_target: "origin-room".into(),
+                        content: "price".into(),
+                        channel: "test-channel".into(),
+                        thread_ts: Some("origin-thread".into()),
+                        timestamp: 1,
+                        ..Default::default()
+                    },
+                    CancellationToken::new(),
+                );
+                let release = async {
+                    approver.approval_started.notified().await;
+                    let events = origin.typing_events.lock().await;
+                    assert_eq!(events.last().unwrap().2, TypingEvent::Paused);
+                    if drafts {
+                        assert_eq!(events.last().unwrap().1, "draft-typing");
+                    }
+                    drop(events);
+                    assert_eq!(approver.start_typing_calls.load(Ordering::SeqCst), 0);
+                    approver.approval_release.notify_one();
+                };
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(turn, release);
+                })
+                .await
+                .unwrap();
+                assert!(
+                    origin
+                        .typing_events
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|(_, _, event)| *event == TypingEvent::Resumed)
+                );
+            }
+        });
     }
 
     #[tokio::test]
@@ -35075,7 +35444,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = inner.clone();
         let typing = Arc::new(ScopedTypingController::new(
             Arc::clone(&channel),
-            "chat".to_string(),
+            SendMessage::new("", "chat"),
         ));
         let wrapped = ApprovalTypingChannel::new(Arc::clone(&channel), typing);
 
@@ -35149,7 +35518,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let channel: Arc<dyn Channel> = channel_impl.clone();
             let typing = Arc::new(ScopedTypingController::new(
                 Arc::clone(&channel),
-                "approval-chat".to_string(),
+                SendMessage::new("", "approval-chat"),
             ));
             typing.resume().await;
 

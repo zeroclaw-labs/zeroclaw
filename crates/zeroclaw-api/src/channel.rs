@@ -12,6 +12,17 @@ use crate::media::MediaAttachment;
 /// namespace out of inbound subjects.
 pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 
+/// Turn-scoped typing transitions. Registration happens once before refresh
+/// starts; a temporary pause retains ownership until terminal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingEvent {
+    Started,
+    Active,
+    Paused,
+    Resumed,
+    Finished,
+}
+
 /// The single authority for the channel-SOP event topic grammar
 /// `channel.alias:event_type`. The producer that lifts a forge/platform event
 /// into SOP ingress builds the topic here; the SOP engine parses it here. The
@@ -1026,6 +1037,35 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Update typing for one reply target and stable turn identity. Channels
+    /// with thread-scoped status can guard ownership; existing implementations
+    /// retain their recipient-only start/stop behavior through these defaults.
+    async fn update_typing(
+        &self,
+        message: &SendMessage,
+        _turn_id: &str,
+        event: TypingEvent,
+    ) -> anyhow::Result<()> {
+        match event {
+            TypingEvent::Active => self.start_typing(&message.recipient).await,
+            TypingEvent::Paused | TypingEvent::Finished => {
+                self.stop_typing(&message.recipient).await
+            }
+            TypingEvent::Started | TypingEvent::Resumed => Ok(()),
+        }
+    }
+
+    /// Pause/resume status for an already registered draft without creating a
+    /// second typing owner. Draft finalization still owns terminal cleanup.
+    async fn update_draft_typing(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _event: TypingEvent,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

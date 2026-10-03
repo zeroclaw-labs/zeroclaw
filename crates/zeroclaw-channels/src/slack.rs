@@ -13,7 +13,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressEvent,
-    SendMessage,
+    SendMessage, TypingEvent,
 };
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -245,11 +245,21 @@ struct SlackDraftTurn {
     assistant_target: Option<AssistantTarget>,
 }
 
+impl SlackDraftTurn {
+    fn status_target(&self) -> Option<AssistantTarget> {
+        self.thread_ts.as_ref().map(|thread_ts| AssistantTarget {
+            channel_id: self.recipient.clone(),
+            thread_ts: thread_ts.clone(),
+        })
+    }
+}
+
 /// Which draft holds the current generation for one Assistant status surface.
 #[derive(Debug, Clone)]
 struct AssistantStatusOwner {
     draft_id: String,
     claimed_at: Instant,
+    paused: bool,
 }
 
 /// Upper bound on tracked Assistant status surfaces, mirroring
@@ -269,6 +279,10 @@ const ASSISTANT_STATUS_CLEAR_ATTEMPTS: usize = 3;
 /// Delay between terminal-clear attempts. Kept short: this runs on the path
 /// that delivers the final answer.
 const ASSISTANT_STATUS_CLEAR_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+// Status is advisory: requests and the aggregate terminal-clear attempt share
+// this budget independently from the 30-second message-delivery timeout.
+const ASSISTANT_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 /// Bound first-interaction thread hydration independently from the number of
@@ -777,6 +791,7 @@ impl SlackChannel {
             AssistantStatusOwner {
                 draft_id: message_id.to_string(),
                 claimed_at: Instant::now(),
+                paused: false,
             },
         );
         // One entry per Assistant thread, so this grows with distinct threads
@@ -840,7 +855,13 @@ impl SlackChannel {
         let _ordered = serializer.lock().await;
         // Re-checked inside the ordering boundary: a turn that was current when
         // it started waiting may have been superseded while it queued.
-        if !self.owns_assistant_status(target, message_id).await {
+        if !self
+            .assistant_status_owners
+            .lock()
+            .await
+            .get(target)
+            .is_some_and(|owner| owner.draft_id == message_id && !owner.paused)
+        {
             return Ok(());
         }
         self.set_assistant_status(target, status).await
@@ -873,6 +894,44 @@ impl SlackChannel {
         }
     }
 
+    async fn pause_assistant_status(
+        &self,
+        target: &AssistantTarget,
+        message_id: &str,
+        paused: bool,
+    ) {
+        if let Some(owner) = self.assistant_status_owners.lock().await.get_mut(target)
+            && owner.draft_id == message_id
+        {
+            owner.paused = paused;
+        }
+    }
+
+    async fn update_thread_typing(
+        &self,
+        target: &AssistantTarget,
+        turn_id: &str,
+        event: TypingEvent,
+    ) -> anyhow::Result<()> {
+        match event {
+            TypingEvent::Started => self.claim_assistant_status(target, turn_id).await,
+            TypingEvent::Resumed => self.pause_assistant_status(target, turn_id, false).await,
+            TypingEvent::Active => {
+                let status = crate::util::localized_lifecycle_progress(ProgressEvent::Planning);
+                self.write_owned_assistant_status(target, turn_id, &status)
+                    .await?;
+            }
+            TypingEvent::Paused | TypingEvent::Finished => {
+                if event == TypingEvent::Paused {
+                    self.pause_assistant_status(target, turn_id, true).await;
+                }
+                self.clear_owned_thread_status(target, turn_id, event == TypingEvent::Finished)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     /// Issue the terminal empty-status clear for a turn that still owns its
     /// Assistant surface.
     ///
@@ -883,10 +942,21 @@ impl SlackChannel {
     /// open — the next turn in that thread reclaims the target and its own
     /// terminal path clears the surface.
     async fn clear_owned_assistant_status(&self, turn: &SlackDraftTurn, message_id: &str) {
-        let Some(target) = turn.assistant_target.as_ref() else {
+        let Some(target) = turn.status_target() else {
             return;
         };
 
+        self.clear_owned_thread_status(&target, message_id, true)
+            .await;
+    }
+
+    async fn clear_owned_thread_status(
+        &self,
+        target: &AssistantTarget,
+        message_id: &str,
+        release: bool,
+    ) {
+        let started = Instant::now();
         let serializer = self.assistant_status_lock(target).await;
         for attempt in 0..ASSISTANT_STATUS_CLEAR_ATTEMPTS {
             // The check, the clear, and the release are one ordered unit per
@@ -897,8 +967,15 @@ impl SlackChannel {
                 if !self.owns_assistant_status(target, message_id).await {
                     return;
                 }
-                let result = self.set_assistant_status(target, "").await;
-                if result.is_ok() {
+                let Some(remaining) =
+                    ASSISTANT_STATUS_REQUEST_TIMEOUT.checked_sub(started.elapsed())
+                else {
+                    return;
+                };
+                let result = self
+                    .set_assistant_status_with_timeout(target, "", remaining)
+                    .await;
+                if result.is_ok() && release {
                     self.release_assistant_status(target, message_id).await;
                 }
                 result
@@ -926,7 +1003,12 @@ impl SlackChannel {
                     if last {
                         return;
                     }
-                    tokio::time::sleep(ASSISTANT_STATUS_CLEAR_RETRY_DELAY).await;
+                    let Some(remaining) =
+                        ASSISTANT_STATUS_REQUEST_TIMEOUT.checked_sub(started.elapsed())
+                    else {
+                        return;
+                    };
+                    tokio::time::sleep(ASSISTANT_STATUS_CLEAR_RETRY_DELAY.min(remaining)).await;
                 }
             }
         }
@@ -988,6 +1070,16 @@ impl SlackChannel {
         target: &AssistantTarget,
         status: &str,
     ) -> anyhow::Result<()> {
+        self.set_assistant_status_with_timeout(target, status, ASSISTANT_STATUS_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn set_assistant_status_with_timeout(
+        &self,
+        target: &AssistantTarget,
+        status: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "channel_id": target.channel_id,
             "thread_ts": target.thread_ts,
@@ -997,6 +1089,7 @@ impl SlackChannel {
         let response = self
             .http_client()
             .post(self.slack_api_url("assistant.threads.setStatus"))
+            .timeout(timeout)
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -5281,19 +5374,16 @@ impl Channel for SlackChannel {
             };
             self.is_assistant_target(&target).then_some(target)
         });
-        // This draft is the newest turn for the thread, so it takes the
-        // generation for the shared Assistant status surface.
-        if let Some(target) = assistant_target.as_ref() {
-            self.claim_assistant_status(target, &lazy_id).await;
+        let turn = SlackDraftTurn {
+            recipient: message.recipient.clone(),
+            thread_ts,
+            assistant_target,
+        };
+        // Channel threads and Assistant panes share Slack's status API.
+        if let Some(target) = turn.status_target() {
+            self.claim_assistant_status(&target, &lazy_id).await;
         }
-        self.draft_turns.lock().await.insert(
-            lazy_id.clone(),
-            SlackDraftTurn {
-                recipient: message.recipient.clone(),
-                thread_ts,
-                assistant_target,
-            },
-        );
+        self.draft_turns.lock().await.insert(lazy_id.clone(), turn);
         Ok(Some(lazy_id))
     }
 
@@ -5429,22 +5519,33 @@ impl Channel for SlackChannel {
     ) -> anyhow::Result<()> {
         let status_line = crate::util::localized_lifecycle_progress(event);
 
-        let assistant_target = self
-            .draft_turns
-            .lock()
-            .await
-            .get(message_id)
-            .and_then(|turn| turn.assistant_target.clone());
-        if let Some(target) = assistant_target {
+        let turn = self.draft_turns.lock().await.get(message_id).cloned();
+        if let Some(target) = turn.as_ref().and_then(SlackDraftTurn::status_target) {
             if self.progress_rate_limited(message_id) {
                 return Ok(());
             }
-            self.record_progress_update(message_id);
-            // Ownership is checked inside the per-target serializer so a stalled
-            // request cannot land after a newer turn has published.
-            return self
+            if turn
+                .as_ref()
+                .is_some_and(|turn| turn.assistant_target.is_some())
+            {
+                self.record_progress_update(message_id);
+                return self
+                    .write_owned_assistant_status(&target, message_id, &status_line)
+                    .await;
+            }
+            // Posting the initial progress message clears Slack's status, so
+            // materialize it before setting the ordinary thread's indicator.
+            self.update_draft(recipient, message_id, &status_line)
+                .await?;
+            // Ordinary threads keep their existing draft progress even when
+            // the advisory status request fails. Status never selects streaming.
+            if let Err(e) = self
                 .write_owned_assistant_status(&target, message_id, &status_line)
-                .await;
+                .await
+            {
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&e.to_string())})), "Slack thread status update failed");
+            }
+            return Ok(());
         }
 
         self.update_draft(recipient, message_id, &status_line).await
@@ -6031,6 +6132,52 @@ impl Channel for SlackChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn update_typing(
+        &self,
+        message: &SendMessage,
+        turn_id: &str,
+        event: TypingEvent,
+    ) -> anyhow::Result<()> {
+        let Some(thread_ts) = self.outbound_thread_ts(message) else {
+            return Ok(());
+        };
+        let target = AssistantTarget {
+            channel_id: message.recipient.clone(),
+            thread_ts: thread_ts.to_string(),
+        };
+        self.update_thread_typing(&target, turn_id, event).await
+    }
+
+    async fn update_draft_typing(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        event: TypingEvent,
+    ) -> anyhow::Result<()> {
+        let target = self
+            .draft_turns
+            .lock()
+            .await
+            .get(message_id)
+            .and_then(SlackDraftTurn::status_target);
+        if let Some(target) = target {
+            match event {
+                TypingEvent::Paused => {
+                    self.update_thread_typing(&target, message_id, event)
+                        .await?
+                }
+                TypingEvent::Resumed => {
+                    self.update_thread_typing(&target, message_id, event)
+                        .await?;
+                    self.update_thread_typing(&target, message_id, TypingEvent::Active)
+                        .await?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -7993,7 +8140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_message_in_assistant_channel_uses_draft_message_api() {
+    async fn ordinary_thread_keeps_draft_progress_and_sets_status_after_posting() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8006,6 +8153,13 @@ mod tests {
                 "ts": "ordinary-draft",
             })))
             .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -8029,10 +8183,199 @@ mod tests {
             .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].url.path(), "/chat.postMessage");
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["thread_ts"], "ordinary-thread");
+        assert_eq!(requests[1].url.path(), "/assistant.threads.setStatus");
+        ch.cancel_draft("C123", &ordinary).await.unwrap();
+        assert_eq!(
+            assistant_status_calls(&server).await,
+            [
+                ("ordinary-thread".into(), "Planning".into()),
+                ("ordinary-thread".into(), String::new())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_thread_typing_preserves_ownership_across_pause_and_supersession() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(false, 1);
+        let first = SendMessage::new("", "C123").in_thread(Some("thread-one".into()));
+        let second = SendMessage::new("", "C123").in_thread(Some("thread-two".into()));
+        for (message, id) in [(&first, "old"), (&second, "independent")] {
+            ch.update_typing(message, id, TypingEvent::Started)
+                .await
+                .unwrap();
+            ch.update_typing(message, id, TypingEvent::Active)
+                .await
+                .unwrap();
+        }
+        ch.update_typing(&first, "old", TypingEvent::Paused)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "old", TypingEvent::Resumed)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "old", TypingEvent::Active)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "new", TypingEvent::Started)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "new", TypingEvent::Active)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "old", TypingEvent::Paused)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "old", TypingEvent::Finished)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "new", TypingEvent::Finished)
+            .await
+            .unwrap();
+        // An old approval resume cannot resurrect ownership even after the
+        // newer turn completed and removed its claim.
+        ch.update_typing(&first, "old", TypingEvent::Resumed)
+            .await
+            .unwrap();
+        ch.update_typing(&first, "old", TypingEvent::Active)
+            .await
+            .unwrap();
+        ch.update_typing(&second, "independent", TypingEvent::Finished)
+            .await
+            .unwrap();
+        assert_eq!(
+            assistant_status_calls(&server).await,
+            [
+                ("thread-one".into(), "Planning".into()),
+                ("thread-two".into(), "Planning".into()),
+                ("thread-one".into(), String::new()),
+                ("thread-one".into(), "Planning".into()),
+                ("thread-one".into(), "Planning".into()),
+                ("thread-one".into(), String::new()),
+                ("thread-two".into(), String::new()),
+            ]
+        );
+        assert!(!ch.supports_draft_updates());
+        assert!(ch.assistant_status_owners.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_draft_status_stays_paused_across_queued_progress() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        for endpoint in [
+            "/assistant.threads.setStatus",
+            "/chat.update",
+            "/chat.postMessage",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true,"ts":"draft-ts"})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let ch = Arc::new(test_slack_channel(&server, tmp.path()).with_streaming(true, 1));
+        let config = zeroclaw_config::schema::SlackConfig {
+            reply_min_interval_secs: 1,
+            ..Default::default()
+        };
+        let paced = crate::paced_channel::PacedChannel::wrap(ch.clone(), &config);
+        let draft = paced
+            .send_draft(&SendMessage::new("", "C123").in_thread(Some("thread".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        paced
+            .update_draft_lifecycle("C123", &draft, ProgressEvent::Planning)
+            .await
+            .unwrap();
+        paced
+            .update_draft_typing("C123", &draft, TypingEvent::Paused)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A queued pre-approval event must not restore the working indicator.
+        paced
+            .update_draft_lifecycle("C123", &draft, ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+        assert_eq!(
+            assistant_status_calls(&server).await,
+            [
+                ("thread".into(), "Planning".into()),
+                ("thread".into(), String::new())
+            ]
+        );
+        paced
+            .update_draft_typing("C123", &draft, TypingEvent::Resumed)
+            .await
+            .unwrap();
+        assert_eq!(
+            assistant_status_calls(&server).await.last(),
+            Some(&("thread".into(), "Planning".into()))
+        );
+        paced.cancel_draft("C123", &draft).await.unwrap();
+        assert!(ch.assistant_status_owners.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_typing_cleanup_uses_one_request_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(4))
+                    .set_body_json(serde_json::json!({"ok":true})),
+            )
+            .mount(&server)
+            .await;
+        let ch = test_slack_channel(&server, tmp.path());
+        let message = SendMessage::new("", "C123").in_thread(Some("thread".into()));
+        ch.update_typing(&message, "turn", TypingEvent::Started)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        ch.update_typing(&message, "turn", TypingEvent::Finished)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "retry attempts must share the three-second cleanup budget"
+        );
+        assert_eq!(assistant_status_calls(&server).await.len(), 1);
+        assert!(
+            ch.owns_assistant_status(
+                &AssistantTarget {
+                    channel_id: "C123".into(),
+                    thread_ts: "thread".into()
+                },
+                "turn"
+            )
+            .await,
+            "a failed clear retains recovery ownership"
+        );
     }
 
     /// Collect every `assistant.threads.setStatus` call the mock saw, as

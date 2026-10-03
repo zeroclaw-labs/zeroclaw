@@ -12,6 +12,7 @@ use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
     ChannelModelPickerRequest, DraftProgress, ProgressEvent, RoomCreationOptions, SendMessage,
+    TypingEvent,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -367,6 +368,26 @@ impl Channel for PacedChannel {
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         self.inner.start_typing(recipient).await
+    }
+
+    async fn update_typing(
+        &self,
+        message: &SendMessage,
+        turn_id: &str,
+        event: TypingEvent,
+    ) -> Result<()> {
+        self.inner.update_typing(message, turn_id, event).await
+    }
+
+    async fn update_draft_typing(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: TypingEvent,
+    ) -> Result<()> {
+        self.inner
+            .update_draft_typing(recipient, message_id, event)
+            .await
     }
 
     fn set_cancel_token(&self, token: CancellationToken) {

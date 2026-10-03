@@ -119,6 +119,8 @@ retry.
 
 {{#streaming channel="Slack" mode="stream_drafts" path="channels.slack.<alias>.stream_drafts"}}
 
+Working status in channel threads is independent of `stream_drafts`. The bot sets and clears the thread's loading indicator with `chat:write`, without requiring an Assistant pane or enabling provider streaming. Draft-enabled threads also retain their progress messages. Status refreshes and cleanup are owned by the latest turn in each thread, so an older turn cannot explicitly clear a newer turn's indicator.
+
 `draft_update_interval_ms` controls how often the streaming draft is edited
 (raise it if Slack rate-limits the edits), and `cancel_reaction` sets an emoji
 users can react with to cancel an in-flight reply.
