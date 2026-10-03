@@ -450,6 +450,8 @@ jobs:
     if: needs.windows-service-smoke-changes.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 35
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -458,12 +460,15 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          key: dev-fixture-v1
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build controlled Windows service fixture
+        # This unshipped fixture proves service lifecycle behavior, so avoid
+        # release optimization and thin LTO before the short smoke.
         shell: bash
         run: >-
-          cargo build --profile ci --locked -p zeroclaw-runtime
+          cargo build --profile dev --locked -p zeroclaw-runtime
           --example windows_service_smoke_fixture
           --target x86_64-pc-windows-msvc
       - name: Exercise installed Windows service lifecycle
@@ -471,7 +476,7 @@ jobs:
         timeout-minutes: 15
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
             -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
       - name: Clean up Windows service smoke
@@ -480,7 +485,7 @@ jobs:
         timeout-minutes: 3
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
             -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
             -CleanupOnly
