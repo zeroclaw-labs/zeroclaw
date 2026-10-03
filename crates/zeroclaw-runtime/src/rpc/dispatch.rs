@@ -33519,13 +33519,20 @@ mod tests {
         dispatcher
     }
 
-    fn make_shared_sessions_dispatcher(
+    /// Another connection's dispatcher on `first`'s daemon: it shares the
+    /// session store and the config write lock, as every connection shares
+    /// the daemon's one context in production, so it queues behind a
+    /// transaction `first` holds open. Its config is its own, so a successor
+    /// it builds stays distinguishable from stale work built from `first`'s.
+    fn make_second_connection_dispatcher(
+        first: &RpcContext,
         config: zeroclaw_config::schema::Config,
-        sessions: Arc<crate::rpc::session::SessionStore>,
     ) -> RpcDispatcher {
-        let ctx = RpcContext::minimal(config, sessions);
+        let mut ctx = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&first.sessions)))
+            .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
+        ctx.config_write_lock = Arc::clone(&first.config_write_lock);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
         dispatcher
     }
@@ -33544,7 +33551,7 @@ mod tests {
             }),
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = crate::LiveConfigAuthority::new(config);
+        let authority = crate::LiveConfigAuthority::for_tests(config);
         let data_dir = authority.config().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
@@ -41608,6 +41615,7 @@ mod tests {
             "old-model"
         );
 
+        let first_ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
         let sid = session_id.clone();
@@ -41638,10 +41646,8 @@ mod tests {
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
-            make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
-        );
+        let dispatcher2 =
+            make_second_connection_dispatcher(&first_ctx, make_model_refresh_test_config(&tmp));
         let replace_sid = session_id.clone();
         let replace = zeroclaw_spawn::spawn!(async move {
             dispatcher2
@@ -41754,9 +41760,9 @@ mod tests {
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
+        let dispatcher2 = make_second_connection_dispatcher(
+            &dispatcher.ctx,
             make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
         let replace_sid = session_id.clone();

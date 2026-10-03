@@ -32,6 +32,22 @@ impl LiveConfigAuthority {
         }
     }
 
+    /// Test-only authority whose config write lock is private to it.
+    ///
+    /// A unit-test binary is one process, so authorities built with
+    /// [`Self::new`] share one lock across every test in it: a test holding
+    /// its context's guard stalls every other test's config writers, and
+    /// parallel runs queue timing-bounded tests behind unrelated ones.
+    /// Clones of this authority still share its lock, as they do in
+    /// production.
+    #[cfg(test)]
+    pub(crate) fn for_tests(config: Config) -> Self {
+        Self {
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ..Self::new(config)
+        }
+    }
+
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
@@ -1074,6 +1090,25 @@ mod tests {
         assert!(Arc::ptr_eq(
             &authority.config_write_lock(),
             &other.config_write_lock()
+        ));
+    }
+
+    #[test]
+    fn only_the_test_authority_has_a_private_write_lock() {
+        let process = zeroclaw_config::write_lock::shared_config_write_lock();
+        let production = LiveConfigAuthority::new(Config::default());
+        assert!(Arc::ptr_eq(&production.config_write_lock(), &process));
+
+        let isolated = LiveConfigAuthority::for_tests(Config::default());
+        let other = LiveConfigAuthority::for_tests(Config::default());
+        assert!(!Arc::ptr_eq(&isolated.config_write_lock(), &process));
+        assert!(!Arc::ptr_eq(
+            &isolated.config_write_lock(),
+            &other.config_write_lock()
+        ));
+        assert!(Arc::ptr_eq(
+            &isolated.config_write_lock(),
+            &isolated.clone().config_write_lock()
         ));
     }
 
