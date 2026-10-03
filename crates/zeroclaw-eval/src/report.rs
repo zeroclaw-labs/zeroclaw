@@ -21,13 +21,18 @@ pub struct CaseReport {
 
 impl CaseReport {
     /// A case passes when it ran without error, produced at least one grade,
-    /// and every grade passed.
+    /// and every non-diagnostic grade passed.
     ///
     /// Fixture admission rejects assertion-free cases, but this aggregation
     /// boundary also fails closed so a caller cannot manufacture a green
     /// report from an empty grade vector.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none()
+            && !self.grades.is_empty()
+            && self
+                .grades
+                .iter()
+                .all(|grade| grade.passed || grade.diagnostic)
     }
 
     fn checks_passed(&self) -> usize {
@@ -254,6 +259,9 @@ impl SuiteReport {
                         "sandbox".into(),
                         serde_json::to_value(&p.sandbox).unwrap_or_default(),
                     );
+                    if let Some(judge_ref) = &p.judge_ref {
+                        map.insert("judge_ref".into(), judge_ref.clone().into());
+                    }
                     // Completion-only fields stay absent for a run that never
                     // finished, rather than being reported as a real zero.
                     if let Some(done) = &rec.completion {
@@ -293,6 +301,7 @@ mod tests {
             passed,
             detail: detail.to_string(),
             category: crate::grader::GradeCategory::Response,
+            diagnostic: false,
         }
     }
 
@@ -726,6 +735,7 @@ mod tests {
             passed,
             detail: String::new(),
             category,
+            diagnostic: false,
         };
         let report = CaseReport {
             name: "mixed".to_string(),
