@@ -55,6 +55,28 @@ expect "mixed unrelated then activation e2e" "true" \
     "web/src/pages/AgentChat.tsx" \
     "tests/plugin_channel_runtime_e2e.rs"
 
+# The gateway's plugin webhook ingress must run the backend job: its handler,
+# HTTP tests, and golden scenarios compile only under the gateway's
+# `plugins-wasm` feature, which the default-feature Test job never enables.
+expect "gateway plugin webhook handler" "true" \
+    "crates/zeroclaw-gateway/src/plugin_webhook.rs"
+expect "gateway plugin webhook tests" "true" \
+    "crates/zeroclaw-gateway/src/plugin_webhook/tests.rs"
+expect "gateway router" "true" "crates/zeroclaw-gateway/src/lib.rs"
+expect "gateway manifest" "true" "crates/zeroclaw-gateway/Cargo.toml"
+expect "gateway golden harness" "true" \
+    "crates/zeroclaw-gateway/tests/golden_frames.rs"
+expect "gateway golden fixture" "true" \
+    "crates/zeroclaw-gateway/tests/golden/plugin_webhook_delivery.json"
+expect "shared webhook types" "true" "crates/zeroclaw-api/src/webhook.rs"
+expect "infra plugin webhook ingress" "true" \
+    "crates/zeroclaw-infra/src/plugin_webhook.rs"
+expect "infra plugin webhook ingress submodule" "true" \
+    "crates/zeroclaw-infra/src/plugin_webhook/tests.rs"
+expect "mixed unrelated then plugin webhook" "true" \
+    "web/src/pages/AgentChat.tsx" \
+    "crates/zeroclaw-gateway/src/plugin_webhook.rs"
+
 expect "wit contracts" "true" "wit/v0/tool-plugin.wit"
 expect "workspace manifest" "true" "Cargo.toml"
 expect "workspace lockfile" "true" "Cargo.lock"
@@ -78,6 +100,12 @@ expect "other workflow changes" "false" \
 # The activation e2e is matched by exact path, not by a `tests/*` wildcard, so
 # the rest of the root test suite must stay outside this job.
 expect "other root tests" "false" "tests/test_live.rs"
+# Only the plugin webhook paths of the gateway, api, and infra crates are
+# listed; the rest of those crates stays with the default-feature Test job.
+expect "other gateway source" "false" "crates/zeroclaw-gateway/src/ws.rs"
+expect "other gateway test" "false" "crates/zeroclaw-gateway/tests/nodes_mdns.rs"
+expect "other api source" "false" "crates/zeroclaw-api/src/lib.rs"
+expect "other infra source" "false" "crates/zeroclaw-infra/src/session_queue.rs"
 expect "empty input" "false"
 
 echo "plugin backend change filter tests: pass"

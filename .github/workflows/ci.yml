@@ -706,6 +706,14 @@ jobs:
             features: plugins-wasmtime
             suite: check
             cache-key: check-plugin-backends
+          # The gateway's `/plugin/{path}` ingress. `features` names the
+          # gateway feature, not a zeroclaw-plugins backend: it pulls in no
+          # wasmtime, so the leg builds a gateway-only dependency set and
+          # keeps its own key.
+          - name: plugins gateway ingress
+            features: plugins-wasm
+            suite: gateway
+            cache-key: plugins-gateway-ingress
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -734,8 +742,10 @@ jobs:
           shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      # Not for the gateway leg: zeroclaw-plugins has no `plugins-wasm`
+      # feature, and that leg's tests already compile it through the gateway.
       - name: Check
-        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'gateway'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
@@ -786,6 +796,21 @@ jobs:
         run: |
           cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
           cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
+      # Guards required plugin webhook ingress coverage from issue #11003; see the bespoke gate registry in README.md.
+      # The gateway's `/plugin/{path}` ingress only compiles under its
+      # `plugins-wasm` feature, so the default-feature Test job never runs its
+      # tests. The filter is a module path: it selects every test in the
+      # handler's `plugin_webhook::tests`, not one test name.
+      - name: Run gateway plugin webhook tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook
+      # Required, unlike the Test job's informational replay of the other
+      # golden scenarios: these pin the public `/plugin/{path}` contract
+      # (statuses, bodies, headers, and what the channel worker receives)
+      # through the real gateway listener, and are not `#[ignore]`d.
+      - name: Run gateway plugin webhook golden frames
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --test golden_frames plugin_webhook
 
   msrv:
     name: MSRV (declared floor)
