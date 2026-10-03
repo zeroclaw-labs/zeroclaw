@@ -219,9 +219,7 @@ impl SessionStore {
 
     /// Replace the last message without exposing an intermediate truncated session.
     pub fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
-        self.update_last_with(session_key, message, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
+        self.update_last_with(session_key, message, publish_staged_rewrite)
     }
 
     fn update_last_with<F>(
@@ -252,9 +250,7 @@ impl SessionStore {
     }
 
     fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
-        self.rewrite_with(session_key, messages, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
+        self.rewrite_with(session_key, messages, publish_staged_rewrite)
     }
 
     /// Transcript+sidecar replacement assuming the caller already holds the
@@ -300,7 +296,7 @@ impl SessionStore {
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
         let path = self.session_path(session_key);
-        let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
+        let mut temp = tempfile::Builder::new().make_in(&self.sessions_dir, create_staging_file)?;
         for msg in messages {
             serde_json::to_writer(&mut temp, msg)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -382,6 +378,37 @@ impl SessionStore {
             })
             .collect()
     }
+}
+
+/// Rename a staged rewrite over the live session file.
+///
+/// Readers take no lock, so one may hold the session file open at this
+/// moment, and that must not stop the replace on any platform. On Windows
+/// `persist` is a bare `MoveFileExW`, which cannot replace a file that any
+/// reader holds open. `std::fs::rename` retries that refusal with POSIX
+/// semantics, which swap the name while open readers keep the old contents,
+/// as long as they opened it with delete sharing (std's own opens do). On Unix
+/// both are rename(2).
+fn publish_staged_rewrite(temp: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    let mut staged = temp.into_temp_path();
+    std::fs::rename(&staged, path)?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
+    Ok(())
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the session file.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 fn is_regular_jsonl_session_file(path: &Path) -> bool {
@@ -983,6 +1010,36 @@ mod tests {
         assert!(!temp_path.unwrap().exists());
     }
 
+    /// Readers take no lock, so one can hold a session file open while a
+    /// writer replaces it. That must not stop the replace, and the reader
+    /// keeps the transcript it opened. Windows refuses a plain replace of an
+    /// open file, so this pins the replace itself rather than leaving it to a
+    /// race.
+    #[test]
+    fn a_rewrite_replaces_a_session_file_a_reader_holds_open() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let key = "held_open";
+        backend.append(key, &ChatMessage::user("first")).unwrap();
+        backend.append(key, &ChatMessage::assistant("old")).unwrap();
+        let mut held = std::fs::File::open(store.session_path(key)).unwrap();
+
+        backend
+            .replace_conversation_state(
+                key,
+                &[ChatMessage::user("first"), ChatMessage::assistant("new")],
+                false,
+            )
+            .expect("an open reader must not stop the rewrite");
+
+        let held_transcript = std::io::read_to_string(&mut held).unwrap();
+        assert!(held_transcript.contains("old"), "{held_transcript}");
+        let messages = backend.load(key);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "new");
+    }
+
     #[test]
     fn concurrent_append_waits_for_update_last_commit() {
         let tmp = TempDir::new().unwrap();
@@ -1003,7 +1060,7 @@ mod tests {
             update_worker.update_last_with(key, &ChatMessage::assistant("new"), |temp, path| {
                 staged_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                temp.persist(path).map(|_| ()).map_err(|error| error.error)
+                publish_staged_rewrite(temp, path)
             })
         });
 
