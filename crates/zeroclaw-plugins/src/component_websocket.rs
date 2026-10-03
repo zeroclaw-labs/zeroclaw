@@ -588,6 +588,7 @@ fn map_egress_error(error: EgressError) -> WebSocketError {
         EgressError::DnsFailed { .. } => WebSocketError::DnsFailed,
         EgressError::ConnectionLimitReached { .. } => WebSocketError::ConnectionLimit,
         EgressError::InvalidTlsMaterial { .. }
+        | EgressError::TlsConfigMismatch
         | EgressError::TlsSecretUnavailable { .. }
         | EgressError::AuthorizationScopeMismatch => WebSocketError::TlsFailed,
         EgressError::PolicyUnavailable(_) => WebSocketError::Unavailable,

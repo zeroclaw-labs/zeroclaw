@@ -664,6 +664,21 @@ connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
 
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. A later frame resolves rotated material; already-open connections
+are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
