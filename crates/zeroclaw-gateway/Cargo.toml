@@ -35,6 +35,9 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 
+# Capability-relative dashboard file opening, already used by runtime/tools.
+cap-std = "4"
+
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 
