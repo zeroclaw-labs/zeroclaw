@@ -2333,7 +2333,9 @@ struct NativeMessage {
     thinking_blocks: Option<Vec<serde_json::Value>>,
     /// Tool name for `role: "tool"` messages. Groq native tool calling
     /// requires this field on every tool-result message; omitting it causes
-    /// HTTP 400 "Tools should have a name!"./
+    /// HTTP 400 "Tools should have a name!". Strict gateways reject the field
+    /// itself, so it is emitted only for endpoints allowlisted by
+    /// `requires_tool_message_name` (Groq-class endpoints).
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
@@ -3387,6 +3389,7 @@ impl OpenAiCompatibleModelProvider {
     ) -> Vec<NativeMessage> {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let requires_string_tool_call_content = self.requires_string_tool_call_content();
+        let requires_tool_message_name = self.requires_tool_message_name();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
@@ -3404,9 +3407,12 @@ impl OpenAiCompatibleModelProvider {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| {
-                            let tc_id = tc.id.clone();
-                            let tc_name = tc.name.clone();
-                            tool_name_map.insert(tc_id, tc_name);
+                            // Collected only for endpoints allowlisted by
+                            // `requires_tool_message_name`; every other
+                            // endpoint never sees the field.
+                            if requires_tool_message_name {
+                                tool_name_map.insert(tc.id.clone(), tc.name.clone());
+                            }
                             ToolCall {
                                 id: Some({
                                     let normalized_id = reserve_tool_call_id_for_contract(
@@ -3529,19 +3535,26 @@ impl OpenAiCompatibleModelProvider {
                         });
 
                     // Groq native tool calling requires the tool `name` on
-                    // every role-tool message; look it up from the paired
-                    // assistant tool-call, falling back to any name carried
-                    // in the tool message content itself./
-                    let tool_name = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|raw_id| tool_name_map.get(raw_id).cloned())
-                        .or_else(|| {
-                            value
-                                .get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToString::to_string)
-                        });
+                    // every role-tool message; strict gateways (e.g. OpenCode
+                    // Go) reject it as an unsupported parameter. Resolve it
+                    // from the paired assistant tool-call, falling back to any
+                    // name carried in the tool message content itself, and
+                    // only for allowlisted endpoints — see
+                    // `requires_tool_message_name`.
+                    let tool_name = if requires_tool_message_name {
+                        value
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|raw_id| tool_name_map.get(raw_id).cloned())
+                            .or_else(|| {
+                                value
+                                    .get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string)
+                            })
+                    } else {
+                        None
+                    };
 
                     return NativeMessage {
                         role: "tool".to_string(),
@@ -3675,6 +3688,24 @@ impl OpenAiCompatibleModelProvider {
             .ok()
             .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
             .is_some_and(|host| host == "mistral.ai" || host.ends_with(".mistral.ai"))
+    }
+
+    /// Whether the endpoint rejects `role: "tool"` messages that omit the
+    /// tool `name`. Groq fails tool results without it (HTTP 400 "Tools
+    /// should have a name!"), while strict gateways — OpenCode Go, for one —
+    /// fail the whole request when the field is present
+    /// (`unsupported_parameter`). The capability is an allowlist, so endpoints
+    /// whose schema is unknown never receive the field; only Groq and
+    /// `.groq.com` hosts do.
+    fn requires_tool_message_name(&self) -> bool {
+        if self.name.eq_ignore_ascii_case("groq") {
+            return true;
+        }
+
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+            .is_some_and(|host| host == "api.groq.com" || host.ends_with(".groq.com"))
     }
 
     fn reserve_tool_call_id(
@@ -10072,6 +10103,68 @@ mod tests {
         }
     }
 
+    /// Wire-level pin for the tool-message `name` allowlist: the serialized
+    /// `chat` body must omit it for endpoints outside the allowlist (OpenCode
+    /// Go rejects it as an unsupported parameter) and must still carry it for
+    /// Groq.
+    #[tokio::test]
+    async fn chat_tool_message_name_is_allowlisted_on_the_wire() {
+        let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        let messages = vec![
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_abc",
+                    "content": "done"
+                })
+                .to_string(),
+            ),
+        ];
+        let request = || ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        provider
+            .chat(request(), "test-model", None)
+            .await
+            .expect("chat against the default endpoint should succeed");
+        provider.name = "Groq".to_string();
+        provider
+            .chat(request(), "test-model", None)
+            .await
+            .expect("chat against Groq should succeed");
+        server.abort();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["messages"][1]["role"], "tool");
+        assert!(
+            requests[0]["messages"][1].get("name").is_none(),
+            "non-Groq endpoints must not receive the tool-message name: {}",
+            requests[0]
+        );
+        assert_eq!(
+            requests[1]["messages"][1]["name"], "shell",
+            "Groq must still receive the tool-message name: {}",
+            requests[1]
+        );
+    }
+
     #[test]
     fn x_api_key_auth_style() {
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -11291,7 +11384,10 @@ mod tests {
         let content = content.as_str().expect("sanitized fallback should be text");
 
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_obj"));
-        assert_eq!(converted[0].name.as_deref(), Some("read"));
+        assert_eq!(
+            converted[0].name, None,
+            "endpoints outside the allowlist must not receive the tool-message name"
+        );
         assert!(content.contains("\"payload\":\""));
         assert!(content.contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE));
         assert_eq!(content.matches(TOOL_RESULT_IMAGE_OMITTED_NOTICE).count(), 1);
@@ -11471,8 +11567,8 @@ mod tests {
             assert_eq!(converted[index].role, "tool");
             assert_eq!(converted[index].tool_call_id.as_deref(), Some(expected_id));
             assert_eq!(
-                converted[index].name.as_deref(),
-                Some(if index == 1 { "first" } else { "second" })
+                converted[index].name, None,
+                "endpoints outside the allowlist must not receive the tool-message name"
             );
             let content = serde_json::to_value(
                 converted[index]
@@ -11541,7 +11637,7 @@ mod tests {
             ),
         ];
 
-        let provider = make_model_provider("test", "https://example.com", None);
+        let provider = make_model_provider("Groq", "https://api.groq.com/openai/v1", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 2);
         assert_eq!(native[0].role, "assistant");
@@ -11550,7 +11646,7 @@ mod tests {
         assert_eq!(
             tool_msg.name.as_deref(),
             Some("shell"),
-            "tool name should resolve from paired assistant tool-call"
+            "Groq tool name should resolve from paired assistant tool-call"
         );
     }
 
@@ -11587,14 +11683,44 @@ mod tests {
             .to_string(),
         )];
 
-        let provider = make_model_provider("test", "https://example.com", None);
+        let provider = make_model_provider("Groq", "https://api.groq.com/openai/v1", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "tool");
         assert_eq!(
             native[0].name.as_deref(),
             Some("read"),
-            "tool name should fall back to the content name field"
+            "Groq tool name should fall back to the content name field"
+        );
+    }
+
+    /// The tool-message `name` is an endpoint allowlist: Groq rejects tool
+    /// results that omit it, while strict gateways reject the field itself.
+    #[test]
+    fn requires_tool_message_name_allowlists_groq_only() {
+        assert!(
+            make_model_provider("Groq", "https://api.groq.com/openai/v1", None)
+                .requires_tool_message_name(),
+            "Groq rejects tool results without a name"
+        );
+        assert!(
+            make_model_provider("groq", "https://example.com", None).requires_tool_message_name(),
+            "the display-name fallback covers proxied Groq endpoints"
+        );
+        assert!(
+            !make_model_provider("opencode-go", "https://opencode.ai/zen/go/v1", None)
+                .requires_tool_message_name(),
+            "OpenCode Go rejects `name` as an unsupported parameter"
+        );
+        assert!(
+            !make_model_provider("custom", "https://api.groq.com.evil.example", None)
+                .requires_tool_message_name(),
+            "lookalike hosts must not inherit the capability"
+        );
+        assert!(
+            !make_model_provider("custom", "https://example.com", None)
+                .requires_tool_message_name(),
+            "unknown endpoints stay off the allowlist"
         );
     }
 
