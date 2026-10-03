@@ -927,6 +927,8 @@ cli-plugin-egress-repair-incomplete = {$name}: after the printed command the run
 cli-plugin-egress-deployment-rejected = The runtime rejects every plugin egress policy in this deployment ({$reason}), so no plugin's grant can take effect until it is fixed. Check `security.nat64_prefixes` and `plugins.limits.max_connections_per_instance`.
 cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
 cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
+cli-plugin-install-unadmitted-package = install failed: '{$name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {$name}`, then install again.
+cli-plugin-remove-unadmitted-package = `zeroclaw plugin remove` left '{$name}' in place: {$reason}. It deletes a directory the host has not loaded only when the directory is empty, or when admission rejects its own contents rather than its signature; delete '{$name}' by hand if it should go.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
@@ -1435,3 +1437,7 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+cli-plugin-recovery-retained = Recovery retained package files at { $path }: { $reason }. Resolve the occupied destination or filesystem error, then retry plugin remove.
+cli-plugin-staging-retained = Retained staging at { $path } because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.
+cli-plugin-namespace-changed = Plugin operation refused because filesystem ownership changed: { $reason }. Inspect the plugins directory before retrying.

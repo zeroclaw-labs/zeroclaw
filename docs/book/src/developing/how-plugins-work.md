@@ -37,7 +37,9 @@ one.
    the first and cheapest check.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
-   containing a `manifest.toml`.
+   containing a `manifest.toml`. It skips dot-prefixed directories, including
+   the hidden staging directory `zeroclaw plugin install` builds a package in
+   before renaming it into place, so a half-written install is never loaded.
 3. **Validate shape.** Each manifest must declare at least one capability, and
    a non-skill plugin must name a confined relative `wasm_path`. Traversal and
    symlink paths are rejected. A malformed manifest is skipped with a warning,
