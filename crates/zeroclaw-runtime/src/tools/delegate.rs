@@ -612,6 +612,19 @@ impl DelegateTool {
         &self.cancellation_token
     }
 
+    /// A child token for work that belongs to the running turn. It hangs off
+    /// the turn's cancellation when a turn is executing this tool, so an abort
+    /// of the turn reaches the parallel and agentic children the turn started
+    /// (their tasks outlive the dropped tool future), and off this tool's own
+    /// token otherwise. Background tasks keep this tool's token on purpose:
+    /// they outlive the turn by design and are cancelled through `cancel_task`.
+    fn turn_bound_child_token(&self) -> CancellationToken {
+        crate::agent::tool_execution::current_turn_cancellation().map_or_else(
+            || self.cancellation_token.child_token(),
+            |turn| turn.child_token(),
+        )
+    }
+
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
@@ -3590,7 +3603,7 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
-            let cancellation_token = self.cancellation_token.child_token();
+            let cancellation_token = self.turn_bound_child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -4737,7 +4750,10 @@ impl DelegateTool {
                         multimodal_config: self.multimodal_config.clone(),
                         delegate_config: self.delegate_config.clone(),
                         workspace_dir: self.workspace_dir.clone(),
-                        cancellation_token: self.cancellation_token.child_token(),
+                        // The child's own delegate tool: its children must
+                        // stay bound to this turn even from a spawned task,
+                        // where the turn token is not visible.
+                        cancellation_token: self.turn_bound_child_token(),
                         memory: self.memory.clone(),
                         providers_models: Arc::clone(&self.providers_models),
                         risk_profiles: Arc::clone(&self.risk_profiles),
@@ -4990,7 +5006,7 @@ impl DelegateTool {
                 injected_memory_preamble: &mut subagent_injected_memory_preamble,
                 channel_name: "delegate",
                 channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
+                cancellation_token: Some(self.turn_bound_child_token()),
                 on_delta: None,
                 shared_budget: execution_tree_budget.clone(),
                 channel: None,
@@ -12155,6 +12171,35 @@ mod tests {
 
         tool.cancel_all_background_tasks();
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn in_turn_child_tokens_follow_the_running_turn() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+
+        let turn = CancellationToken::new();
+        let bound = crate::agent::tool_execution::scope_turn_cancellation(turn.clone(), async {
+            tool.turn_bound_child_token()
+        })
+        .await;
+        assert!(!bound.is_cancelled());
+        turn.cancel();
+        assert!(
+            bound.is_cancelled(),
+            "aborting the turn reaches its children"
+        );
+        assert!(
+            !tool.cancellation_token().is_cancelled(),
+            "the tool's own token, which background tasks use, is untouched"
+        );
+
+        let detached = tool.turn_bound_child_token();
+        assert!(!detached.is_cancelled());
+        tool.cancel_all_background_tasks();
+        assert!(
+            detached.is_cancelled(),
+            "outside a turn the child falls back to the tool's own token"
+        );
     }
 
     #[test]
