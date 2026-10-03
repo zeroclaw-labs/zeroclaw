@@ -172,6 +172,7 @@ for plugin_path in \
     'crates/zeroclaw-runtime/src/lib.rs' \
     'crates/zeroclaw-config/src/lib.rs' \
     'tests/plugin_channel_runtime_e2e.rs' \
+    'tests/support/plugin_channel_fixture.rs' \
     'Cargo.toml' \
     'Cargo.lock' \
     'scripts/ci/plugin_backend_change_filter.sh' \
@@ -410,6 +411,12 @@ for target in ("channel_plugin_e2e", "tool_plugin_timeout_e2e", "reference_plugi
     assert f"--test {target}" in windows_job
 assert plugin_root_command in windows_job
 assert "--test plugin_channel_runtime_e2e" in plugin_backend_job
+assert "--test plugin_webhook_ipc_e2e" in plugin_backend_job
+for gateway_command in (
+    "cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook",
+    "cargo test --locked -p zeroclaw-gateway --features plugins-wasm --test golden_frames plugin_webhook",
+):
+    assert gateway_command in plugin_backend_job
 assert 'plugin_components_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_lib_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_runtime_config_status=${PIPESTATUS[0]}' in windows_job
