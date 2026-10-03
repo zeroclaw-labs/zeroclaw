@@ -55,6 +55,21 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// The provider repeatedly emitted malformed internal tool-call protocol.
+///
+/// This is a semantic turn failure: the transport completed, but the requested
+/// tool work could not be parsed and therefore was not executed.
+#[derive(Debug)]
+pub struct MalformedToolProtocolExhausted;
+
+impl std::fmt::Display for MalformedToolProtocolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider exhausted malformed tool-protocol retries")
+    }
+}
+
+impl std::error::Error for MalformedToolProtocolExhausted {}
+
 /// The complete provider-facing request cannot fit the active model's capacity.
 #[derive(Debug)]
 pub struct ContextWindowExceeded {
@@ -294,6 +309,12 @@ fn terminal_completion_error_message_with_renderer(
         return Some(semantic_empty_terminal_completion_message_with_renderer(
             agent_name, render,
         ));
+    }
+    if err
+        .chain()
+        .any(|source| source.is::<MalformedToolProtocolExhausted>())
+    {
+        return Some(render("channel-runtime-malformed-tool-output", &[]));
     }
     err.chain()
         .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
