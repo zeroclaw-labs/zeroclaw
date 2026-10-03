@@ -362,6 +362,13 @@ pub(crate) struct ResumeEntry {
     recovery_required: bool,
 }
 
+/// The queue owns both its pause and the explanation shown to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePauseReason {
+    Generic,
+    MissingCompletion,
+}
+
 /// Client-owned queue and composer state that cannot be reconstructed from the
 /// daemon's durable transcript. This is the live `ChatState` data carried
 /// across a transport rebuild; transcript and turn state are reloaded from the
@@ -370,7 +377,7 @@ pub(crate) struct ResumeEntry {
 struct ReconnectQueueState {
     messages: VecDeque<QueuedMessage>,
     next_id: u64,
-    paused: bool,
+    paused: Option<QueuePauseReason>,
     selected: Option<u64>,
     composer_text: String,
     composer_attachments: Vec<PendingAttachment>,
@@ -2683,7 +2690,12 @@ impl Chat {
             // The response proves the handler returned, but only the missing
             // terminal notification distinguishes completed from cancelled or
             // failed. Settle conservatively so queued work cannot auto-run.
-            state.settle_turn_from_prompt_response();
+            let pause_reason = if completion.error.is_some() {
+                QueuePauseReason::Generic
+            } else {
+                QueuePauseReason::MissingCompletion
+            };
+            state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
                 state.set_info_notice(crate::i18n::t_args(
@@ -6228,7 +6240,10 @@ fn render_with_plan_placement(
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
         Some(crate::i18n::t_args(
-            "zc-queue-paused-ghost",
+            match state.queue_paused {
+                Some(QueuePauseReason::MissingCompletion) => "zc-queue-missing-completion-ghost",
+                _ => "zc-queue-paused-ghost",
+            },
             &[("key", &resume_queue_chord_label())],
         ))
     } else {
@@ -9475,8 +9490,8 @@ pub struct ChatState {
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
     next_queue_id: u64,
-    /// Set on Cancel/Fail; freezes auto-dispatch until the user resumes.
-    queue_paused: bool,
+    /// Pause reason; freezes auto-dispatch until the user resumes.
+    queue_paused: Option<QueuePauseReason>,
     resume_override: bool,
     cancel_started_at: Option<Instant>,
     /// Selected queued message id for sidebar edit/delete.
@@ -9592,7 +9607,7 @@ impl ChatState {
             context_model_window: None,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
-            queue_paused: false,
+            queue_paused: None,
             resume_override: false,
             cancel_started_at: None,
             queue_sel: None,
@@ -11486,10 +11501,15 @@ impl ChatState {
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
-        self.settle_turn_lifecycle(clean);
+        // A terminal notification resolves the earlier uncertainty, but the
+        // queued backlog still waits for the user's deliberate resume.
+        if self.queue_paused == Some(QueuePauseReason::MissingCompletion) {
+            self.queue_paused = Some(QueuePauseReason::Generic);
+        }
+        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
     }
 
-    fn settle_turn_from_prompt_response(&mut self) {
+    fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -11509,10 +11529,10 @@ impl ChatState {
         // Preserve per-turn provenance for a delayed terminal notification;
         // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
-        self.settle_turn_lifecycle(false);
+        self.settle_turn_lifecycle(false, pause_reason);
     }
 
-    fn settle_turn_lifecycle(&mut self, clean: bool) {
+    fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
@@ -11521,7 +11541,7 @@ impl ChatState {
         cleanup_report.merge(self.input_bar.take_cleanup_report());
         self.surface_cleanup_report(cleanup_report);
         if !clean && !self.resume_override && !self.message_queue.is_empty() {
-            self.queue_paused = true;
+            self.queue_paused = Some(pause_reason);
         }
         self.resume_override = false;
     }
@@ -11721,7 +11741,7 @@ impl ChatState {
         );
         // An inject is the force-send-now intent: resume the queue and let it
         // survive a cancel auto-pause, unlike a plain queued submission.
-        self.queue_paused = false;
+        self.queue_paused = None;
         if self.turn_in_flight {
             self.resume_override = true;
         }
@@ -11739,7 +11759,7 @@ impl ChatState {
         {
             return Some(idx);
         }
-        if self.queue_paused {
+        if self.queue_paused() {
             return None;
         }
         self.message_queue
@@ -11760,20 +11780,24 @@ impl ChatState {
     /// Flip the queue pause state. Returns the new paused value so the caller
     /// can pump on resume and surface the right notice.
     pub fn toggle_queue_pause(&mut self) -> bool {
-        self.queue_paused = !self.queue_paused;
-        self.queue_paused
+        self.queue_paused = if self.queue_paused() {
+            None
+        } else {
+            Some(QueuePauseReason::Generic)
+        };
+        self.queue_paused()
     }
 
     pub fn queue_paused(&self) -> bool {
-        self.queue_paused
+        self.queue_paused.is_some()
     }
 
     /// Clear an explicit pause without bypassing the cancel auto-pause: a
     /// cancelled turn settles into the paused state and the backlog waits for a
     /// deliberate resume. Returns true if the queue was paused.
     pub fn resume_queue(&mut self) -> bool {
-        let was_paused = self.queue_paused;
-        self.queue_paused = false;
+        let was_paused = self.queue_paused();
+        self.queue_paused = None;
         was_paused
     }
 
@@ -12078,7 +12102,7 @@ impl ChatState {
             cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
         self.next_queue_id = 0;
-        self.queue_paused = false;
+        self.queue_paused = None;
         self.resume_override = false;
         self.queue_sel = None;
         cleanup_report
@@ -16855,7 +16879,7 @@ mod tests {
             status: QueueItemStatus::Pending,
         });
         focused.queue.next_id = 1;
-        focused.queue.paused = true;
+        focused.queue.paused = Some(QueuePauseReason::Generic);
         let mut bad_background = resume_entry("sess-bad", "beta", false);
         bad_background.queue.messages.push_back(QueuedMessage {
             id: 0,
@@ -16864,7 +16888,7 @@ mod tests {
             status: QueueItemStatus::Pending,
         });
         bad_background.queue.next_id = 1;
-        bad_background.queue.paused = true;
+        bad_background.queue.paused = Some(QueuePauseReason::Generic);
         let mut healthy_background = resume_entry("sess-good", "gamma", false);
         healthy_background.queue.messages.push_back(QueuedMessage {
             id: 0,
@@ -16873,7 +16897,7 @@ mod tests {
             status: QueueItemStatus::Pending,
         });
         healthy_background.queue.next_id = 1;
-        healthy_background.queue.paused = true;
+        healthy_background.queue.paused = Some(QueuePauseReason::Generic);
         chat.set_resume_sessions(vec![focused, bad_background, healthy_background]);
 
         let init = tokio::spawn(async move {
@@ -17058,7 +17082,7 @@ mod tests {
         prior
             .enqueue_message("keep queued".to_string(), Vec::new())
             .expect("queue message");
-        prior.queue_paused = true;
+        prior.queue_paused = Some(QueuePauseReason::MissingCompletion);
         prior.turn_in_flight = true;
         prior.turn_status = TurnStatus::WaitingForApproval;
         prior.pending_approval = Some(PendingApproval {
@@ -17086,7 +17110,10 @@ mod tests {
         let entry = entries.remove(0);
         assert!(entry.interrupted);
         assert_eq!(entry.queue.messages.len(), 1);
-        assert!(entry.queue.paused);
+        assert_eq!(
+            entry.queue.paused,
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(entry.queue.composer_text, "draft survives reconnect");
         assert_eq!(entry.queue.composer_attachments.len(), 1);
         assert_eq!(entry.queue.composer_attachments[0].filename, "keep.txt");
@@ -17129,7 +17156,10 @@ mod tests {
         );
         rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
         assert_eq!(rebuilt.queue_len(), 1);
-        assert!(rebuilt.queue_paused());
+        assert_eq!(
+            rebuilt.queue_paused,
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(rebuilt.input_bar.input(), "draft survives reconnect");
         assert_eq!(rebuilt.input_bar.pending_attachments().len(), 1);
         assert_eq!(
@@ -18583,6 +18613,11 @@ mod tests {
         };
         assert!(!state.turn_in_flight);
         assert!(state.lag_reattach.is_none());
+        assert_eq!(
+            state.queue_paused,
+            Some(QueuePauseReason::MissingCompletion),
+            "the reload must retain why queued work paused"
+        );
         assert!(state.entries.iter().any(|entry| matches!(
             entry,
             ChatEntry::AgentMessage(message) if message.as_ref() == "durable answer"
@@ -27314,7 +27349,7 @@ mod tests {
         s.enqueue_message("ordinary two".to_string(), Vec::new())
             .unwrap();
         let promoted_id = s.message_queue[2].id;
-        s.queue_paused = true;
+        s.queue_paused = Some(QueuePauseReason::Generic);
 
         assert!(s.promote_queued_by_id(promoted_id));
         assert!(!s.queue_paused());
@@ -27824,7 +27859,7 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.queue_paused = true;
+        s.queue_paused = Some(QueuePauseReason::Generic);
         s.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(1, 1, 6, 1),
             text: Arc::<str>::from("stale"),
@@ -28431,6 +28466,10 @@ mod tests {
         assert!(!active.turn_in_flight);
         assert!(matches!(active.turn_status, TurnStatus::Idle));
         assert!(active.queue_paused());
+        assert_eq!(
+            active.queue_paused,
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(active.queue_len(), 1);
         assert!(
             active
@@ -28439,6 +28478,39 @@ mod tests {
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
         );
+
+        // Reach the production Chat renderer's final terminal cells, rather
+        // than asserting only the source string or input-bar helper.
+        use ratatui::{Terminal, backend::TestBackend};
+        let hint = crate::i18n::t_args(
+            "zc-queue-missing-completion-ghost",
+            &[("key", &resume_queue_chord_label())],
+        );
+        for width in [80, 120] {
+            let area = Rect::new(0, 0, width, 24);
+            let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+            terminal
+                .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+                .unwrap();
+            let rendered = overlay_text(&terminal, area);
+            assert!(
+                rendered.contains(&hint),
+                "missing full recovery hint at {width}: {rendered}"
+            );
+            let row = rendered.lines().find(|row| row.contains(&hint)).unwrap();
+            println!("{width}x24 terminal cells: {}", row.trim_end());
+        }
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "uncertain work must not dispatch"
+        );
+        assert!(active_state(&mut chat).resume_queue());
+        chat.pump_all_queues();
+        let follow_up =
+            next_rpc_request(&mut writer_rx, "explicit resume dispatches backlog").await;
+        assert_eq!(follow_up["params"]["prompt"], "wait for explicit resume");
+        assert!(!active_state(&mut chat).queue_paused());
     }
 
     #[tokio::test]
@@ -28465,6 +28537,9 @@ mod tests {
             })
             .unwrap();
         chat.drain_notifications();
+        active_state(&mut chat)
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .unwrap();
         respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
         tokio::task::yield_now().await;
         chat.drain_prompt_completions();
@@ -28482,6 +28557,12 @@ mod tests {
             .unwrap();
         chat.drain_notifications();
 
+        let active = active_state(&mut chat);
+        assert_eq!(active.queue_paused, Some(QueuePauseReason::Generic));
+        assert!(
+            active.take_next_dispatchable().is_none(),
+            "a late signal must not resume work"
+        );
         let replies = active_state(&mut chat)
             .entries()
             .iter()
@@ -28884,6 +28965,9 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(active));
         chat.pump_all_queues();
         let request = next_rpc_request(&mut writer_rx, "busy prompt should be sent").await;
+        active_state(&mut chat)
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .unwrap();
         respond_err(
             &chat.rpc_out,
             &request,
@@ -28894,6 +28978,8 @@ mod tests {
         chat.drain_prompt_completions();
 
         let active = active_state(&mut chat);
+        assert_eq!(active.queue_paused, Some(QueuePauseReason::Generic));
+        assert!(active.take_next_dispatchable().is_none());
         assert!(!active.turn_in_flight);
         assert!(
             active.first_message.is_none(),

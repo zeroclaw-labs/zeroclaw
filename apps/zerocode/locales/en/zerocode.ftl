@@ -174,6 +174,7 @@ zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.
 zc-queue-paused-ghost = Queue paused — press { $key } or send a message to resume
+zc-queue-missing-completion-ghost = Completion signal missing. Press { $key } or send to resume queue.
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
 zc-queue-clear-empty = Queue is already empty.
