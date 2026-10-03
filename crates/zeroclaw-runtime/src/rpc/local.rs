@@ -1575,10 +1575,11 @@ mod tests {
     async fn call_local_initializes_and_executes_one_admin_request() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        ctx.config
-            .write()
-            .create_map_key("agents", "local_client")
-            .unwrap();
+        // Seed the agent as a publication — the read-only handle the
+        // context exposes has no raw write path.
+        let mut seeded = ctx.config.snapshot();
+        seeded.create_map_key("agents", "local_client").unwrap();
+        ctx.config_authority.publish_for_test(seeded);
         let config = ctx.config.read().clone();
         let sock_path = socket_path(&config);
         let cancel = CancellationToken::new();

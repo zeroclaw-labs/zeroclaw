@@ -1274,6 +1274,8 @@ rpc_type! {
 rpc_type! {
     /// Config readiness status for the dashboard/TUI.
     pub struct ConfigStatusResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<crate::config_application::ConfigApplicationStatus>,
         pub needs_quickstart: bool,
         pub reason: String,
         pub has_partial_state: bool,
