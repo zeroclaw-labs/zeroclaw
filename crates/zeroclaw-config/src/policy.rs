@@ -352,6 +352,9 @@ pub struct SecurityPolicy {
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
+    /// Native subprocess resident-memory threshold in MiB; zero disables it.
+    /// Carried from the runtime profile alongside the shell timeout.
+    pub shell_max_memory_mb: u64,
     /// Tool name allowlist. `None` is unrestricted (default for agents
     /// without an explicit `risk_profile.allowed_tools` setting).
     /// `Some(vec![])` denies every tool. `Some(list)` admits only the
@@ -680,6 +683,8 @@ pub enum EscalationViolation {
     /// ceiling. The shell budget is a runaway-process guard; raising
     /// it on the child side defeats the parent's intent.
     ShellTimeoutExceeded { child: u64, parent: u64 },
+    /// Child raises or disables an enabled subprocess memory threshold.
+    ShellMemoryExceeded { child: u64, parent: u64 },
     /// Child flips `block_high_risk_commands` from `true` (parent) to
     /// `false`, opening the high-risk command surface the parent
     /// closed.
@@ -736,6 +741,10 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent shell_timeout_secs={child} exceeds parent's {parent}"
             ),
+            Self::ShellMemoryExceeded { child, parent } => write!(
+                f,
+                "subagent shell_max_memory_mb={child} raises or disables parent's {parent} MiB threshold"
+            ),
             Self::BlockHighRiskCommandsDisabledByChild => write!(
                 f,
                 "subagent attempts to set block_high_risk_commands=false but the parent enforces it"
@@ -771,6 +780,7 @@ impl Default for SecurityPolicy {
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
+            shell_max_memory_mb: 0,
             allowed_tools: None,
             excluded_tools: None,
             auto_approve: vec![],
@@ -4612,6 +4622,15 @@ impl SecurityPolicy {
                 parent: parent.shell_timeout_secs,
             });
         }
+        if parent.shell_max_memory_mb > 0
+            && (self.shell_max_memory_mb == 0
+                || self.shell_max_memory_mb > parent.shell_max_memory_mb)
+        {
+            return Err(EscalationViolation::ShellMemoryExceeded {
+                child: self.shell_max_memory_mb,
+                parent: parent.shell_max_memory_mb,
+            });
+        }
         if parent.block_high_risk_commands && !self.block_high_risk_commands {
             return Err(EscalationViolation::BlockHighRiskCommandsDisabledByChild);
         }
@@ -4684,6 +4703,7 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
+            shell_max_memory_mb: runtime.shell_max_memory_mb,
             allowed_tools: risk_profile.effective_allowed_tools(),
             excluded_tools: if risk_profile.excluded_tools.is_empty() {
                 None
@@ -5235,18 +5255,17 @@ mod tests {
             level: AutonomyLevel::Supervised,
             ..crate::schema::RiskProfileConfig::default()
         };
-        let runtime = RuntimeProfileConfig {
-            max_actions_per_hour: 99,
-            max_cost_per_day_cents: 1234,
-            shell_timeout_secs: 300,
-            ..RuntimeProfileConfig::default()
-        };
+        let runtime: RuntimeProfileConfig = toml::from_str(
+            "max_actions_per_hour = 99\nmax_cost_per_day_cents = 1234\nshell_timeout_secs = 300\nshell_max_memory_mb = 768",
+        )
+        .unwrap();
 
         let policy = SecurityPolicy::from_profiles(&risk, Some(&runtime), Path::new("/ws"));
 
         assert_eq!(policy.max_actions_per_hour, 99);
         assert_eq!(policy.max_cost_per_day_cents, 1234);
         assert_eq!(policy.shell_timeout_secs, 300);
+        assert_eq!(policy.shell_max_memory_mb, 768);
     }
 
     #[test]
@@ -5263,6 +5282,7 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 20);
         assert_eq!(policy.max_cost_per_day_cents, 500);
         assert_eq!(policy.shell_timeout_secs, 60);
+        assert_eq!(policy.shell_max_memory_mb, 0);
     }
 
     fn unix_forbidden_path_policy() -> SecurityPolicy {
@@ -9712,6 +9732,41 @@ mod tests {
             EscalationViolation::ShellTimeoutExceeded { child, parent }
             if child == 600 && parent == 30
         ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_enforces_shell_memory_threshold() {
+        let parent = SecurityPolicy {
+            shell_max_memory_mb: 512,
+            ..parent_policy_for_escalation_tests()
+        };
+        for threshold in [0, 513] {
+            let child = SecurityPolicy {
+                shell_max_memory_mb: threshold,
+                ..parent.clone()
+            };
+            assert!(matches!(
+                child.ensure_no_escalation_beyond(&parent),
+                Err(EscalationViolation::ShellMemoryExceeded { child, parent })
+                    if child == threshold && parent == 512
+            ));
+        }
+        for threshold in [256, 512] {
+            let child = SecurityPolicy {
+                shell_max_memory_mb: threshold,
+                ..parent.clone()
+            };
+            assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+        }
+        let unbounded_parent = SecurityPolicy {
+            shell_max_memory_mb: 0,
+            ..parent.clone()
+        };
+        assert!(
+            parent
+                .ensure_no_escalation_beyond(&unbounded_parent)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
 /// Disarmed after `child.wait()` returns so it never signals a recycled PID.
@@ -261,6 +262,17 @@ impl Tool for ShellTool {
         }
 
         // Execute with timeout to prevent hanging commands.
+        if let Some(error) = super::runtime_command_error::memory_watchdog_support_error(
+            self.security.shell_max_memory_mb,
+            self.runtime.name(),
+            self.sandbox.name(),
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
         // The forwarded map is immutable for the session incarnation, so
@@ -336,85 +348,8 @@ impl Tool for ShellTool {
             cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
-        let timeout_secs = self.timeout_secs;
-        // Run in own process group so `ChildGroupGuard` can reap the
-        // whole subtree (backgrounded jobs, subshells) on any exit path.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        cmd.kill_on_drop(true);
-        // `output()` pipes stdio implicitly; `spawn()` does not.
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.stdin(std::process::Stdio::null());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("Failed to spawn command: {e}")),
-                });
-            }
-        };
-
-        #[cfg(unix)]
-        let group_guard = ChildGroupGuard::new(child.id());
-
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
-        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
-
         let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => {
-                    #[cfg(unix)]
-                    group_guard.disarm();
-                    let (stdout_capture, stderr_capture) =
-                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-
-                    let mut stdout = decode_capture(&stdout_capture);
-                    let mut stderr = decode_capture(&stderr_capture);
-
-                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-                    }
-                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-                    }
-
-                    ToolResult {
-                        success: status.success(),
-                        output: stdout.into(),
-                        error: if stderr.is_empty() {
-                            None
-                        } else {
-                            Some(stderr)
-                        },
-                    }
-                }
-                Ok(Err(e)) => {
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to execute command: {e}")),
-                    }
-                }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Command timed out after {timeout_secs}s and was killed"
-                        )),
-                    }
-                }
-            };
+            run_shell_command(cmd, self.timeout_secs, self.security.shell_max_memory_mb).await;
 
         // The command ran inside an ephemeral workspace: any files it wrote are
         // invisible on the host and discarded at session end
@@ -428,6 +363,84 @@ impl Tool for ShellTool {
         }
 
         Ok(result)
+    }
+}
+
+/// Shared command boundary for built-in and skill shell tools. Output remains
+/// bounded independently of the child's resident-memory threshold.
+pub(super) async fn run_shell_command(
+    mut cmd: tokio::process::Command,
+    timeout_secs: u64,
+    memory_mb: u64,
+) -> ToolResult {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+
+    let mut child = match super::subprocess_memory::ManagedChild::spawn(cmd, memory_mb) {
+        Ok(child) => child,
+        Err(error) => {
+            return ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to spawn command: {error}")),
+            };
+        }
+    };
+    #[cfg(unix)]
+    let group_guard = ChildGroupGuard::new(child.id());
+    let stdout_drain = spawn_drain(child.stdout().take(), MAX_OUTPUT_BYTES);
+    let stderr_drain = spawn_drain(child.stderr().take(), MAX_OUTPUT_BYTES);
+    let wait = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        child.wait_with_memory(memory_mb),
+    )
+    .await;
+
+    let mut error = match wait {
+        Ok(Ok(status)) => {
+            // Reaping invalidates group ownership. Never signal this PID again.
+            #[cfg(unix)]
+            group_guard.disarm();
+            let (stdout_capture, stderr_capture) =
+                tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+            let stdout =
+                decode_capture_with_marker(&stdout_capture, "\n... [output truncated at 1MB]");
+            let stderr =
+                decode_capture_with_marker(&stderr_capture, "\n... [stderr truncated at 1MB]");
+            return ToolResult {
+                success: status.success(),
+                output: stdout.into(),
+                error: if stderr.is_empty() {
+                    None
+                } else {
+                    Some(stderr)
+                },
+            };
+        }
+        Ok(Err(error)) => super::runtime_command_error::format_memory_wait_error(&error),
+        Err(_) => format!("Command timed out after {timeout_secs}s and was killed"),
+    };
+    // Kill the still-owned group before reaping its leader. The Windows child
+    // wrapper terminates its owned Job Object through start_kill.
+    #[cfg(unix)]
+    drop(group_guard);
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(CHILD_CLEANUP_TIMEOUT, child.wait()).await;
+    let (stdout_capture, stderr_capture) =
+        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+    let stdout = decode_capture_with_marker(&stdout_capture, "\n... [output truncated at 1MB]");
+    let stderr = decode_capture_with_marker(&stderr_capture, "\n... [stderr truncated at 1MB]");
+    if !stderr.is_empty() {
+        error.push('\n');
+        error.push_str(&stderr);
+    }
+    ToolResult {
+        success: false,
+        output: stdout.into(),
+        error: Some(error),
     }
 }
 
@@ -449,6 +462,14 @@ fn decode_capture(capture: &DrainOutput) -> String {
     } else {
         decode_output(&capture.bytes)
     }
+}
+
+fn decode_capture_with_marker(capture: &DrainOutput, marker: &str) -> String {
+    let mut output = decode_capture(capture);
+    if capture.truncated || output.len() > MAX_OUTPUT_BYTES {
+        append_truncation_marker(&mut output, marker);
+    }
+    output
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -477,11 +498,6 @@ async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
         .lock()
         .map(|output| output.clone())
         .unwrap_or_default()
-}
-
-async fn abort_drain(drain: DrainHandle) {
-    drain.task.abort();
-    let _ = drain.task.await;
 }
 
 async fn drain_capped_into<R>(
@@ -649,6 +665,41 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[tokio::test]
+    async fn shell_memory_failure_surfaces_resident_cause() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tools::subprocess_memory::tests::memory_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ZEROCLAW_RESIDENT_MEMORY_FIXTURE", "resident");
+        let result = run_shell_command(command, 10, 128).await;
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("resident-memory threshold"));
+    }
+
+    #[tokio::test]
+    async fn shell_memory_rejects_container_runtime_before_spawn() {
+        let security = Arc::new(SecurityPolicy {
+            shell_max_memory_mb: 128,
+            ..(*test_security(AutonomyLevel::Full)).clone()
+        });
+        let tool = ShellTool::new(
+            security,
+            Arc::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("requires a native"));
     }
 
     fn test_security_with_allowed_commands(
@@ -1891,6 +1942,23 @@ mod tests {
                 .ends_with("\n... [stderr truncated at 1MB]"),
             "stderr should retain the truncation marker after the drain cap"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_marks_partial_output_truncated_on_timeout() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(
+            "awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"x\" }'; \
+             awk 'BEGIN { for (i = 0; i < 1048600; i++) printf \"y\" }' 1>&2; sleep 10",
+        );
+        let result = run_shell_command(command, 2, 0).await;
+
+        assert!(!result.success);
+        assert!(result.output.ends_with("\n... [output truncated at 1MB]"));
+        let error = result.error.unwrap();
+        assert!(error.contains("Command timed out"));
+        assert!(error.ends_with("\n... [stderr truncated at 1MB]"));
     }
 
     #[cfg(unix)]
