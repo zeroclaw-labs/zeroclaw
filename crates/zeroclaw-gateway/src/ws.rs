@@ -19,6 +19,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,96 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// names in observability while interactive tools still route correctly —
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
+
+/// Scope the durable-session capability and its best-effort prompt-budget
+/// snapshot around one WebSocket primary turn. Keeping this together prevents
+/// the WebSocket transport from silently diverging from RPC/channel admission.
+async fn scope_websocket_session_prompt_context<T>(
+    session_prompt_tools_allowed: bool,
+    session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    session_prompt_budget: Option<zeroclaw_infra::session_backend::SessionPromptBudget>,
+    session_prompt_owner: Option<zeroclaw_infra::session_backend::SessionPromptOwner>,
+    session_key: Option<String>,
+    future: impl Future<Output = T>,
+) -> T {
+    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_OWNER
+        .scope(
+            session_prompt_owner,
+            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                session_prompt_tools_allowed,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    session_backend.map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                        session_prompt_budget,
+                        zeroclaw_runtime::agent::loop_::scope_session_key(session_key, future),
+                    ),
+                ),
+            ),
+        )
+        .await
+}
+
+/// Derive WebSocket admission evidence under the same capability scope the
+/// primary turn later uses to advertise and execute session-prompt tools.
+fn websocket_session_prompt_budget<T, E>(
+    session_prompt_tools_allowed: bool,
+    derive: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    if session_prompt_tools_allowed {
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .sync_scope(true, derive)
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Registration owned by one admitted WebSocket turn.
+///
+/// The gateway token registry is the canonical cancellation authority. Create
+/// this immediately after the queue admission's generation check, before any
+/// fallible setup or provider work. A REST DELETE can then cancel the exact
+/// admitted turn instead of waiting behind it and missing the token.
+struct GatewayCancelTokenRegistration<'a> {
+    state: &'a AppState,
+    cancel_key: String,
+    token: Arc<tokio_util::sync::CancellationToken>,
+}
+
+impl<'a> GatewayCancelTokenRegistration<'a> {
+    fn register(
+        state: &'a AppState,
+        session_key: &str,
+        session_id: &str,
+        session_generation: u64,
+    ) -> Self {
+        debug_assert_eq!(gateway_cancel_key(session_id), session_key);
+        let cancel_key = gateway_cancel_key(session_id);
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            &state.cancel_tokens,
+            &cancel_key,
+            session_key,
+            session_generation,
+            Arc::clone(&token),
+        );
+        Self {
+            state,
+            cancel_key,
+            token,
+        }
+    }
+
+    fn token(&self) -> tokio_util::sync::CancellationToken {
+        self.token.as_ref().clone()
+    }
+}
+
+impl Drop for GatewayCancelTokenRegistration<'_> {
+    fn drop(&mut self) {
+        remove_cancel_token_if_current(&self.state.cancel_tokens, &self.cancel_key, &self.token);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -394,6 +485,15 @@ async fn handle_socket(
     // existing persisted histories and metadata rows stay resumable across
     // reconnects.
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // Keep the generation tombstone until this socket exits. A WebSocket
+    // carries its observed generation across idle periods, so reclaiming that
+    // value while it remains connected would let it mistake a later ID reuse
+    // for its original session.
+    let _session_lifecycle_lease = state.session_queue.retain(&session_key).await;
+    // DELETE advances this queue-owned value while holding the same queue.
+    // This connection can therefore never write into a successor that reuses
+    // its caller-selected session ID.
+    let session_generation = state.session_queue.lifecycle_generation(&session_key).await;
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -641,12 +741,14 @@ async fn handle_socket(
     // How much of the persisted transcript this connection's history reflects.
     // Read the generation before seeding so a write landing in between shows
     // up as a changed generation on the next turn, which is the safe direction.
-    let connect_generation = state.session_queue.generation(&session_key);
+    let connect_generation = state.session_queue.transcript_generation(&session_key);
+    let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
     let restored = match restore_agent_history(
         state.session_backend.as_deref(),
         &mut agent,
         &session_key,
         &stored_messages,
+        session_prompts_enabled,
     ) {
         Ok(restored) => restored,
         Err(()) => {
@@ -740,6 +842,23 @@ async fn handle_socket(
                             return;
                         }
                     };
+                    if state.session_queue.lifecycle_generation(&session_key).await
+                        != session_generation
+                    {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "Session not found",
+                            "code": "SESSION_NOT_FOUND"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        return;
+                    }
+                    let cancellation = GatewayCancelTokenRegistration::register(
+                        &state,
+                        &session_key,
+                        &session_id,
+                        session_generation,
+                    );
                     let client_gone = process_chat_message(
                         &state,
                         &mut agent,
@@ -753,6 +872,7 @@ async fn handle_socket(
                         &content,
                         &session_key,
                         &session_id,
+                        cancellation.token(),
                         auth_subject.as_deref(),
                     )
                     .await;
@@ -871,10 +991,24 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         continue;
                     }
-                    if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                        let _ = tx.send(decision.expect("checked above"));
-                    } else {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
+                    let resolution = crate::ws_approval::resolve_pending_approval(
+                        &pending_approvals,
+                        request_id,
+                        decision.expect("checked above"),
+                    );
+                    match resolution {
+                        crate::ws_approval::ApprovalResolution::RejectedPersistentAction => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": "This approval accepts only the one-time approve action",
+                                "code": "APPROVAL_ACTION_UNAVAILABLE"
+                            });
+                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        }
+                        crate::ws_approval::ApprovalResolution::Unknown => {
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
+                        }
+                        crate::ws_approval::ApprovalResolution::Resolved => {}
                     }
                     continue;
                 }
@@ -930,6 +1064,22 @@ async fn handle_socket(
                         continue;
                     }
                 };
+                if state.session_queue.lifecycle_generation(&session_key).await != session_generation
+                {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Session not found",
+                        "code": "SESSION_NOT_FOUND"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+                let cancellation = GatewayCancelTokenRegistration::register(
+                    &state,
+                    &session_key,
+                    &session_id,
+                    session_generation,
+                );
 
                 let client_gone = process_chat_message(
                     &state,
@@ -944,6 +1094,7 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
+                    cancellation.token(),
                     auth_subject.as_deref(),
                 )
                 .await;
@@ -978,6 +1129,10 @@ async fn handle_socket(
                         "tool": tool_name,
                         "arguments_summary": arguments_summary,
                         "timeout_secs": timeout_secs,
+                        "allow_always": crate::ws_approval::allow_always(
+                            &pending_approvals,
+                            &request_id,
+                        ),
                     }),
                     other => {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
@@ -1071,8 +1226,17 @@ fn replace_conversation_state_unless_deleted(
     session_key: &str,
     durable: &[zeroclaw_providers::ChatMessage],
     breadcrumb_present: bool,
+    session_prompts_enabled: bool,
 ) -> bool {
-    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
+    // The canonical in-memory history remains provider-visible, but durable
+    // transcripts always honor host-marked sensitivity, even after a live
+    // disable. Only unmarked invocation inference is feature-gated, preserving
+    // ordinary disabled-mode conversation without rebuilding provider history.
+    let redacted = zeroclaw_runtime::agent::prompt::redact_session_prompt_history_for_export(
+        durable,
+        session_prompts_enabled,
+    );
+    match backend.replace_conversation_state_if_exists(session_key, &redacted, breadcrumb_present) {
         Ok(_) => true,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -1100,6 +1264,7 @@ fn persist_agent_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
+    session_prompts_enabled: bool,
 ) -> bool {
     let durable = zeroclaw_providers::durable_chat_messages(agent.history());
     replace_conversation_state_unless_deleted(
@@ -1107,6 +1272,7 @@ fn persist_agent_conversation_state(
         session_key,
         &durable,
         agent.history_has_trim_breadcrumb(),
+        session_prompts_enabled,
     )
 }
 
@@ -1147,6 +1313,7 @@ fn restore_agent_history(
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     messages: &[zeroclaw_providers::ChatMessage],
+    session_prompts_enabled: bool,
 ) -> Result<RestoredHistory, ()> {
     if messages.is_empty() {
         return Ok(RestoredHistory {
@@ -1198,7 +1365,7 @@ fn restore_agent_history(
         && let Some(backend) = backend
         && backend.session_exists(session_key)
     {
-        if !persist_agent_conversation_state(backend, session_key, agent) {
+        if !persist_agent_conversation_state(backend, session_key, agent, session_prompts_enabled) {
             return Err(());
         }
         persisted = true;
@@ -1222,8 +1389,9 @@ fn refresh_history_if_advanced(
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     persisted_watermark: &mut PersistedWatermark,
+    session_prompts_enabled: bool,
 ) -> Result<Option<zeroclaw_api::agent::TurnEvent>, ()> {
-    let generation = queue.generation(session_key);
+    let generation = queue.transcript_generation(session_key);
     let persisted = backend.load(session_key);
     let current = PersistedWatermark {
         generation,
@@ -1246,7 +1414,13 @@ fn refresh_history_if_advanced(
         "session transcript moved since this connection synced; rebuilding execution history"
     );
     agent.clear_history();
-    let restored = restore_agent_history(Some(backend), agent, session_key, &persisted)?;
+    let restored = restore_agent_history(
+        Some(backend),
+        agent,
+        session_key,
+        &persisted,
+        session_prompts_enabled,
+    )?;
     *persisted_watermark = if restored.persisted {
         note_own_transcript_write(queue, session_key, agent)
     } else {
@@ -1684,6 +1858,24 @@ fn build_done_frame_json(
     done
 }
 
+/// Attribute pre-turn storage failures without holding a span across an await.
+fn record_session_prompt_load_failure(session_key: &str, error: &std::io::Error) {
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        session_key = %session_key,
+        channel = WS_CHANNEL_KEY,
+    );
+    let _guard = span.entered();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+        "Failed to load persistent session prompts"
+    );
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1706,6 +1898,7 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
+    cancel_token: tokio_util::sync::CancellationToken,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
@@ -1719,12 +1912,14 @@ async fn process_chat_message(
     // history from a transcript that has since moved; rebuild from the
     // persisted transcript before running on the stale snapshot.
     if let Some(ref backend) = state.session_backend {
+        let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
         match refresh_history_if_advanced(
             backend.as_ref(),
             &state.session_queue,
             agent,
             session_key,
             persisted_watermark,
+            session_prompts_enabled,
         ) {
             Ok(trim_event) => {
                 if let Some(frame) = trim_event.and_then(history_trimmed_frame_for) {
@@ -1742,6 +1937,69 @@ async fn process_chat_message(
             }
         }
     }
+    let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
+    let mut session_prompt_owner = None;
+    let attachments = if session_prompts_enabled {
+        let Some(backend) = state.session_backend.as_ref() else {
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": "Persistent session prompts are enabled but the chat session backend is unavailable.",
+                        "code": "SESSION_PROMPT_LOAD_FAILED",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            return false;
+        };
+        let prompts = backend
+            .admit_session_prompt_owner(session_key)
+            .and_then(|owner| {
+                let prompts = backend.list_session_prompts_for_owner(&owner)?;
+                session_prompt_owner = Some(owner);
+                Ok(prompts)
+            });
+        match prompts {
+            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
+            Err(error) => {
+                record_session_prompt_load_failure(session_key, &error);
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "Failed to load persistent session prompts; the turn was not started.",
+                            "code": "SESSION_PROMPT_LOAD_FAILED",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                return false;
+            }
+        }
+    } else {
+        String::new()
+    };
+    // Refresh once before the primary turn. Changes made by a prompt tool in
+    // this turn are deliberately picked up only by the next turn.
+    agent.set_session_prompt_attachments(attachments);
+
+    // Derive the best-effort admission snapshot before this function marks a
+    // turn running. Its caller already published the cancellation handle after
+    // queue admission; a construction error still leaves no started turn.
+    let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
+    let session_prompt_budget =
+        match websocket_session_prompt_budget(session_prompt_tools_allowed, || {
+            agent.session_prompt_budget()
+        }) {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = send_ws_turn_failure(sender, &error, None).await;
+                return false;
+            }
+        };
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
@@ -1773,25 +2031,13 @@ async fn process_chat_message(
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
-    // ── Cancellation token lifecycle ─────────────────────────────
-    // Create a token before the turn starts so the abort endpoint
-    // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled). Registration uses the
-    // process-local cancellation key shared with the webhook SSE transport,
-    // while persistence stays on the raw transcript key.
-    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-    register_cancel_token(
-        &state.cancel_tokens,
-        &gateway_cancel_key(session_id),
-        Arc::clone(&cancel_token),
-    );
-
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    let canonical_session_backend = state.session_backend.clone();
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
     // typed result as a standalone WS frame.
@@ -1806,7 +2052,11 @@ async fn process_chat_message(
             model = %turn_model,
             channel = WS_CHANNEL_KEY,
         );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
+        scope_websocket_session_prompt_context(
+            session_prompt_tools_allowed,
+            canonical_session_backend,
+            session_prompt_budget,
+            session_prompt_owner,
             Some(session_key_owned.clone()),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
                 turn_usage.clone(),
@@ -1816,7 +2066,7 @@ async fn process_chat_message(
                         .turn_streamed_with_steering_state(
                             &content_owned,
                             event_tx,
-                            Some(cancel_token.as_ref().clone()),
+                            Some(cancel_token.clone()),
                             Some(&mut steering_rx),
                         )
                         .instrument(span),
@@ -1916,10 +2166,24 @@ async fn process_chat_message(
                                         if request_id.is_empty() || decision.is_none() {
                                             continue;
                                         }
-                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                            let _ = tx.send(decision.expect("checked above"));
-                                        } else {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                        let resolution = crate::ws_approval::resolve_pending_approval(
+                                            pending_approvals,
+                                            request_id,
+                                            decision.expect("checked above"),
+                                        );
+                                        match resolution {
+                                            crate::ws_approval::ApprovalResolution::RejectedPersistentAction => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "This approval accepts only the one-time approve action",
+                                                    "code": "APPROVAL_ACTION_UNAVAILABLE"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            crate::ws_approval::ApprovalResolution::Unknown => {
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                            }
+                                            crate::ws_approval::ApprovalResolution::Resolved => {}
                                         }
                                     }
                                     Some("message") => {
@@ -1977,6 +2241,10 @@ async fn process_chat_message(
                                         "tool": tool_name,
                                         "arguments_summary": arguments_summary,
                                         "timeout_secs": timeout_secs,
+                                        "allow_always": crate::ws_approval::allow_always(
+                                            pending_approvals,
+                                            &request_id,
+                                        ),
                                     });
                                     if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
                                         detach_mid_turn(session_key, &turn_id, pending_approvals);
@@ -2033,6 +2301,10 @@ async fn process_chat_message(
                                             "tool": tool_name,
                                             "arguments_summary": arguments_summary,
                                             "timeout_secs": timeout_secs,
+                                            "allow_always": crate::ws_approval::allow_always(
+                                                pending_approvals,
+                                                &request_id,
+                                            ),
                                         })
                                     }
                                     TurnEvent::HistoryTrimmed {
@@ -2080,13 +2352,6 @@ async fn process_chat_message(
 
     let (result, client_gone) = tokio::join!(turn_fut, forward_fut);
 
-    // ── Remove cancel token (turn finished) ──────────────────────
-    remove_cancel_token_if_current(
-        &state.cancel_tokens,
-        &gateway_cancel_key(session_id),
-        &cancel_token,
-    );
-
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
     let was_cancelled = match &result {
@@ -2128,6 +2393,7 @@ async fn process_chat_message(
                 session_key,
                 &durable,
                 crumb,
+                session_prompts_enabled,
             );
             *persisted_watermark = PersistedWatermark {
                 generation: state.session_queue.advance_generation(session_key),
@@ -2182,7 +2448,12 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+                persist_agent_conversation_state(
+                    backend.as_ref(),
+                    session_key,
+                    agent,
+                    session_prompts_enabled,
+                );
                 *persisted_watermark =
                     note_own_transcript_write(&state.session_queue, session_key, agent);
             }
@@ -2357,7 +2628,12 @@ async fn process_chat_message(
         }
         Err(e) => {
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
+                persist_agent_conversation_state(
+                    backend.as_ref(),
+                    session_key,
+                    agent,
+                    session_prompts_enabled,
+                );
                 *persisted_watermark =
                     note_own_transcript_write(&state.session_queue, session_key, agent);
             }
@@ -2452,6 +2728,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_prompt_load_failure_uses_span_attribution() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let key = "gw_load_failure_test";
+        super::record_session_prompt_load_failure(
+            key,
+            &std::io::Error::other("synthetic storage failure"),
+        );
+        let event = loop {
+            match receiver.try_recv() {
+                Ok(value)
+                    if value["message"].as_str()
+                        == Some("Failed to load persistent session prompts") =>
+                {
+                    break value;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("load failure log was not broadcast: {error}"),
+            }
+        };
+        zeroclaw_log::clear_broadcast_hook();
+        assert_eq!(event["zeroclaw"]["session_key"], key);
+        assert_eq!(event["zeroclaw"]["channel_type"], WS_CHANNEL_KEY);
+        assert!(event["attributes"].get("session_key").is_none());
+        assert_eq!(event["attributes"]["error"], "synthetic storage failure");
+    }
+
     use super::*;
     use axum::{
         Json, Router,
@@ -2459,6 +2766,116 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[tokio::test]
+    async fn websocket_session_prompt_context_rejects_an_over_budget_write() {
+        use serde_json::json;
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_infra::{
+            session_backend::SessionBackend, session_prompts::render_session_prompts,
+            session_sqlite::SqliteSessionBackend,
+        };
+        use zeroclaw_runtime::tools::SessionPromptSetTool;
+
+        let temp = tempfile::TempDir::new().expect("temporary SQLite backend");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(temp.path()).expect("session backend"));
+        backend
+            .set_session_prompt("gw-budget", "task", "keep current")
+            .expect("initial prompt");
+        let rendered = render_session_prompts(
+            &backend
+                .list_session_prompts("gw-budget")
+                .expect("initial prompt list"),
+        );
+        let host_prompt_chars = 100;
+        let budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+            host_prompt_chars,
+            host_prompt_chars + 2 + rendered.chars().count(),
+        );
+
+        let result = scope_websocket_session_prompt_context(
+            true,
+            Some(backend.clone()),
+            Some(budget),
+            Some(
+                backend
+                    .admit_session_prompt_owner("gw-budget")
+                    .expect("admitted owner"),
+            ),
+            Some("gw-budget".to_string()),
+            SessionPromptSetTool::new(Arc::new(zeroclaw_config::policy::SecurityPolicy::default()))
+                .execute(json!({
+                    "id": "task",
+                    "content": "this replacement exceeds the current WebSocket turn budget"
+                })),
+        )
+        .await
+        .expect("tool execution");
+
+        assert!(
+            !result.success,
+            "WebSocket must reject an over-budget write"
+        );
+        let prompts = backend
+            .list_session_prompts("gw-budget")
+            .expect("prompt list after rejection");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, "keep current");
+    }
+
+    #[test]
+    fn websocket_budget_derivation_enables_session_prompt_tool_visibility() {
+        let budget = websocket_session_prompt_budget(true, || {
+            assert!(
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .try_with(|allowed| *allowed)
+                    .unwrap_or(false),
+                "WebSocket admission must render the same session-prompt tools as its turn"
+            );
+            Ok::<_, ()>(zeroclaw_infra::session_backend::SessionPromptBudget::new(
+                0, 0,
+            ))
+        })
+        .expect("scoped WebSocket budget derivation should succeed");
+        assert!(budget.is_some());
+
+        let disabled = websocket_session_prompt_budget(false, || -> Result<(), ()> {
+            panic!("disabled WebSocket session prompts must not derive a budget")
+        })
+        .expect("disabled WebSocket session prompts should skip budget derivation");
+        assert!(disabled.is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_prompt_context_keeps_the_admitted_owner_after_reset() {
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        let temp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(temp.path()).unwrap(),
+        );
+        let owner = backend.admit_session_prompt_owner("gw-owner").unwrap();
+        let result = scope_websocket_session_prompt_context(
+            true,
+            Some(backend.clone()),
+            None,
+            Some(owner),
+            Some("gw-owner".to_owned()),
+            async {
+                backend.reset_session("gw-owner").unwrap();
+                zeroclaw_runtime::tools::SessionPromptSetTool::new(Arc::new(
+                    zeroclaw_config::policy::SecurityPolicy::default(),
+                ))
+                .execute(serde_json::json!({"id":"task","content":"stale"}))
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+        assert!(!result.success);
+        assert!(backend.list_session_prompts("gw-owner").unwrap().is_empty());
+    }
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
@@ -3452,18 +3869,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[test]
-    fn stale_socket_rebuilds_after_delete_and_equal_length_recreate() {
+    fn stale_socket_cannot_join_after_delete_and_equal_length_recreate() {
         run_ws_regression(
             "ws-delete-recreate",
-            stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner,
+            stale_socket_cannot_join_after_delete_and_equal_length_recreate_inner,
         );
     }
 
-    async fn stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner() {
-        // An idle socket keeps the history it loaded. If its session is
-        // deleted and recreated under the same id with a transcript of the
-        // same length, its next turn must run on the new transcript, not send
-        // the deleted conversation to the provider.
+    async fn stale_socket_cannot_join_after_delete_and_equal_length_recreate_inner() {
+        // An idle socket keeps the history it loaded. Deletion invalidates
+        // that socket's session incarnation even if a later session reuses
+        // the id with a transcript of the same length.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "delete-recreate";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
@@ -3504,24 +3920,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
 
         send_chat(&mut old, "follow-up on the old socket").await;
-        let request = fixture.next_provider_request().await;
-        let texts: Vec<String> = provider_messages(&request)
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
+        let frame = next_text_frame(&mut old).await;
+        assert_eq!(frame["code"], "SESSION_NOT_FOUND");
         assert!(
-            !texts
-                .iter()
-                .any(|text| text.contains("deleted conversation prompt")),
-            "the old socket must not send the deleted conversation: {texts:?}"
+            fixture.request_seen.try_recv().is_err(),
+            "the deleted socket must not reach the provider for the successor"
         );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text.contains("recreated conversation prompt")),
-            "the old socket runs on the recreated transcript: {texts:?}"
+        assert_eq!(
+            fixture.backend.load(&session_key).len(),
+            old_len,
+            "the deleted socket must not change the recreated transcript"
         );
-        fixture.release_next();
         drop(old);
         drop(new);
         fixture.shutdown();
@@ -3546,7 +3955,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fixture
             .start_parked_turn(&mut client, "work in progress")
             .await;
-        let before = fixture.state.session_queue.generation(&session_key);
+        let before = fixture
+            .state
+            .session_queue
+            .transcript_generation(&session_key);
 
         let response = crate::api::handle_api_session_delete(
             axum::extract::State(fixture.state.clone()),
@@ -3569,7 +3981,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             fixture.backend.load(&session_key).is_empty(),
             "nothing the turn persisted outlived the delete"
         );
-        assert!(fixture.state.session_queue.generation(&session_key) > before);
+        assert!(
+            fixture
+                .state
+                .session_queue
+                .transcript_generation(&session_key)
+                > before
+        );
         fixture.release_next();
         drop(client);
         fixture.shutdown();
@@ -3625,6 +4043,303 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
         fixture.release_next();
         fixture.shutdown();
+    }
+
+    #[tokio::test]
+    async fn deleted_websocket_cannot_write_into_a_same_id_successor() {
+        use axum::extract::Path;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("gateway data directory");
+        config.memory.backend = "none".to_string();
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: Vec::new(),
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(config.data_dir.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = crate::api::tests::test_state_with_session_backend(config, backend.clone());
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let request = axum::http::Uri::builder()
+            .scheme("ws")
+            .authority(address.to_string())
+            .path_and_query("/ws/chat?agent=web&session_id=delete-race")
+            .build()
+            .expect("test WebSocket URI");
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("chat WebSocket upgrade");
+        let _ = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+
+        let deleted = crate::api::handle_api_session_delete(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            Path("delete-race".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(deleted.status(), axum::http::StatusCode::OK);
+        assert!(!backend.session_exists("gw_delete-race"));
+
+        // Simulate a fresh connection creating the same caller-selected ID.
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "stale write"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("stale connection can send its frame");
+        let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("deletion rejection deadline")
+            .expect("stale connection remains readable")
+            .expect("rejection frame");
+        let frame: serde_json::Value =
+            serde_json::from_str(&frame.into_text().expect("text rejection frame"))
+                .expect("JSON rejection frame");
+        assert_eq!(frame["code"], "SESSION_NOT_FOUND");
+        let messages = backend.load("gw_delete-race");
+        assert_eq!(
+            messages.len(),
+            1,
+            "predecessor must not contaminate successor"
+        );
+        assert_eq!(messages[0].content, "successor");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_delete_cancels_websocket_turn_registered_at_admission() {
+        use axum::extract::Path;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("gateway data directory");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).expect("SQLite session backend"));
+        backend
+            .append(
+                "gw_delete-admission",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .expect("durable session");
+        backend
+            .set_session_prompt("gw_delete-admission", "task", "keep this task")
+            .expect("durable prompt attachment");
+
+        let state = crate::api::tests::test_state_with_session_backend(config, backend.clone());
+        let session_key = "gw_delete-admission";
+        let session_guard = state
+            .session_queue
+            .acquire(session_key)
+            .await
+            .expect("WebSocket turn admission");
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
+        let cancellation = GatewayCancelTokenRegistration::register(
+            &state,
+            session_key,
+            "delete-admission",
+            generation,
+        );
+        let token = cancellation.token();
+
+        let delete = crate::api::handle_api_session_delete(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Path("delete-admission".to_string()),
+        );
+        tokio::pin!(delete);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete)
+                .await
+                .is_err(),
+            "DELETE must wait for the admitted WebSocket turn to finalize"
+        );
+        assert!(
+            token.is_cancelled(),
+            "DELETE must find the token registered immediately after WebSocket admission"
+        );
+
+        // Match the WebSocket handler's exit order: remove its registration
+        // before it releases the queue, then let DELETE own the lifecycle
+        // boundary and delete the durable session and attached prompts.
+        drop(cancellation);
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .expect("DELETE completes after cancelled turn finalization")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(!backend.session_exists(session_key));
+        assert!(
+            backend
+                .list_session_prompts(session_key)
+                .expect("deleted session prompt query")
+                .is_empty(),
+            "deletion must remove attachments after cancelling the admitted turn"
+        );
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel token lock")
+                .contains_key(session_key),
+            "a completed deletion must not leave an admission token behind"
+        );
+    }
+
+    /// DELETE can reach the lifecycle signal after queue admission but before
+    /// the WebSocket handler has installed its cancellation token. That exact
+    /// interleaving must not let the turn start uncancelled.
+    #[tokio::test]
+    async fn websocket_registration_consumes_pending_delete_at_admission() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_pending-delete";
+        let session_guard = state
+            .session_queue
+            .acquire(session_key)
+            .await
+            .expect("WebSocket turn admission");
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
+
+        let delete =
+            crate::api::signal_gateway_deletion_at_generation(&state, session_key, generation);
+        assert!(
+            !delete.cancelled_active_turn,
+            "the token does not exist yet, so DELETE must latch its generation"
+        );
+        let registration = GatewayCancelTokenRegistration::register(
+            &state,
+            session_key,
+            session_key.strip_prefix("gw_").expect("gateway key"),
+            generation,
+        );
+        assert!(
+            registration.token().is_cancelled(),
+            "registration must atomically consume the pending DELETE signal"
+        );
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel token lock")
+                .pending_deletions
+                .contains_key(session_key),
+            "DELETE keeps the latch until its lifecycle operation finishes"
+        );
+
+        drop(registration);
+        drop(delete);
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel token lock")
+                .pending_deletions
+                .contains_key(session_key),
+            "the completed DELETE must not leak its latch to a later session"
+        );
+        drop(session_guard);
+    }
+
+    #[tokio::test]
+    async fn dotted_websocket_registration_consumes_pending_delete_at_admission() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_pending.delete";
+        let session_guard = state
+            .session_queue
+            .acquire(session_key)
+            .await
+            .expect("dotted WebSocket turn admission");
+        let generation = state.session_queue.lifecycle_generation(session_key).await;
+        let delete =
+            crate::api::signal_gateway_deletion_at_generation(&state, session_key, generation);
+        let registration = GatewayCancelTokenRegistration::register(
+            &state,
+            session_key,
+            "pending.delete",
+            generation,
+        );
+
+        assert!(
+            registration.token().is_cancelled(),
+            "a pending delete must cancel a raw dotted session before its provider turn"
+        );
+        drop(registration);
+        drop(delete);
+        drop(session_guard);
     }
 
     #[tokio::test]
@@ -4482,7 +5197,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     fn detach_mid_turn_drops_parked_approvals_so_they_fail_closed() {
         let pending = new_pending_approvals();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        pending.lock().insert("req-1".to_string(), tx);
+        pending.lock().insert(
+            "req-1".to_string(),
+            crate::ws_approval::PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         detach_mid_turn("gw_detached", "turn-1", &pending);
 
@@ -4570,7 +5291,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         ];
 
-        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
+        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false, false);
 
         assert!(
             backend.rewrite_calls.lock().unwrap().is_empty(),
@@ -4625,7 +5346,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             zeroclaw_providers::ChatMessage::assistant("final reply"),
         ];
 
-        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
+        replace_conversation_state_unless_deleted(
+            &backend,
+            "gw_append_only",
+            &authoritative,
+            true,
+            false,
+        );
 
         let persisted = backend.messages.lock().unwrap().clone();
         assert_eq!(
@@ -4689,9 +5416,216 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
 
         assert!(
-            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
+            !replace_conversation_state_unless_deleted(
+                &backend,
+                "gw_failing",
+                &durable,
+                false,
+                false,
+            ),
             "a failed durable replacement must be reported to the caller, not swallowed"
         );
+    }
+
+    struct RecordingSessionBackend {
+        appended: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for RecordingSessionBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.appended.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            *self.appended.lock().unwrap() = messages.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persist_conversation_state_redacts_session_prompt_tool_exchange() {
+        use zeroclaw_providers::ChatMessage;
+
+        let marker = "session-prompt-private-marker";
+        let backend = RecordingSessionBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+        };
+        let messages = vec![
+            ChatMessage::user("set task"),
+            ChatMessage::assistant(format!(
+                "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{marker}\"}}}}</tool_call>"
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"session_prompt_set\">stored {marker}</tool_result>"
+            )),
+            ChatMessage::assistant("done"),
+        ];
+
+        assert!(replace_conversation_state_unless_deleted(
+            &backend,
+            "gw_prompt",
+            &messages,
+            false,
+            true,
+        ));
+
+        let appended = backend.appended.lock().unwrap();
+        assert_eq!(appended.len(), 4);
+        assert_eq!(appended[0].content, "set task");
+        assert_eq!(
+            appended[1].content,
+            "[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(
+            appended[2].content,
+            "[Tool results]\n[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(appended[3].content, "done");
+        assert!(
+            appended
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "retained transcripts must not include opaque session-prompt bodies"
+        );
+        let replayed =
+            zeroclaw_runtime::agent::history_trim::trim_to_recent_turns(appended.clone(), 1);
+        assert_eq!(replayed.kept_turns, 1);
+        assert!(!replayed.trimmed);
+        assert_eq!(replayed.history[0].content, "set task");
+    }
+
+    #[test]
+    fn websocket_prompt_history_stays_private_after_live_disable() {
+        use zeroclaw_infra::session_backend::{SessionBackend, SessionQuery};
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+        use zeroclaw_providers::ChatMessage;
+
+        let temp = tempfile::tempdir().expect("isolated session storage");
+        let backend = SqliteSessionBackend::new(temp.path()).expect("SQLite backend");
+        let key = "gw_disable_privacy";
+        let secret = "privatepromptmarker";
+        let ordinary =
+            "documentation <tool_call>session_prompt_set ordinarypromptmarker</tool_call>";
+        let mut history = vec![
+            ChatMessage::user("set task"),
+            ChatMessage::assistant(format!(
+                "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{secret}\"}}}}</tool_call>"
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\n[Session-prompt tool result]\nstored {secret}"
+            )),
+            ChatMessage::assistant("first turn complete"),
+        ];
+        backend.append(key, &history[0]).expect("existing session");
+        backend
+            .set_session_prompt(key, "task", secret)
+            .expect("attachment");
+        assert!(replace_conversation_state_unless_deleted(
+            &backend, key, &history, false, true,
+        ));
+        assert!(
+            backend
+                .load(key)
+                .iter()
+                .all(|message| !message.content.contains(secret))
+        );
+
+        // The provider retains its private working copy across the live toggle.
+        history.push(ChatMessage::user(ordinary));
+        history.push(ChatMessage::assistant("next turn complete"));
+        assert!(replace_conversation_state_unless_deleted(
+            &backend, key, &history, false, false,
+        ));
+        drop(backend);
+
+        let reopened = SqliteSessionBackend::new(temp.path()).expect("reopen session storage");
+        let saved = reopened.load(key);
+        assert_eq!(saved.len(), history.len());
+        assert_eq!(saved[4].content, ordinary);
+        assert_eq!(
+            reopened
+                .list_session_prompts(key)
+                .expect("retained attachment")[0]
+                .content,
+            secret
+        );
+        assert!(
+            saved
+                .iter()
+                .all(|message| !message.content.contains(secret)),
+            "a disabled next-turn save must not reintroduce private tool exchanges"
+        );
+        assert!(
+            reopened
+                .search(&SessionQuery {
+                    keyword: Some(secret.into()),
+                    limit: None,
+                })
+                .is_empty(),
+            "private history must remain absent from FTS after reopen"
+        );
+        assert!(
+            !reopened
+                .search(&SessionQuery {
+                    keyword: Some("ordinarypromptmarker".into()),
+                    limit: None,
+                })
+                .is_empty(),
+            "ordinary history remains searchable"
+        );
+        assert!(
+            history[1].content.contains(secret),
+            "provider history remains unchanged"
+        );
+    }
+
+    #[test]
+    fn persist_conversation_state_preserves_session_prompt_like_content_when_disabled() {
+        use zeroclaw_providers::ChatMessage;
+
+        let marker = "session-prompt-disabled-marker";
+        let backend = RecordingSessionBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+        };
+        let messages = vec![ChatMessage::assistant(format!(
+            "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"
+        ))];
+
+        assert!(replace_conversation_state_unless_deleted(
+            &backend,
+            "gw_prompt_disabled",
+            &messages,
+            false,
+            false,
+        ));
+
+        let appended = backend.appended.lock().unwrap();
+        assert_eq!(appended.len(), messages.len());
+        for (actual, expected) in appended.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler

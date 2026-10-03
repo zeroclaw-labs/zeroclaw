@@ -327,6 +327,7 @@ mod tests {
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
     }
 

@@ -271,6 +271,8 @@ export interface WsMessage {
   tool?: string;
   arguments_summary?: string;
   timeout_secs?: number;
+  /** Daemon-owned permission to offer the persistent approval action. */
+  allow_always?: boolean;
   dropped_messages?: number;
   dropped_turns?: number;
   kept_turns?: number;
@@ -302,6 +304,8 @@ export interface PendingApproval {
   toolName: string;
   argumentsSummary: string;
   timeoutSecs: number;
+  /** False for required one-time session-prompt confirmations. */
+  allowAlways: boolean;
   /** Wall-clock millis when the request arrived; used to compute remaining time. */
   receivedAt: number;
 }

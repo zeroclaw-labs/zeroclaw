@@ -77,15 +77,17 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
             <X className="h-3.5 w-3.5" />
             {t('agent.approval_deny')}
           </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => onRespond('always')}
-            title={t('agent.approval_always_hint')}
-          >
-            <ShieldCheck className="h-3.5 w-3.5" />
-            {t('agent.approval_always')}
-          </Button>
+          {pending.allowAlways && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onRespond('always')}
+              title={t('agent.approval_always_hint')}
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {t('agent.approval_always')}
+            </Button>
+          )}
           <Button
             size="sm"
             variant="primary"

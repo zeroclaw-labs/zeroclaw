@@ -21,17 +21,30 @@ use crate::daemon::ChannelGenerationControl;
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
-    /// `request_id -> (originating session_id, responder)`. The session ID
-    /// binds each in-flight approval to the session it was raised for, so
+    /// The originating session ID and strict policy travel with each request.
+    /// The binding ties each in-flight approval to its session, so
     /// `session/approve` authorizes against that session's owner instead
     /// of trusting a client-supplied `session_id` or the bare
     /// `request_id`.
     inner: std::sync::Mutex<HashMap<String, PendingApprovalEntry>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalResolution {
+    /// No pending request belongs to the supplied session and request IDs.
+    Unknown,
+    /// A known strict request rejected an unsupported persistent action and
+    /// remains parked for a valid one-time answer.
+    Rejected,
+    /// The request was consumed and its response was delivered (or its
+    /// receiver had already gone away).
+    Resolved,
+}
+
 struct PendingApprovalEntry {
     session_id: String,
     tx: oneshot::Sender<ChannelApprovalResponse>,
+    strict_session_prompt_approval: bool,
 }
 
 pub struct PendingApproval {
@@ -60,8 +73,14 @@ impl ApprovalPendingMap {
         request_id: String,
         session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
+        strict_session_prompt_approval: bool,
     ) -> PendingApproval {
-        self.insert(request_id.clone(), session_id, tx);
+        self.insert_with_policy(
+            request_id.clone(),
+            session_id,
+            tx,
+            strict_session_prompt_approval,
+        );
         PendingApproval {
             map: Arc::clone(self),
             request_id,
@@ -69,16 +88,66 @@ impl ApprovalPendingMap {
         }
     }
 
+    /// Test-only compatibility helper for ordinary approvals. Production
+    /// callers must use [`Self::register`] or [`Self::insert_with_policy`] so
+    /// strict session-prompt policy is always explicit at the insertion site.
+    #[cfg(test)]
     pub fn insert(
         &self,
         request_id: String,
         session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
     ) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, PendingApprovalEntry { session_id, tx });
+        self.insert_with_policy(request_id, session_id, tx, false);
+    }
+
+    pub fn insert_with_policy(
+        &self,
+        request_id: String,
+        session_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+        strict_session_prompt_approval: bool,
+    ) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id,
+            PendingApprovalEntry {
+                session_id,
+                tx,
+                strict_session_prompt_approval,
+            },
+        );
+    }
+
+    pub(crate) fn resolve_status(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        response: ChannelApprovalResponse,
+    ) -> ApprovalResolution {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .get(request_id)
+            .is_none_or(|entry| entry.session_id != session_id)
+        {
+            return ApprovalResolution::Unknown;
+        }
+        if guard.get(request_id).is_some_and(|entry| {
+            entry.strict_session_prompt_approval
+                && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+        }) {
+            return ApprovalResolution::Rejected;
+        }
+        let entry = guard.remove(request_id);
+        drop(guard);
+        if let Some(entry) = entry {
+            let _ = entry.tx.send(response);
+            return ApprovalResolution::Resolved;
+        }
+        // The entry was observed while holding the same lock, so this branch
+        // is unreachable unless the implementation above changes. Keep the
+        // fallback explicit rather than turning an impossible state into an
+        // acknowledged approval.
+        ApprovalResolution::Unknown
     }
 
     pub fn resolve(
@@ -87,18 +156,10 @@ impl ApprovalPendingMap {
         session_id: &str,
         response: ChannelApprovalResponse,
     ) -> bool {
-        let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if pending
-            .get(request_id)
-            .is_none_or(|entry| entry.session_id != session_id)
-        {
-            return false;
-        }
-        if let Some(entry) = pending.remove(request_id) {
-            let _ = entry.tx.send(response);
-            return true;
-        }
-        false
+        matches!(
+            self.resolve_status(request_id, session_id, response),
+            ApprovalResolution::Resolved
+        )
     }
 
     /// The session id an in-flight approval was raised for, if still
@@ -741,6 +802,54 @@ mod tests {
     fn pending_map_resolve_unknown_key_is_noop() {
         let map = ApprovalPendingMap::default();
         assert!(!map.resolve("nonexistent", "sess-1", ChannelApprovalResponse::Deny));
+        assert_eq!(
+            map.resolve_status("nonexistent", "sess-1", ChannelApprovalResponse::Deny),
+            ApprovalResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn strict_session_prompt_rejects_always_without_consuming_request() {
+        let map = ApprovalPendingMap::default();
+        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert_with_policy(
+            "req-strict".to_string(),
+            "test-session".to_string(),
+            tx,
+            true,
+        );
+
+        // Session binding is checked before either strict-policy rejection
+        // or consumption, so even a one-time foreign answer leaves it parked.
+        assert!(!map.resolve(
+            "req-strict",
+            "foreign-session",
+            ChannelApprovalResponse::Approve
+        ));
+        assert!(map.contains("req-strict"));
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            map.resolve_status(
+                "req-strict",
+                "test-session",
+                ChannelApprovalResponse::AlwaysApprove
+            ),
+            ApprovalResolution::Rejected
+        );
+        assert!(map.contains("req-strict"));
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            map.resolve_status(
+                "req-strict",
+                "test-session",
+                ChannelApprovalResponse::Approve
+            ),
+            ApprovalResolution::Resolved
+        );
+        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+        assert!(!map.contains("req-strict"));
     }
 
     #[test]
@@ -768,7 +877,7 @@ mod tests {
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let guard = map.register("req-4".to_string(), "sess-4".to_string(), tx);
+        let guard = map.register("req-4".to_string(), "sess-4".to_string(), tx, false);
         assert!(map.contains("req-4"));
         drop(guard);
         assert!(!map.contains("req-4"));
@@ -778,7 +887,7 @@ mod tests {
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let mut guard = map.register("req-5".to_string(), "sess-5".to_string(), tx);
+        let mut guard = map.register("req-5".to_string(), "sess-5".to_string(), tx, false);
         assert!(map.resolve("req-5", "sess-5", ChannelApprovalResponse::Approve));
         guard.disarm();
         drop(guard);

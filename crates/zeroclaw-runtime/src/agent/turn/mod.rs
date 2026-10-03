@@ -981,7 +981,7 @@ impl<'a> TurnState<'a> {
         &mut self,
         assistant_history_content: String,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
-        individual_results: &[(Option<String>, String)],
+        individual_results: &[results_collect::CollectedToolResult],
         tool_results: &str,
         use_native_tools: bool,
     ) {
@@ -1106,6 +1106,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     } = exec;
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
+
+    // A missing config is a test/degraded path. Preserve the production
+    // fail-closed default rather than accidentally treating it as disabled.
+    let session_prompt_approval_required = config
+        .map(|config| {
+            config.session_prompt_approval_for_agent(agent_alias)
+                == zeroclaw_config::schema::SessionPromptApproval::Required
+        })
+        .unwrap_or(true);
 
     turn_state.sync_pending();
 
@@ -1233,6 +1242,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         context_limits,
         temperature,
         approval,
+        session_prompt_approval_required,
         channel_name,
         channel_reply_target,
         cancellation_token: cancellation_token.as_ref(),
@@ -2379,6 +2389,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            hook_contexts,
             stream_calls,
         } = prepare_tool_calls(
             &ctx,
@@ -2454,9 +2465,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // the turn aborts.
                 call_prep::abandon_unexecuted_prepared_contexts(
                     &ctx,
-                    iteration,
                     &executable_indices,
                     &executable_calls,
+                    &hook_contexts,
                     &[],
                 )
                 .await;
@@ -2468,18 +2479,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_hook_contexts = Vec::new();
         let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
-            executable_indices
-                .iter()
-                .copied()
-                .zip(executable_calls.iter())
-                .zip(stream_calls),
-        ) {
+        for (slot, (((call_idx, call), stream_call), hook_context)) in
+            executed_slots.into_iter().zip(
+                executable_indices
+                    .iter()
+                    .copied()
+                    .zip(executable_calls.iter())
+                    .zip(stream_calls)
+                    .zip(hook_contexts.iter()),
+            )
+        {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_hook_contexts.push(hook_context.clone());
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
@@ -2489,6 +2505,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_hook_contexts,
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
@@ -2501,9 +2518,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // post-execution handling and gets exactly one abandonment.
             call_prep::abandon_unexecuted_prepared_contexts(
                 &ctx,
-                iteration,
                 &executable_indices,
                 &executable_calls,
+                &hook_contexts,
                 &executed_completed_indices,
             )
             .await;
@@ -3523,7 +3540,7 @@ async fn drive_live_sop_actions(
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
                             let mut nested_memory_preamble: Option<MemoryPreamble> = None;
-                            let step_result = ::zeroclaw_log::scope!(
+                            let nested_step = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
@@ -3637,8 +3654,10 @@ async fn drive_live_sop_actions(
                                     sop_reassembly: sop_reassembly.clone(),
                                     })),
                                 )
-                            )
-                            .await;
+                            );
+                            let step_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step)
+                                .await;
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()
@@ -3858,6 +3877,15 @@ mod surface3_tests {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
         ))
+    }
+
+    #[test]
+    fn tool_protocol_framings_have_equal_char_length() {
+        assert_eq!(
+            NATIVE_TOOLS_TASK_FRAMING.chars().count(),
+            NO_TOOLS_TASK_FRAMING.chars().count(),
+            "post-budget anchor refresh must not change prompt character count"
+        );
     }
 
     #[test]
@@ -5206,6 +5234,7 @@ mod active_route_context_tests {
             context_limits: text_limits,
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,

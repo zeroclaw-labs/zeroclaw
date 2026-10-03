@@ -568,12 +568,19 @@ fn record_tool_loop_cost_usage_inner_with_live(
         }
     }
 
-    // The session key scoped around this turn is the chat conversation the
-    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
-    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+    // External attribution retains the caller-visible conversation ID even
+    // when persistence namespaces its key. Other surfaces keep their scoped
+    // key; the tracker's own id is daemon-lifetime scoped.
+    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_ID
         .try_with(Clone::clone)
         .ok()
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+        });
     if let Some(tracker) = &ctx.tracker
         && let Err(error) = tracker.record_usage_attributed(
             cost_usage.clone(),
@@ -1682,16 +1689,23 @@ mod tests {
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        for session in ["chat-session-a", "chat-session-b"] {
+        for (storage_key, caller_id) in [
+            ("chat-session-a", None),
+            ("chat-session-b", None),
+            ("rpc_chat-session-a", Some("chat-session-a")),
+            ("rpc_rpc_alpha", Some("rpc_alpha")),
+        ] {
             let ctx = ctx.clone();
             let usage = usage.clone();
-            let session = session.to_string();
-            runtime.block_on(zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
-                Some(session),
-                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
-                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
-                        .expect("cost usage")
-                }),
+            runtime.block_on(zeroclaw_api::TOOL_LOOP_SESSION_ID.scope(
+                caller_id.map(str::to_owned),
+                zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                    Some(storage_key.to_owned()),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                        record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                            .expect("cost usage")
+                    }),
+                ),
             ));
         }
 
@@ -1707,8 +1721,13 @@ mod tests {
         conversation_ids.sort();
         assert_eq!(
             conversation_ids,
-            vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
-            "two chat sessions on one daemon must stay separable in the ledger"
+            vec![
+                "chat-session-a".to_string(),
+                "chat-session-a".to_string(),
+                "chat-session-b".to_string(),
+                "rpc_alpha".to_string(),
+            ],
+            "conversation attribution must preserve public IDs across storage namespacing"
         );
     }
 

@@ -173,11 +173,16 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
-        let mut pending_request =
-            self.pending
-                .register(request_id.clone(), self.session_id.clone(), tx);
+        let mut pending_request = self.pending.register(
+            request_id.clone(),
+            self.session_id.clone(),
+            tx,
+            strict_session_prompt_approval,
+        );
 
         self.rpc
             .notify(
@@ -189,6 +194,7 @@ impl RpcApprovalChannel {
                     "tool_name": request.tool_name,
                     "arguments_summary": request.arguments_summary,
                     "timeout_secs": timeout.as_secs(),
+                    "allow_always": !strict_session_prompt_approval,
                 }),
             )
             .await;
@@ -344,6 +350,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_approval_transports_literal_summary_and_rejects_always_without_consuming() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let channel = make_channel_no_caps(rpc, Arc::clone(&pending));
+        let summary = "[FILE:report.txt] <img src=x> **literal** & @room";
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: summary.into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            channel
+                .request_approval_attributed_with_timeout("", &request, Duration::from_secs(5))
+                .await
+        });
+        let line = tokio::time::timeout(Duration::from_secs(5), write_rx.recv())
+            .await
+            .expect("bounded notification")
+            .expect("approval notification");
+        let body: serde_json::Value = serde_json::from_str(&line).expect("notification JSON");
+        assert_eq!(body["params"]["arguments_summary"], summary);
+        assert_eq!(body["params"]["allow_always"], false);
+        let id = body["params"]["request_id"].as_str().expect("request ID");
+        assert!(!pending.resolve(id, "sess-1", ChannelApprovalResponse::AlwaysApprove));
+        assert!(pending.contains(id));
+        assert!(pending.resolve(id, "sess-1", ChannelApprovalResponse::Approve));
+        let response = task
+            .await
+            .expect("approval task")
+            .expect("approval result")
+            .expect("decision");
+        assert_eq!(response.response, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            response.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(!pending.contains(id));
+    }
+
+    #[tokio::test]
     async fn sends_approval_request_notification_and_awaits_response() {
         let (rpc, mut write_rx) = make_rpc();
         let pending = make_pending();
@@ -354,6 +402,7 @@ mod tests {
             arguments_summary: "ls /tmp".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let pending_for_resolve = Arc::clone(&pending);
@@ -383,6 +432,7 @@ mod tests {
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
@@ -416,6 +466,7 @@ mod tests {
             arguments_summary: "sleep 60".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))

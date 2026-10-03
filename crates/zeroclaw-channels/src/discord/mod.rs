@@ -871,11 +871,14 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let text = crate::util::build_yesno_approval_prompt(
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -886,7 +889,9 @@ impl DiscordChannel {
         token: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<()> {
-        let (row, bindings) = approval::build_approval_row(token);
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let (row, bindings) = approval::build_approval_row(token, strict_session_prompt_approval);
         // Register every button's intent first. Single-use is enforced by the
         // registry's `take`; the per-click `interaction_gate` is enforced by the
         // type-3 dispatch before any `take`.
@@ -899,6 +904,7 @@ impl DiscordChannel {
                         ComponentIntent::Approval {
                             token: token.to_string(),
                             decision: *decision,
+                            strict_session_prompt_approval,
                         },
                     );
                 }
@@ -2933,7 +2939,7 @@ impl Channel for DiscordChannel {
                                             &interaction_channel,
                                         ).await;
                                         let prompt = match intent {
-                                            Some(ComponentIntent::Approval { token, decision }) => {
+                                            Some(ComponentIntent::Approval { token, decision, .. }) => {
                                                 let resolution = crate::util::resolve_pending_approval(
                                                     &pending_approvals,
                                                     &token,
@@ -4017,7 +4023,13 @@ impl Channel for DiscordChannel {
         if parse_discord_interaction_target(recipient).is_some() {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
+        // Discord cannot disable interpretation of Markdown in this preview.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let token = crate::util::new_approval_token();
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -4026,6 +4038,7 @@ impl Channel for DiscordChannel {
                 sender: tx,
                 destination: Self::canonical_approval_destination(recipient),
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
         let mut guard = crate::util::PendingApprovalGuard::new(
@@ -4224,6 +4237,48 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let channel = Arc::new(DiscordChannel::new(
+            "test-token".into(),
+            vec![],
+            "strict-test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        ));
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+        let paced = crate::paced_channel::PacedChannel::wrap(
+            channel.clone(),
+            &zeroclaw_config::schema::DiscordConfig {
+                reply_min_interval_secs: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            paced
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("paced strict denial")
+                .is_none()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+    }
 
     #[test]
     fn effective_recipient_prefers_per_message_target() {
@@ -7906,6 +7961,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         let resolution = crate::util::resolve_pending_approval(
@@ -7942,7 +7998,9 @@ mod tests {
         )
         .await;
         match intent {
-            Some(ComponentIntent::Approval { token, decision }) => {
+            Some(ComponentIntent::Approval {
+                token, decision, ..
+            }) => {
                 let resolution = crate::util::resolve_pending_approval(
                     pending_approvals,
                     &token,
@@ -7970,6 +8028,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let approvals = AsyncMutex::new(HashMap::new());
@@ -7980,6 +8039,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8003,6 +8063,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let approvals = AsyncMutex::new(HashMap::new());
@@ -8013,6 +8074,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8059,6 +8121,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8118,6 +8181,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let approvals = AsyncMutex::new(HashMap::new());
@@ -8128,6 +8192,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8163,6 +8228,7 @@ mod tests {
             ComponentIntent::Approval {
                 token: token.to_string(),
                 decision,
+                strict_session_prompt_approval: false,
             },
         );
         let approvals = AsyncMutex::new(HashMap::new());
@@ -8173,6 +8239,7 @@ mod tests {
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -8205,7 +8272,7 @@ mod tests {
         // Register exactly what send_buttoned_approval registers, then confirm
         // every button id resolves to its bound decision (and only its own).
         let token = "abc123";
-        let (_, bindings) = approval::build_approval_row(token);
+        let (_, bindings) = approval::build_approval_row(token, false);
         {
             let mut reg = ch.pending_components.lock();
             for (cid, decision) in &bindings {
@@ -8214,6 +8281,7 @@ mod tests {
                     ComponentIntent::Approval {
                         token: token.to_string(),
                         decision: *decision,
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -8225,6 +8293,7 @@ mod tests {
                 Some(ComponentIntent::Approval {
                     token: token.to_string(),
                     decision: *decision,
+                    strict_session_prompt_approval: false,
                 }),
                 "each button resolves to its server-bound decision"
             );

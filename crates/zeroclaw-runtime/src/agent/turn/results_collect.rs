@@ -19,13 +19,20 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
-    /// Per-call `(tool_call_id, output)` so native-mode history can emit one
-    /// `role=tool` message per call with the correct ID.
-    pub(crate) individual_results: Vec<(Option<String>, String)>,
+    /// Per-call output and executed-identity privacy provenance.
+    pub(crate) individual_results: Vec<CollectedToolResult>,
     /// XML `<tool_result>` blocks for prompt-mode history.
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
+}
+
+/// History provenance comes from the executed call, not the model's original
+/// envelope: a before hook may have renamed the tool before execution.
+pub(crate) struct CollectedToolResult {
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) output: String,
+    pub(crate) sensitive_session_prompt: bool,
 }
 
 /// Collect this round's tool results (upstream loop body, results-collection
@@ -46,7 +53,7 @@ pub(crate) fn collect_tool_results(
     turn_id: &str,
 ) -> Result<CollectedResults> {
     let mut tool_results = String::new();
-    let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
+    let mut individual_results = Vec::new();
     let mut detection_relevant_output = String::new();
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
@@ -158,7 +165,12 @@ pub(crate) fn collect_tool_results(
                 v.push(format!("{tool_name}: {receipt}"));
             }
         }
-        individual_results.push((tool_call_id, result_output.clone()));
+        individual_results.push(CollectedToolResult {
+            tool_call_id,
+            output: result_output.clone(),
+            sensitive_session_prompt:
+                crate::agent::tool_execution::is_sensitive_session_prompt_tool(&tool_name),
+        });
         let _ = writeln!(
             tool_results,
             "<tool_result name=\"{}\">\n{}\n</tool_result>",

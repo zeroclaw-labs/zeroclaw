@@ -120,6 +120,11 @@ pub struct ChannelApprovalRequest {
     /// count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<ApprovalPosition>,
+    /// Whether this request is the dedicated strict confirmation for a
+    /// session-prompt mutation. This is explicit so downstream adapters do
+    /// not infer policy from the presence or absence of `raw_arguments`.
+    #[serde(default)]
+    pub strict_session_prompt_approval: bool,
 }
 
 impl ChannelApprovalRequest {
@@ -1364,11 +1369,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     ///
     /// The convention in-tree is to put the real body here and let
     /// [`Channel::request_approval`] delegate to it, so the logic lives once.
+    /// Strict session-prompt confirmations default to unsupported: a legacy
+    /// approval implementation cannot guarantee literal, side-effect-free
+    /// delivery of the exact preview. Override this method to provide that
+    /// guarantee before accepting strict requests.
     async fn request_approval_attributed(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        if crate::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         Ok(self
             .request_approval(recipient, request)
             .await?
@@ -1562,6 +1574,92 @@ mod tests {
 
     fn msg_from(sender: &str) -> ChannelMessage {
         ChannelMessage::new("1", sender, "", "hi", "stub", 0)
+    }
+
+    /// Legacy-only approval adapter used to prove the strict default never
+    /// delegates to an unaudited delivery path.
+    #[derive(Default)]
+    struct LegacyApprovalChannel {
+        approval_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::attribution::Attributable for LegacyApprovalChannel {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Channel(crate::attribution::ChannelKind::Webhook)
+        }
+
+        fn alias(&self) -> &str {
+            "legacy-approval"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for LegacyApprovalChannel {
+        fn name(&self) -> &str {
+            "legacy-approval"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_approval_default_denies_strict_without_delivery_and_preserves_ordinary() {
+        let channel = LegacyApprovalChannel::default();
+        let mut request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("room", &request)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            channel
+                .approval_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // Disabling the special gate retains the legacy operator decision.
+        request.strict_session_prompt_approval = false;
+        let response = channel
+            .request_approval_attributed("room", &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.response, ChannelApprovalResponse::Approve);
+        assert_eq!(response.source, ApprovalSource::Operator);
+        assert_eq!(
+            channel
+                .approval_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

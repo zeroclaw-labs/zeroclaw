@@ -6,6 +6,7 @@ use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
+use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
@@ -16,59 +17,82 @@ pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
+    hook_contexts: &[Option<ToolCallHookContext>],
     stream_calls: &[Option<StreamToolCall>],
     executed_outcomes: Vec<ToolExecutionOutcome>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+    for ((((idx, call), hook_context), stream_call), outcome) in executable_indices
         .iter()
         .zip(executable_calls.iter())
+        .zip(hook_contexts.iter())
         .zip(stream_calls.iter())
         .zip(executed_outcomes)
     {
+        let sensitive_session_prompt =
+            crate::agent::tool_execution::is_sensitive_session_prompt_tool(&call.name);
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
         // outcome to history, logs, hooks, and ordered_results.
 
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_outcome(if outcome.success {
-                    ::zeroclaw_log::EventOutcome::Success
-                } else {
-                    ::zeroclaw_log::EventOutcome::Failure
-                })
-                .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
-                    "trace_id": ctx.turn_id,
-                })),
-            "tool_call_result"
-        );
+        if !sensitive_session_prompt {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(if outcome.success {
+                        ::zeroclaw_log::EventOutcome::Success
+                    } else {
+                        ::zeroclaw_log::EventOutcome::Failure
+                    })
+                    .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": call.name.clone(),
+                        "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
+                        "output": scrub_credentials(&outcome.output),
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_result"
+            );
+        }
 
         // ── Hook: after_tool_call (void) ─────────────────
-        if let Some(hooks) = ctx.hooks {
-            let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *idx);
-            let tool_result_obj = crate::tools::ToolResult {
-                success: outcome.success,
-                output: outcome.output.clone().into(),
-                error: None,
+        if let (Some(hook_context), Some(hooks)) = (hook_context, ctx.hooks) {
+            // A session-prompt call that began as such never has a hook
+            // context. If a before hook rewrote an ordinary call into one, its
+            // already-entered lifecycle must still terminate, but the attached
+            // body and result remain outside hook visibility. A richer prompt
+            // hook policy would be a separate architecture decision; this V1
+            // projection intentionally carries only the final tool identity
+            // and completion status.
+            let (hook_args, tool_result_obj) = if sensitive_session_prompt {
+                (
+                    serde_json::json!({"session_prompt_payload": "omitted"}),
+                    crate::tools::ToolResult {
+                        success: outcome.success,
+                        output: "[Session-prompt tool result omitted for hook privacy]".into(),
+                        error: None,
+                    },
+                )
+            } else {
+                (
+                    call.arguments.clone(),
+                    crate::tools::ToolResult {
+                        success: outcome.success,
+                        output: outcome.output.clone().into(),
+                        error: None,
+                    },
+                )
             };
-            // The prepared arguments travel with the completion call so
-            // argument-auditing hooks export what was actually dispatched and
-            // never need to retain arguments between the hook phases.
             hooks
                 .fire_after_tool_call_with_context_and_args(
-                    &hook_context,
+                    hook_context,
                     &call.name,
-                    &call.arguments,
+                    &hook_args,
                     &tool_result_obj,
                     outcome.duration,
                 )

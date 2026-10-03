@@ -170,15 +170,21 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     out
 }
 
-/// Name of the environment variable that carries the in-flight session key
-/// into shell tools.
+/// Name of the environment variable that carries the caller-visible session
+/// ID into shell tools.
 pub(crate) const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
 
 fn get_session_id() -> Option<String> {
-    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+    zeroclaw_api::TOOL_LOOP_SESSION_ID
         .try_with(Clone::clone)
         .ok()
         .flatten()
+        .or_else(|| {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+        })
         .filter(|key| !key.is_empty())
 }
 
@@ -622,12 +628,25 @@ mod tests {
     use zeroclaw_tools::wrappers::RateLimitedTool;
 
     #[tokio::test]
-    async fn get_session_id_returns_scoped_session_key() {
+    async fn get_session_id_falls_back_to_scoped_storage_key() {
         let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
             get_session_id()
         })
         .await;
         assert_eq!(got, Some("gw_abc-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_session_id_prefers_caller_id_over_namespaced_storage_key() {
+        let got = zeroclaw_api::TOOL_LOOP_SESSION_ID
+            .scope(Some("rpc_alpha".to_string()), async {
+                crate::agent::loop_::scope_session_key(Some("rpc_rpc_alpha".to_string()), async {
+                    get_session_id()
+                })
+                .await
+            })
+            .await;
+        assert_eq!(got.as_deref(), Some("rpc_alpha"));
     }
 
     #[test]
@@ -636,10 +655,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_session_id_none_for_empty_session_key() {
-        let got =
-            crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
-                .await;
+    async fn get_session_id_none_for_empty_caller_id_and_rpc_storage_key() {
+        let got = zeroclaw_api::TOOL_LOOP_SESSION_ID
+            .scope(Some(String::new()), async {
+                crate::agent::loop_::scope_session_key(Some("rpc_".to_string()), async {
+                    get_session_id()
+                })
+                .await
+            })
+            .await;
         assert_eq!(got, None);
     }
 

@@ -173,7 +173,7 @@ All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding 
 
 ## Tool input/output propagation
 
-The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool`) wraps every `Tool::execute(args)` call with invoke/complete/fail events. Each event's name is `module_path!()` (the executor's own module), not a hardcoded string; the `Action` and severity distinguish them:
+The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool`) wraps ordinary `Tool::execute(args)` calls with invoke/complete/fail events. Each event's name is `module_path!()` (the executor's own module), not a hardcoded string; the `Action` and severity distinguish them:
 
 1. Before running: `record!(DEBUG, Event::new(module_path!(), Action::Invoke).with_category(EventCategory::Tool).with_attrs(...))` with `tool`, `tool_call_id`, and the full `input` in attrs.
 2. Runs `execute(args).await`.
@@ -182,6 +182,14 @@ The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs:
 5. On `Err` from `execute`: `record!(ERROR, ... Action::Fail)` with `Outcome::Failure`, the duration, and the debug-formatted error in attrs.
 
 These events are emitted inside a `scope!`-style span (`target = "zeroclaw_log_internal_scope"`, field `tool = <name>`) opened around the call, so the `tool` field rides on every descendant emission too. Per-tool `Tool::execute` impls add zero logging code.
+
+Session-prompt tools are a sensitive-I/O exception: their executor events retain
+tool identity, call ID, outcome and duration, but omit arguments, output and
+error text. The post-execution `tool_call_result` event, payload-bearing stream
+cards and receipts are suppressed. This keeps attachment content out of
+ordinary logs and captures; see
+[Tool execution lifecycle](./tool-execution-lifecycle.md) for the provider,
+explicit list-result and exact ephemeral approval-preview boundaries.
 
 ## `LogCaptureLayer` and the on-disk schema
 
