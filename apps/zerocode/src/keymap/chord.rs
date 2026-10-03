@@ -114,7 +114,9 @@ impl Chord {
                 "Alt"
             });
         }
-        if self.modifiers.contains(KeyModifiers::SHIFT) {
+        // BackTab renders as "Shift+Tab" already; a chord captured from a real
+        // Shift+Tab carries Shift as well, which must not render twice.
+        if self.modifiers.contains(KeyModifiers::SHIFT) && self.code != KeyCode::BackTab {
             parts.push("Shift");
         }
         let key = render_keycode(&self.code);
@@ -289,7 +291,9 @@ fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
     // Enhanced keyboard protocols can report Shift with a lowercase glyph.
     // That Shift distinguishes undo from redo; it is not encoded in the glyph.
     // Keep the existing compatibility for already-shifted glyphs and symbols.
-    if matches!(code, KeyCode::Char(c) if !c.is_lowercase()) {
+    // BackTab already means Shift+Tab, and terminals report it with Shift
+    // set, so that Shift is redundant too.
+    if matches!(code, KeyCode::Char(c) if !c.is_lowercase()) || code == KeyCode::BackTab {
         m.remove(KeyModifiers::SHIFT);
     }
     m
@@ -321,6 +325,31 @@ fn render_keycode(code: &KeyCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// crossterm reports Shift+Tab as `BackTab` with Shift set, from the
+    /// legacy `CSI Z` sequence, the enhanced keyboard protocol, and Windows.
+    #[test]
+    fn backtab_matches_the_shift_tab_terminals_report() {
+        let chord = Chord::key(KeyCode::BackTab);
+        assert!(chord.matches(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert!(chord.matches(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert!(!chord.matches(&KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        )));
+        assert!(!chord.matches(&KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+    }
+
+    /// The binding editor records a pressed chord verbatim, so a captured
+    /// Shift+Tab carries Shift; it is the same key and renders once.
+    #[test]
+    fn a_captured_shift_tab_is_the_same_key_and_renders_once() {
+        let captured = Chord::with(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(captured.same_key(&Chord::key(KeyCode::BackTab)));
+        assert!(captured.matches(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert_eq!(captured.display(), "Shift+Tab");
+        assert_eq!(Chord::key(KeyCode::BackTab).display(), "Shift+Tab");
+    }
 
     #[test]
     fn bare_letter_matches_no_modifier_event() {

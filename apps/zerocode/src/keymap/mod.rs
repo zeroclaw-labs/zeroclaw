@@ -197,6 +197,28 @@ mod tests {
         ));
     }
 
+    /// Terminals report Shift+Tab as `BackTab` with Shift set, so every
+    /// default `BackTab` binding has to resolve from that event, not only from
+    /// a bare `BackTab` no terminal sends.
+    #[test]
+    fn shift_tab_resolves_every_default_backtab_binding() {
+        with_default_bindings(|| {
+            let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+            assert_eq!(
+                ConfigTabAction::from_chord(&shift_tab),
+                Some(ConfigTabAction::SectionPrev)
+            );
+            assert_eq!(
+                DashboardTabAction::from_chord(&shift_tab),
+                Some(DashboardTabAction::PrevTab)
+            );
+            assert_eq!(
+                QuickstartModalAction::from_chord(&shift_tab),
+                Some(QuickstartModalAction::PrevField)
+            );
+        });
+    }
+
     #[test]
     fn browse_enter_resolves_from_control_k() {
         let ev = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
