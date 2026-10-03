@@ -9,7 +9,7 @@ use super::outcome::{
     StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
-use super::stream_consume::consume_provider_streaming_response;
+use super::stream_consume::consume_provider_streaming_response_with_policy;
 use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
@@ -236,6 +236,7 @@ pub(crate) async fn call_provider(
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
@@ -249,10 +250,16 @@ pub(crate) async fn call_provider(
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response(
+                    match consume_provider_streaming_response_with_policy(
                         active_model_provider,
-                        prepared_messages,
-                        request_tools,
+                        ChatRequest {
+                            messages: prepared_messages,
+                            tools: request_tools,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
@@ -260,6 +267,7 @@ pub(crate) async fn call_provider(
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
+                        policy,
                     )
                     .await
                     {
@@ -280,6 +288,9 @@ pub(crate) async fn call_provider(
                         }
                         Err(stream_err)
                             if stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .is_some()
+                                || stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .is_some()
                                 || is_tool_loop_cancelled(&stream_err)
@@ -288,8 +299,13 @@ pub(crate) async fn call_provider(
                                     .is_some() =>
                         {
                             if let Some(usage) = stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .and_then(|error| error.usage.clone())
+                                .or_else(|| {
+                                    stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .and_then(|error| error.usage.clone())
+                                })
                                 .or_else(|| {
                                     stream_err
                                         .downcast_ref::<StreamInterruptedAfterOutput>()
@@ -411,20 +427,22 @@ pub(crate) async fn call_provider(
                                         match streamed_refusal {
                                             Some(refusal) => {
                                                 dispatcher
-                                                    .chat_after_stream_refusal(
+                                                    .chat_after_stream_refusal_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
                                                         refusal,
+                                                        policy,
                                                     )
                                                     .await
                                             }
                                             None => {
                                                 dispatcher
-                                                    .chat(
+                                                    .chat_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
+                                                        policy,
                                                     )
                                                     .await
                                             }
@@ -462,7 +480,7 @@ pub(crate) async fn call_provider(
         let chat_future = scope.scope(Box::pin(with_exact_dispatch_route(
             active_model_provider_name.to_string(),
             active_model.to_string(),
-            dispatcher.chat(
+            dispatcher.chat_with_tool_round_policy(
                 ChatRequest {
                     messages: prepared_messages,
                     tools: request_tools,
@@ -473,6 +491,7 @@ pub(crate) async fn call_provider(
                 },
                 active_dispatch_model,
                 ctx.temperature,
+                policy,
             ),
         )));
 
@@ -1048,7 +1067,9 @@ mod streaming_fallback_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
+    use zeroclaw_api::model_provider::{
+        ModelRefusalError, StreamError, StreamEvent, ToolRoundPolicy,
+    };
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
@@ -1061,6 +1082,7 @@ mod streaming_fallback_tests {
         stream_calls: Arc<AtomicUsize>,
         non_stream_calls: Arc<AtomicUsize>,
         cancel_on_final: Option<tokio_util::sync::CancellationToken>,
+        policies: Arc<std::sync::Mutex<Vec<ToolRoundPolicy>>>,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -1160,6 +1182,29 @@ mod streaming_fallback_tests {
 
     #[async_trait]
     impl ModelProvider for EmptyStreamThenTextProvider {
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> Result<ChatResponse> {
+            self.policies.lock().unwrap().push(policy);
+            self.chat(request, model, temperature).await
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.policies.lock().unwrap().push(policy);
+            self.stream_chat(request, model, temperature, options)
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1503,22 +1548,26 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
-        check_empty_stream_recovery(false).await;
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            check_empty_stream_recovery(false, policy).await;
+        }
     }
 
     #[tokio::test]
     async fn cancelled_empty_stream_does_not_start_recovery() {
-        check_empty_stream_recovery(true).await;
+        check_empty_stream_recovery(true, ToolRoundPolicy::Batch).await;
     }
 
-    async fn check_empty_stream_recovery(cancel_on_final: bool) {
+    async fn check_empty_stream_recovery(cancel_on_final: bool, policy: ToolRoundPolicy) {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let token = tokio_util::sync::CancellationToken::new();
         let provider = EmptyStreamThenTextProvider {
             stream_calls: Arc::clone(&stream_calls),
             non_stream_calls: Arc::clone(&non_stream_calls),
             cancel_on_final: cancel_on_final.then(|| token.clone()),
+            policies: Arc::clone(&policies),
         };
         let provider = ReliableModelProvider::new(
             "test",
@@ -1573,6 +1622,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         true,
+                        policy,
                         0,
                     ),
                 ),
@@ -1581,6 +1631,11 @@ mod streaming_fallback_tests {
             .expect("provider call returns its terminal outcome");
 
         assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *policies.lock().unwrap(),
+            vec![policy; if cancel_on_final { 1 } else { 2 }],
+            "non-stream recovery must preserve the stream request's explicit policy"
+        );
         assert!(matches!(
             event_rx
                 .try_recv()
@@ -1670,6 +1725,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
         )
         .await
@@ -1724,6 +1780,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
         )
         .await
@@ -1859,6 +1916,7 @@ mod streaming_fallback_tests {
                 &[ChatMessage::user("go")],
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
             )
             .await
@@ -1945,6 +2003,7 @@ mod streaming_fallback_tests {
                 &[ChatMessage::user("go")],
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
             )
             .await
@@ -2048,6 +2107,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
         )
         .await
@@ -2118,6 +2178,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
         )
         .await
@@ -2189,6 +2250,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
         )
         .await
@@ -2343,6 +2405,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                     ),
                 ),
@@ -2448,6 +2511,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                     ),
                 ),
@@ -2702,6 +2766,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                     ),
                 ),
@@ -2778,6 +2843,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                     ),
                 ),

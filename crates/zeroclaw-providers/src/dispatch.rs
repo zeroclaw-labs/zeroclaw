@@ -597,12 +597,28 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    pub async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_chat_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat(request, model, temperature)
+                => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
             )
             .await
         })
@@ -640,9 +656,27 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         refusal: crate::AnthropicRefusalError,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            refusal,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         crate::reliable::scope_stream_refusal_recovery(
             refusal,
-            self.chat(request, model, temperature),
+            self.chat_with_tool_round_policy(request, model, temperature, policy),
         )
         .await
     }
@@ -653,6 +687,23 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
         options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    pub fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let attribution = zeroclaw_log::attribution_span!(&*self.inner);
         // Enter the attribution span synchronously so the model_scope
@@ -667,7 +718,13 @@ impl ProviderDispatch {
         );
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
@@ -901,12 +958,28 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    pub async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_chat_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat(request, model, temperature)
+                => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
             )
             .await
         })
@@ -967,9 +1040,27 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         refusal: crate::AnthropicRefusalError,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            refusal,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         crate::reliable::scope_stream_refusal_recovery(
             refusal,
-            self.chat(request, model, temperature),
+            self.chat_with_tool_round_policy(request, model, temperature, policy),
         )
         .await
     }
@@ -981,6 +1072,23 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    pub fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let attribution = zeroclaw_log::attribution_span!(self.inner);
         let _attribution_enter = attribution.enter();
         let model_scope = zeroclaw_log::info_span!(
@@ -990,7 +1098,13 @@ impl<'a> ProviderDispatchRef<'a> {
         );
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);

@@ -648,6 +648,18 @@ Agents reference a provider by dotted alias. Provider entries on their own do no
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
 
+## Single-tool-round support
+
+The agent runtime profile's `single_tool_rounds` setting is default-off. See [Single-tool rounds](../agents/internals.md#single-tool-rounds) for configuration, accounting, and rollback behavior. It requests one call per response only when the actual model route and every reachable fallback honor a native control.
+
+| Configured provider path | Native control | Support |
+| --- | --- | --- |
+| `openai`, API-key auth, official OpenAI endpoint, chat-completions or Responses wire | `parallel_tool_calls: false` | Supported |
+| `anthropic`, official Anthropic endpoint | `tool_choice.disable_parallel_tool_use: true` | Supported |
+| Custom or compatible endpoints, OVH, Codex subscription auth, and other adapters | No verified control | Batch with a visible limitation notice |
+
+Responses and Anthropic send the control in streaming and non-streaming requests. OpenAI chat-completions uses its existing non-streaming implementation, including when a router projects that response as stream events. Requests without tools keep their existing wire shape. Sharing an adapter with a supported provider does not establish support for another endpoint. A mixed fallback chain stays batch even if its primary provider supports the control.
+
 ## Fallback on failure
 
 When a request to a provider fails after exhausting its retries (provider down,
