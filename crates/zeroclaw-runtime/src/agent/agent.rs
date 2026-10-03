@@ -15769,11 +15769,14 @@ vision_model_provider = "custom.vision"
                 serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: format!("here it is [IMAGE:{}]", self.path).into(),
-                    error: None,
-                })
+                // The producer declares its image; under the attachment
+                // contract nothing in the result text is promoted.
+                Ok(crate::tools::ToolResult::ok("here it is").with_attachment(
+                    zeroclaw_api::media::RenderedMarker {
+                        target: self.path.clone(),
+                        kind: zeroclaw_api::media::MarkerKind::Image,
+                    },
+                ))
             }
         }
         impl zeroclaw_api::attribution::Attributable for AttachImage {

@@ -204,6 +204,7 @@ tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not
 tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
 tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
 tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
+tool-browser-screenshot-error-allocated-target-exists = Allocated screenshot target '{ $filename }' already exists; pass an explicit `path` instead of overwriting it
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 

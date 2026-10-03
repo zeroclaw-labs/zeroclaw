@@ -1021,31 +1021,30 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // The graceful-summary path now prepares the accumulated history through
-    // the full multimodal normalizer before dispatch, and the dispatch seam
-    // still strips loadable audio markers as a fail-closed backstop. A
-    // tool-result audio marker in the history must never reach the provider
-    // as a raw filesystem path the model would hallucinate over; this pins
-    // the combined contract on the max-iteration exit.
+    // The summary request must drop declared audio attachments before dispatch,
+    // just like an in-loop request. Legacy tool text is not scanned for markers.
     #[tokio::test]
-    async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
+    async fn graceful_summary_drops_declared_tool_audio_attachment() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
             ..Default::default()
         };
-        // A properly paired assistant tool_call + native tool-result JSON blob,
-        // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
-        // the exchange intact and the audio marker survives to dispatch. This
-        // also exercises stripping a marker embedded inside a tool-result JSON
-        // object (the native-dispatcher shape), not just plain text.
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: "/tmp/clip.wav".to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Audio,
+        }];
+        let tool_content = serde_json::json!({
+            "content": "recorded 3:00 PM",
+            "tool_call_id": "toolu_1",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and tell me what you hear"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_1"}]}"#),
-            ChatMessage::tool(
-                r#"{"content":"[AUDIO:/tmp/clip.wav] recorded 3:00 PM","tool_call_id":"toolu_1"}"#,
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1085,25 +1084,28 @@ mod graceful_summary_metering_tests {
         let captured = seen.lock().unwrap().join("\n");
         assert!(
             !captured.contains("/tmp/clip.wav"),
-            "raw audio path reached the provider on the max-iteration path: {captured}"
+            "declared audio path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "audio marker should be replaced with a placeholder: {captured}"
+            captured.contains("recorded 3:00 PM"),
+            "tool text should survive dropping the audio attachment: {captured}"
         );
     }
 
-    // The summary request is prepared like an in-loop request, so a
-    // tool-result image marker whose file is not an interpretable image is
-    // dropped by the normalizer with a model-facing note: the raw path never
-    // reaches the provider, and the model is told the image could not be
-    // loaded rather than being handed a path to hallucinate over.
+    // The summary request is prepared like an in-loop request, so an image a
+    // tool DECLARED whose file is not an interpretable image is dropped by
+    // the normalizer with a model-facing note: the raw path never reaches
+    // the provider, and the model is told the attachment could not be loaded
+    // rather than being handed a path to hallucinate over.
     #[tokio::test]
     async fn graceful_summary_drops_unloadable_tool_image_marker() {
         let temp = tempfile::tempdir().expect("temp dir");
         let bogus_image = temp.path().join("shot.txt");
         std::fs::write(&bogus_image, b"not an image").expect("write text bytes");
-        let marker = format!("[{}:{}]", "IMAGE", bogus_image.display());
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: bogus_image.display().to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
@@ -1111,19 +1113,20 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
-        // A properly paired assistant tool_call + native tool-result JSON
-        // blob, so the orphan sweep keeps the exchange intact and the marker
-        // reaches the summary preparation as a latest-run tool result.
+        // A properly paired assistant tool_call + declared native tool-result
+        // envelope, so the orphan sweep keeps the exchange intact and the
+        // declared attachment reaches the summary preparation as a
+        // latest-run tool result.
+        let tool_content = serde_json::json!({
+            "content": "shot",
+            "tool_call_id": "toolu_img",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_img"}]}"#),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": format!("{marker} shot"),
-                    "tool_call_id": "toolu_img",
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1166,8 +1169,8 @@ mod graceful_summary_metering_tests {
             "raw image path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            !captured.contains(&marker),
-            "the unloadable image marker must be dropped, not forwarded: {captured}"
+            !captured.contains("data:image"),
+            "the unloadable declared attachment must yield no image: {captured}"
         );
         assert!(
             captured.contains("could not be loaded"),
@@ -1175,11 +1178,12 @@ mod graceful_summary_metering_tests {
         );
     }
 
-    // A loadable local image and an already-inline data URI both reach the
-    // summary request as validated inline markers: the file is read,
-    // MIME-checked and inlined by the normalizer, and the inline marker
-    // passes through byte-identical. This pins the normalize decision for
-    // the summary path: the summary may see the turn's images.
+    // A loadable local image and an already-inline data URI, both DECLARED
+    // as attachments, reach the summary request as validated inline data
+    // URIs: the file is read, MIME-checked and inlined by the normalizer,
+    // and the inline attachment passes through byte-identical, so both
+    // arrive as the same payload. This pins the normalize decision for the
+    // summary path: the summary may see the turn's images.
     #[tokio::test]
     async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1193,8 +1197,16 @@ mod graceful_summary_metering_tests {
         )
         .expect("write PNG fixture");
         let inline_uri = format!("data:image/png;base64,{PNG_B64}");
-        let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
-        let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
+        let attachments = vec![
+            zeroclaw_api::media::RenderedMarker {
+                target: png_path.display().to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            },
+            zeroclaw_api::media::RenderedMarker {
+                target: inline_uri.to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            },
+        ];
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
@@ -1202,16 +1214,16 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
+        let tool_content = serde_json::json!({
+            "content": "both shots",
+            "tool_call_id": "toolu_two",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and describe both screenshots"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_two"}]}"#),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": format!("{local_marker} and {inline_marker}"),
-                    "tool_call_id": "toolu_two",
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1254,13 +1266,230 @@ mod graceful_summary_metering_tests {
             "the local path must be inlined, not forwarded: {captured}"
         );
         assert!(
-            !captured.contains(&local_marker),
-            "the path-form marker must be replaced by its inline form: {captured}"
+            captured.contains("both shots"),
+            "the declared body is delivered verbatim: {captured}"
         );
         assert_eq!(
-            captured.matches(&inline_marker).count(),
+            captured.matches(&inline_uri).count(),
             2,
-            "both images must arrive as the same byte-identical inline marker: {captured}"
+            "both declared images must arrive inlined as the same payload: {captured}"
+        );
+    }
+
+    // Legacy control: a tool result whose body embeds image marker syntax
+    // with no declaration is never promoted, even when the referenced file
+    // is a valid image. Nothing is loaded, no note is appended, and the body
+    // is delivered as the legacy path delivers it: the one-shot seam's
+    // compatibility sweep replaces the path reference with a placeholder.
+    #[tokio::test]
+    async fn graceful_summary_does_not_promote_legacy_tool_body_markers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let png_path = temp.path().join("shot.png");
+        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .expect("write png signature");
+        let marker = format!("[{}:{}]", "IMAGE", png_path.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let tool_content = serde_json::json!({
+            "content": format!("saw {marker} in output"),
+            "tool_call_id": "toolu_legacy",
+        })
+        .to_string();
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe the screenshot"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
+            ChatMessage::tool(tool_content),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-legacy",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains("data:image"),
+            "a legacy body marker must not be promoted to an image: {captured}"
+        );
+        assert!(
+            !captured.contains("could not be loaded"),
+            "nothing is loaded for a legacy body, so no note is appended: {captured}"
+        );
+        // A legacy carrier is delivered as its bytes: the body reaches the
+        // provider verbatim, quoted marker syntax and raw path included, as
+        // text. Nothing infers, sweeps, or strips it.
+        let body = format!("saw {marker} in output");
+        assert!(
+            captured.contains(&body),
+            "the legacy body is delivered verbatim: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no seam rewrites a legacy carrier's body: {captured}"
+        );
+    }
+
+    // A declared count-zero tool result whose body quotes a path marker: the
+    // body is text under the attachment-identity contract, and the one-shot
+    // dispatch seam behind the graceful summary must deliver it byte for
+    // byte instead of replacing the quoted reference with a placeholder.
+    // Both carrier shapes are covered: the native envelope and the prompt
+    // carrier.
+    #[tokio::test]
+    async fn graceful_summary_keeps_declared_zero_tool_body_verbatim() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/example.png");
+        let body = format!("source: {marker} end");
+
+        // Native shape: a properly paired assistant tool_call plus a
+        // declared envelope with an empty attachments array, so the orphan
+        // sweep keeps the exchange intact.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let native_content = serde_json::json!({
+            "content": body,
+            "tool_call_id": "toolu_quote",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&[]),
+        })
+        .to_string();
+        let mut history = vec![
+            ChatMessage::user("call the tool and read the file"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_quote"}]}"#),
+            ChatMessage::tool(native_content.clone()),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-quote",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&native_content),
+            "the declared count-zero native body must arrive byte for byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no placeholder may be substituted at the seam: {captured}"
+        );
+
+        // Prompt shape: a count-zero prompt carrier in a user-role message.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let mut history = vec![
+            ChatMessage::user("call the tool and read the file"),
+            ChatMessage::user(carrier.clone()),
+        ];
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-quote-prompt",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&carrier),
+            "the declared count-zero prompt carrier must arrive byte for byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no placeholder may be substituted at the seam: {captured}"
         );
     }
 
