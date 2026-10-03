@@ -25978,17 +25978,43 @@ impl Config {
             return edited_field != error_field;
         }
 
-        let Some((edited_agent, edited_field)) = Self::agent_required_field(edited_path) else {
-            return false;
-        };
         let Some((error_agent, error_field)) = Self::agent_required_field(error_path) else {
             return false;
         };
+        // The edited path may be one of the agent's required references itself, or
+        // any other field on the agent being authored (`enabled`, `channels`, ...).
+        // Building an agent field-by-field is legitimate, but only while the agent
+        // is still a blank scaffold: the caller re-validates with the companion
+        // fields filled, so a value that references something dangling is rejected.
+        let mut parts = edited_path.split('.');
+        let (edited_agent, edited_field) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("agents"), Some(agent), Some(field), None) => (agent, field),
+                _ => return false,
+            };
 
         if edited_agent != error_agent {
             return true;
         }
-        edited_field != error_field
+        // Editing the very required field the error names is not a companion case.
+        if edited_path == format!("agents.{error_agent}.{error_field}") {
+            return false;
+        }
+        // Editing one required reference while its companion is still empty is the
+        // staged reference-authoring case.
+        if edited_field == "model_provider" || edited_field == "risk_profile" {
+            return true;
+        }
+        // Editing any other field (`enabled`, `channels`, ...) only counts as
+        // scaffolding while the agent has no required reference configured at all.
+        // Once one reference is set, enabling the agent with the other still empty
+        // must surface the incompleteness rather than wave it through.
+        match self.agents.get(edited_agent) {
+            Some(agent) => {
+                agent.model_provider.trim().is_empty() && agent.risk_profile.trim().is_empty()
+            }
+            None => false,
+        }
     }
 
     /// Parse a route required-field edit path `model_routes.<hint>.<field>` or
