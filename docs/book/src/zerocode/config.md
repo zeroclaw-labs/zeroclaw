@@ -28,6 +28,56 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
   from the backend registry, so the options you see are exactly the ones this
   build supports.
 
+## Plugins sub-tab
+
+The Config pane has three sub-tabs: `zeroclaw` for the daemon's settings,
+`zerocode` for zerocode's own settings, and `plugins`. `Tab` moves to the
+next sub-tab by default, and clicking a sub-tab name selects it.
+
+The `plugins` sub-tab is a read-only view of the connected daemon's plugin
+catalog, the same package catalog the dashboard's Plugins page shows. It lists
+installed packages and packages in the daemon's cached registry, one row per
+package, in the order the daemon returns them. A filled dot marks a package
+with an installed record and a hollow dot marks one that is only in the cached
+registry. The filters on the left show all packages, only installed ones, or
+only ones in the registry. When the daemon cannot read a catalog source, the
+pane shows that source's facts as unknown rather than absent: a package with no
+installed record gets a neutral `?` marker instead of the hollow dot, its
+detail says the source could not be read, the filter for that source shows
+`(?)` instead of a count, and the total reads as a lower bound, such as
+`All (3+)`.
+
+- **Installed and registry records stay separate.** When a package is
+  installed at one version and listed in the registry at another, its row
+  names both versions. Press `Enter` on a package to open its detail: the
+  installed record and the registry record each get their own section with
+  their own version, description, and capabilities, plus the requested
+  permissions of the installed record and the `name@version` identity of the
+  registry record. The two capability lists are never merged, and the pane
+  never says which version is newer.
+- **No runtime status.** Appearing in the catalog does not mean a plugin is
+  loaded, running, or healthy, and the pane never claims any of those.
+  `[plugins] enabled in config` reports the `plugins.enabled` setting, which
+  is configuration intent.
+- **Read-only.** The sub-tab never changes configuration and never installs,
+  removes, enables, or disables a package. Change `plugins.*` settings in the
+  `zeroclaw` sub-tab and manage packages with `zeroclaw plugin`.
+
+The sub-tab needs a daemon that serves the `plugins/list` RPC method and was
+built with WASM plugin support. A daemon without the method shows a message
+saying it does not provide the catalog. A daemon built without WASM plugin
+support shows that as its own state, not as an empty catalog. The connection
+also needs the `plugins:read` grant; when the daemon refuses the request, the
+pane shows the reason the daemon gave. When the daemon cannot read a catalog
+source (the installed plugin directory or the cached registry), the left
+column names the source and the details are in the daemon log.
+
+The catalog loads the first time you open the sub-tab. Press `r` to refresh
+it. The previous rows stay on screen, marked as refreshing, until the new
+result arrives; if the refresh fails, the error replaces them. Refreshing
+rereads what the daemon has on disk and does not download the registry:
+`zeroclaw plugin search` updates the cached registry.
+
 ## Local UI settings (`zerocode-config.toml`)
 
 Some settings describe how *zerocode itself* draws its panes rather than how the
