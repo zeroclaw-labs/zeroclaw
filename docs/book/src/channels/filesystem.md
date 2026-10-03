@@ -18,7 +18,24 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 ## Safety
 
-The broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` are rejected at config validation unless `allow_broad_roots` is set. Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
+The broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` are rejected at config validation unless `allow_broad_roots` is set. On macOS the same check also rejects:
+
+- `/Users` and each folder in it: every home directory (`/Users/<name>`) and `/Users/Shared`
+- `/Volumes` and each mounted volume in it (`/Volumes/<name>`), including the startup disk's entry, which links to `/`
+- `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`, the directories that `/etc`, `/tmp`, and `/var` link to
+
+On macOS, paths match case-insensitively, as a default macOS volume resolves them, and repeated or trailing `/` are ignored, so `/TMP` and `//Users` are rejected as well.
+
+On Windows the same check also rejects:
+
+- every drive root (`C:\`, `C:`), volume root, and network share root (`\\server\share`)
+- beneath a drive root: `Windows`, `Windows\Temp`, `Users`, each user profile in `Users` (`C:\Users\<name>`), `Program Files`, `Program Files (x86)`, and `ProgramData`
+
+Windows paths match case-insensitively with either separator and with or without trailing separators, and the `\\?\` and `\\.\` device spellings (`\\?\C:\`, `\\?\UNC\server\share`) match the drive or share they name. On every platform the check reads the path as written: it does not resolve `..` segments, links, or substituted drives.
+
+The check never reads `$HOME`, so its result does not depend on the account the daemon runs as. macOS and Windows reject every home directory by its location (`/Users/<name>`, `C:\Users\<name>`). Linux and other Unix systems accept a home directory such as `/home/<name>`, so point `paths` at the folder your SOPs need rather than a whole home directory.
+
+Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
 
 ## Troubleshooting
 
