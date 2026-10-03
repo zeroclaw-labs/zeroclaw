@@ -43,6 +43,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 
 ### Plugins, Skills, Configuration, and Tools
 
+- **Large web fetches spill to a workspace file** (#9824): `web_fetch` responses whose converted text exceeds 50 KB are written under `tmp/web_fetch/` in the agent workspace and the tool returns the path plus guidance to read or search it with the file tools, instead of hard-truncating and discarding the tail. Spilling only happens when the security policy permits the `file_write` tool, and otherwise falls back to the previous inline truncation. Writes are containment-checked to the workspace root; the existing size cap remains the absolute guard.
 - Require typed instance schemas for plugins that read configuration and add coherent channel-config services (#9126, #9129).
 - Add scoped tool-secret access, a shared plugin egress foundation, host-owned `wasi:http` policy, and logical channel instances (#9128, #9137, #9582, #10146).
 - Bound plugin export calls by wall-clock time and execute live-config plugin regressions in required CI (#9403, #10181).
