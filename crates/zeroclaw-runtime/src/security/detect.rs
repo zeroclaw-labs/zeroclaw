@@ -1,5 +1,6 @@
 //! Auto-detection of available security features
 
+use crate::security::policy::SandboxPolicy;
 use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -337,8 +338,23 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
     }
 }
 
+/// Create a sandbox based on auto-detection or explicit config.
+///
+/// Takes a [`SandboxConfig`] (synthesized from the active risk profile via
+/// `RiskProfileConfig::sandbox_config()`) and a resolved [`SandboxPolicy`]
+/// (from `SandboxPolicy::from_risk_profile`). When the caller has set
+/// `runtime.kind` to the native runtime, Docker must never be selected as the
+/// sandbox backend during auto-detection — the user explicitly opted out of
+/// container wrapping.
+///
+/// `policy` is accepted to establish a stable call-site contract but is not
+/// yet forwarded to individual backends; sandbox selection is currently driven
+/// solely by `SandboxConfig` and `runtime_kind`. It IS consulted for one
+/// thing: deciding whether to warn that `deny_write`/`deny_read` are
+/// unenforced (see `warn_if_denials_unenforced`).
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
+    policy: &SandboxPolicy,
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
@@ -347,12 +363,16 @@ pub fn create_sandbox(
 
     // If explicitly disabled, return noop
     if matches!(backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
+        warn_if_denials_unenforced(policy);
         return Arc::new(super::traits::NoopSandbox);
     }
 
     match backend {
         SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots, &sandbox.image)
+            let selected =
+                detect_best_sandbox(runtime_kind, workspace_dir, extra_roots, &sandbox.image);
+            warn_if_denials_unenforced(policy);
+            selected
         }
         requested => {
             let selected =
@@ -365,19 +385,61 @@ pub fn create_sandbox(
                         requested,
                     ));
                 }
+                warn_if_denials_unenforced(policy);
                 return Arc::new(super::traits::NoopSandbox);
             }
             if let Some(built) =
                 create_selected_sandbox(selected, workspace_dir, extra_roots, &sandbox.image)
             {
+                warn_if_denials_unenforced(policy);
                 return built;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
+            warn_if_denials_unenforced(policy);
             Arc::new(super::traits::NoopSandbox)
         }
     }
 }
 
+/// Whether `policy`'s `deny_write`/`deny_read` denials are NOT enforced by
+/// any active sandbox backend. Currently always `true`: RFC 6996 made the
+/// default write guardrails always-on, so every resolved policy carries
+/// denials — and `create_selected_sandbox` does not forward `policy` to any
+/// backend constructor (Landlock/Bubblewrap/Seatbelt/Docker/Firejail), so
+/// enforcement against arbitrary shell/script child-process I/O is
+/// application-layer-only (`SecurityPolicy`, `zeroclaw-config`) regardless of
+/// which backend is selected, until per-backend OS sandbox wiring lands (see
+/// the sandbox-policy RFC's Phase 2 rollout). Deliberately backend-name-agnostic
+/// — a backend that merely *activates* does not yet *enforce* these fields;
+/// once a backend PR wires `policy` through to its constructor, that backend
+/// should gain a real capability signal here, not before. Pure predicate,
+/// split out from [`warn_if_denials_unenforced`] so it is unit-testable
+/// without a logging harness.
+#[must_use]
+fn sandbox_denials_unenforced(policy: &SandboxPolicy) -> bool {
+    !policy.deny_write.is_empty() || !policy.deny_read.is_empty()
+}
+
+/// Emit a one-time-per-call WARN naming the enforcement gap when denials are
+/// configured but no active backend can enforce them against shell/script
+/// child-process I/O. See [`sandbox_denials_unenforced`].
+fn warn_if_denials_unenforced(policy: &SandboxPolicy) {
+    if sandbox_denials_unenforced(policy) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "sandbox_policy denials are enforced for file tools only; shell child processes \
+             are not confined (no OS sandbox backend forwards this policy yet)"
+        );
+    }
+}
+
+/// Auto-detect the best available sandbox.
+///
+/// When `runtime_kind` is the native runtime the caller has explicitly opted
+/// out of container wrapping, so Docker is excluded from consideration even
+/// if it is installed on the host.
 fn detect_best_sandbox(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
@@ -669,7 +731,12 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::policy::SandboxPolicy;
     use zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE;
+
+    fn default_policy() -> SandboxPolicy {
+        SandboxPolicy::default()
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -721,6 +788,7 @@ mod tests {
             };
             let sandbox = create_sandbox(
                 &config,
+                &default_policy(),
                 RuntimeKind::Native,
                 Some(fixture.path()),
                 &extra_roots,
@@ -738,6 +806,7 @@ mod tests {
             config.enabled = Some(false);
             let disabled = create_sandbox(
                 &config,
+                &default_policy(),
                 RuntimeKind::Native,
                 Some(fixture.path()),
                 &extra_roots,
@@ -762,6 +831,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &config,
+            &default_policy(),
             RuntimeKind::Native,
             Some(fixture.path()),
             &SandboxExtraRoots::default(),
@@ -798,6 +868,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
@@ -827,13 +898,14 @@ mod tests {
     #[test]
     fn auto_mode_detects_something() {
         let sandbox_cfg = SandboxConfig {
-            enabled: None, // Auto-detect
+            enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
             ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
@@ -883,6 +955,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
@@ -909,6 +982,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
@@ -969,6 +1043,7 @@ mod tests {
 
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Docker,
             None,
             &SandboxExtraRoots::default(),
@@ -1128,5 +1203,78 @@ mod tests {
                 name == "memory" && enabled == "1"
             });
         }
+    }
+
+    // ── sandbox_policy denial enforcement-gap WARN (Blocker 2c) ──────────
+    //
+    // Withhold-and-document scope decision: `deny_write`/`deny_read` are
+    // enforced today for file tools only (`SecurityPolicy` in
+    // `zeroclaw-config`), never for arbitrary shell/script child-process I/O,
+    // until per-backend OS sandbox wiring lands (RFC 6996 Phase 2, one PR
+    // per backend — Bubblewrap/Landlock/Seatbelt). `sandbox_denials_unenforced`
+    // is the pure predicate `warn_if_denials_unenforced` gates on; there is no
+    // log-capture harness in this crate, so these tests exercise the
+    // predicate directly rather than asserting on emitted log records — the
+    // predicate IS the enforcement-owner contract this WARN exists to name.
+
+    #[test]
+    fn sandbox_denials_unenforced_when_deny_write_configured() {
+        let policy = default_policy();
+        assert!(
+            !policy.deny_write.is_empty(),
+            "default profile carries the mandatory deny_write guardrail list"
+        );
+        assert!(sandbox_denials_unenforced(&policy));
+    }
+
+    #[test]
+    fn sandbox_denials_unenforced_when_deny_read_configured() {
+        let mut policy = default_policy();
+        policy.deny_write = Vec::new();
+        policy.deny_read = vec![std::path::PathBuf::from("/secret")];
+        assert!(sandbox_denials_unenforced(&policy));
+    }
+
+    #[test]
+    fn sandbox_denials_unenforced_true_regardless_of_backend_name() {
+        // No backend constructor receives `policy` today (`create_selected_sandbox`
+        // takes only workspace_dir: landlock/bubblewrap/sandbox-exec/docker/
+        // firejail all wire the same as "none" here), so the predicate takes
+        // no backend argument at all — an active-looking backend must not
+        // suppress the warning. A prior revision of this test asserted the
+        // opposite and was itself the bug: it treated backend presence as
+        // proof of enforcement.
+        let policy = default_policy();
+        assert!(!policy.deny_write.is_empty());
+        assert!(sandbox_denials_unenforced(&policy));
+    }
+
+    #[test]
+    fn sandbox_denials_unenforced_false_when_no_denials_configured() {
+        let mut policy = default_policy();
+        policy.deny_write = Vec::new();
+        policy.deny_read = Vec::new();
+        assert!(!sandbox_denials_unenforced(&policy));
+    }
+
+    #[test]
+    fn create_sandbox_with_denials_and_explicit_none_backend_does_not_panic() {
+        // Exercises the actual create_sandbox call site (not just the
+        // predicate) to confirm the WARN wiring compiles and runs without
+        // requiring the discarded `_policy` binding removed in this change.
+        let sandbox_cfg = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            &default_policy(),
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+        assert_eq!(sandbox.name(), "none");
     }
 }

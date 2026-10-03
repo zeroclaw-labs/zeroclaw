@@ -43,10 +43,60 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: absolute component-prefix rules from
-  `[risk_profiles.<alias>].forbidden_paths`. Competing allow and deny prefixes
-  use most-specific-match precedence, with deny winning ties; see
-  [Autonomy path rules](./autonomy.md#path-rules).
+- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`, or the newer `sandbox_policy` table below, enforced today at the application layer only (see the [enforcement matrix](#enforcement-matrix-what-actually-enforces-each-field-today) below); no OS sandbox backend consumes these fields yet. Competing allow and deny prefixes use most-specific-match precedence, with deny winning ties; see [Autonomy path rules](./autonomy.md#path-rules).
+
+## Sandbox policy (`sandbox_policy`)
+
+`[risk_profiles.<alias>.sandbox_policy]` is the canonical model for filesystem restrictions, layered on top of the legacy `workspace_only`/`forbidden_paths`/`allowed_roots` fields on the same risk profile:
+
+```toml
+[risk_profiles.<alias>.sandbox_policy]
+# Read: deny-then-allow (default allow everywhere)
+deny_read  = ["~/.ssh", "~/.gnupg", "~/.aws"]
+allow_read = []               # re-allows within denied regions; a more specific allow wins, deny wins ties
+
+# Write: allow-only (default deny everywhere)
+allow_write = [".", "/tmp"]
+deny_write  = [".env"]        # exceptions within allowed; takes precedence over allow_write
+
+# Per-entry exceptions to the mandatory deny-write guardrail list below.
+# Re-permits ONLY the named file or subtree; siblings stay denied; operator
+# deny_write entries are never relaxable. A non-empty list emits a WARN.
+guardrail_exceptions = []
+```
+
+**No network fields.** Per [RFC #6996](https://github.com/zeroclaw-labs/zeroclaw/issues/6996), `sandbox_policy` is the *filesystem* policy slice. Network-shaped keys (`allowed_domains`, `denied_domains`, `allow_unix_sockets`, raw `bubblewrap_args` escape hatches) are **rejected at parse time** with an unknown-field error rather than accepted and silently ignored; a schema field with no enforcement behind it is worse than no field at all. They return only alongside the separately reviewed network-policy RFC and its enforcing consumer. Unknown keys anywhere in this table fail parsing, so typos cannot silently drop a restriction either.
+
+**Precedence**: `allow_read` overrides `deny_read` for a **more specific allowed path** (deny wins whenever the matching deny entry is at least as specific as the allow); `deny_write` overrides `allow_write` flatly, with no more-specific-allow exception.
+
+**Built-in default roots lose a tie, operator entries do not.** The default safety list and the default write roots both name `/tmp`, so an `allow_write` entry spelled identically to a *default* forbidden root wins at equal specificity; otherwise an explicit `allow_write = ["/tmp"]` would be silently nullified by a default it was written to override. A default root that is *strictly* more specific than the grant still denies (`/etc` stays protected under a broad grant), and an **operator-authored** denial always wins a tie. On the read side, provenance decides whether a `/tmp`-shaped deny entry is a default at all: the default safety list ships through the **legacy `forbidden_paths` fallback** (the `RiskProfileConfig` defaults and presets populate it), so a workspace rooted at exactly `/tmp` stays readable under it; an explicit `sandbox_policy.deny_read` is operator-authored in **any spelling, including one identical to a default entry**, and blanks the workspace grant.
+
+**Field presence matters.** Each of `deny_read`/`allow_read`/`allow_write`/`deny_write` is presence-preserving: omitting a field falls back to the corresponding legacy field (`forbidden_paths` maps to `deny_read`, `allowed_roots` maps to `allow_read`/`allow_write`); an explicit value, even an empty list, or one shaped like the schema default (`allow_write = [".", "/tmp"]`), always wins outright and is never merged with the legacy fallback. `workspace_only = true` scopes only the *implicit* workspace grant; an explicit `allow_write` (including an explicit `[]`) is authoritative regardless of `workspace_only`; name `"."` in the list to keep the workspace writable. At `Full` autonomy `workspace_only` is always treated as `false`, and the per-agent `workspace.unrestricted_filesystem` flag composes the same way: both lift only the implicit workspace scoping and never bypass a canonical `deny_read`/`deny_write`/`allow_read`/`allow_write`.
+
+**Mandatory deny-write guardrail.** Regardless of `allow_write`, a default list of paths is always blocked for writes; there is deliberately **no switch that disables the whole list** (rejected by [RFC #6996](https://github.com/zeroclaw-labs/zeroclaw/issues/6996): it would force an operator to drop every unrelated default protection to permit one legitimate write). The list covers: shell configs (`.bashrc`, `.zshrc`, `.profile`, etc.), git control surfaces (`.git/hooks/`, `.git/config`, `.gitconfig`, `.gitmodules`), secrets/agent-control surfaces (`.env`, `.mcp.json`, `.claude/agents/`), editor project-control dirs (`.vscode/`, `.idea/`), and ZeroClaw's own control surfaces (`config.toml`, `.secret_key`, `auth-profiles.json`, `IDENTITY.md`, `SOUL.md`, `shared/skills/`).
+
+Guardrail scope and matching are pinned so two implementations cannot diverge: entries apply under the workspace **and every other writable root** the resolved policy grants; and **everywhere** when write access is unrestricted. Matching is a path-suffix match on resolved components: a bare entry (`.bashrc`) matches that file name at any depth under a covered root; a directory entry (trailing `/`, e.g. `.git/hooks/`, `.vscode/`) covers the directory and all its descendants (a nested repo's own `.git/hooks/` is covered identically); a `~/`-prefixed entry expands through home-relative resolution; a `path/segment` entry matches only that relative suffix. No glob syntax in this slice.
+
+Relaxation is **per-entry** via `guardrail_exceptions`: an exception uses the same matching rules and re-permits only the named file or subtree (`[".vscode/settings.json"]` leaves the rest of `.vscode/` denied). Operator-supplied `deny_write` entries are absolute and exception-proof. Exceptions never weaken `deny_read`, and any non-empty exception list emits a visible WARN. Because these defaults can block writes that previously succeeded, this is a documented compatibility change; the rollback for a blocked legitimate write is to add that specific path to `guardrail_exceptions`, never to drop the list.
+
+Two stores a tool manages end to end are checked against the operator's `deny_write` only, not the built-in guardrails: Git's own metadata during an authorized `git_operations` write, and archive copies that `backup` writes or rotates under its `backups/` directory (an archived `config.toml` is a copy, not the install config). Operator `deny_write` entries still apply to both. Restoring a backup into the workspace, and every file tool, keep the full guardrails.
+
+**No config keys are removed.** `forbidden_paths`/`allowed_roots` remain valid indefinitely as compatibility aliases; no action is required for existing configs that never touch `sandbox_policy`.
+
+**Legacy `allowed_roots` under unrestricted write is a compatibility change.** Historically, `allowed_roots` on a `workspace_only = false` (or `Full` autonomy) profile was additive-only: it broadened the write surface but never restricted writes elsewhere. The canonical resolver now enforces it as a real write allowlist; the effective writable set is the workspace, `/tmp`, and the listed roots; everything else is denied at the application layer. Only a **non-empty** legacy list derives an allowlist: an omitted or empty `allowed_roots` reads as absent and leaves writes unrestricted (mod `deny_write` and the guardrails). The first start after upgrade warns once, naming the affected profile; to restore the old write surface, remove `allowed_roots` or set an explicit `sandbox_policy.allow_write`. Under `workspace_only = true` with `allow_write` omitted, legacy `allowed_roots` keep their historical meaning: each listed root stays readable and writable alongside the workspace.
+
+**Delegation narrowing.** Subagent and bounded-delegation child policies are checked over each side's **effective** read/write capability sets (the fully resolved sets, including implicit workspace access, default fallback roots, and cross-agent grants), never compared as raw operator lists. A child cannot drop a parent denial, broaden a parent grant, or carry a `guardrail_exceptions` entry the parent does not share. Independent delegation is unaffected: the target runs under its own configured policy with no caller-imposed filesystem ceiling.
+
+### Enforcement matrix: what actually enforces each field, today
+
+This is the part operators most often get wrong: setting a `sandbox_policy` field does not by itself mean an OS-level sandbox is confining that access.
+
+| Field | Enforced by | NOT enforced against |
+|---|---|---|
+| `deny_read` / `allow_read` / `allow_write` / `deny_write` / `guardrail_exceptions` | Application-layer path guard (`SecurityPolicy`), regardless of which OS sandbox backend (if any) is active. The exact covered tools and operations: **reads**: `file_read`, `deliver_file`, `image_info` (registered behind `PathGuardedTool`), `glob_search` and `content_search` (per-target canonical checks at the search root and on every result file); **writes**: `file_write`, `file_edit` (exact-target check before any partial mutation), `file_upload`, `file_upload_bundle`, `file_download` (canonical checks at their own operation boundary); **repository operations**: `git_operations`, registered directly and applying the policy at its own operation boundary. It binds repository discovery to the approved roots and checks the repository's own Git metadata (the `.git` directory, linked-worktree and module Git directories) against the operator's `deny_write` before any write-classified command; Git maintaining its own index, refs, and objects is not blocked by the built-in guardrails, which still stop a tool from writing `.git/config` or `.git/hooks/` directly. It then lists the working-tree files each operation would read (`diff`, `add`) or create, replace, or delete (`checkout`, `stash` push/pop, `worktree` add/remove) and refuses the whole operation if any is denied or if the affected set cannot be listed exactly. For `stash`, that set covers both halves of an entry: `push` counts the tracked modifications it reverts plus, with `-u`, the untracked files it removes, and `pop` counts the tracked files it restores plus any untracked files the entry was created with. `worktree prune` only deletes stale administrative directories under the common Git directory, which the metadata check already covers. `commit` records already-staged content, and `log`/`branch`/`status` report metadata, so neither reaches file contents. Future file-admission surfaces (the #9488 unified file/attachment architecture's Select named roots, #10526 file resolution) must consume this same resolver's `allow_read`/`deny_read`; no second admission path | Arbitrary shell/script child-process I/O. A permitted `shell`/`python`/`node` invocation is not confined by these lists on any backend today. The same holds for helper programs Git runs itself: read-classified `git_operations` commands disable configured filter drivers, `core.fsmonitor`, external diff and textconv, signature display, and mailmap, while write-classified commands keep Git's normal behavior (repository hooks, filter drivers, and other configured helpers can run) and go through the runtime sandbox adapter, which rejects them under the Docker runtime. Whatever confinement that adapter applies comes from the selected backend's own baseline, not from these lists, and a no-op backend confines nothing. No OS sandbox backend (Landlock, Bubblewrap, Seatbelt, Docker, Firejail) receives the resolved policy yet; that is follow-up work per [RFC #6996](https://github.com/zeroclaw-labs/zeroclaw/issues/6996) Phase 2, one PR per backend |
+| `allowed_domains` / `denied_domains` / `allow_unix_sockets` / `bubblewrap_args` | **Removed from the schema** (RFC #6996): parse fails with an unknown-field error instead of accepting an inert key. Network confinement is a separate, future RFC. | n/a |
+
+The runtime logs a WARN, `sandbox_policy denials are enforced for file tools only; shell child processes are not confined`, whenever a sandbox is created, independent of which backend is selected, precisely because no backend forwards the policy yet; and because the default write guardrails are always on, every profile carries denials. Effective two-layer posture reporting (canonical-policy application-layer enforcement vs backend baseline OS confinement, reported separately per backend and never collapsed) is owned by [#6971](https://github.com/zeroclaw-labs/zeroclaw/issues/6971); until that surface lands, this WARN is the truthful signal, and selecting a backend name does not suppress it.
 
 ### Network
 
@@ -113,7 +163,7 @@ The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires 
 Limitations:
 
 - No network confinement: Landlock only controls filesystem access.
-- `forbidden_paths` is enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this).
+- `forbidden_paths`/`sandbox_policy` denials are not forwarded to Landlock yet (see the enforcement matrix above). Landlock's own kernel-enforced filesystem confinement is a fixed allowlist independent of those fields: workspace read/write, `/tmp` read/write, `/usr` and `/bin` read-only. Everything else is denied by the kernel regardless of `forbidden_paths`/`sandbox_policy` config.
 
 ### Bubblewrap (`bwrap`)
 
