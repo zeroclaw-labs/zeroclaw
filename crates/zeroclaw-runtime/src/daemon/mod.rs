@@ -958,6 +958,7 @@ pub async fn run_with_authority(
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
+    let plugin_webhooks = registry.take_plugin_webhooks();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -1125,6 +1126,7 @@ pub async fn run_with_authority(
             sop_engine,
             sop_audit,
             sop_driver_handles,
+            plugin_webhooks,
             hooks,
             cert_audit,
             auth: rpc_auth,
@@ -4598,6 +4600,53 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             1,
             "an unbindable path must fail closed instead of being retried"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_hands_the_registered_plugin_webhook_ingress_to_the_rpc_context() {
+        use std::io;
+        use std::sync::Arc;
+
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let ingress = Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+            300, 16,
+        ));
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<bool>();
+
+        let mut registry = DaemonRegistry::new();
+        registry.set_plugin_webhooks(Arc::clone(&ingress));
+        let expected = Arc::clone(&ingress);
+        registry.register_socket(Box::new(move |ctx, _cancel, _client_count, _readiness| {
+            let _ = seen_tx.send(
+                ctx.plugin_webhooks
+                    .as_ref()
+                    .is_some_and(|handed| Arc::ptr_eq(handed, &expected)),
+            );
+            // Stop the daemon at its first bind so the test ends.
+            Box::pin(async {
+                Err(anyhow::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test socket refuses to bind",
+                )))
+            })
+        }));
+
+        let result = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon must stop at the refused socket bind");
+        assert!(result.is_err(), "the refused bind ends the daemon run");
+        assert!(
+            seen_rx
+                .try_recv()
+                .expect("the socket starter received the RPC context"),
+            "the RPC context must carry the exact ingress registered for this generation"
         );
     }
 

@@ -137,6 +137,7 @@ pub struct DaemonRegistry {
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     sop_driver_handles: Option<crate::sop::SopDriverHandles>,
+    plugin_webhooks: Option<Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>>,
 }
 
 /// The SOP wiring one daemon generation hands from `main` into the RPC
@@ -284,6 +285,22 @@ impl DaemonRegistry {
             self.sop_driver_handles.take(),
         )
     }
+
+    /// Set this daemon iteration's plugin webhook ingress: the instance the
+    /// gateway and channel starters were given, placed in the RPC context too.
+    pub fn set_plugin_webhooks(
+        &mut self,
+        ingress: Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>,
+    ) -> &mut Self {
+        self.plugin_webhooks = Some(ingress);
+        self
+    }
+
+    pub(crate) fn take_plugin_webhooks(
+        &mut self,
+    ) -> Option<Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>> {
+        self.plugin_webhooks.take()
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +421,21 @@ mod tests {
             None,
         ));
         std::mem::drop(channels(authority, CancellationToken::new()));
+    }
+
+    #[test]
+    fn plugin_webhook_ingress_is_taken_once() {
+        let mut registry = DaemonRegistry::new();
+        assert!(registry.take_plugin_webhooks().is_none());
+
+        let ingress = Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+            300, 16,
+        ));
+        registry.set_plugin_webhooks(Arc::clone(&ingress));
+        let taken = registry
+            .take_plugin_webhooks()
+            .expect("the registered ingress is handed over");
+        assert!(Arc::ptr_eq(&taken, &ingress));
+        assert!(registry.take_plugin_webhooks().is_none());
     }
 }

@@ -10,6 +10,14 @@ const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::f
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Most `plugin-webhook/dispatch` requests one connection may hold, counted
+/// until each response is written; past this a dispatch answers `queue_full`
+/// without reaching the ingress.
+const MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION: usize = 1024;
+/// Longest `body_b64` that can decode to an admissible body. Checked before
+/// decoding so an oversized payload is refused without allocating it.
+const MAX_PLUGIN_WEBHOOK_BODY_B64_BYTES: usize =
+    zeroclaw_api::webhook::MAX_PLUGIN_WEBHOOK_BODY_BYTES.div_ceil(3) * 4;
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -31,10 +39,14 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
+use zeroclaw_api::webhook::{PluginWebhookOutcome, PluginWebhookRequest};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +61,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +97,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +112,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -465,6 +201,14 @@ impl Method {
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
+            // Plugin webhook ingress. Dispatch and cancel act only on this
+            // connection's own dispatches; routes lists route owners. The
+            // handlers also refuse every transport but local IPC.
+            M::PluginWebhookDispatch | M::PluginWebhookCancel => {
+                (Resource::Channels, Verb::Execute)
+            }
+            M::PluginWebhookRoutes => (Resource::Channels, Verb::Read),
+
             M::FileAttach | M::FileUploadBegin | M::FileUploadChunk | M::FileUploadCommit => {
                 (Resource::Files, Verb::Create)
             }
@@ -499,7 +243,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -1071,6 +815,33 @@ pub struct RpcDispatcher {
     /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
     /// resolves from the registry.
     peer_cert_fingerprint: Option<String>,
+    /// Tracked `plugin-webhook/dispatch` tasks: joined by [`Self::shutdown`]
+    /// and aborted on drop, like `prompt_tasks`.
+    plugin_webhook_tasks: Vec<JoinHandle<()>>,
+    /// In-flight plugin webhook dispatches on this connection, by
+    /// `request_id`. Shared with every [`Self::spawn_handle`] clone. Each
+    /// token is a child of `connection_cancel`; only the dispatch that
+    /// inserted an entry removes it.
+    plugin_webhook_inflight:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    /// Admission for `plugin-webhook/dispatch` on this connection. The read
+    /// loop takes a permit and the dispatch task holds it until its response
+    /// is written, so a caller that stops reading responses runs out of
+    /// permits instead of piling up blocked tasks.
+    plugin_webhook_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Removes one in-flight plugin webhook dispatch from its connection's map
+/// when the dispatch finishes, is aborted, or unwinds.
+struct PluginWebhookInflightEntry {
+    inflight: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    request_id: String,
+}
+
+impl Drop for PluginWebhookInflightEntry {
+    fn drop(&mut self) {
+        self.inflight.lock().remove(&self.request_id);
+    }
 }
 
 /// Read an allowlisted personality file through a handle on `workspace`, with
@@ -1201,6 +972,11 @@ impl RpcDispatcher {
             uploads: std::sync::Mutex::default(),
             initialize_deadline: None,
             peer_cert_fingerprint: None,
+            plugin_webhook_tasks: Vec::new(),
+            plugin_webhook_inflight: Arc::default(),
+            plugin_webhook_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION,
+            )),
         }
     }
 
@@ -2994,26 +2770,25 @@ impl RpcDispatcher {
             // Prompt handles do not read frames.
             initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+            plugin_webhook_tasks: Vec::new(),
+            plugin_webhook_inflight: Arc::clone(&self.plugin_webhook_inflight),
+            plugin_webhook_permits: Arc::clone(&self.plugin_webhook_permits),
         }
     }
 
-    /// Cancel and join every prompt accepted by this connection generation.
-    /// The queue guard held by an in-flight turn is released only after its
-    /// provider/tool future has observed cancellation and returned, so a
-    /// replacement connection cannot race invisible old-generation work.
+    /// Cancel and join every prompt and plugin webhook dispatch accepted by
+    /// this connection generation. The queue guard held by an in-flight turn
+    /// is released only after its provider/tool future has observed
+    /// cancellation and returned, so a replacement connection cannot race
+    /// invisible old-generation work.
     pub(crate) async fn shutdown(&mut self) {
         self.connection_cancel.cancel();
-        // Join each handle where it is stored, and remove it only once its
-        // join has returned. Moving handles out first would detach whichever
-        // prompt is being awaited if this future is itself dropped: the
-        // listener force-aborts a connection that outlives its drain deadline,
-        // and `Drop` below can only abort the handles it still holds.
-        while !self.prompt_tasks.is_empty() {
-            if let Some(task) = self.prompt_tasks.last_mut() {
-                Self::log_prompt_task_failure(task.await);
-            }
-            self.prompt_tasks.pop();
-        }
+        join_in_place(&mut self.prompt_tasks, Self::log_prompt_task_failure).await;
+        join_in_place(
+            &mut self.plugin_webhook_tasks,
+            Self::log_plugin_webhook_task_failure,
+        )
+        .await;
     }
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
@@ -3215,6 +2990,23 @@ impl RpcDispatcher {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!("RPC session/prompt task failed: {error}")
+            );
+        }
+    }
+
+    /// A dispatch task that failed left its caller without a response, so
+    /// leave a record of it.
+    fn log_plugin_webhook_task_failure(result: Result<(), tokio::task::JoinError>) {
+        if let Err(error) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "method": Method::PluginWebhookDispatch.wire_name(),
+                        "error_key": "plugin_webhook_dispatch_task_failed",
+                    })),
+                &format!("RPC plugin-webhook/dispatch task failed: {error}")
             );
         }
     }
@@ -3522,6 +3314,16 @@ impl RpcDispatcher {
 
             // TUI
             Method::TuiList => self.handle_tui_list(),
+
+            // Plugin webhooks
+            Method::PluginWebhookDispatch => {
+                match self.start_plugin_webhook_dispatch(params, &req_id, is_notification) {
+                    Some(result) => result,
+                    None => return,
+                }
+            }
+            Method::PluginWebhookCancel => self.handle_plugin_webhook_cancel(params),
+            Method::PluginWebhookRoutes => self.handle_plugin_webhook_routes(),
 
             // Files
             Method::FileAttach => self.handle_file_attach(params).await,
@@ -4003,6 +3805,228 @@ impl RpcDispatcher {
                     connected_at_unix: e.connected_at.timestamp(),
                     peer_label: e.peer_label,
                     transport: e.transport,
+                })
+                .collect(),
+        })
+    }
+
+    // ── Plugin webhook handlers ──────────────────────────────────
+
+    /// Plugin webhook methods carry public ingress traffic into the daemon,
+    /// so only local IPC peers may call them, whatever their grants.
+    fn require_local_ipc(&self, method: Method) -> Result<(), JsonRpcError> {
+        use crate::rpc::transport::TransportKind;
+        match self.transport_kind {
+            TransportKind::Local => Ok(()),
+            TransportKind::Wss => {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(
+                    crate::i18n::get_required_cli_string_with_args(
+                        "rpc-plugin-webhook-local-ipc-only",
+                        &[("method", method.wire_name())],
+                    ),
+                );
+                self.audit_auth_denial(method, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+        }
+    }
+
+    /// Take up `plugin-webhook/dispatch` on the read loop. `Some` is answered
+    /// here: a refusal, invalid params, or an outcome decided before
+    /// admission. `None` means a tracked task owns the response or, for a
+    /// notification, nothing is sent.
+    fn start_plugin_webhook_dispatch(
+        &mut self,
+        params: &Value,
+        id: &Value,
+        is_notification: bool,
+    ) -> Option<RpcResult> {
+        if let Err(denied) = self.require_local_ipc(Method::PluginWebhookDispatch) {
+            return Some(Err(denied));
+        }
+        if is_notification {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "method": Method::PluginWebhookDispatch.wire_name(),
+                        "error_key": "plugin_webhook_dispatch_notification",
+                    })),
+                "Dropped a plugin webhook dispatch sent without a request id"
+            );
+            return None;
+        }
+        let (request_id, request) = match plugin_webhook_request_from_params(params) {
+            Ok(parsed) => parsed,
+            Err(error) => return Some(Err(error)),
+        };
+        let Some(ingress) = self.ctx.plugin_webhooks.clone() else {
+            return Some(to_result(PluginWebhookDispatchResult::from(
+                PluginWebhookOutcome::Unavailable,
+            )));
+        };
+        let cancel = self.connection_cancel.child_token();
+        let permit = {
+            let mut inflight = self.plugin_webhook_inflight.lock();
+            if inflight.contains_key(&request_id) {
+                return Some(Err(rpc_err(
+                    INVALID_PARAMS,
+                    "request_id is already in flight on this connection",
+                )));
+            }
+            let Ok(permit) = Arc::clone(&self.plugin_webhook_permits).try_acquire_owned() else {
+                return Some(to_result(PluginWebhookDispatchResult::from(
+                    PluginWebhookOutcome::QueueFull,
+                )));
+            };
+            inflight.insert(request_id.clone(), cancel.clone());
+            permit
+        };
+        let entry = PluginWebhookInflightEntry {
+            inflight: Arc::clone(&self.plugin_webhook_inflight),
+            request_id,
+        };
+        let handle = self.spawn_handle();
+        let id = id.clone();
+        self.plugin_webhook_tasks.retain(|task| !task.is_finished());
+        let task = zeroclaw_spawn::spawn!(async move {
+            let decided = ingress
+                .dispatch_admitted(request, &cancel, |owner| handle.admit_plugin_webhook(owner))
+                .await;
+            // Release the id before answering: the caller may reuse it as soon
+            // as it has read this response.
+            drop(entry);
+            let connection = handle.connection_cancel.clone();
+            let respond = async {
+                match decided
+                    .and_then(|outcome| to_result(PluginWebhookDispatchResult::from(outcome)))
+                {
+                    Ok(result) => handle.send_result(id, result).await,
+                    Err(error) => handle.send_error(id, error.code, &error.message).await,
+                }
+            };
+            // A closing connection gets no answer, so `shutdown` never waits
+            // on a writer queue that nobody drains.
+            tokio::select! {
+                biased;
+                () = connection.cancelled() => {}
+                () = respond => {}
+            }
+            drop(permit);
+        });
+        self.plugin_webhook_tasks.push(task);
+        None
+    }
+
+    /// Cancel one of this connection's in-flight dispatches. The entry stays
+    /// in the map until its own dispatch finishes, so the id cannot be
+    /// admitted again while the cancelled dispatch is still unwinding.
+    fn handle_plugin_webhook_cancel(&self, params: &Value) -> RpcResult {
+        self.require_local_ipc(Method::PluginWebhookCancel)?;
+        let p: PluginWebhookCancelParams = parse_params(params)?;
+        require_plugin_webhook_request_id(&p.request_id)?;
+        let token = self
+            .plugin_webhook_inflight
+            .lock()
+            .get(&p.request_id)
+            .cloned();
+        if let Some(token) = &token {
+            token.cancel();
+        }
+        to_result(PluginWebhookCancelResult {
+            cancelled: token.is_some(),
+        })
+    }
+
+    /// Decide, on the owner the ingress is about to queue to, whether this
+    /// connection may deliver there. The caller's channel selector must name
+    /// the owning channel instance, and neither that instance nor an agent
+    /// that handles it may refuse injected webhooks
+    /// (`accept_injected_webhooks = false`), whatever the caller's grants. A
+    /// refusal is audited and answered FORBIDDEN.
+    fn admit_plugin_webhook(
+        &self,
+        owner: &zeroclaw_api::webhook::PluginWebhookOwner,
+    ) -> Result<(), JsonRpcError> {
+        let channel = plugin_webhook_channel(owner);
+        let refusal = if self
+            .auth
+            .as_ref()
+            .is_some_and(|auth| !auth.grants.may_use_channel(&channel))
+        {
+            Some(crate::i18n::get_required_cli_string_with_args(
+                "rpc-plugin-webhook-channel-not-granted",
+                &[("channel", &channel)],
+            ))
+        } else {
+            let config = self.ctx.config.read();
+            if config
+                .channels
+                .plugin
+                .get(owner.channel_alias())
+                .is_some_and(|instance| !instance.accept_injected_webhooks)
+            {
+                Some(crate::i18n::get_required_cli_string_with_args(
+                    "rpc-plugin-webhook-channel-refuses",
+                    &[("channel", &channel)],
+                ))
+            } else {
+                config
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| {
+                        !agent.accept_injected_webhooks
+                            && agent
+                                .channels
+                                .iter()
+                                .any(|handled| handled.trim() == channel)
+                    })
+                    .map(|(alias, _)| alias)
+                    .min()
+                    .map(|agent| {
+                        crate::i18n::get_required_cli_string_with_args(
+                            "rpc-plugin-webhook-agent-refuses",
+                            &[("agent", agent), ("channel", &channel)],
+                        )
+                    })
+            }
+        };
+        match refusal {
+            None => Ok(()),
+            Some(message) => {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(message);
+                self.audit_auth_denial(Method::PluginWebhookDispatch, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+        }
+    }
+
+    fn handle_plugin_webhook_routes(&self) -> RpcResult {
+        self.require_local_ipc(Method::PluginWebhookRoutes)?;
+        let Some(ingress) = self.ctx.plugin_webhooks.as_ref() else {
+            return to_result(PluginWebhookRoutesResult {
+                generation: 0,
+                routes: Vec::new(),
+            });
+        };
+        let listed = ingress.routes();
+        // A caller sees only the routes of channel instances it may reach.
+        let granted = |owner: &zeroclaw_api::webhook::PluginWebhookOwner| {
+            self.auth
+                .as_ref()
+                .is_none_or(|auth| auth.grants.may_use_channel(&plugin_webhook_channel(owner)))
+        };
+        to_result(PluginWebhookRoutesResult {
+            generation: listed.generation(),
+            routes: listed
+                .routes()
+                .iter()
+                .filter(|(_, owner)| granted(owner))
+                .map(|(path, owner)| PluginWebhookRouteInfo {
+                    path: path.clone(),
+                    plugin: owner.plugin().to_owned(),
+                    channel_alias: owner.channel_alias().to_owned(),
                 })
                 .collect(),
         })
@@ -11927,6 +11951,21 @@ fn response_id_key(id: &Value) -> Option<String> {
     }
 }
 
+/// Join each handle where it is stored, and remove it only once its join has
+/// returned. Moving handles out first would detach whichever task is being
+/// awaited if the joining future is itself dropped: the listener force-aborts
+/// a connection that outlives its drain deadline, and `Drop` for
+/// [`RpcDispatcher`] can only abort the handles it still holds.
+async fn join_in_place(
+    tasks: &mut Vec<JoinHandle<()>>,
+    on_join: impl Fn(Result<(), tokio::task::JoinError>),
+) {
+    while let Some(task) = tasks.last_mut() {
+        on_join(task.await);
+        tasks.pop();
+    }
+}
+
 impl Drop for RpcDispatcher {
     fn drop(&mut self) {
         // Only the connection owner ends the generation. A prompt handle shares
@@ -11936,7 +11975,7 @@ impl Drop for RpcDispatcher {
             return;
         }
         self.connection_cancel.cancel();
-        for task in &self.prompt_tasks {
+        for task in self.prompt_tasks.iter().chain(&self.plugin_webhook_tasks) {
             task.abort();
         }
     }
@@ -12141,6 +12180,58 @@ fn still_authorized(
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+}
+
+/// The channel instance a plugin webhook route belongs to, in the
+/// `<type>.<alias>` form that channel selectors and agent `channels` use.
+fn plugin_webhook_channel(owner: &zeroclaw_api::webhook::PluginWebhookOwner) -> String {
+    format!("plugin.{}", owner.channel_alias())
+}
+
+fn require_plugin_webhook_request_id(request_id: &str) -> Result<(), JsonRpcError> {
+    if is_valid_plugin_webhook_request_id(request_id) {
+        Ok(())
+    } else {
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!(
+                "request_id must be 1 to {MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES} bytes of printable \
+                 ASCII without spaces"
+            ),
+        ))
+    }
+}
+
+/// The ingress request a `plugin-webhook/dispatch` carries, and its
+/// `request_id`. A bound or encoding refusal names the rule, never the value.
+fn plugin_webhook_request_from_params(
+    params: &Value,
+) -> Result<(String, PluginWebhookRequest), JsonRpcError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let p: PluginWebhookDispatchParams = parse_params(params)?;
+    require_plugin_webhook_request_id(&p.request_id)?;
+    if p.body_b64.len() > MAX_PLUGIN_WEBHOOK_BODY_B64_BYTES {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            "body_b64 exceeds the plugin webhook body limit",
+        ));
+    }
+    let body = STANDARD
+        .decode(&p.body_b64)
+        .map_err(|_| rpc_err(INVALID_PARAMS, "body_b64 is not standard base64"))?;
+    let headers = p
+        .headers
+        .into_iter()
+        .map(|header| (header.name, header.value))
+        .collect();
+    let request =
+        PluginWebhookRequest::new(p.path, &p.method, p.query, headers, body).map_err(|error| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("invalid plugin webhook request: {error}"),
+            )
+        })?;
+    Ok((p.request_id, request))
 }
 
 fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<(), JsonRpcError> {
@@ -13961,6 +14052,1655 @@ mod tests {
             },
         );
         config
+    }
+
+    /// `plugin-webhook/*` through the real dispatcher, against a real core
+    /// ingress whose routes are served by scripted workers.
+    mod plugin_webhook {
+        use super::*;
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use std::collections::HashMap;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use zeroclaw_api::webhook::{
+            MAX_PLUGIN_WEBHOOK_BODY_BYTES, MAX_PLUGIN_WEBHOOK_HEADER_BYTES,
+            MAX_PLUGIN_WEBHOOK_HEADERS, MAX_PLUGIN_WEBHOOK_QUERY_BYTES,
+            MAX_WEBHOOK_RESPONSE_BODY_BYTES, PLUGIN_WEBHOOK_DEADLINE, PLUGIN_WEBHOOK_QUEUE_DEPTH,
+            PluginWebhookOwner, PluginWebhookRegistryLease, PluginWebhookRoute, RawWebhook,
+            WebhookOutcome, WebhookReject,
+        };
+        use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
+
+        const DISPATCH: &str = "plugin-webhook/dispatch";
+        const CANCEL: &str = "plugin-webhook/cancel";
+        const ROUTES: &str = "plugin-webhook/routes";
+
+        /// How a scripted route worker treats the requests it is sent.
+        #[derive(Clone)]
+        enum Worker {
+            /// Answer every request with this outcome.
+            Answer(Result<WebhookOutcome, WebhookReject>),
+            /// Drop each request's reply sender without answering.
+            DropReply,
+            /// Hold each request until its cancellation fires, then report it
+            /// and answer `Timeout`, as the plugin worker does.
+            Park,
+            /// Keep the queue open and never read it.
+            Unread,
+            /// Close the queue before any request arrives.
+            Closed,
+        }
+
+        /// What a worker received for one request.
+        #[derive(Debug, PartialEq)]
+        struct Seen {
+            path: String,
+            method: String,
+            query: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        /// One published route generation and what its workers observed.
+        struct Routes {
+            _lease: PluginWebhookRegistryLease,
+            seen: mpsc::UnboundedReceiver<Seen>,
+            /// Paths of parked requests whose cancellation fired.
+            cancelled: mpsc::UnboundedReceiver<String>,
+            /// Queues of `Worker::Unread` routes, in declaration order.
+            unread: Vec<mpsc::Receiver<RawWebhook>>,
+        }
+
+        /// Start a route generation on `ingress` with one worker per
+        /// `(path, plugin, channel_alias, queue capacity, worker)`.
+        fn publish(
+            ingress: &PluginWebhookIngress,
+            routes: &[(&str, &str, &str, usize, Worker)],
+        ) -> Routes {
+            let (seen_tx, seen) = mpsc::unbounded_channel();
+            let (cancelled_tx, cancelled) = mpsc::unbounded_channel();
+            let mut published = HashMap::new();
+            let mut unread = Vec::new();
+            for (path, plugin, channel_alias, capacity, worker) in routes {
+                let (sink, receiver) = mpsc::channel::<RawWebhook>(*capacity);
+                published.insert(
+                    (*path).to_string(),
+                    PluginWebhookRoute::new(PluginWebhookOwner::new(*plugin, *channel_alias), sink),
+                );
+                match worker {
+                    Worker::Unread => unread.push(receiver),
+                    Worker::Closed => drop(receiver),
+                    serving => {
+                        let worker = serve_route(
+                            (*path).to_string(),
+                            serving.clone(),
+                            receiver,
+                            seen_tx.clone(),
+                            cancelled_tx.clone(),
+                        );
+                        zeroclaw_spawn::spawn!(worker);
+                    }
+                }
+            }
+            let lease = ingress.registry().start_generation();
+            assert!(lease.replace(published), "the test generation is current");
+            Routes {
+                _lease: lease,
+                seen,
+                cancelled,
+                unread,
+            }
+        }
+
+        async fn serve_route(
+            path: String,
+            worker: Worker,
+            mut receiver: mpsc::Receiver<RawWebhook>,
+            seen: mpsc::UnboundedSender<Seen>,
+            cancelled: mpsc::UnboundedSender<String>,
+        ) {
+            while let Some(request) = receiver.recv().await {
+                let _ = seen.send(Seen {
+                    path: path.clone(),
+                    method: request.method.clone(),
+                    query: request.query.clone(),
+                    headers: request.headers.clone(),
+                    body: request.body.clone(),
+                });
+                match &worker {
+                    Worker::Answer(answer) => {
+                        let _ = request.reply.send(answer.clone());
+                    }
+                    Worker::DropReply => drop(request),
+                    Worker::Park => {
+                        let path = path.clone();
+                        let cancelled = cancelled.clone();
+                        zeroclaw_spawn::spawn!(async move {
+                            let RawWebhook {
+                                cancellation,
+                                reply,
+                                ..
+                            } = request;
+                            cancellation.cancelled().await;
+                            let _ = cancelled.send(path);
+                            let _ = reply.send(Err(WebhookReject::Timeout));
+                        });
+                    }
+                    Worker::Unread | Worker::Closed => {
+                        panic!("unread and closed routes have no worker")
+                    }
+                }
+            }
+        }
+
+        fn test_ingress() -> Arc<PluginWebhookIngress> {
+            Arc::new(PluginWebhookIngress::new(300, 64))
+        }
+
+        fn ctx_with_ingress(
+            config: Config,
+            ingress: Option<Arc<PluginWebhookIngress>>,
+        ) -> Arc<RpcContext> {
+            let mut ctx = Arc::try_unwrap(enforcement_ctx(config))
+                .ok()
+                .expect("a fresh context has one owner");
+            ctx.plugin_webhooks = ingress;
+            Arc::new(ctx)
+        }
+
+        /// A local connection bound as the shared operator, and the frames it
+        /// writes.
+        fn connection(
+            ingress: Option<Arc<PluginWebhookIngress>>,
+            capacity: usize,
+        ) -> (RpcDispatcher, mpsc::Receiver<String>) {
+            let (tx, rx) = mpsc::channel(capacity);
+            let mut dispatcher = RpcDispatcher::new(
+                ctx_with_ingress(Config::default(), ingress),
+                tx,
+                "unix:plugin-webhook-test".into(),
+            );
+            dispatcher.set_authenticated_for_test();
+            (dispatcher, rx)
+        }
+
+        /// Params for a POST of `{}` to `path` with no query and no headers.
+        fn params(request_id: &str, path: &str) -> Value {
+            json!({
+                "request_id": request_id,
+                "path": path,
+                "method": "POST",
+                "query": "",
+                "headers": [],
+                "body_b64": "e30=",
+            })
+        }
+
+        fn line(id: u64, method: &str, params: Value) -> String {
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
+        }
+
+        async fn next_frame(rx: &mut mpsc::Receiver<String>) -> Value {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame arrives")
+                .expect("the connection writer is open");
+            serde_json::from_str(&frame).expect("frames are JSON")
+        }
+
+        /// Send one request and read the next frame, which must answer it.
+        async fn call(
+            dispatcher: &mut RpcDispatcher,
+            rx: &mut mpsc::Receiver<String>,
+            id: u64,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            dispatcher.process_line(&line(id, method, params)).await;
+            let frame = next_frame(rx).await;
+            assert_eq!(frame["id"], json!(id), "{frame}");
+            frame
+        }
+
+        /// Read `count` frames and key them by JSON-RPC id.
+        async fn frames_by_id(
+            rx: &mut mpsc::Receiver<String>,
+            count: usize,
+        ) -> HashMap<u64, Value> {
+            let mut frames = HashMap::new();
+            for _ in 0..count {
+                let frame = next_frame(rx).await;
+                let id = frame["id"].as_u64().expect("a numeric response id");
+                frames.insert(id, frame);
+            }
+            frames
+        }
+
+        /// Let spawned work run until `done` holds, without moving a paused
+        /// clock.
+        async fn settle(mut done: impl FnMut() -> bool) {
+            for _ in 0..10_000 {
+                if done() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("spawned work never reached the expected state");
+        }
+
+        async fn next_seen(routes: &mut Routes) -> Seen {
+            tokio::time::timeout(Duration::from_secs(5), routes.seen.recv())
+                .await
+                .expect("the worker receives the request")
+                .expect("the worker is alive")
+        }
+
+        async fn next_cancelled(routes: &mut Routes) -> String {
+            tokio::time::timeout(Duration::from_secs(5), routes.cancelled.recv())
+                .await
+                .expect("the worker observes cancellation")
+                .expect("the worker is alive")
+        }
+
+        fn error_code(frame: &Value) -> i64 {
+            frame["error"]["code"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("expected an error response, got {frame}"))
+        }
+
+        fn ack_route() -> (&'static str, &'static str, &'static str, usize, Worker) {
+            (
+                "fixture",
+                "fixture-plugin",
+                "fixture-alias",
+                PLUGIN_WEBHOOK_QUEUE_DEPTH,
+                Worker::Answer(Ok(WebhookOutcome::Ack)),
+            )
+        }
+
+        /// A config under `tmp` whose file `status` can classify.
+        fn status_config(tmp: &tempfile::TempDir) -> Config {
+            Config {
+                config_path: tmp.path().join("config.toml"),
+                data_dir: tmp.path().join("data"),
+                ..Config::default()
+            }
+        }
+
+        struct ChannelTransport {
+            frames: mpsc::Receiver<String>,
+            writer: mpsc::Sender<String>,
+        }
+
+        #[async_trait]
+        impl RpcTransport for ChannelTransport {
+            fn writer(&self) -> mpsc::Sender<String> {
+                self.writer.clone()
+            }
+
+            async fn next_frame(&mut self) -> Option<String> {
+                self.frames.recv().await
+            }
+
+            fn peer_label(&self) -> String {
+                "test:plugin-webhook".into()
+            }
+
+            fn kind(&self) -> crate::rpc::transport::TransportKind {
+                crate::rpc::transport::TransportKind::Local
+            }
+        }
+
+        /// A connection served by `run_connection`, as a listener serves one.
+        struct Served {
+            frames: mpsc::Sender<String>,
+            responses: mpsc::Receiver<String>,
+            connection_cancel: CancellationToken,
+            /// The connection's in-flight dispatches, shared with its
+            /// dispatcher.
+            inflight: Arc<parking_lot::Mutex<HashMap<String, CancellationToken>>>,
+            task: JoinHandle<RpcDispatcher>,
+        }
+
+        fn serve(ctx: Arc<RpcContext>) -> Served {
+            let (writer, responses) = mpsc::channel(64);
+            serve_with_writer(ctx, writer, responses)
+        }
+
+        /// [`serve`] over a writer queue the test built, and may have filled.
+        fn serve_with_writer(
+            ctx: Arc<RpcContext>,
+            writer: mpsc::Sender<String>,
+            responses: mpsc::Receiver<String>,
+        ) -> Served {
+            let (frames, incoming) = mpsc::channel(64);
+            let connection_cancel = CancellationToken::new();
+            let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                ctx,
+                writer.clone(),
+                "test:plugin-webhook".into(),
+                connection_cancel.clone(),
+            );
+            dispatcher.set_authenticated_for_test();
+            let inflight = Arc::clone(&dispatcher.plugin_webhook_inflight);
+            let mut transport = ChannelTransport {
+                frames: incoming,
+                writer,
+            };
+            // Heap-pinned like the listeners do: the dispatcher future is too
+            // large for a test worker's stack.
+            let task = zeroclaw_spawn::spawn!(async move {
+                Box::pin(dispatcher.run_connection(&mut transport)).await;
+                dispatcher
+            });
+            Served {
+                frames,
+                responses,
+                connection_cancel,
+                inflight,
+                task,
+            }
+        }
+
+        /// Drop the finished dispatcher and assert the connection wrote
+        /// nothing more.
+        async fn assert_no_more_frames(
+            dispatcher: RpcDispatcher,
+            responses: &mut mpsc::Receiver<String>,
+        ) {
+            drop(dispatcher);
+            let rest = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+                .await
+                .expect("every writer handle is dropped with the connection");
+            assert_eq!(rest, None, "a cancelled dispatch must not be answered");
+        }
+
+        #[tokio::test]
+        async fn dispatch_delivers_request_to_route_and_acks() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let body = b"not json \x00\xff";
+            let mut request = params("gw-1", "fixture");
+            request["query"] = json!("a=1&b=2");
+            request["headers"] = json!([
+                {"name": "x-signature", "value": "sig"},
+                {"name": "x-multi", "value": "one"},
+                {"name": "x-multi", "value": "two"},
+            ]);
+            request["body_b64"] = json!(STANDARD.encode(body));
+
+            let response = call(&mut dispatcher, &mut rx, 7, DISPATCH, request).await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(
+                next_seen(&mut routes).await,
+                Seen {
+                    path: "fixture".into(),
+                    method: "POST".into(),
+                    query: "a=1&b=2".into(),
+                    headers: vec![
+                        ("x-signature".into(), "sig".into()),
+                        ("x-multi".into(), "one".into()),
+                        ("x-multi".into(), "two".into()),
+                    ],
+                    body: body.to_vec(),
+                }
+            );
+            settle(|| dispatcher.plugin_webhook_inflight.lock().is_empty()).await;
+        }
+
+        #[tokio::test]
+        async fn mixed_case_header_names_reach_the_worker_lowercased() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let mut request = params("gw-1", "fixture");
+            request["method"] = json!("GET");
+            request["headers"] = json!([
+                {"name": "X-Sig", "value": "Mixed-Case Value"},
+                {"name": "CONTENT-TYPE", "value": "text/plain"},
+            ]);
+
+            let response = call(&mut dispatcher, &mut rx, 1, DISPATCH, request).await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            let seen = next_seen(&mut routes).await;
+            assert_eq!(seen.method, "GET");
+            assert_eq!(
+                seen.headers,
+                [
+                    ("x-sig".to_string(), "Mixed-Case Value".to_string()),
+                    ("content-type".to_string(), "text/plain".to_string()),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn dispatch_maps_every_ingress_outcome() {
+            let secret = "secret detail";
+            let ingress = test_ingress();
+            let depth = PLUGIN_WEBHOOK_QUEUE_DEPTH;
+            let _routes = publish(
+                &ingress,
+                &[
+                    (
+                        "ack",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Ok(WebhookOutcome::Ack)),
+                    ),
+                    (
+                        "reply",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Ok(WebhookOutcome::Body("challenge".into()))),
+                    ),
+                    (
+                        "unauthorized",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Err(WebhookReject::Unauthorized(secret.into()))),
+                    ),
+                    (
+                        "bad-request",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Err(WebhookReject::BadRequest(secret.into()))),
+                    ),
+                    (
+                        "unavailable",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Err(WebhookReject::Unavailable(secret.into()))),
+                    ),
+                    ("dropped", "p", "a", depth, Worker::DropReply),
+                    ("closed", "p", "a", depth, Worker::Closed),
+                    (
+                        "invalid",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Err(WebhookReject::InvalidResponse)),
+                    ),
+                    (
+                        "oversized",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Ok(WebhookOutcome::Body(
+                            "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1),
+                        ))),
+                    ),
+                    (
+                        "worker-timeout",
+                        "p",
+                        "a",
+                        depth,
+                        Worker::Answer(Err(WebhookReject::Timeout)),
+                    ),
+                ],
+            );
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            for (id, (path, expected)) in [
+                ("ack", json!({"outcome": "ack"})),
+                ("reply", json!({"outcome": "reply", "body": "challenge"})),
+                ("unauthorized", json!({"outcome": "unauthorized"})),
+                ("bad-request", json!({"outcome": "bad_request"})),
+                ("unavailable", json!({"outcome": "unavailable"})),
+                ("dropped", json!({"outcome": "unavailable"})),
+                ("closed", json!({"outcome": "unavailable"})),
+                ("invalid", json!({"outcome": "invalid_response"})),
+                ("oversized", json!({"outcome": "invalid_response"})),
+                ("worker-timeout", json!({"outcome": "timeout"})),
+                ("missing", json!({"outcome": "not_found"})),
+                ("../x", json!({"outcome": "not_found"})),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = id as u64;
+                let response = call(
+                    &mut dispatcher,
+                    &mut rx,
+                    id,
+                    DISPATCH,
+                    params(&format!("r-{id}"), path),
+                )
+                .await;
+                assert_eq!(response["result"], expected, "path {path}: {response}");
+                assert!(
+                    !response.to_string().contains(secret),
+                    "plugin diagnostics must stay in the core's logs: {response}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn dispatch_reports_queue_full_when_route_queue_is_full() {
+            let ingress = test_ingress();
+            let routes = publish(&ingress, &[("full", "p", "a", 1, Worker::Unread)]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("first", "full")))
+                .await;
+            settle(|| routes.unread[0].len() == 1).await;
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("second", "full"),
+            )
+            .await;
+            assert_eq!(
+                response["result"],
+                json!({"outcome": "queue_full"}),
+                "{response}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "the admitted dispatch is still waiting for its worker"
+            );
+            assert_eq!(routes.unread[0].len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn dispatch_times_out_at_the_ingress_deadline() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 1, Worker::Park)]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            let started = tokio::time::Instant::now();
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("slow-1", "slow")))
+                .await;
+            // Only the ingress deadline can end this dispatch; the paused
+            // clock jumps to it once every task is idle.
+            let frame = rx.recv().await.expect("the dispatch is answered");
+            let response: Value = serde_json::from_str(&frame).expect("frames are JSON");
+            assert_eq!(response["id"], json!(1));
+            assert_eq!(
+                response["result"],
+                json!({"outcome": "timeout"}),
+                "{response}"
+            );
+            assert!(started.elapsed() >= PLUGIN_WEBHOOK_DEADLINE);
+            assert_eq!(next_cancelled(&mut routes).await, "slow");
+        }
+
+        #[tokio::test]
+        async fn dispatch_does_not_block_other_requests_on_the_connection() {
+            let tmp = tempfile::TempDir::new().expect("temporary test directory");
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 1, Worker::Park)]);
+            let mut served = serve(ctx_with_ingress(status_config(&tmp), Some(ingress)));
+
+            served
+                .frames
+                .send(line(1, DISPATCH, params("slow-1", "slow")))
+                .await
+                .expect("the connection reads frames");
+            next_seen(&mut routes).await;
+            served
+                .frames
+                .send(line(2, "status", json!({})))
+                .await
+                .expect("the connection reads frames");
+
+            let status = next_frame(&mut served.responses).await;
+            assert_eq!(
+                status["id"],
+                json!(2),
+                "status must be answered while the dispatch is parked: {status}"
+            );
+            assert!(status["result"]["server_version"].is_string(), "{status}");
+
+            drop(served.frames);
+            let dispatcher = tokio::time::timeout(Duration::from_secs(5), served.task)
+                .await
+                .expect("the connection drains")
+                .expect("the connection task joins");
+            assert_eq!(next_cancelled(&mut routes).await, "slow");
+            assert_no_more_frames(dispatcher, &mut served.responses).await;
+        }
+
+        #[tokio::test]
+        async fn cancel_ends_an_in_flight_dispatch() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 1, Worker::Park)]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("c-1", "slow")))
+                .await;
+            next_seen(&mut routes).await;
+            dispatcher
+                .process_line(&line(2, CANCEL, json!({"request_id": "c-1"})))
+                .await;
+            let frames = frames_by_id(&mut rx, 2).await;
+            assert_eq!(frames[&2]["result"], json!({"cancelled": true}));
+            assert_eq!(frames[&1]["result"], json!({"outcome": "cancelled"}));
+            assert_eq!(next_cancelled(&mut routes).await, "slow");
+
+            for (id, request_id) in [(3, "c-1"), (4, "never-sent")] {
+                let response = call(
+                    &mut dispatcher,
+                    &mut rx,
+                    id,
+                    CANCEL,
+                    json!({"request_id": request_id}),
+                )
+                .await;
+                assert_eq!(
+                    response["result"],
+                    json!({"cancelled": false}),
+                    "{request_id}"
+                );
+            }
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                5,
+                CANCEL,
+                json!({"request_id": ""}),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(INVALID_PARAMS));
+        }
+
+        #[tokio::test]
+        async fn closing_the_connection_cancels_in_flight_dispatches() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 1, Worker::Park)]);
+            let mut served = serve(ctx_with_ingress(Config::default(), Some(ingress)));
+
+            served
+                .frames
+                .send(line(1, DISPATCH, params("close-1", "slow")))
+                .await
+                .expect("the connection reads frames");
+            next_seen(&mut routes).await;
+
+            drop(served.frames);
+            let dispatcher = tokio::time::timeout(Duration::from_secs(1), served.task)
+                .await
+                .expect("closing the connection ends it within a second")
+                .expect("the connection task joins");
+            assert_eq!(next_cancelled(&mut routes).await, "slow");
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+            assert_no_more_frames(dispatcher, &mut served.responses).await;
+        }
+
+        #[tokio::test]
+        async fn connection_generation_cancel_joins_webhook_dispatches_within_drain_grace() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 4, Worker::Park)]);
+            let mut served = serve(ctx_with_ingress(Config::default(), Some(ingress)));
+            for id in 1..=3_u64 {
+                served
+                    .frames
+                    .send(line(id, DISPATCH, params(&format!("gen-{id}"), "slow")))
+                    .await
+                    .expect("the connection reads frames");
+                next_seen(&mut routes).await;
+            }
+
+            let started = std::time::Instant::now();
+            served.connection_cancel.cancel();
+            let dispatcher = tokio::time::timeout(crate::rpc::CONNECTION_DRAIN_GRACE, served.task)
+                .await
+                .expect("a generation cancel drains the connection")
+                .expect("the connection task joins");
+            assert!(
+                started.elapsed() < crate::rpc::CONNECTION_DRAIN_GRACE / 2,
+                "dispatches must end at the generation cancel, not at their deadline; took {:?}",
+                started.elapsed()
+            );
+            for _ in 0..3 {
+                assert_eq!(next_cancelled(&mut routes).await, "slow");
+            }
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+            assert_no_more_frames(dispatcher, &mut served.responses).await;
+        }
+
+        #[tokio::test]
+        async fn aborting_a_dispatch_task_cancels_its_worker_request() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[("slow", "p", "a", 1, Worker::Park)]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("abort-1", "slow")))
+                .await;
+            next_seen(&mut routes).await;
+            let [task] = dispatcher.plugin_webhook_tasks.as_mut_slice() else {
+                panic!("one dispatch task is tracked");
+            };
+            task.abort();
+            let joined = task.await;
+            assert!(joined.expect_err("the task was aborted").is_cancelled());
+
+            assert_eq!(next_cancelled(&mut routes).await, "slow");
+            assert!(!dispatcher.connection_cancel.is_cancelled());
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+            assert_eq!(
+                dispatcher.plugin_webhook_permits.available_permits(),
+                MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "an aborted dispatch is not answered"
+            );
+        }
+
+        /// Mirrors `shutdown_aborted_mid_join_still_ends_its_prompt` for the
+        /// dispatch tasks.
+        #[tokio::test]
+        async fn shutdown_aborted_mid_join_still_ends_its_webhook_dispatch() {
+            let (writer_tx, _writer_rx) = mpsc::channel::<String>(8);
+            let connection_cancel = CancellationToken::new();
+            let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                ctx_with_ingress(Config::default(), None),
+                writer_tx,
+                "test:forced-drain".to_string(),
+                connection_cancel.clone(),
+            );
+            let (ended_tx, ended_rx) = oneshot::channel::<()>();
+            dispatcher
+                .plugin_webhook_tasks
+                .push(zeroclaw_spawn::spawn!(async move {
+                    let _ends_with_the_task = ended_tx;
+                    std::future::pending::<()>().await;
+                }));
+
+            let shutdown = zeroclaw_spawn::spawn!(async move {
+                dispatcher.shutdown().await;
+            });
+            tokio::time::timeout(Duration::from_secs(5), connection_cancel.cancelled())
+                .await
+                .expect("shutdown cancels the generation before joining its dispatches");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !shutdown.is_finished(),
+                "shutdown must be joining the dispatch task"
+            );
+
+            shutdown.abort();
+            let _ = shutdown.await;
+            tokio::time::timeout(Duration::from_secs(5), ended_rx)
+                .await
+                .expect("an aborted shutdown must still end the dispatch it was joining")
+                .expect_err("the dispatch must be aborted rather than run to completion");
+        }
+
+        /// A dispatch that has its outcome but cannot write it, because
+        /// nobody drains the connection's writer queue, must not hold up
+        /// `shutdown`.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_does_not_wait_on_an_answer_the_writer_cannot_take() {
+            const CAP: usize = MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION;
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 1);
+            assert!(
+                dispatcher.rpc.send_raw("unread".to_string()).await,
+                "fill the connection's writer queue"
+            );
+
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("blocked-1", "fixture")))
+                .await;
+            next_seen(&mut routes).await;
+            settle(|| dispatcher.plugin_webhook_inflight.lock().is_empty()).await;
+            assert_eq!(
+                dispatcher.plugin_webhook_permits.available_permits(),
+                CAP - 1,
+                "the answered dispatch is still waiting to write its response"
+            );
+
+            tokio::time::timeout(Duration::from_secs(1), dispatcher.shutdown())
+                .await
+                .expect("shutdown must not wait on a writer queue nobody drains");
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+            assert_eq!(dispatcher.plugin_webhook_permits.available_permits(), CAP);
+            assert_eq!(rx.try_recv().expect("the prefilled frame"), "unread");
+            assert!(
+                rx.try_recv().is_err(),
+                "a dispatch ended by shutdown is not answered"
+            );
+        }
+
+        /// The connection teardown path: EOF from a peer that stopped reading
+        /// ends the connection promptly while a dispatch waits to write.
+        #[tokio::test(start_paused = true)]
+        async fn closing_a_connection_does_not_wait_on_an_answer_the_writer_cannot_take() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (writer, responses) = mpsc::channel(1);
+            writer
+                .try_send("unread".to_string())
+                .expect("fill the connection's writer queue");
+            let mut served = serve_with_writer(
+                ctx_with_ingress(Config::default(), Some(ingress)),
+                writer,
+                responses,
+            );
+
+            served
+                .frames
+                .send(line(1, DISPATCH, params("blocked-1", "fixture")))
+                .await
+                .expect("the connection reads frames");
+            next_seen(&mut routes).await;
+            settle(|| served.inflight.lock().is_empty()).await;
+
+            drop(served.frames);
+            let dispatcher = tokio::time::timeout(Duration::from_secs(1), served.task)
+                .await
+                .expect("closing the connection ends it within a second")
+                .expect("the connection task joins");
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+            assert_eq!(
+                served.responses.try_recv().expect("the prefilled frame"),
+                "unread"
+            );
+            assert_no_more_frames(dispatcher, &mut served.responses).await;
+        }
+
+        #[tokio::test]
+        async fn plugin_webhook_methods_are_refused_on_wss() {
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut records = zeroclaw_log::subscribe_or_install();
+            while records.try_recv().is_ok() {}
+
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut dispatcher = RpcDispatcher::new(
+                ctx_with_ingress(Config::default(), Some(ingress)),
+                tx,
+                "wss:test".into(),
+            )
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+            dispatcher.set_authenticated_for_test();
+            let principal_id = dispatcher
+                .auth
+                .as_ref()
+                .expect("the test connection is bound")
+                .principal
+                .id
+                .as_str()
+                .to_owned();
+
+            for (id, (method, request)) in [
+                (DISPATCH, params("wss-1", "fixture")),
+                (CANCEL, json!({"request_id": "wss-1"})),
+                (ROUTES, json!({})),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let response = call(&mut dispatcher, &mut rx, id as u64, method, request).await;
+                assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{method}");
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains(method), "{message}");
+                assert!(!message.contains("rpc-plugin-webhook"), "{message}");
+
+                // Other tests share the log stream, so pick this refusal's
+                // record by event, method, and principal.
+                let mut audited = Vec::new();
+                while let Ok(record) = records.try_recv() {
+                    if record["message"] == "RPC authorization denied"
+                        && record["attributes"]["method"] == method
+                        && record["attributes"]["principal_id"] == principal_id
+                    {
+                        audited.push(record);
+                    }
+                }
+                let [record] = audited.as_slice() else {
+                    panic!("expected one denial record for {method}, got {audited:#?}");
+                };
+                assert_eq!(record["severity_text"], "WARN", "{record:#?}");
+                assert_eq!(record["event"]["action"], "reject", "{record:#?}");
+                assert_eq!(record["attributes"]["reason"], message, "{record:#?}");
+                assert_eq!(record["attributes"]["code"], FORBIDDEN, "{record:#?}");
+            }
+            zeroclaw_log::clear_broadcast_hook();
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+            assert!(routes.seen.try_recv().is_err());
+        }
+
+        /// Declare plugin channel instances under `aliases`, so a profile may
+        /// name them in `allowed_channels`.
+        fn with_plugin_channels(mut config: Config, aliases: &[&str]) -> Config {
+            for alias in aliases {
+                config.channels.plugin.insert(
+                    (*alias).to_string(),
+                    zeroclaw_config::schema::PluginChannelConfig {
+                        package: "fixture-plugin".into(),
+                        ..zeroclaw_config::schema::PluginChannelConfig::default()
+                    },
+                );
+            }
+            config
+        }
+
+        fn channel_grant_config(verb: zeroclaw_api::grants::Verb) -> Config {
+            let mut config = with_plugin_channels(roster_config(4242), &["fixture-alias"]);
+            let profile = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists");
+            profile.grants =
+                HashMap::from([(zeroclaw_api::grants::Resource::Channels, vec![verb])]);
+            profile.allowed_channels = vec!["plugin.fixture-alias".into()];
+            config
+        }
+
+        async fn roster_connection(
+            config: Config,
+            ingress: Arc<PluginWebhookIngress>,
+        ) -> (RpcDispatcher, mpsc::Receiver<String>) {
+            let (tx, rx) = mpsc::channel(8);
+            let mut dispatcher = RpcDispatcher::new(
+                ctx_with_ingress(config, Some(ingress)),
+                tx,
+                "unix:test".into(),
+            )
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+            dispatcher
+                .handle_initialize(&json!({}))
+                .await
+                .expect("the roster uid authenticates");
+            (dispatcher, rx)
+        }
+
+        #[tokio::test]
+        async fn plugin_webhook_methods_require_channel_grants() {
+            use zeroclaw_api::grants::Verb;
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+
+            let (mut reader, mut rx) =
+                roster_connection(channel_grant_config(Verb::Read), Arc::clone(&ingress)).await;
+            let response = call(
+                &mut reader,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("read-1", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let response = call(
+                &mut reader,
+                &mut rx,
+                2,
+                CANCEL,
+                json!({"request_id": "read-1"}),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let response = call(&mut reader, &mut rx, 3, ROUTES, json!({})).await;
+            assert_eq!(
+                response["result"]["routes"][0]["path"],
+                json!("fixture"),
+                "{response}"
+            );
+            assert!(routes.seen.try_recv().is_err());
+
+            let (mut executor, mut rx) =
+                roster_connection(channel_grant_config(Verb::Execute), ingress).await;
+            let response = call(&mut executor, &mut rx, 4, ROUTES, json!({})).await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let response = call(
+                &mut executor,
+                &mut rx,
+                5,
+                DISPATCH,
+                params("exec-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+        }
+
+        /// A `channels` grant reaches only the channel instances the profile
+        /// names: a dispatch to another channel's route is refused and
+        /// audited before anything is queued, and the route listing leaves
+        /// that route out.
+        #[tokio::test]
+        async fn plugin_webhook_dispatch_reaches_only_granted_channels() {
+            use zeroclaw_api::grants::{Resource, Verb};
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut records = zeroclaw_log::subscribe_or_install();
+            while records.try_recv().is_ok() {}
+
+            let ingress = test_ingress();
+            let (_, plugin, _, depth, worker) = ack_route();
+            let mut routes = publish(
+                &ingress,
+                &[ack_route(), ("other", plugin, "other-alias", depth, worker)],
+            );
+            let mut config =
+                with_plugin_channels(roster_config(4242), &["fixture-alias", "other-alias"]);
+            let profile = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists");
+            profile.grants = HashMap::from([(Resource::Channels, vec![Verb::Execute, Verb::Read])]);
+            profile.allowed_channels = vec!["plugin.fixture-alias".into()];
+            let (mut caller, mut rx) = roster_connection(config, Arc::clone(&ingress)).await;
+            let principal_id = caller
+                .auth
+                .as_ref()
+                .expect("the roster uid is bound")
+                .principal
+                .id
+                .as_str()
+                .to_owned();
+
+            let response = call(
+                &mut caller,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("granted-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+
+            let response = call(
+                &mut caller,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("other-1", "other"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("plugin.other-alias"), "{message}");
+            // Other tests share the log stream and this roster principal, so
+            // pick this refusal's record by its reason too.
+            let audited: Vec<Value> = std::iter::from_fn(|| records.try_recv().ok())
+                .filter(|record| {
+                    record["message"] == "RPC authorization denied"
+                        && record["attributes"]["method"] == DISPATCH
+                        && record["attributes"]["principal_id"] == principal_id
+                        && record["attributes"]["reason"] == message
+                })
+                .collect();
+            let [record] = audited.as_slice() else {
+                panic!("expected one denial record, got {audited:#?}");
+            };
+            assert_eq!(record["severity_text"], "WARN", "{record:#?}");
+            assert_eq!(record["attributes"]["code"], FORBIDDEN, "{record:#?}");
+
+            let response = call(&mut caller, &mut rx, 3, ROUTES, json!({})).await;
+            let listed: Vec<Value> = response["result"]["routes"]
+                .as_array()
+                .expect("a route listing")
+                .iter()
+                .map(|route| route["path"].clone())
+                .collect();
+            assert_eq!(listed, [json!("fixture")], "{response}");
+
+            zeroclaw_log::clear_broadcast_hook();
+            assert!(
+                routes.seen.try_recv().is_err(),
+                "a refused dispatch reaches no worker"
+            );
+        }
+
+        /// Config can close the path whatever the caller's grants: a channel
+        /// instance that refuses injected webhooks, or an agent handling it
+        /// that refuses them, turns the dispatch away before anything is
+        /// queued.
+        #[tokio::test]
+        async fn plugin_webhook_dispatch_honors_channel_and_agent_refusal() {
+            use zeroclaw_config::schema::{AliasedAgentConfig, PluginChannelConfig};
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let instance = |accept_injected_webhooks: bool| PluginChannelConfig {
+                package: "fixture-plugin".into(),
+                accept_injected_webhooks,
+                ..PluginChannelConfig::default()
+            };
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .channels
+                .plugin
+                .insert("fixture-alias".into(), instance(false));
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("refused-1", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("plugin.fixture-alias") && message.contains("refuses webhooks"),
+                "{message}"
+            );
+
+            {
+                let mut config = dispatcher.ctx.config.write();
+                config
+                    .channels
+                    .plugin
+                    .insert("fixture-alias".into(), instance(true));
+                config.agents.insert(
+                    "ops".into(),
+                    AliasedAgentConfig {
+                        channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                            "plugin.fixture-alias",
+                        )],
+                        accept_injected_webhooks: false,
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("refused-2", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Agent ops") && message.contains("refuses turns"),
+                "{message}"
+            );
+            assert!(
+                routes.seen.try_recv().is_err(),
+                "a refused dispatch reaches no worker"
+            );
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("ops")
+                .expect("the agent was added")
+                .accept_injected_webhooks = true;
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                3,
+                DISPATCH,
+                params("accepted-1", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+            assert_eq!(next_seen(&mut routes).await.path, "fixture");
+        }
+
+        #[test]
+        fn plugin_webhook_methods_are_classified_under_channels() {
+            use zeroclaw_api::grants::{Resource, Verb};
+            assert_eq!(
+                Method::PluginWebhookDispatch.authz(),
+                MethodAuthz::Requires(Resource::Channels, Verb::Execute)
+            );
+            assert_eq!(
+                Method::PluginWebhookCancel.authz(),
+                MethodAuthz::Requires(Resource::Channels, Verb::Execute)
+            );
+            assert_eq!(
+                Method::PluginWebhookRoutes.authz(),
+                MethodAuthz::Requires(Resource::Channels, Verb::Read)
+            );
+        }
+
+        fn numbered_headers(count: usize) -> Value {
+            Value::Array(
+                (0..count)
+                    .map(|index| json!({"name": format!("x-h-{index}"), "value": "v"}))
+                    .collect(),
+            )
+        }
+
+        /// One header whose name and value add up to `bytes`.
+        fn header_of_bytes(bytes: usize) -> Value {
+            json!([{"name": "x", "value": "v".repeat(bytes - 1)}])
+        }
+
+        #[tokio::test]
+        async fn dispatch_rejects_invalid_params() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let with = |field: &str, value: Value| {
+                let mut request = params("ok-id", "fixture");
+                request[field] = value;
+                request
+            };
+            let one_over_body = STANDARD.encode(vec![b'b'; MAX_PLUGIN_WEBHOOK_BODY_BYTES + 1]);
+            assert_eq!(
+                one_over_body.len(),
+                MAX_PLUGIN_WEBHOOK_BODY_B64_BYTES,
+                "one byte over the body bound still passes the encoded-length check, so the \
+                 request constructor refuses it"
+            );
+            let mut missing_body = params("ok-id", "fixture");
+            missing_body
+                .as_object_mut()
+                .expect("params are an object")
+                .remove("body_b64");
+
+            let cases = [
+                ("missing body_b64", missing_body),
+                ("empty request_id", with("request_id", json!(""))),
+                (
+                    "long request_id",
+                    with(
+                        "request_id",
+                        json!("x".repeat(MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES + 1)),
+                    ),
+                ),
+                ("request_id with a space", with("request_id", json!("a b"))),
+                ("request_id with a tab", with("request_id", json!("a\tb"))),
+                (
+                    "non-ASCII request_id",
+                    with("request_id", json!("caf\u{e9}")),
+                ),
+                ("PUT", with("method", json!("PUT"))),
+                ("HEAD", with("method", json!("HEAD"))),
+                ("undecodable body", with("body_b64", json!("@@@"))),
+                (
+                    "encoded body over the bound",
+                    with(
+                        "body_b64",
+                        json!("A".repeat(MAX_PLUGIN_WEBHOOK_BODY_B64_BYTES + 4)),
+                    ),
+                ),
+                (
+                    "decoded body over the bound",
+                    with("body_b64", json!(one_over_body)),
+                ),
+                (
+                    "too many headers",
+                    with("headers", numbered_headers(MAX_PLUGIN_WEBHOOK_HEADERS + 1)),
+                ),
+                (
+                    "header bytes over the bound",
+                    with(
+                        "headers",
+                        header_of_bytes(MAX_PLUGIN_WEBHOOK_HEADER_BYTES + 1),
+                    ),
+                ),
+                (
+                    "header value with a newline",
+                    with("headers", json!([{"name": "x-sig", "value": "a\nb"}])),
+                ),
+                (
+                    "query over the bound",
+                    with(
+                        "query",
+                        json!("q".repeat(MAX_PLUGIN_WEBHOOK_QUERY_BYTES + 1)),
+                    ),
+                ),
+            ];
+            for (id, (case, request)) in cases.into_iter().enumerate() {
+                let response = call(&mut dispatcher, &mut rx, id as u64, DISPATCH, request).await;
+                assert_eq!(
+                    error_code(&response),
+                    i64::from(INVALID_PARAMS),
+                    "{case}: {response}"
+                );
+            }
+            assert!(
+                dispatcher.plugin_webhook_tasks.is_empty(),
+                "a refused dispatch never reaches the ingress"
+            );
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+            assert!(routes.seen.try_recv().is_err());
+
+            let at_bounds = [
+                (
+                    "body at the bound",
+                    with(
+                        "body_b64",
+                        json!(STANDARD.encode(vec![b'b'; MAX_PLUGIN_WEBHOOK_BODY_BYTES])),
+                    ),
+                ),
+                (
+                    "headers at the bound",
+                    with("headers", numbered_headers(MAX_PLUGIN_WEBHOOK_HEADERS)),
+                ),
+                (
+                    "header bytes at the bound",
+                    with("headers", header_of_bytes(MAX_PLUGIN_WEBHOOK_HEADER_BYTES)),
+                ),
+                (
+                    "query at the bound",
+                    with("query", json!("q".repeat(MAX_PLUGIN_WEBHOOK_QUERY_BYTES))),
+                ),
+            ];
+            for (id, (case, request)) in at_bounds.into_iter().enumerate() {
+                let id = 100 + id as u64;
+                let response = call(&mut dispatcher, &mut rx, id, DISPATCH, request).await;
+                assert_eq!(
+                    response["result"],
+                    json!({"outcome": "ack"}),
+                    "{case}: {response}"
+                );
+                next_seen(&mut routes).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn duplicate_in_flight_request_id_is_invalid_params() {
+            let ingress = test_ingress();
+            let mut routes = publish(
+                &ingress,
+                &[("slow", "p", "a", 1, Worker::Park), ack_route()],
+            );
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+
+            dispatcher
+                .process_line(&line(1, DISPATCH, params("dup", "slow")))
+                .await;
+            assert_eq!(next_seen(&mut routes).await.path, "slow");
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                DISPATCH,
+                params("dup", "fixture"),
+            )
+            .await;
+            assert_eq!(
+                error_code(&response),
+                i64::from(INVALID_PARAMS),
+                "{response}"
+            );
+            assert!(routes.seen.try_recv().is_err());
+
+            dispatcher
+                .process_line(&line(3, CANCEL, json!({"request_id": "dup"})))
+                .await;
+            let frames = frames_by_id(&mut rx, 2).await;
+            assert_eq!(frames[&3]["result"], json!({"cancelled": true}));
+            assert_eq!(frames[&1]["result"], json!({"outcome": "cancelled"}));
+            assert!(
+                dispatcher.plugin_webhook_inflight.lock().is_empty(),
+                "the id is free once its response has been read"
+            );
+
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                4,
+                DISPATCH,
+                params("dup", "fixture"),
+            )
+            .await;
+            assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn in_flight_dispatches_are_capped_per_connection() {
+            const CAP: usize = MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION;
+            let ingress = test_ingress();
+            let routes = publish(&ingress, &[("held", "p", "a", 2 * CAP, Worker::Unread)]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 4 * CAP);
+
+            for index in 0..CAP {
+                dispatcher
+                    .process_line(&line(
+                        index as u64,
+                        DISPATCH,
+                        params(&format!("r-{index}"), "held"),
+                    ))
+                    .await;
+            }
+            settle(|| routes.unread[0].len() == CAP).await;
+            let over = CAP as u64;
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                over,
+                DISPATCH,
+                params("over", "held"),
+            )
+            .await;
+            assert_eq!(
+                response["result"],
+                json!({"outcome": "queue_full"}),
+                "{response}"
+            );
+            assert_eq!(
+                routes.unread[0].len(),
+                CAP,
+                "the refused dispatch never reached the route"
+            );
+            assert_eq!(dispatcher.plugin_webhook_inflight.lock().len(), CAP);
+
+            dispatcher
+                .process_line(&line(over + 1, CANCEL, json!({"request_id": "r-0"})))
+                .await;
+            let frames = frames_by_id(&mut rx, 2).await;
+            assert_eq!(frames[&(over + 1)]["result"], json!({"cancelled": true}));
+            assert_eq!(frames[&0]["result"], json!({"outcome": "cancelled"}));
+            settle(|| dispatcher.plugin_webhook_permits.available_permits() == 1).await;
+
+            dispatcher
+                .process_line(&line(over + 2, DISPATCH, params("again", "held")))
+                .await;
+            settle(|| routes.unread[0].len() == CAP + 1).await;
+            assert!(
+                dispatcher
+                    .plugin_webhook_inflight
+                    .lock()
+                    .contains_key("again")
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "the admitted dispatch is still waiting"
+            );
+        }
+
+        /// A caller that never reads its responses keeps every permit: each
+        /// dispatch finished at the ingress, but none could write its answer.
+        #[tokio::test]
+        async fn unread_responses_hold_the_in_flight_cap() {
+            const CAP: usize = MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION;
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.try_send("unread".to_string())
+                .expect("fill the connection's writer queue");
+            let mut dispatcher = RpcDispatcher::new(
+                ctx_with_ingress(Config::default(), Some(test_ingress())),
+                tx,
+                "unix:plugin-webhook-test".into(),
+            );
+            dispatcher.set_authenticated_for_test();
+
+            for index in 0..CAP {
+                dispatcher
+                    .process_line(&line(
+                        index as u64,
+                        DISPATCH,
+                        params(&format!("r-{index}"), "no-such-route"),
+                    ))
+                    .await;
+            }
+            settle(|| dispatcher.plugin_webhook_inflight.lock().is_empty()).await;
+            assert_eq!(dispatcher.plugin_webhook_permits.available_permits(), 0);
+
+            let over = CAP as u64;
+            let over_line = line(over, DISPATCH, params("over", "no-such-route"));
+            let (_, frames) = tokio::join!(dispatcher.process_line(&over_line), async {
+                let mut frames = Vec::new();
+                for _ in 0..CAP + 2 {
+                    frames.push(
+                        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                            .await
+                            .expect("a frame arrives")
+                            .expect("the writer is open"),
+                    );
+                }
+                frames
+            });
+            assert_eq!(frames[0], "unread");
+            let mut outcomes = HashMap::new();
+            for frame in &frames[1..] {
+                let response: Value = serde_json::from_str(frame).expect("frames are JSON");
+                let id = response["id"].as_u64().expect("a numeric response id");
+                outcomes.insert(id, response["result"]["outcome"].clone());
+            }
+            assert_eq!(outcomes.len(), CAP + 1);
+            assert_eq!(outcomes[&over], json!("queue_full"));
+            for id in 0..over {
+                assert_eq!(outcomes[&id], json!("not_found"), "dispatch {id}");
+            }
+        }
+
+        #[tokio::test]
+        async fn dispatch_without_an_ingress_is_unavailable() {
+            let (mut dispatcher, mut rx) = connection(None, 8);
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                1,
+                DISPATCH,
+                params("r-1", "fixture"),
+            )
+            .await;
+            assert_eq!(
+                response["result"],
+                json!({"outcome": "unavailable"}),
+                "{response}"
+            );
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                2,
+                CANCEL,
+                json!({"request_id": "r-1"}),
+            )
+            .await;
+            assert_eq!(
+                response["result"],
+                json!({"cancelled": false}),
+                "{response}"
+            );
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+        }
+
+        #[tokio::test]
+        async fn routes_without_an_ingress_is_empty() {
+            let (mut dispatcher, mut rx) = connection(None, 8);
+            let response = call(&mut dispatcher, &mut rx, 1, ROUTES, json!({})).await;
+            assert_eq!(
+                response["result"],
+                json!({"generation": 0, "routes": []}),
+                "{response}"
+            );
+        }
+
+        #[tokio::test]
+        async fn routes_lists_published_owners() {
+            let ingress = test_ingress();
+            let (mut dispatcher, mut rx) = connection(Some(Arc::clone(&ingress)), 8);
+            let first = publish(
+                &ingress,
+                &[
+                    ("zeta", "plugin-z", "z-alias", 1, Worker::Unread),
+                    ("alpha", "plugin-a", "a-alias", 1, Worker::Unread),
+                ],
+            );
+            let response = call(&mut dispatcher, &mut rx, 1, ROUTES, json!({})).await;
+            assert_eq!(
+                response["result"],
+                json!({
+                    "generation": 1,
+                    "routes": [
+                        {"path": "alpha", "plugin": "plugin-a", "channel_alias": "a-alias"},
+                        {"path": "zeta", "plugin": "plugin-z", "channel_alias": "z-alias"},
+                    ],
+                }),
+                "{response}"
+            );
+
+            let second = publish(
+                &ingress,
+                &[("beta", "plugin-b", "b-alias", 1, Worker::Unread)],
+            );
+            drop(first);
+            let response = call(&mut dispatcher, &mut rx, 2, ROUTES, json!({})).await;
+            assert_eq!(
+                response["result"],
+                json!({
+                    "generation": 2,
+                    "routes": [{"path": "beta", "plugin": "plugin-b", "channel_alias": "b-alias"}],
+                }),
+                "{response}"
+            );
+
+            drop(second);
+            let response = call(&mut dispatcher, &mut rx, 3, ROUTES, json!({})).await;
+            assert_eq!(
+                response["result"],
+                json!({"generation": 2, "routes": []}),
+                "{response}"
+            );
+        }
+
+        #[tokio::test]
+        async fn notification_form_dispatch_is_dropped() {
+            let ingress = test_ingress();
+            let mut routes = publish(&ingress, &[ack_route()]);
+            let (mut dispatcher, mut rx) = connection(Some(ingress), 8);
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": DISPATCH,
+                "params": params("notified", "fixture"),
+            })
+            .to_string();
+
+            dispatcher.process_line(&notification).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "a notification is never answered"
+            );
+            assert!(routes.seen.try_recv().is_err());
+            assert!(dispatcher.plugin_webhook_tasks.is_empty());
+            assert!(dispatcher.plugin_webhook_inflight.lock().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -33579,6 +35319,7 @@ mod tests {
             hooks: None,
             cert_audit: None,
             auth,
+            plugin_webhooks: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-supervised-generation".to_string());
@@ -38335,6 +40076,7 @@ mod tests {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
@@ -38388,6 +40130,7 @@ mod tests {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
@@ -38577,6 +40320,7 @@ mod tests {
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
+            plugin_webhooks: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(

@@ -508,15 +508,6 @@ fn channel_sender_authorizer(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn valid_webhook_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    (1..=64).contains(&bytes.len())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-#[cfg(feature = "plugins-wasm")]
 fn bounded_plugin_log_value(value: impl AsRef<str>, max_chars: usize) -> String {
     let value = value.as_ref();
     if value.chars().count() <= max_chars {
@@ -532,6 +523,11 @@ async fn finalize_plugin_webhooks(
     candidates: Vec<BuiltChannelCandidate>,
     registry: Option<&PluginWebhookRegistryLease>,
 ) -> Vec<Arc<dyn Channel>> {
+    use zeroclaw_api::webhook::{
+        PLUGIN_WEBHOOK_QUEUE_DEPTH, PluginWebhookOwner, PluginWebhookRoute,
+        is_valid_plugin_webhook_path,
+    };
+
     let Some(registry) = registry else {
         return candidates
             .into_iter()
@@ -568,7 +564,7 @@ async fn finalize_plugin_webhooks(
         }
 
         match candidate.channel.webhook_path().await {
-            Ok(Some(path)) if valid_webhook_path(&path) => {
+            Ok(Some(path)) if is_valid_plugin_webhook_path(&path) => {
                 claimants.entry(path.clone()).or_default().push(index);
                 paths.push(Some(path));
             }
@@ -650,9 +646,15 @@ async fn finalize_plugin_webhooks(
         }
 
         if let Some(path) = paths[index].as_ref() {
-            let (sink, receiver) = tokio::sync::mpsc::channel(64);
+            let (sink, receiver) = tokio::sync::mpsc::channel(PLUGIN_WEBHOOK_QUEUE_DEPTH);
             candidate.channel.set_webhook_receiver(receiver);
-            routes.insert(path.clone(), sink);
+            routes.insert(
+                path.clone(),
+                PluginWebhookRoute::new(
+                    PluginWebhookOwner::new(candidate.package.clone(), candidate.alias.clone()),
+                    sink,
+                ),
+            );
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
@@ -859,28 +861,6 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
-    fn webhook_paths_use_the_bounded_single_segment_grammar() {
-        for path in ["a", "Fixture_01", "a-b", &"x".repeat(64)] {
-            assert!(valid_webhook_path(path), "expected valid path: {path:?}");
-        }
-        for path in [
-            "".to_string(),
-            "x".repeat(65),
-            "has.dot".to_string(),
-            "has/slash".to_string(),
-            "has space".to_string(),
-            "control\n".to_string(),
-            "unicode-λ".to_string(),
-        ] {
-            assert!(
-                !valid_webhook_path(&path),
-                "expected invalid path: {path:?}"
-            );
-        }
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    #[test]
     fn channel_sender_policy_resolves_plugin_peer_groups_live() {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
@@ -1064,6 +1044,7 @@ mod tests {
                 PluginChannelConfig {
                     package: "alpha".to_string(),
                     enabled: true,
+                    ..PluginChannelConfig::default()
                 },
             ),
             (
@@ -1071,6 +1052,7 @@ mod tests {
                 PluginChannelConfig {
                     package: "alpha".to_string(),
                     enabled: true,
+                    ..PluginChannelConfig::default()
                 },
             ),
         ]);
@@ -1252,6 +1234,7 @@ mod tests {
             PluginChannelConfig {
                 package: "real".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         )]);
         config.agents = HashMap::from([(
@@ -1413,6 +1396,7 @@ mod tests {
             PluginChannelConfig {
                 package: "not-installed".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         // `zeta` is installed but declares only the tool capability.
@@ -1421,6 +1405,7 @@ mod tests {
             PluginChannelConfig {
                 package: "zeta".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         let agent = config.agents.get_mut("operator").unwrap();

@@ -361,6 +361,7 @@ mod tests {
             zeroclaw_config::schema::PluginChannelConfig {
                 package: "email-plugin".to_string(),
                 enabled: true,
+                ..zeroclaw_config::schema::PluginChannelConfig::default()
             },
         );
 
