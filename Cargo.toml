@@ -347,7 +347,7 @@ memory-postgres = ["zeroclaw-memory/memory-postgres"]
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
-    "zeroclaw-gateway/observability-prometheus",
+    "zeroclaw-gateway?/observability-prometheus",
 ]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
@@ -366,7 +366,8 @@ plugins-wasm = [
 ]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
-embedded-web = ["zeroclaw-gateway/embedded-web"]
+# Embeds web/dist in the gateway; it has no effect unless `gateway` is enabled.
+embedded-web = ["zeroclaw-gateway?/embedded-web"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]
