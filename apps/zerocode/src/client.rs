@@ -244,9 +244,12 @@ pub struct RpcInboundRequest {
 ///
 /// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
 /// background sessions live): chunk volume multiplies between draw-loop
-/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
-/// session's status dot in "running" forever.
-pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+/// drains, and a `Lagged` receiver forces a durable transcript reload of
+/// every tracked session, during which their live stream is gated. The draw
+/// loop wakes early to drain pending notifications; this capacity is the
+/// headroom for draw stalls (resize storms, full transcript rebuilds, the
+/// process being descheduled) on top of that.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
 
 // ── Typed session updates ────────────────────────────────────────
 

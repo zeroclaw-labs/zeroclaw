@@ -102,6 +102,10 @@ impl Acp {
         self.inner.tick_transport_events();
     }
 
+    pub(crate) fn has_pending_transport_events(&self) -> bool {
+        self.inner.has_pending_transport_events()
+    }
+
     pub(crate) fn draw_with_dock(
         &mut self,
         frame: &mut ratatui::Frame,
