@@ -328,6 +328,34 @@ pub fn canonical_hosts(raw: &[String]) -> Vec<String> {
     out
 }
 
+/// What a `[[plugins.entries]]` row starts out granting when installation
+/// creates it.
+///
+/// `Declared` seeds the manifest declaration into a row this call creates,
+/// which is what `zeroclaw plugin install` does. `Withheld` creates the row
+/// with an empty grant, so the instance reaches nothing until the operator
+/// grants destinations. Neither decision touches a row that already exists:
+/// an existing grant is reported against, never extended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressDecision {
+    /// Grant the destinations the manifest declares.
+    Declared,
+    /// Grant nothing; the operator grants destinations later.
+    Withheld,
+}
+
+impl EgressDecision {
+    /// The allowlist a row created under this decision starts with: the
+    /// canonical declaration, or nothing.
+    #[must_use]
+    pub fn seeded_hosts(self, declared: &[String]) -> Vec<String> {
+        match self {
+            Self::Declared => canonical_hosts(declared),
+            Self::Withheld => Vec::new(),
+        }
+    }
+}
+
 /// Declaration-versus-grant comparison for one plugin instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EgressDeclarationDiff {
@@ -1192,6 +1220,20 @@ mod tests {
         assert_eq!(
             canonical_hosts(&v(&["NOT-LOWERCASE.example.com"])),
             v(&["NOT-LOWERCASE.example.com"])
+        );
+    }
+
+    #[test]
+    fn a_withheld_decision_seeds_nothing_and_a_declared_one_seeds_the_declaration() {
+        let declared = v(&["b.example.com", "a.example.com", "b.example.com"]);
+        assert_eq!(
+            EgressDecision::Declared.seeded_hosts(&declared),
+            canonical_hosts(&declared),
+            "declared seeding is the canonical declaration, exactly as install always seeded"
+        );
+        assert!(
+            EgressDecision::Withheld.seeded_hosts(&declared).is_empty(),
+            "a withheld grant starts deny-everything whatever the manifest declares"
         );
     }
 

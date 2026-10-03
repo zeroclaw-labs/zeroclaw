@@ -393,6 +393,83 @@ impl PluginActivationPlan {
     }
 }
 
+/// Whether one installed tool package would activate, and if not, why.
+///
+/// Only [`Self::Admitted`] is an activation decision, and it is the
+/// activation plan's own. Every other variant explains why that plan did not
+/// admit the package, in the order [`tool_instance_admission`] checks them.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolInstanceAdmission {
+    /// `plugins.enabled` is off, so no plugin instance activates.
+    PluginsDisabled,
+    /// `plugins.auto_discover` is off, so installed tool packages stay dormant.
+    AutoDiscoverDisabled,
+    /// The plugin host has no admitted package with this name.
+    PackageNotInstalled,
+    /// The package is installed but does not declare the tool capability.
+    PackageNotATool,
+    /// Candidates ordered ahead of this one took every instance slot.
+    CeilingReached {
+        /// The configured `plugins.max_active_instances`.
+        max_active_instances: usize,
+    },
+    /// The plan admits the package's tool instance.
+    Admitted {
+        /// Name of the `[[plugins.entries]]` row that configures the instance.
+        instance_key: String,
+    },
+}
+
+/// Report whether `package`'s tool instance would activate under `config`.
+///
+/// The answer comes from the same `PluginActivationPlan` every registry build
+/// derives, so there is one activation rule. Like the plan, this reads only
+/// manifests the host already admitted and never runs guest code.
+///
+/// # Errors
+///
+/// Returns the [`PluginError`] from building the plan or from deriving the
+/// admitted instance's config key.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_admission(
+    config: &Config,
+    host: &PluginHost,
+    package: &str,
+) -> Result<ToolInstanceAdmission, PluginError> {
+    let plan = PluginActivationPlan::build(config, host)?;
+    if plan.admits(package, PluginCapability::Tool, package)
+        && let Some(manifest) = host.manifest(package)
+    {
+        let instance_key = PluginInstanceScope::for_package_binding(
+            manifest,
+            PluginCapability::Tool,
+            std::iter::empty(),
+        )?
+        .id()
+        .config_entry_key()?;
+        return Ok(ToolInstanceAdmission::Admitted { instance_key });
+    }
+
+    if !config.plugins.enabled {
+        return Ok(ToolInstanceAdmission::PluginsDisabled);
+    }
+    if !config.plugins.auto_discover {
+        return Ok(ToolInstanceAdmission::AutoDiscoverDisabled);
+    }
+    let Some(manifest) = host.manifest(package) else {
+        return Ok(ToolInstanceAdmission::PackageNotInstalled);
+    };
+    if !manifest.capabilities.contains(&PluginCapability::Tool) {
+        return Ok(ToolInstanceAdmission::PackageNotATool);
+    }
+    // The plan refused an enabled, auto-discovered, installed tool package, so
+    // the shared ceiling truncated the candidate sequence before reaching it.
+    Ok(ToolInstanceAdmission::CeilingReached {
+        max_active_instances: config.plugins.max_active_instances,
+    })
+}
+
 /// An explicit channel binding activates only when some enabled agent actually
 /// routes to it. Without an owner the listener would run with nothing to
 /// deliver to, so an orphaned declaration is inert rather than half-live.
@@ -1437,6 +1514,90 @@ mod tests {
             plan.scope("zeta", PluginCapability::Channel, "toolonly")
                 .is_none(),
             "a package without the channel capability must not back a channel binding"
+        );
+    }
+
+    #[test]
+    fn tool_admission_reports_the_admitted_instance_key() {
+        let (_plugins, config, host) = fixture();
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+        let expected = plan
+            .scope("zeta", PluginCapability::Tool, "zeta")
+            .expect("the fixture plan admits zeta's tool")
+            .id()
+            .config_entry_key()
+            .unwrap();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::Admitted {
+                instance_key: expected
+            }
+        );
+    }
+
+    #[test]
+    fn tool_admission_reports_a_disabled_plugin_system_before_any_other_gate() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+
+        // An admissible tool, a skill-only package and a missing package each
+        // fail a later gate too, but the first gate in order is the one named.
+        for package in ["zeta", "beta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::PluginsDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_reports_disabled_auto_discovery() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.auto_discover = false;
+
+        for package in ["zeta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::AutoDiscoverDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_tells_a_missing_package_from_a_non_tool_package() {
+        let (_plugins, config, host) = fixture();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "not-installed").unwrap(),
+            ToolInstanceAdmission::PackageNotInstalled
+        );
+        // `beta` is installed but ships only a skill.
+        assert_eq!(
+            tool_instance_admission(&config, &host, "beta").unwrap(),
+            ToolInstanceAdmission::PackageNotATool
+        );
+    }
+
+    #[test]
+    fn tool_admission_attributes_a_refused_tool_to_the_shared_ceiling() {
+        let (_plugins, mut config, host) = fixture();
+        // Plan order puts both explicit channels, alpha's tool and beta's skill
+        // into the four slots, which leaves zeta's tool past the ceiling.
+        config.plugins.max_active_instances = 4;
+
+        assert!(matches!(
+            tool_instance_admission(&config, &host, "alpha").unwrap(),
+            ToolInstanceAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::CeilingReached {
+                max_active_instances: 4
+            }
         );
     }
 

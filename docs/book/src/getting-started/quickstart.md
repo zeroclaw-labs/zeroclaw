@@ -73,6 +73,186 @@ may use `--model-provider claude` as an alias. Quickstart still writes the
 canonical `[providers.models.anthropic.<alias>]` entry; the token is stored
 through the same credential path as `api_key`.
 
+### Plugins
+
+Builds with WASM plugin support add an optional **Plugins** row to the CLI
+checklist, after **Peer groups**. The row exists only when the binary is built
+with the `plugins-wasm` feature. Today's release archives are built without it,
+so their checklist has no Plugins row; a source build with `--preset full` and
+the `all-features` container image include it. Only the CLI Quickstart offers
+the row for now: the zerocode and web gateway Quickstart do not list plugins
+yet. Leaving the row unvisited changes nothing.
+
+Opening the row fetches the plugin registry index, the same one
+`zeroclaw plugin search` uses (set `ZEROCLAW_PLUGIN_REGISTRY_URL` to use another
+registry), and lists every tool plugin the registry offers or this machine
+already has, marking the installed ones. If the registry cannot be reached, you
+can retry or continue without plugins. Picking plugins downloads no package and
+changes no config. Opening the row only writes the registry index cache under
+the data directory, as `zeroclaw plugin search` does, and creates the plugins
+directory if it is missing.
+
+If Quickstart could not read the `[plugins]` section of the config file,
+because that section or the whole file is malformed, the row says so instead
+of fetching the registry. It offers nothing to pick, and **Create** installs no
+plugin. Repair the file, then run Quickstart again to install plugins.
+
+When you choose **Create**, Quickstart installs the picked plugins before it
+creates the agent. First it checks the rest of your choices the way the agent
+step will: if the agent step would refuse them, Quickstart reports the problems
+and stops before any plugin is downloaded or written. Then it installs the
+plugins one at a time, through the pipeline `zeroclaw plugin install` uses:
+
+1. It resolves the package from the registry and refuses a registry entry that
+   has no `sha256` digest for its archive, before requesting the archive.
+   `zeroclaw plugin install` checks the digest only when the registry lists
+   one; Quickstart requires it.
+2. It downloads and verifies the archive, confirms that the manifest provides a
+   tool, admits the package, and runs the install-time load check. When any of
+   these steps fails, Quickstart reports it, writes nothing for that plugin,
+   and moves on to the next one. Quickstart has no `--no-verify`: for a plugin
+   that fails the load check it prints the
+   `zeroclaw plugin install <name> --no-verify` command, which installs a
+   plugin that the daemon then skips at startup.
+3. It prints what the plugin is and what it asks for: name, version, author,
+   description, capabilities, permissions, and the network destinations its
+   manifest declares. Publisher text is stripped of terminal control sequences
+   first.
+4. For a plugin that requests `http_client` and declares destinations, you
+   choose to grant the declared destinations, install without network access,
+   or skip the plugin. The choice starts on installing without network access,
+   so accepting it as offered grants nothing. Installing without network
+   access creates the plugin's config entry with an empty `egress_hosts`, so
+   the plugin reaches nothing, and prints the exact `zeroclaw config set`
+   command that grants the declared destinations later. A plugin that requests
+   network access but declares no destinations gets no question; after
+   installing it, Quickstart prints the grant command with a `<host>`
+   placeholder to fill in.
+5. For a plugin whose manifest has a `config_schema`, Quickstart prompts for
+   the settings it describes: required properties first, optional ones only if
+   you ask for them. Properties marked `x-secret` are masked as you type them,
+   and spaces or line breaks around a secret value are dropped, as
+   `zeroclaw config set` drops them. The values are checked against the schema
+   before anything is written; after a failed check you get one more try, then
+   Quickstart asks whether to install the plugin without them. Pressing Esc at
+   a required setting that is secret or picked from a list skips the plugin.
+   Quickstart prompts only for properties whose names are in the portable key
+   grammar (up to 128 ASCII letters, digits, `.`, `-` and `_`). It names the
+   others so that you can set them later with `zeroclaw config set`. When a
+   required property is one of them, or a name the schema requires without
+   declaring it, no answers could pass the check, so Quickstart asks for no
+   settings and goes straight to asking whether to install the plugin without
+   them.
+6. It publishes the package and seeds its config entry in the same transaction
+   `zeroclaw plugin install` uses, then saves the settings the way
+   `zeroclaw config set` does. If seeding the entry fails, the transaction
+   removes the package again. If that removal fails too, Quickstart says the
+   plugin is still installed and prints the `zeroclaw plugin remove` command
+   for it.
+
+Values you type for settings that are not marked `x-secret` are echoed at the
+prompt, and a default from the schema is prefilled there. Setting values are
+never written to logs or to the status lines Quickstart prints; those name the
+settings only.
+
+A plugin that is already installed is not downloaded, upgraded, or prompted for
+settings again. Quickstart only creates its config entry when that entry is
+missing. A new entry is a new grant, so for a plugin that requests
+`http_client` and declares destinations you first see what the plugin is and
+make the same choice as for a fresh install: grant the declared destinations,
+create the entry without network access, or skip, which leaves the entry absent
+and prints the command that creates it later. That command creates the entry
+without network access. The command that grants the declared destinations is
+printed on its own line, to run after it, so running a printed command never
+grants what you declined. Any other missing entry is seeded as
+`zeroclaw plugin install` seeds it. An existing entry is never changed,
+whether it belongs to an installed plugin or was left behind by an earlier
+install, so its egress grant and settings stay exactly as they are. Running
+Quickstart again with the same picks therefore downloads nothing and leaves
+those entries untouched.
+
+After the last plugin, if at least one picked plugin is installed and
+`plugins.enabled` or `plugins.auto_discover` is off, Quickstart asks once
+whether to turn plugin activation on. First it lists which of those settings
+would change and everything that would become active as a result: every
+installed tool and skill plugin, including plugins installed before this run,
+and, when `plugins.enabled` is off, every enabled `[channels.plugin.<alias>]`
+channel. The list is read from the plugins directory, as a daemon would load
+it at its next start, so it also names a plugin whose failed install could not
+be undone. The answer defaults to yes when the list matches the plugins this run
+installed or kept, and to no when it would activate anything else, including an
+installed plugin whose missing config entry you chose to skip. If the plugins
+directory cannot be read, Quickstart says the list may be incomplete and the
+answer defaults to no. Declining leaves
+both settings unchanged and prints the `zeroclaw config set` commands that turn
+them on later. When both settings are already on, there is nothing to ask.
+
+Once the agent is created, Quickstart prints the status of each picked plugin
+that is installed: active as a tool, with its config entry key, or the reason
+it is not active, such as `plugins.enabled` or `plugins.auto_discover` being
+off or the `plugins.max_active_instances` limit being reached. A plugin is
+reported active only when its config entry passes the settings check the
+runtime applies on every call. Otherwise, for example when you installed it
+without its required settings, its status shows the reason the check gives,
+names the required settings that are missing, and prints the
+`zeroclaw config set` command that asks for each value. Quickstart prints
+commands only for setting names in the portable key grammar, which are safe to
+show and to paste into a shell. A required setting with any other name is
+named without a command: set it in the config file, or with a
+`zeroclaw config set` command you quote yourself. A required name that the
+plugin's schema does not declare is named too, since no config entry can
+satisfy that schema until the plugin's publisher fixes it. A plugin whose
+config entry is missing, for example because you skipped creating it, is not
+reported active either: `zeroclaw config set` only changes entries that exist,
+so its status prints the command that creates the entry instead. That command
+grants no network access; for a plugin that requests `http_client` and
+declares destinations, a separate line gives the command that grants them once
+the entry exists. A plugin with nothing to configure and no network access
+needs no config entry.
+
+A picked plugin that was already installed may never have passed the load
+check, for example when it was installed with
+`zeroclaw plugin install --no-verify`, so Quickstart runs the check
+`zeroclaw plugin info` runs before it reports the plugin. When the plugin does
+not load against this host, ZeroClaw skips it at startup, so its status says
+that instead of calling it active and gives the `zeroclaw plugin info` command
+that shows why.
+
+Quickstart writes the config file and never signals a running daemon. A daemon
+that is already running keeps the configuration it loaded, so it uses the new
+plugins, their settings, and any change to plugin activation only after it
+restarts or reloads its configuration. The status ends with the
+`zeroclaw service restart` command, addressed to the same configuration
+directory, which restarts a daemon that runs as the installed service.
+`zeroclaw agent` and other one-shot commands pick the changes up the next time
+they start.
+
+Ctrl+C does not work the same everywhere in the plugin step. At a secret setting
+it works like Esc: at a required setting it cancels that plugin's settings, so
+the plugin is skipped, and at an optional one it leaves the setting unset.
+Quickstart then carries on. Anywhere else in the step, Ctrl+C ends Quickstart
+at once, without a summary of what it already did. A plugin whose install
+finished stays installed and configured, and `zeroclaw plugin list` shows it.
+A plugin interrupted after its install but before its config entry was written
+stays installed without that entry; running Quickstart again with the same pick
+creates the entry, asking first when it would grant network destinations.
+
+If the agent step still fails after the plugin step changed something,
+Quickstart does not claim that nothing changed. It names the plugins that stay
+installed, configured, or activated, and prints the `zeroclaw plugin remove`
+command for each plugin that run installed, including one whose failed install
+could not be undone and so stays in the plugins directory. Running Quickstart
+again does not reinstall them.
+
+The architecture roadmap
+([FND-001](../foundations/fnd-001-intentional-architecture.md#d4-integrate-zeroclaw-onboard-with-the-plugin-system),
+RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574), deliverable
+D4) asks for `zeroclaw onboard` to install plugins. `zeroclaw quickstart`, the
+maintained command that `zeroclaw onboard` now points to, delivers that for
+tool plugins, in builds with plugin support. Installing channel plugins during
+onboarding and shipping release artifacts with plugin support are separate
+deliverables.
+
 ## zerocode
 
 In the [zerocode](./zerocode.md) terminal interface, the Quickstart pane is one of
