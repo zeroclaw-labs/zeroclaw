@@ -348,6 +348,15 @@ map rather than a key inside it. The allowlist is the thing an operator audits,
 so it stays readable in the same file being audited while the secrets beside it
 remain `enc2:…`.
 
+A refused destination shows up in the log even when the plugin reports
+nothing. Whether the plugin used HTTP, a raw socket, or a WebSocket, a
+destination the egress policy refuses logs a WARN record with `error_key`
+`plugin_egress_denied` that names the instance, the `transport`, the host, and
+the reason, plus a `remedy` command when a grant would fix it. A connection
+refused because the instance's connection budget is spent logs
+`plugin_egress_connection_limit` instead. Search the log for those keys when a
+plugin cannot reach a service.
+
 ### What install and list do
 
 `zeroclaw plugin install` is the one moment the two sides are reconciled

@@ -9,6 +9,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress_records.rs"]
+mod egress_records;
 mod support;
 
 use std::collections::HashMap;
@@ -384,4 +386,48 @@ async fn starttls_negotiates_in_plaintext_then_upgrades_in_place() {
     })
     .await;
     assert_eq!(upgraded.as_deref(), Ok("ping"));
+}
+
+/// A refused connect is recorded for the operator, who otherwise sees nothing:
+/// the guest gets only `access-denied`. The record names the transport and,
+/// when a grant would help, the command that adds it while keeping the grant
+/// the instance already has.
+#[tokio::test]
+async fn a_refused_socket_is_recorded_for_the_operator() {
+    egress_records::start();
+    let port = plain_echo().await;
+    // The binding `run` derives for a plaintext run on this port.
+    let instance = format!("socket-plaintext-{port}");
+
+    run(plain(port, Some(egress(&["records.example.com"], false))))
+        .await
+        .expect_err("an ungranted destination must be refused");
+    let refused = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_string()
+    });
+    assert_eq!(
+        refused.len(),
+        1,
+        "one refused connect, one record: {refused:?}"
+    );
+    assert_eq!(refused[0]["transport"], "socket");
+    assert_eq!(refused[0]["error_key"], "plugin_egress_denied");
+    assert_eq!(refused[0]["host"], "localhost");
+    let remedy = refused[0]["remedy"].as_str().unwrap_or_default();
+    assert!(
+        remedy.ends_with(".egress_hosts '[\"records.example.com\",\"localhost\"]'"),
+        "the remedy keeps the current grant: {remedy}"
+    );
+
+    run(plain(port, None))
+        .await
+        .expect_err("a store with no egress authority has no reach");
+    let unattached = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_null()
+    });
+    assert_eq!(unattached.len(), 1, "{unattached:?}");
+    assert_eq!(
+        unattached[0]["reason"],
+        "no egress policy granted for this instance"
+    );
 }
