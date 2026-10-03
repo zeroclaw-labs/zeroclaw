@@ -645,16 +645,29 @@ pub struct StreamedTurnError {
 pub type ConfigGeneration =
     std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
     /// Live shared config used by tools whose security policy must reflect the
     /// next dispatch even when model/provider state remains generation-pinned.
-    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// Live shared config this snapshot is refreshed from when the caller owns
     /// an acknowledged model-generation refresh transaction. `None` for
     /// one-shot/test agents and direct ACP/WS agents pinned until reconnect.
-    pub live: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    pub live: Option<zeroclaw_config::live::LiveConfigHandle>,
+}
+
+impl std::fmt::Debug for ProviderSwitchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSwitchConfig")
+            .field("config", &self.config)
+            .field(
+                "live_config",
+                &self.live_config.as_ref().map(|_| "LiveConfigHandle"),
+            )
+            .field("live", &self.live.as_ref().map(|_| "LiveConfigHandle"))
+            .finish()
+    }
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -1677,7 +1690,7 @@ impl Agent {
             .provider_switch_config
             .as_ref()
             .and_then(|cfg| cfg.live.as_ref())
-            .map(Arc::clone)
+            .cloned()
         else {
             return;
         };
@@ -2283,7 +2296,7 @@ impl Agent {
     /// until reconnect while independently live tool/history policy continues
     /// to follow the shared config.
     pub async fn from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2309,7 +2322,7 @@ impl Agent {
     }
 
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2345,7 +2358,7 @@ impl Agent {
     /// Build a daemon-backed ACP/WS Agent from live tool and history policy
     /// while keeping its model route generation pinned until reconnect.
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2370,7 +2383,7 @@ impl Agent {
     }
 
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2399,7 +2412,7 @@ impl Agent {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2498,7 +2511,7 @@ impl Agent {
     /// the shared config after reloads.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2525,7 +2538,7 @@ impl Agent {
     /// is only the current assembly ceiling, not a long-lived policy snapshot.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env_and_principal_tools(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2554,7 +2567,7 @@ impl Agent {
     }
 
     pub async fn from_live_config_with_tui_env_with_capability(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2587,7 +2600,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_snapshot_with_tui_env_with_capability(
         config: &Config,
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -2628,7 +2641,7 @@ impl Agent {
                 sop_audit,
                 None,
                 acp_session_store,
-                Some(Arc::clone(&live_config)),
+                Some(live_config.clone()),
                 Some(live_config),
                 principal_allowed_tools,
                 execution_capability,
@@ -2654,8 +2667,8 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
         acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
-        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
-        live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        live_model_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         // The caller principal's tool selector (RFC 7141 composition by
         // intersection): `None` = unrestricted, `Some(list)` keeps only the
         // named tools from the assembled surface (empty = a tool-less
@@ -9507,7 +9520,7 @@ mod tests {
 
         let authority = crate::live_config_authority::LiveConfigAuthority::new(config);
         let managed = Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-            authority.config(),
+            authority.live_handle(),
             "test-agent",
             Some(&data_dir),
             false,
@@ -16584,7 +16597,7 @@ model_provider = "custom.only"
                 let lifecycle = authority.agent_lifecycle();
                 let reservation = lifecycle.reserve_admission("direct").unwrap();
                 let capability = authority.execution_capability();
-                let live = authority.config();
+                let live = authority.live_handle();
 
                 let (release, blocked) = std::sync::mpsc::channel();
                 let (entered, ready) = tokio::sync::oneshot::channel();
@@ -16638,15 +16651,15 @@ model_provider = "custom.only"
     #[tokio::test]
     async fn direct_live_agents_pin_one_route_generation_until_reconnect() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let live = Arc::new(parking_lot::RwLock::new(direct_live_generation_config(
+        let live = zeroclaw_config::live::LiveConfig::new(direct_live_generation_config(
             temp.path(),
             "old",
             "old-model",
             200_000,
             12,
-        )));
+        ));
         let mut retained = Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
-            Arc::clone(&live),
+            live.handle(),
             "direct",
             Some(temp.path()),
             false,
@@ -16659,7 +16672,11 @@ model_provider = "custom.only"
         .await
         .expect("direct Agent construction");
 
-        *live.write() = direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3);
+        live.publish(
+            live.next_revision().unwrap(),
+            direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3),
+        )
+        .unwrap();
         retained.sync_config_generation();
 
         let (_, retained_provider, retained_model) = retained.attribution_fields();
@@ -16703,7 +16720,7 @@ model_provider = "custom.only"
         );
 
         let rebuilt = Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
-            Arc::clone(&live),
+            live.handle(),
             "direct",
             Some(temp.path()),
             false,
@@ -16746,11 +16763,9 @@ model_provider = "custom.only"
     /// capacity.
     #[test]
     fn config_set_then_model_switch_dispatches_and_reports_one_generation() {
-        let live = Arc::new(parking_lot::RwLock::new(generation_config(
-            200_000, "large-v1",
-        )));
+        let live = zeroclaw_config::live::LiveConfig::new(generation_config(200_000, "large-v1"));
         let generation: ConfigGeneration =
-            Arc::new(parking_lot::RwLock::new(Arc::new(live.read().clone())));
+            Arc::new(parking_lot::RwLock::new(Arc::new(live.snapshot())));
 
         let mut agent = build_test_agent(
             "custom.large",
@@ -16758,7 +16773,7 @@ model_provider = "custom.only"
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
                 live_config: None,
-                live: Some(Arc::clone(&live)),
+                live: Some(live.handle()),
             }),
         );
         agent.config_generation = Some(Arc::clone(&generation));
@@ -16776,7 +16791,11 @@ model_provider = "custom.only"
         );
 
         // A `config/set` lands on the live shared config mid-session.
-        *live.write() = generation_config(8_000, "large-v2");
+        live.publish(
+            live.next_revision().unwrap(),
+            generation_config(8_000, "large-v2"),
+        )
+        .unwrap();
 
         // Within the turn already in flight the generation is still the old one:
         // a reload must not be observed by half a turn.

@@ -22959,6 +22959,66 @@ impl Config {
         }
     }
 
+    /// Hydrate one already-migrated config body exactly as a reload would,
+    /// without replacing the config file.
+    ///
+    /// This is the preparation step for config migration (see the
+    /// gateway's migrate endpoint): the candidate must be fully hydrated
+    /// — strict parse into the current schema, computed paths attached,
+    /// secrets decrypted through the install's store, env overrides
+    /// applied with their save-masking snapshots captured — and must pass
+    /// strict validation *before* the migrated file is allowed to replace
+    /// the live one. Any failure (parse, secret, unresolvable env path,
+    /// validation) refuses the migration with the original config file
+    /// untouched and nothing published. Migration acceptance is stricter
+    /// than resilient boot ([`Config::load_or_init`] warns and serves);
+    /// an operator-driven replacement may not install a config the
+    /// current schema rejects.
+    ///
+    /// The caller supplies the canonical `config_path` and `data_dir`
+    /// (from the currently published config) so the prepared candidate is
+    /// exactly the config the next daemon generation would load from the
+    /// migrated file.
+    pub async fn prepare_from_migrated_toml(
+        content: &str,
+        config_path: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let mut config = crate::migration::migrate_to_current(content)
+            .context("migrated config failed to hydrate as the current schema")?;
+        config.config_path = config_path.to_path_buf();
+        config.data_dir = data_dir.to_path_buf();
+
+        if let Some(default_profile) = config.risk_profiles.get_mut("default") {
+            default_profile.ensure_default_auto_approve();
+        }
+
+        let zeroclaw_dir = config_path
+            .parent()
+            .context("config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config = tokio::task::spawn_blocking(move || {
+            config.decrypt_secrets(&store)?;
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("migrated config secret decryption task failed")??;
+
+        let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+
+        // Strict validation: unlike resilient boot, an operator-driven
+        // migration refuses a candidate the current schema rejects. The
+        // refusal happens before any disk replacement, so the original
+        // file and the published pair are unchanged.
+        config
+            .validate()
+            .context("migrated config failed strict validation")?;
+        Ok(config)
+    }
+
     /// Report that opting into `[verifiable_intent]` does not currently enable
     /// credential verification, because `vi_verify` is withheld from the
     /// model-visible registry until a chain verifier exists.
