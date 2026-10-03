@@ -1129,6 +1129,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Failed to initialize model_provider `{ $provider }`. Route unchanged.
     Details: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ Effort routing configuration is invalid. Check the configured local and cloud route hints.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
 channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
 channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.

@@ -19,13 +19,48 @@ For ad-hoc multi-step routing inside a single conversation, the `spawn_subagent`
 
 A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent. Each route entry carries a `hint` (the string a prompt must declare to fire it), a `model_provider` (the dotted `<type>.<alias>` profile to switch to, e.g. `deepseek.reasoner`), and a `model` (the provider-local model id, e.g. `deepseek-reasoner`). Configure routes through the gateway, zerocode, or `zeroclaw config set`; see the [Config reference](../reference/config.md#model_routes) for the field schema.
 
-Routes only fire when a prompt explicitly carries the matching hint. The default request path uses the agent's primary `model_provider`.
+Routes normally fire when a prompt explicitly carries the matching hint. An opted-in effort-routing runtime profile can also select two named routes automatically before provider execution.
 
 An unknown `hint:<name>` logs a warning and stays in the default reliability domain while preserving the literal hint as the requested model. A pinned default entry still serves its active/default pin. An unpinned default entry forwards the literal value, which the provider may reject before normal fallback or error handling continues.
 
 `model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and optional default model. The `model` field is provider-local state under that profile.
 
 > **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model remains unpinned and receives the route model; its `fallback_models` are not materialized, although referenced fallback profiles are still walked. Keep the route model aligned with the target pin when one exists.
+
+## Effort-based local/cloud routing
+
+An `effort_routing` block on a runtime profile can select a local route for simple and ambiguous turns and a cloud route for complex turns. The feature is off unless the block is present. It reuses exact, case-sensitive `[[model_routes]].hint` values, so provider credentials and model IDs remain owned by the existing route and provider-profile configuration.
+
+```toml
+[[model_routes]]
+hint = "local"
+model_provider = "ollama.local"
+model = "qwen3:8b"
+
+[[model_routes]]
+hint = "cloud"
+model_provider = "anthropic.sonnet"
+model = "claude-sonnet-4-5"
+
+[runtime_profiles.local_first.effort_routing]
+local_hint = "local"
+cloud_hint = "cloud"
+cloud_escalation = "auto"
+```
+
+The first implementation uses ZeroClaw's deterministic complexity estimator. It does not send the prompt to another model for classification. Simple and standard turns select `local_hint`. Complex turns select `cloud_hint` only when `cloud_escalation = "auto"`; the default `"never"` keeps every automatic decision local.
+
+The routing decision is per turn. Logs include the selected target, complexity tier, escalation policy, and message length, but not the message text. A local decision restricts provider attempts to the configured local provider, including stream-to-nonstream recovery, so an availability fallback cannot silently disclose that turn to cloud. A cloud decision permits the configured local and cloud provider references.
+
+Explicit choices take precedence over automatic effort routing. CLI `--provider` or `--model` overrides bypass it. A channel `/model <model-or-hint>` choice and an in-turn `model_switch` remain selected instead of being replaced on the next classifiable turn. Use `/model auto` to clear the sender-session choice and restore configured automatic routing; scoped `/model --user auto` and `/model --agent auto` clear those scoped choices. Structured session provider or model overrides remain explicit for that session.
+
+This slice does not provide an ask-before-cloud mode, escalation-frequency limits, or a separate cost cap. Use `cloud_escalation = "never"` when cloud egress is not allowed, and use provider budgets and normal observability for cost controls.
+
+Effort routing has a deliberately narrow relationship to adjacent work:
+
+- [Issue #5287](https://github.com/zeroclaw-labs/zeroclaw/issues/5287) owns how a local or small model behaves after it is selected.
+- [Issue #7539](https://github.com/zeroclaw-labs/zeroclaw/issues/7539) concerns local model-router and discovery work; effort routing consumes configured aliases instead of discovering models.
+- [Issue #7431](https://github.com/zeroclaw-labs/zeroclaw/issues/7431) concerns delivery and tool-routing intent, not local-versus-cloud model selection.
 
 ## Reliability fallback
 

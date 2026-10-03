@@ -982,6 +982,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     model_provider `{ $provider }` の初期化に失敗しました。ルートは変更されていません。
     詳細: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ エフォートルーティングの設定が無効です。設定済みのローカルおよびクラウドルートを確認してください。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` には設定済みエイリアスが複数あります。`/models { $family }.<alias>` で指定してください: { $list }
 channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済み provider エントリがありません。`[providers.models.{ $provider }]`（api_key/uri を含む）を追加するか、設定済み provider を選択してください。`/models` で有効な項目を確認できます。
 channel-runtime-provider-unknown = 不明な model_provider `{ $provider }` です。`/models` で有効な model_provider を一覧表示してください。

@@ -983,6 +983,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     初始化 model_provider `{ $provider }` 失败。路由未更改。
     详情：{ $error }
+channel-runtime-effort-routing-invalid = ⚠️ 工作量路由配置无效。请检查已配置的本地和云端路由。
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` 有多个已配置别名。请用 `/models { $family }.<alias>` 指定其中一个：{ $list }
 channel-runtime-provider-no-alias = 未找到 `{ $provider }` 的已配置 provider 条目。请添加 `[providers.models.{ $provider }]`（含 api_key/uri），或选择一个已配置的 provider；`/models` 会列出有效项。
 channel-runtime-provider-unknown = 未知 model_provider `{ $provider }`。使用 `/models` 查看有效的 model_provider。

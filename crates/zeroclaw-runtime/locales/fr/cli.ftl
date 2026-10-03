@@ -987,6 +987,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Échec de l'initialisation de model_provider `{ $provider }`. Route inchangée.
     Détails : { $error }
+channel-runtime-effort-routing-invalid = ⚠️ La configuration du routage selon l'effort n'est pas valide. Vérifiez les routes locale et cloud configurées.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` a plusieurs alias configurés. Précisez lequel avec `/models { $family }.<alias>` : { $list }
 channel-runtime-provider-no-alias = Aucune entrée de provider configurée pour `{ $provider }`. Ajoutez `[providers.models.{ $provider }]` (avec api_key/uri) ou sélectionnez un provider configuré ; `/models` liste les valeurs valides.
 channel-runtime-provider-unknown = model_provider inconnu `{ $provider }`. Utilisez `/models` pour lister les model_providers valides.

@@ -135,17 +135,19 @@ pub(crate) async fn finish_after_max_iterations(
 
     // Resolve against the real latest user turn, before the synthetic summary
     // prompt could hide a fresh image from the vision-capability policy.
-    let (vision_provider, degrade_strip_images) = super::vision_route::resolve_vision_provider(
-        config,
-        model_provider,
-        history,
-        multimodal_config,
-        provider_name,
-        model,
-        dispatch_model,
-        security,
-    )
-    .await?;
+    let (vision_provider, degrade_strip_images) =
+        super::vision_route::resolve_vision_provider_with_allowed_refs(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+            model,
+            dispatch_model,
+            security,
+            knobs.provider_attempt_allowlist.as_deref(),
+        )
+        .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),

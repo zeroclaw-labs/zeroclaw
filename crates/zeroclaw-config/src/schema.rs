@@ -3817,6 +3817,7 @@ pub struct ResolvedRuntime {
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
@@ -4010,6 +4011,7 @@ impl Default for ResolvedRuntime {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
@@ -4913,6 +4915,7 @@ impl Config {
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
             resolved.auto_classify = profile.auto_classify.clone();
+            resolved.effort_routing = profile.effort_routing.clone();
             resolved.context_compression = profile.context_compression.clone();
             resolved.tool_receipts = profile.tool_receipts.clone();
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
@@ -14714,6 +14717,8 @@ pub struct RuntimeProfileConfig {
     #[nested]
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     #[nested]
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
+    #[nested]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     #[nested]
     pub tool_receipts: ToolReceiptsConfig,
@@ -14749,6 +14754,7 @@ impl Default for RuntimeProfileConfig {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
@@ -23805,6 +23811,40 @@ impl Config {
                     "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
                 );
             }
+            if let Some(policy) = &profile.effort_routing {
+                let local_hint = policy.local_hint.trim();
+                let cloud_hint = policy.cloud_hint.trim();
+                if local_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.local_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.local_hint must not be empty"
+                    );
+                }
+                if cloud_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.cloud_hint must not be empty"
+                    );
+                }
+                if local_hint.eq_ignore_ascii_case(cloud_hint) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing local_hint and cloud_hint must name distinct model_routes"
+                    );
+                }
+                for (field, hint) in [("local_hint", local_hint), ("cloud_hint", cloud_hint)] {
+                    if !self.model_routes.iter().any(|route| route.hint == hint) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("runtime_profiles.{profile_alias}.effort_routing.{field}"),
+                            "runtime_profiles.{profile_alias}.effort_routing.{field} = {hint:?} but no model_routes entry has that hint"
+                        );
+                    }
+                }
+            }
         }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
@@ -24432,12 +24472,21 @@ impl Config {
         }
 
         // Model routes
+        let mut model_route_hints = std::collections::HashSet::new();
         for (i, route) in self.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
                     "model_routes[{i}].hint must not be empty"
+                );
+            }
+            if !model_route_hints.insert(route.hint.as_str()) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("model_routes[{i}].hint"),
+                    "model_routes[{i}].hint = {:?} duplicates an existing exact route hint",
+                    route.hint
                 );
             }
             let mp = route.model_provider.trim();
@@ -49492,5 +49541,104 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    fn effort_routing_config() -> super::Config {
+        let mut config = super::Config::default();
+        for alias in ["local", "cloud"] {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", alias)
+                .expect("custom provider entry");
+            entry.model = Some(format!("{alias}-model"));
+        }
+        config.model_routes = vec![
+            super::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            super::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".into(),
+            super::RuntimeProfileConfig {
+                effort_routing: Some(crate::scattered_types::EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: crate::scattered_types::CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn effort_routing_requires_two_existing_distinct_hints() {
+        let config = effort_routing_config();
+        config.validate().expect("valid effort routing config");
+
+        let mut missing = config.clone();
+        missing
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "missing".into();
+        let error = missing.validate().expect_err("missing route must fail");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut wrong_case = config.clone();
+        wrong_case
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .local_hint = "LOCAL".into();
+        let error = wrong_case
+            .validate()
+            .expect_err("route hints are case-sensitive");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut duplicate = config;
+        duplicate
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "LOCAL".into();
+        let error = duplicate.validate().expect_err("duplicate hints must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must name distinct model_routes")
+        );
+
+        let mut duplicate_route = effort_routing_config();
+        duplicate_route
+            .model_routes
+            .push(duplicate_route.model_routes[0].clone());
+        let error = duplicate_route
+            .validate()
+            .expect_err("duplicate exact route hints must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicates an existing exact route hint")
+        );
     }
 }

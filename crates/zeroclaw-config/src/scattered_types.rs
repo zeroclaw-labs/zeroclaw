@@ -218,6 +218,37 @@ impl Default for AutoClassifyConfig {
     }
 }
 
+/// Whether an effort-routed turn may leave the configured local route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloudEscalationPolicy {
+    /// Keep every automatically classified turn on the local route.
+    #[default]
+    Never,
+    /// Send complex turns to the configured cloud route.
+    Auto,
+}
+
+impl HasPropKind for CloudEscalationPolicy {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
+/// Opt-in deterministic local/cloud routing for one runtime profile.
+///
+/// The hints reference existing `[[model_routes]]` entries; provider
+/// credentials, models, and reliability remain owned by those entries and
+/// their provider profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.effort_routing"]
+pub struct EffortRoutingConfig {
+    pub local_hint: String,
+    pub cloud_hint: String,
+    #[serde(default)]
+    pub cloud_escalation: CloudEscalationPolicy,
+}
+
 fn default_min_quality_score() -> f64 {
     0.5
 }

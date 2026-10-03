@@ -55,7 +55,7 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 /// probed. `None` fails closed: no local path resolves, so a configless
 /// caller degrades to a text-only turn instead of erroring, and data-URI
 /// and remote references are unaffected by `None`.
-pub(crate) async fn resolve_vision_provider(
+pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     config: Option<&Config>,
     model_provider: &dyn ModelProvider,
     history: &[ChatMessage],
@@ -64,6 +64,7 @@ pub(crate) async fn resolve_vision_provider(
     model: &str,
     dispatch_model: &str,
     security: Option<&SecurityPolicy>,
+    allowed_provider_refs: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
@@ -73,6 +74,26 @@ pub(crate) async fn resolve_vision_provider(
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
+            let provider_allowed = allowed_provider_refs.map_or_else(
+                || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(vp),
+                |allowed| allowed.contains(vp),
+            );
+            if !provider_allowed {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "vision_provider": vp,
+                            "reason": "effort_routing_policy",
+                        })),
+                    "vision model_provider blocked by turn routing policy"
+                );
+                return Err(anyhow::Error::msg(format!(
+                    "configured vision model_provider '{vp}' is not permitted by the selected effort route"
+                )));
+            }
             // Resolve the configured vision provider through the alias-aware
             // factory so its per-alias `vision` override and typed config
             // (endpoint URI, credentials) are honored - the legacy
@@ -235,6 +256,31 @@ pub(crate) async fn resolve_vision_provider(
     };
 
     Ok((vision_model_provider, degrade_strip_images))
+}
+
+#[cfg(test)]
+async fn resolve_vision_provider(
+    config: Option<&Config>,
+    model_provider: &dyn ModelProvider,
+    history: &[ChatMessage],
+    multimodal_config: &MultimodalConfig,
+    provider_name: &str,
+    model: &str,
+    dispatch_model: &str,
+    security: Option<&SecurityPolicy>,
+) -> Result<(Option<ResolvedVisionProvider>, bool)> {
+    resolve_vision_provider_with_allowed_refs(
+        config,
+        model_provider,
+        history,
+        multimodal_config,
+        provider_name,
+        model,
+        dispatch_model,
+        security,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn prepare_messages_for_iteration(
@@ -1497,6 +1543,49 @@ model = "vision-model"
             !degrade_strip_images,
             "a live vision route must not degrade/strip images"
         );
+
+        let allowed =
+            std::sync::Arc::new(std::collections::HashSet::from(
+                ["custom.local".to_string()],
+            ));
+        let result = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+            Some(allowed),
+            resolve_vision_provider(
+                Some(&config),
+                &PlainNonVisionPrimary,
+                &history,
+                &multimodal,
+                "custom.local",
+                "primary-model",
+                "primary-model",
+                Some(&security),
+            ),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an excluded vision provider must fail closed before dispatch"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not permitted"));
+
+        let direct_allowed = std::collections::HashSet::from(["custom.local".to_string()]);
+        let direct_result = resolve_vision_provider_with_allowed_refs(
+            Some(&config),
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "custom.local",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+            Some(&direct_allowed),
+        )
+        .await;
+        let direct_error = match direct_result {
+            Ok(_) => panic!("the explicit direct-turn boundary must block the vision side route"),
+            Err(error) => error,
+        };
+        assert!(direct_error.to_string().contains("not permitted"));
     }
 
     /// Success-path companion to the error-branch test above: when the primary

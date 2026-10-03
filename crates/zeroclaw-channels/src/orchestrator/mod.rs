@@ -337,9 +337,21 @@ fn channel_message_timeout_budget_secs_with_cap(
 struct ChannelRouteSelection {
     model_provider: String,
     model: String,
+    /// True when this selection came from config and remains eligible for
+    /// automatic classification. `/model` and `model_switch` set it false.
+    automatic: bool,
     /// Route-specific API key override. When set, this credential is passed
     /// directly to the requested provider instead of the alias entry's key.
     api_key: Option<String>,
+}
+
+fn configured_provider_allowed_for_turn(
+    attempt_allowlist: Option<&HashSet<String>>,
+    provider_ref: &str,
+) -> bool {
+    let provider_ref = provider_ref.trim();
+    provider_ref.is_empty()
+        || attempt_allowlist.is_none_or(|allowed| allowed.contains(provider_ref))
 }
 
 fn resolve_channel_context_limits(
@@ -3022,6 +3034,7 @@ fn default_route_selection_from_snapshot(
     ChannelRouteSelection {
         model_provider: defaults.default_model_provider,
         model: defaults.model,
+        automatic: true,
         api_key: None,
     }
 }
@@ -3091,6 +3104,7 @@ fn apply_model_ref(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     model: &str,
 ) {
+    sel.automatic = false;
     if let Some(route) = model_routes
         .iter()
         .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
@@ -3148,6 +3162,18 @@ fn set_scope_override(
     } else {
         overrides.insert(key, next);
     }
+}
+
+fn clear_scope_override(
+    ctx: &ChannelRuntimeContext,
+    scope: OverrideScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) {
+    let key = scope_override_key(scope, msg, ctx.agent_alias.as_str());
+    ctx.scope_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
 }
 
 /// Per-sender authorization for `/model --agent <model>`. Resolves live
@@ -4938,15 +4964,14 @@ async fn handle_runtime_command_for_delivery(
                     match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
                     {
                         Ok(_) => {
-                            if provider_ref != current.model_provider {
-                                current.model_provider = provider_ref.clone();
-                                set_route_selection(
-                                    ctx,
-                                    &sender_key,
-                                    current.clone(),
-                                    &defaults_snapshot,
-                                );
-                            }
+                            current.model_provider = provider_ref.clone();
+                            current.automatic = false;
+                            set_route_selection(
+                                ctx,
+                                &sender_key,
+                                current.clone(),
+                                &defaults_snapshot,
+                            );
 
                             channel_runtime_cli_string_with_args(
                                 "channel-runtime-set-provider-switched",
@@ -5031,6 +5056,17 @@ async fn handle_runtime_command_for_delivery(
                         ("model", model.as_str()),
                     ],
                 )
+            } else if model.eq_ignore_ascii_case("auto") {
+                clear_scope_override(ctx, scope, msg);
+                let current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-scoped-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                        ("scope", channel_runtime_scope_label(scope).as_str()),
+                    ],
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
@@ -5079,6 +5115,16 @@ async fn handle_runtime_command_for_delivery(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
+            } else if model.eq_ignore_ascii_case("auto") {
+                current = default_route_selection_from_snapshot(&defaults_snapshot);
+                set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
+                )
             } else {
                 // Authoritative picker-revocation claim at the mutation
                 // point. The early dispatch gate in
@@ -9097,8 +9143,58 @@ async fn process_channel_message_body(
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let mut attempt_allowlist: Option<Arc<HashSet<String>>> = None;
 
-    if let Some(hint) =
+    let resolved_agent = runtime_defaults
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str());
+    let effort_policy = resolved_agent
+        .as_ref()
+        .and_then(|agent| agent.resolved.effort_routing.as_ref());
+
+    if let Some(policy) = effort_policy {
+        if route.automatic {
+            let Some(selection) = zeroclaw_runtime::agent::eval::resolve_effort_route(
+                policy,
+                &runtime_defaults.config.model_routes,
+                &msg.content,
+            ) else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::reply_to(
+                                &msg,
+                                channel_runtime_cli_string(
+                                    "channel-runtime-effort-routing-invalid",
+                                ),
+                            )
+                            .suppress_voice(),
+                        )
+                        .await;
+                }
+                return;
+            };
+            attempt_allowlist = Some(Arc::new(selection.allowed_provider_refs.clone()));
+            route = ChannelRouteSelection {
+                model_provider: selection.route.model_provider.clone(),
+                model: selection.route.model.clone(),
+                automatic: true,
+                api_key: selection.route.api_key.clone(),
+            };
+            zeroclaw_runtime::agent::eval::log_effort_route_selection(
+                &selection,
+                msg.content.len(),
+                "channel",
+            );
+        }
+    } else if let Some(hint) =
         zeroclaw_runtime::agent::classifier::classify(&ctx.query_classification, &msg.content)
         && let Some(matched_route) = ctx
             .model_routes
@@ -9109,6 +9205,7 @@ async fn process_channel_message_body(
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
             model: matched_route.model.clone(),
+            automatic: true,
             api_key: matched_route.api_key.clone(),
         };
     }
@@ -9427,17 +9524,36 @@ async fn process_channel_message_body(
                 );
                 AssistantChannelOutcome::Reply(String::new())
             } else {
+                let configured_classifier_allowed = configured_provider_allowed_for_turn(
+                    attempt_allowlist.as_deref(),
+                    ctx.agent_cfg.classifier_provider.as_str(),
+                );
+                if !configured_classifier_allowed {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                            .with_attrs(::serde_json::json!({
+                                "phase": "precheck",
+                                "reason": "effort_routing_policy",
+                            })),
+                        "configured classifier_provider skipped by turn routing policy"
+                    );
+                }
+                let configured_classifier = if configured_classifier_allowed {
+                    resolve_classifier_route(
+                        ctx.as_ref(),
+                        &ctx.agent_cfg.classifier_provider,
+                        &runtime_defaults,
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
                     Arc<dyn ModelProvider>,
                     String,
                     Option<f64>,
-                ) = resolve_classifier_route(
-                    ctx.as_ref(),
-                    &ctx.agent_cfg.classifier_provider,
-                    &runtime_defaults,
-                )
-                .await
-                .unwrap_or_else(|| {
+                ) = configured_classifier.unwrap_or_else(|| {
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
@@ -9446,12 +9562,16 @@ async fn process_channel_message_body(
                 });
 
                 let started = Instant::now();
-                let precheck_future = classify_channel_reply_intent(
-                    classifier_provider_arc.as_ref(),
-                    history[0].content.as_str(),
-                    &history,
-                    classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                let precheck_future =
+                    zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                        attempt_allowlist.clone(),
+                        classify_channel_reply_intent(
+                            classifier_provider_arc.as_ref(),
+                            history[0].content.as_str(),
+                            &history,
+                            classifier_model_owned.as_str(),
+                            classifier_temperature.or(runtime_defaults.defaults.temperature),
+                        ),
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
@@ -9950,6 +10070,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
+            loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -10052,6 +10173,10 @@ async fn process_channel_message_body(
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            let tool_loop = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                tool_loop,
+            );
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -10118,7 +10243,9 @@ async fn process_channel_message_body(
                         active_model_provider = new_prov;
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
+                        route.automatic = false;
                         route.api_key = resolved_api_key;
+                        attempt_allowlist = None;
                         context_limits = resolve_channel_context_limits(
                             runtime_defaults.config.as_ref(),
                             ctx.agent_alias.as_str(),
@@ -10133,6 +10260,7 @@ async fn process_channel_message_body(
                             ChannelRouteSelection {
                                 model_provider: route.model_provider.clone(),
                                 model: route.model.clone(),
+                                automatic: false,
                                 api_key: route.api_key.clone(),
                             },
                             &runtime_defaults,
@@ -30045,6 +30173,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ChannelRouteSelection {
                     model_provider: "no-such-provider".into(),
                     model: "route-model".to_string(),
+                    automatic: false,
                     api_key: None,
                 },
             );
@@ -30935,6 +31064,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter".into(),
                 model: "route-model".to_string(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -40497,6 +40627,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let sel = |m: &str| ChannelRouteSelection {
             model_provider: "openrouter.default".into(),
             model: m.into(),
+            automatic: false,
             api_key: None,
         };
 
@@ -40582,6 +40713,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.large".to_string(),
                 model: "large-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -40592,6 +40724,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.small".to_string(),
                 model: "small-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -40626,6 +40759,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "other".into(),
+                automatic: false,
                 api_key: None,
             },
             &snapshot,
@@ -40634,6 +40768,49 @@ BTC is currently around $65,000 based on latest tool output."#
         // Setting it back to the config default clears the entry.
         set_scope_override(&ctx, OverrideScope::User, &msg, default, &snapshot);
         assert!(ctx.scope_overrides.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_session_selection_survives_until_automatic_is_restored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let automatic = default_route_selection_from_snapshot(&snapshot);
+        let mut manual = automatic.clone();
+        manual.automatic = false;
+
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, automatic.model_provider);
+        assert_eq!(selected.model, automatic.model);
+
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "restoring automatic selection should clear the session override"
+        );
+    }
+
+    #[test]
+    fn effort_policy_excludes_cloud_reply_intent_classifier() {
+        let allowed = HashSet::from(["custom.local".to_string()]);
+        assert!(configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.local"
+        ));
+        assert!(!configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.cloud"
+        ));
+        assert!(configured_provider_allowed_for_turn(None, "custom.cloud"));
     }
 
     #[test]
@@ -42039,6 +42216,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "anthropic.work".into(),
                 model: "claude-sonnet-4-5".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -43044,6 +43222,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "original-session-model".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -43117,6 +43296,36 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             overrides.is_empty(),
             "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_auto_reset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(
+            handle_runtime_command_if_needed(
+                ctx.as_ref(),
+                &scope_agent_msg("alice"),
+                Some(&target),
+            )
+            .await
+        );
+        let mut reset = scope_agent_msg("mallory");
+        reset.content = "/model --agent auto".into();
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &reset, Some(&target)).await);
+
+        assert_eq!(
+            ctx.scope_overrides.lock().unwrap().len(),
+            1,
+            "an unauthorized sender must not clear the agent-scoped selection"
         );
     }
 

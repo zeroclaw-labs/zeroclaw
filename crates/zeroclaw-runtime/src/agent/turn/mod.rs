@@ -71,7 +71,7 @@ pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
-pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
+pub(crate) use vision_route::prepare_messages_for_iteration;
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -1408,17 +1408,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
-            config,
-            model_provider,
-            turn_state.history,
-            multimodal_config,
-            provider_name,
-            model,
-            dispatch_model,
-            security,
-        )
-        .await?;
+        let (vision_model_provider_box, degrade_strip_images) =
+            vision_route::resolve_vision_provider_with_allowed_refs(
+                config,
+                model_provider,
+                turn_state.history,
+                multimodal_config,
+                provider_name,
+                model,
+                dispatch_model,
+                security,
+                knobs.provider_attempt_allowlist.as_deref(),
+            )
+            .await?;
 
         let (
             active_model_provider,

@@ -13,6 +13,7 @@ use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +42,11 @@ type SessionModelProvider = (
     String,
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
+
+struct TurnModelSelection {
+    selector: String,
+    allowed_provider_refs: Option<Arc<HashSet<String>>>,
+}
 
 pub fn build_session_model_provider(
     config: &Config,
@@ -503,6 +509,9 @@ pub struct Agent {
     history_has_trim_breadcrumb: bool,
     history_trim_generation: u64,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
+    /// True while the configured baseline may be replaced by automatic routing.
+    /// Explicit session and in-turn selection set this false.
+    automatic_model_routing: bool,
     /// The exact immutable route table used by `model_provider` for hint
     /// dispatch. It is replaced atomically with the provider on model switch.
     model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
@@ -1294,6 +1303,7 @@ impl AgentBuilder {
             history_has_trim_breadcrumb: false,
             history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
+            automatic_model_routing: true,
             model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
@@ -1871,6 +1881,11 @@ impl Agent {
 
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
+    }
+
+    /// Mark the current model/provider selection as an explicit runtime choice.
+    pub fn disable_automatic_model_routing(&mut self) {
+        self.automatic_model_routing = false;
     }
 
     pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
@@ -3462,6 +3477,7 @@ impl Agent {
                 self.model_route_resolver = new_route_resolver;
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
+                self.automatic_model_routing = false;
                 Some(new_model)
             }
             Err(e) => {
@@ -3480,7 +3496,54 @@ impl Agent {
         }
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
+    fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
+        let resolved_agent = self
+            .full_config()
+            .and_then(|config| config.resolved_agent_config(&self.agent_alias));
+        let effort_policy = resolved_agent.as_ref().map_or_else(
+            || self.config.resolved.effort_routing.as_ref(),
+            |agent| agent.resolved.effort_routing.as_ref(),
+        );
+
+        if !self.automatic_model_routing && effort_policy.is_some() {
+            return Ok(TurnModelSelection {
+                selector: self.model_name.clone(),
+                allowed_provider_refs: None,
+            });
+        }
+
+        if let Some(policy) = effort_policy {
+            let config = self.full_config().ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but the agent has no model-route config snapshot",
+                )
+            })?;
+            let selection = super::eval::resolve_effort_route(
+                policy,
+                &config.model_routes,
+                user_message,
+            )
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous",
+                )
+            })?;
+            let selector = format!("hint:{}", selection.route.hint);
+            let installed_route = self.model_route_resolver.resolve(&selector);
+            if installed_route.provider_name != selection.route.model_provider
+                || installed_route.model != selection.route.model
+            {
+                return Err(anyhow::Error::msg(
+                    "effort routing changed after this provider generation was installed; retry after the model configuration refresh completes",
+                ));
+            }
+            super::eval::log_effort_route_selection(&selection, user_message.len(), "agent");
+            return Ok(TurnModelSelection {
+                selector,
+                allowed_provider_refs: Some(Arc::new(selection.allowed_provider_refs)),
+            });
+        }
+
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
             && self.model_route_resolver.has_hint(&decision.hint)
@@ -3490,7 +3553,10 @@ impl Agent {
                 .configured_model_for_hint(&decision.hint)
                 .unwrap_or("unknown");
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
-            return format!("hint:{}", decision.hint);
+            return Ok(TurnModelSelection {
+                selector: format!("hint:{}", decision.hint),
+                allowed_provider_refs: None,
+            });
         }
 
         // Fallback: auto-classify by complexity when no rule matched.
@@ -3500,11 +3566,17 @@ impl Agent {
                 && self.model_route_resolver.has_hint(hint)
             {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
-                return format!("hint:{hint}");
+                return Ok(TurnModelSelection {
+                    selector: format!("hint:{hint}"),
+                    allowed_provider_refs: None,
+                });
             }
         }
 
-        self.model_name.clone()
+        Ok(TurnModelSelection {
+            selector: self.model_name.clone(),
+            allowed_provider_refs: None,
+        })
     }
 
     fn replay_loop_messages(
@@ -3715,7 +3787,9 @@ impl Agent {
         // reports come from the same generation.
         self.sync_config_generation();
 
-        let effective_model = self.classify_model(user_message);
+        let model_selection = self.classify_model(user_message)?;
+        let effective_model = model_selection.selector;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let selected_route = self.model_route_resolver.resolve(&effective_model);
         let context_limits =
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
@@ -3763,15 +3837,19 @@ impl Agent {
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
+                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                        self.full_config(),
+                        self.model_provider.as_ref(),
+                        &base_provider_messages,
+                        &self.multimodal_config,
+                        &selected_route.provider_name,
+                        &selected_route.model,
+                        &effective_model,
+                        Some(self.security.as_ref()),
+                        attempt_allowlist.as_deref(),
+                    ),
                 )
                 .await
                 {
@@ -3842,6 +3920,7 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -3971,18 +4050,21 @@ impl Agent {
             turn_safeguard_fallback,
         ) = zeroclaw_providers::scope_safeguard_fallback(async {
             let (result, recovery, context_truncated) =
-                zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = crate::agent::turn::scope_tool_protocol_prompts(
-                        Arc::clone(&tool_protocol_prompts),
-                        turn_loop,
-                    )
-                    .await;
-                    (
-                        result,
-                        zeroclaw_providers::reliable::take_last_provider_fallback(),
-                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
-                    )
-                })
+                zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    zeroclaw_providers::reliable::scope_provider_fallback(async {
+                        let result = crate::agent::turn::scope_tool_protocol_prompts(
+                            Arc::clone(&tool_protocol_prompts),
+                            turn_loop,
+                        )
+                        .await;
+                        (
+                            result,
+                            zeroclaw_providers::reliable::take_last_provider_fallback(),
+                            zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                        )
+                    }),
+                )
                 .await;
             (
                 result,
@@ -4211,7 +4293,15 @@ impl Agent {
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
-        let mut effective_model = self.classify_model(user_message);
+        let model_selection =
+            self.classify_model(user_message)
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                })?;
+        let mut effective_model = model_selection.selector;
+        let mut attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -4237,15 +4327,19 @@ impl Agent {
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
+                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                        self.full_config(),
+                        self.model_provider.as_ref(),
+                        &base_provider_messages,
+                        &self.multimodal_config,
+                        &selected_route.provider_name,
+                        &selected_route.model,
+                        &effective_model,
+                        Some(self.security.as_ref()),
+                        attempt_allowlist.as_deref(),
+                    ),
                 )
                 .await
                 {
@@ -4350,11 +4444,12 @@ impl Agent {
                 )) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
-        let knobs = crate::agent::loop_::LoopKnobs {
+        let mut knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -4385,6 +4480,7 @@ impl Agent {
         let served_route_sink: crate::agent::loop_::ServedRouteSink =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         for round in 0..self.config.resolved.max_tool_iterations {
+            knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -4565,19 +4661,22 @@ impl Agent {
             let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
                 zeroclaw_providers::scope_safeguard_fallback(async {
                     let (result, fallback, context_truncated) =
-                        zeroclaw_providers::reliable::scope_provider_fallback(async {
-                            let result = crate::agent::turn::scope_tool_protocol_prompts(
-                                Arc::clone(&tool_protocol_prompts),
-                                round_loop,
-                            )
-                            .await;
-                            (
-                                result,
-                                zeroclaw_providers::reliable::take_last_provider_fallback(),
-                                zeroclaw_providers::reliable::take_last_provider_context_truncation(
-                                ),
-                            )
-                        })
+                        zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                            attempt_allowlist.clone(),
+                            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                                let result = crate::agent::turn::scope_tool_protocol_prompts(
+                                    Arc::clone(&tool_protocol_prompts),
+                                    round_loop,
+                                )
+                                .await;
+                                (
+                                    result,
+                                    zeroclaw_providers::reliable::take_last_provider_fallback(),
+                                    zeroclaw_providers::reliable::take_last_provider_context_truncation(
+                                    ),
+                                )
+                            }),
+                        )
                         .await;
                     (
                         result,
@@ -4763,6 +4862,7 @@ impl Agent {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
+                        attempt_allowlist = None;
                         selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
                     }
@@ -4919,6 +5019,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
+    let explicit_model_selection = provider_override.is_some() || model_override.is_some();
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -4944,6 +5045,9 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    if explicit_model_selection {
+        agent.disable_automatic_model_routing();
+    }
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;

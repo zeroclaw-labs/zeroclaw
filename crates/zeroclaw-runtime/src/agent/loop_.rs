@@ -246,6 +246,61 @@ use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::ChatRequest;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
 
+#[derive(Debug, Clone)]
+struct EffortTurnRoute {
+    model_provider: String,
+    model: String,
+    allowed_provider_refs: Arc<HashSet<String>>,
+}
+
+fn effort_turn_route(
+    config: &Config,
+    policy: Option<&zeroclaw_config::scattered_types::EffortRoutingConfig>,
+    message: &str,
+) -> Result<Option<EffortTurnRoute>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let selection = crate::agent::eval::resolve_effort_route(policy, &config.model_routes, message)
+        .ok_or_else(|| {
+            anyhow::Error::msg(
+                "effort routing is enabled but its local/cloud hints are missing or ambiguous",
+            )
+        })?;
+    crate::agent::eval::log_effort_route_selection(&selection, message.len(), "direct");
+    Ok(Some(EffortTurnRoute {
+        model_provider: selection.route.model_provider.clone(),
+        model: selection.route.model.clone(),
+        allowed_provider_refs: Arc::new(selection.allowed_provider_refs),
+    }))
+}
+
+fn effort_scoped_provider_config(
+    config: &Config,
+    allowed_provider_refs: &HashSet<String>,
+) -> Box<Config> {
+    let mut scoped = Box::new(config.clone());
+    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
+        profile
+            .fallback
+            .retain(|candidate| allowed_provider_refs.contains(candidate.trim()));
+    }
+    let excluded_profiles: Vec<(String, String)> = scoped
+        .providers
+        .models
+        .iter_entries()
+        .filter(|(family, alias, _)| !allowed_provider_refs.contains(&format!("{family}.{alias}")))
+        .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
+        .collect();
+    for (family, alias) in excluded_profiles {
+        scoped.providers.models.remove_alias(&family, &alias);
+    }
+    scoped
+        .model_routes
+        .retain(|route| allowed_provider_refs.contains(&route.model_provider));
+    scoped
+}
+
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
@@ -1016,6 +1071,7 @@ pub async fn agent_turn(
         max_tool_iterations,
         approval,
         security,
+        None,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -1056,6 +1112,7 @@ async fn agent_turn_with_sop_reassembly(
     max_tool_iterations: usize,
     approval: Option<&ApprovalManager>,
     security: Option<&SecurityPolicy>,
+    provider_attempt_allowlist: Option<Arc<HashSet<String>>>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -1159,7 +1216,10 @@ async fn agent_turn_with_sop_reassembly(
                 max_tool_result_chars,
                 context_limits,
                 context_limits_resolver: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &LoopKnobs {
+                    provider_attempt_allowlist,
+                    ..LoopKnobs::default()
+                },
             },
         ),
         history,
@@ -1712,6 +1772,7 @@ pub async fn run(
 
         // ── Resolve model_provider ─────────────────────────────────────────
         let agent_provider_ref = agent_provider_composite(&config, agent_alias);
+        let mut automatic_model_routing = provider_override.is_none() && model_override.is_none();
         let mut provider_name = provider_override
             .as_deref()
             .or(agent_provider_ref.as_deref())
@@ -1742,6 +1803,25 @@ pub async fn run(
              [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
+        let mut effort_provider_config = None;
+        let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        if automatic_model_routing && let Some(initial_message) = message.as_deref() {
+            let effective_message =
+                crate::agent::thinking::strip_thinking_directive(initial_message);
+            if let Some(selection) = effort_turn_route(
+                &config,
+                agent.resolved.effort_routing.as_ref(),
+                effective_message.as_ref(),
+            )? {
+                provider_name = selection.model_provider;
+                model_name = selection.model;
+                effort_provider_config = Some(effort_scoped_provider_config(
+                    &config,
+                    selection.allowed_provider_refs.as_ref(),
+                ));
+                active_effort_provider_refs = Some(selection.allowed_provider_refs);
+            }
+        }
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
 
@@ -1776,14 +1856,15 @@ pub async fn run(
         // (e.g. an xai key) to a different provider family that doesn't expect it.
         let (initial_api_key, initial_uri) =
             api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
+                provider_config,
                 &provider_name,
                 initial_api_key.as_deref(),
                 initial_uri.as_deref(),
                 &config.reliability,
-                &config.model_routes,
+                &provider_config.model_routes,
                 &model_name,
                 &provider_runtime_options,
             )?;
@@ -2245,7 +2326,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                                                exec: ResolvedAgentExecution::resolve(
+                                    exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
@@ -2276,7 +2357,11 @@ pub async fn run(
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         context_limits,
                                         context_limits_resolver: None,
-                                        knobs: &LoopKnobs::default(),
+                                        knobs: &LoopKnobs {
+                                            provider_attempt_allowlist:
+                                                active_effort_provider_refs.clone(),
+                                            ..LoopKnobs::default()
+                                        },
                                     },
                                 ),
                                 history: &mut history,
@@ -2369,6 +2454,7 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
+                            active_effort_provider_refs = None;
                             context_limits = config.resolved_context_limits_for_route(
                                 agent_alias,
                                 &provider_name,
@@ -2639,6 +2725,57 @@ pub async fn run(
                     )
                 });
 
+                if automatic_model_routing
+                    && let Some(selection) = effort_turn_route(
+                        &config,
+                        agent.resolved.effort_routing.as_ref(),
+                        &effective_input,
+                    )?
+                {
+                    if provider_name != selection.model_provider
+                        || model_name != selection.model
+                        || active_effort_provider_refs.as_deref()
+                            != Some(selection.allowed_provider_refs.as_ref())
+                    {
+                        let (route_api_key, route_uri) = api_key_and_uri_for_provider(
+                            &config,
+                            &selection.model_provider,
+                            agent_model_provider,
+                        );
+                        let scoped_config = effort_scoped_provider_config(
+                            &config,
+                            selection.allowed_provider_refs.as_ref(),
+                        );
+                        model_provider =
+                            zeroclaw_providers::create_routed_model_provider_with_options(
+                                &scoped_config,
+                                &selection.model_provider,
+                                route_api_key.as_deref(),
+                                route_uri.as_deref(),
+                                &config.reliability,
+                                &scoped_config.model_routes,
+                                &selection.model,
+                                &zeroclaw_providers::options_for_provider_ref(
+                                    &config,
+                                    &selection.model_provider,
+                                    &zeroclaw_providers::provider_runtime_options_for_agent(
+                                        &config,
+                                        agent_alias,
+                                    ),
+                                ),
+                            )?;
+                        provider_name = selection.model_provider;
+                        model_name = selection.model;
+                        context_limits = config.resolved_context_limits_for_route(
+                            agent_alias,
+                            &provider_name,
+                            &model_name,
+                        );
+                        turn_guard.set_model_route(provider_name.clone(), model_name.clone());
+                    }
+                    active_effort_provider_refs = Some(selection.allowed_provider_refs);
+                }
+
                 // Compute per-turn excluded MCP tools from tool_filter_groups
                 // before the provider call; the system prompt is rebuilt from
                 // this same set immediately before each attempt.
@@ -2883,7 +3020,11 @@ pub async fn run(
                                                 .max_tool_result_chars,
                                             context_limits,
                                             context_limits_resolver: None,
-                                            knobs: &LoopKnobs::default(),
+                                            knobs: &LoopKnobs {
+                                                provider_attempt_allowlist:
+                                                    active_effort_provider_refs.clone(),
+                                                ..LoopKnobs::default()
+                                            },
                                         },
                                     ),
                                     history: &mut history,
@@ -2979,6 +3120,8 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
+                                automatic_model_routing = false;
+                                active_effort_provider_refs = None;
                                 context_limits = config.resolved_context_limits_for_route(
                                     agent_alias,
                                     &provider_name,
@@ -3648,7 +3791,7 @@ async fn process_message_inner(
             );
         }
 
-        let model_name = match agent_model_provider
+        let mut model_name = match agent_model_provider
             .as_ref()
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
@@ -3660,22 +3803,47 @@ async fn process_message_inner(
              `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
             ),
         };
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let agent_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
             &config,
             provider_name,
             provider_alias.as_str(),
         );
-        let model_provider_ref = format!("{provider_name}.{provider_alias}");
+        let mut model_provider_ref = format!("{provider_name}.{provider_alias}");
+        let mut effort_provider_config = None;
+        let mut effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        let effective_message = crate::agent::thinking::strip_thinking_directive(message);
+        if let Some(selection) = effort_turn_route(
+            &config,
+            agent.resolved.effort_routing.as_ref(),
+            effective_message.as_ref(),
+        )? {
+            model_provider_ref = selection.model_provider;
+            model_name = selection.model;
+            effort_provider_config = Some(effort_scoped_provider_config(
+                &config,
+                selection.allowed_provider_refs.as_ref(),
+            ));
+            effort_provider_refs = Some(selection.allowed_provider_refs);
+        }
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &model_provider_ref,
+            &agent_provider_runtime_options,
+        );
+        let (initial_api_key, initial_uri) = api_key_and_uri_for_provider(
+            &config,
+            &model_provider_ref,
+            agent_model_provider.as_ref(),
+        );
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
+                provider_config,
                 &model_provider_ref,
-                agent_model_provider
-                    .as_ref()
-                    .and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.as_ref().and_then(|e| e.uri.as_deref()),
+                initial_api_key.as_deref(),
+                initial_uri.as_deref(),
                 &config.reliability,
-                &config.model_routes,
+                &provider_config.model_routes,
                 &model_name,
                 &provider_runtime_options,
             )?;
@@ -3986,6 +4154,7 @@ async fn process_message_inner(
                     // tools, so the no-vision image-marker gate reads the
                     // exact ledger the file tools enforce.
                     Some(&security),
+                    effort_provider_refs.clone(),
                     &excluded_tools,
                     &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
@@ -4035,10 +4204,107 @@ async fn process_message_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
+        estimate_history_tokens, load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        seed_channel_handles, truncate_tool_result,
     };
+
+    #[test]
+    fn effort_turn_route_limits_local_and_cloud_provider_attempts() {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{Config, ModelRouteConfig};
+
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .unwrap()
+            .fallback
+            .push(zeroclaw_config::providers::ModelProviderRef::new(
+                "custom.cloud",
+            ));
+        config.providers.models.ensure("custom", "cloud").unwrap();
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "small".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "large".into(),
+                api_key: None,
+            },
+        ];
+        let policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Auto,
+        };
+
+        let local = effort_turn_route(&config, Some(&policy), "say hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.model_provider, "custom.local");
+        assert_eq!(local.model, "small");
+        assert_eq!(
+            local.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from(["custom.local".to_string()])
+        );
+        let local_config =
+            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref());
+        assert!(
+            local_config
+                .providers
+                .models
+                .find("custom", "local")
+                .unwrap()
+                .fallback
+                .is_empty(),
+            "a local turn must prune a configured cloud reliability fallback"
+        );
+        assert!(
+            local_config
+                .providers
+                .models
+                .find("custom", "cloud")
+                .is_none(),
+            "direct turns must remove excluded profiles so side routes such as vision cannot construct them"
+        );
+
+        let cloud = effort_turn_route(&config, Some(&policy), &"a".repeat(201))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cloud.model_provider, "custom.cloud");
+        assert_eq!(cloud.model, "large");
+        assert_eq!(
+            cloud.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from([
+                "custom.local".to_string(),
+                "custom.cloud".to_string(),
+            ])
+        );
+
+        let mut malformed = config.clone();
+        malformed.model_routes.retain(|route| route.hint != "local");
+        assert!(
+            effort_turn_route(&malformed, Some(&policy), "say hello").is_err(),
+            "an opted-in policy with a missing hint must fail closed"
+        );
+
+        let mut ambiguous = config;
+        ambiguous
+            .model_routes
+            .push(ambiguous.model_routes[0].clone());
+        assert!(
+            effort_turn_route(&ambiguous, Some(&policy), "say hello").is_err(),
+            "an opted-in policy with an ambiguous exact hint must fail closed"
+        );
+    }
 
     /// One decision, four gates. The origin gate is the load-bearing one:
     /// the heartbeat session-context shape defeats the content filter (it no
@@ -22034,8 +22300,10 @@ Let me check the result."#;
     async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
         use axum::{Json, Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
@@ -22087,7 +22355,7 @@ Let me check the result."#;
         });
 
         let (_tmp, mut config) = isolated_run_test_config();
-        for alias in ["default", "switched"] {
+        for (alias, vision) in [("default", true), ("switched", false), ("vision", true)] {
             config.providers.models.ollama.insert(
                 alias.to_string(),
                 OllamaModelProviderConfig {
@@ -22095,6 +22363,7 @@ Let me check the result."#;
                         model: Some(format!("run-lifecycle-switch-{alias}-model")),
                         timeout_secs: Some(5),
                         uri: Some(format!("http://{addr}")),
+                        vision: Some(vision),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -22106,12 +22375,39 @@ Let me check the result."#;
             AliasedAgentConfig {
                 model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.default".into(),
+                model: "run-lifecycle-switch-default-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.switched".into(),
+                model: "switched-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
                 ..Default::default()
             },
         );
         config
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
+        config.multimodal.vision_model_provider = Some("ollama.vision".to_string());
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -22120,7 +22416,7 @@ Let me check the result."#;
         let result = super::run(
             config,
             "run-lifecycle-switch-agent",
-            Some("please switch models".to_string()),
+            Some("please switch models [IMAGE:data:image/png;base64,aQ==]".to_string()),
             None,
             None,
             None,
