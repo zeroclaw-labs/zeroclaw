@@ -346,6 +346,14 @@ fn lookup_prop_field(
         })
 }
 
+fn cron_schedule_for_path<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    path: &str,
+) -> Option<&'a zeroclaw_config::schema::CronScheduleDecl> {
+    let alias = path.strip_prefix("cron.")?.strip_suffix(".schedule")?;
+    config.cron.get(alias).map(|job| &job.schedule)
+}
+
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
@@ -1221,7 +1229,18 @@ pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuer
             let value = if is_sensitive {
                 None
             } else {
-                Some(serde_json::Value::String(info.display_value.clone()))
+                // The schedule is a tagged object. Give its config form JSON
+                // text rather than the TOML display string, so saving it can
+                // submit the object through the typed property setter.
+                let displayed = cron_schedule_for_path(&config, &info.name).map_or_else(
+                    || info.display_value.clone(),
+                    |schedule| {
+                        serde_json::to_string(schedule).expect(
+                            "CronScheduleDecl contains only JSON-serializable strings and integers",
+                        )
+                    },
+                );
+                Some(serde_json::Value::String(displayed))
             };
             let section = section_for_path(&info.name).map(|s| s.as_str());
             let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
@@ -2624,7 +2643,16 @@ pub async fn handle_patch(
                     Ok(s) => s,
                     Err(e) => return error_response(e.with_path(&path).with_op_index(idx)),
                 };
-                if actual_str != want_str {
+                let matches = cron_schedule_for_path(&working, &path).map_or_else(
+                    || actual_str == want_str,
+                    |actual| {
+                        serde_json::from_value::<zeroclaw_config::schema::CronScheduleDecl>(
+                            want.clone(),
+                        )
+                        .is_ok_and(|expected| expected == *actual)
+                    },
+                );
+                if !matches {
                     return error_response(
                         ConfigApiError::new(
                             ConfigApiCode::ValidationFailed,
@@ -4100,6 +4128,145 @@ mod tests {
             None,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn patch_declarative_cron_schedule_persists_tagged_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.cron.insert("daily".into(), Default::default());
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let mut prior_schedule = serde_json::json!({"kind":"cron","expr":"","tz":null});
+
+        for schedule in [
+            serde_json::json!({"kind":"cron","expr":"0 9 * * *","tz":"UTC"}),
+            serde_json::json!({"kind":"cron","expr":"0 10 * * *","tz":null}),
+            serde_json::json!({"kind":"every","every_ms":60000}),
+            serde_json::json!({"kind":"at","at":"2026-10-01T09:00:00Z"}),
+        ] {
+            let (status, result) = response_json(
+                handle_patch(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    axum::Json(serde_json::json!([
+                        {"op":"test","path":"/cron/daily/schedule","value":prior_schedule},
+                        {"op":"replace","path":"/cron/daily/schedule","value":schedule},
+                        {"op":"replace","path":"/cron/daily/command","value":"date"}
+                    ])),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["saved"], true);
+
+            let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+            assert_eq!(
+                serde_json::to_value(&reloaded.cron["daily"].schedule).unwrap(),
+                schedule,
+            );
+
+            let (list_status, listed) = response_json(
+                handle_list(
+                    State(state.clone()),
+                    Query(ListQuery {
+                        prefix: Some("cron.daily".into()),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(list_status, StatusCode::OK);
+            let field = listed["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"] == "cron.daily.schedule")
+                .expect("config form lists the declarative schedule");
+            assert_eq!(field["kind"], "object");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(field["value"].as_str().unwrap())
+                    .unwrap(),
+                schedule,
+            );
+            prior_schedule = schedule;
+        }
+
+        let (put_status, put_result) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: "cron.daily.schedule".into(),
+                    value: serde_json::json!({"kind":"every","every_ms":30000}),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(put_status, StatusCode::OK, "{put_result}");
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded.cron["daily"].schedule).unwrap(),
+            serde_json::json!({"kind":"every","every_ms":30000}),
+        );
+
+        let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let (status, result) = response_json(
+            handle_patch(
+                State(state),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op":"replace","path":"/cron/daily/schedule","value":{"kind":"cron"}
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            before,
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_cron_schedule_test_rejects_stale_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        let job = zeroclaw_config::schema::CronJobDecl {
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 30000 },
+            command: Some("date".into()),
+            ..Default::default()
+        };
+        config.cron.insert("daily".into(), job);
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let (status, result) = response_json(
+            handle_patch(
+                State(test_state(config)),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {"op":"test","path":"/cron/daily/schedule","value":{"kind":"every","every_ms":90000}},
+                    {"op":"replace","path":"/cron/daily/schedule","value":{"kind":"every","every_ms":120000}}
+                ])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            before,
+        );
     }
 
     #[tokio::test]
