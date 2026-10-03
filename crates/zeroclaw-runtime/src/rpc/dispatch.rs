@@ -7174,6 +7174,18 @@ impl RpcDispatcher {
             .capture_session_access(&req.session_id)
             .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        // The ownership check and the waits since then can span a same-ID
+        // replacement. Fence on the incarnation that was authorized: a
+        // successor captured here is refused like one installed during the
+        // lock wait below, instead of becoming the generation that
+        // re-verification expects.
+        if authorized
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_some_and(|generation| generation != session_generation)
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
 
         // Acquire the per-session ordering boundary.
         let _model_provider_update = self
@@ -20725,14 +20737,79 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // Replace only once configure is parked on the update lock, after
+            // its generation capture; a fixed delay cannot promise that under
+            // parallel test load.
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+                .await
+                .expect("configure must reach the provider update lock");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
                     .await;
             drop(lock);
+            successor
+        };
+        let (result, successor) = tokio::join!(operation, replace);
+        let err = result.expect_err("a replaced session cannot be configured by the old owner");
+        assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+        assert!(err.message.contains("Session changed while queued"));
+        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+        assert_eq!(
+            sessions
+                .get_overrides("cfg")
+                .await
+                .and_then(|o| o.temperature),
+            None,
+            "bob's successor keeps its own overrides"
+        );
+    }
+
+    /// The waits between configure's ownership check and its generation
+    /// capture (a provisional binding, the config write lock) can span a
+    /// same-ID replacement too. The successor is refused as a changed
+    /// session, not captured and left for the owner re-check to deny.
+    #[tokio::test]
+    async fn configure_refuses_an_incarnation_replaced_before_the_lock() {
+        use crate::rpc::types::ChatMode;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        // An unconfirmed binding parks configure after its ownership check.
+        let binding = Arc::new(tokio::sync::Notify::new());
+        sessions
+            .insert(
+                "cfg".to_string(),
+                owned_test_session(Some("user:alice"), ChatMode::Chat)
+                    .with_pending_generation(Arc::clone(&binding)),
+            )
+            .await
+            .unwrap();
+        let idle_handles = Arc::strong_count(&binding);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let operation = alice.handle_session_configure(&params);
+        let replace = async {
+            // A waiting configure holds its own handle on the binding.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while Arc::strong_count(&binding) == idle_handles {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("configure must wait for the provisional binding");
+            // Publishing over alice's entry swaps incarnations without an
+            // empty slot; then release the wait.
+            let successor =
+                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
+                    .await;
+            binding.notify_waiters();
             successor
         };
         let (result, successor) = tokio::join!(operation, replace);
