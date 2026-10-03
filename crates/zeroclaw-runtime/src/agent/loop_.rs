@@ -19098,7 +19098,7 @@ Let me check the result."#;
             AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
 
-        let mut config = zeroclaw_config::schema::Config::default();
+        let (_tmp, mut config) = isolated_run_test_config();
         config.providers.models.ollama.insert(
             "default".to_string(),
             OllamaModelProviderConfig {
@@ -19357,7 +19357,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
+        let (_tmp, config) = isolated_run_test_config();
         let security = Arc::new(TestPolicy {
             workspace_dir: std::env::temp_dir(),
             ..TestPolicy::default()
@@ -21737,14 +21737,15 @@ Let me check the result."#;
 
     /// A `Config::default()` rooted under a fresh temp dir instead of the
     /// real `$HOME/.zeroclaw`. `Config::default()` points `data_dir` (the
-    /// sqlite memory db, `{data_dir}/memory/brain.db`) and `config_path`
-    /// (whose parent `install_root_dir()` backs `agent_workspace_dir`, i.e.
-    /// `{install_root}/agents/<alias>/workspace`) at the real home
-    /// directory, so a `run()`-driving test that doesn't override them
-    /// creates/writes real files on every dev and CI machine and, under the
-    /// crate's parallel test gate, has every such test contend on the same
-    /// `brain.db`. The returned `TempDir` must be kept alive for the
-    /// duration of the test — it deletes the directory on drop.
+    /// sqlite memory and session dbs, e.g. `{data_dir}/memory/brain.db`)
+    /// and `config_path` (whose parent `install_root_dir()` backs
+    /// `agent_workspace_dir`, i.e. `{install_root}/agents/<alias>/workspace`)
+    /// at the real home directory, so a test that drives `run()` or
+    /// `process_message()`, or builds the tool registry, without overriding
+    /// them creates/writes real files on every dev and CI machine and,
+    /// under the crate's parallel test gate, has every such test contend on
+    /// the same `brain.db`. The returned `TempDir` must be kept alive for
+    /// the duration of the test — it deletes the directory on drop.
     fn isolated_run_test_config() -> (tempfile::TempDir, Config) {
         let tmp = tempdir().expect("temp dir for isolated run() test config should create");
         let config = Config {
