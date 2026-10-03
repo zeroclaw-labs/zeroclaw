@@ -1149,6 +1149,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-model-fallback-redacted = ⚡ The requested model was unavailable; a fallback model served this reply.
 channel-runtime-safeguard-footer-server =
     🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
 channel-runtime-safeguard-footer-client =

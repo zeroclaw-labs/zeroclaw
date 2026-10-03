@@ -378,6 +378,7 @@ fn append_provider_fallback_footer(
     mut response: String,
     fallback: Option<&ProviderFallbackInfo>,
     safeguard: Option<&SafeguardFallbackNotice>,
+    model_notice: zeroclaw_config::schema::ModelFallbackNotice,
 ) -> String {
     // The ordinary recovery leg comes first so the footers read in route
     // order: the provider fallback, then the safeguard switch the accepted
@@ -423,6 +424,27 @@ fn append_provider_fallback_footer(
                         ("model", fallback.actual_model.as_str()),
                     ],
                 ));
+            } else if fallback.requested_model != fallback.actual_model {
+                use zeroclaw_config::schema::ModelFallbackNotice;
+                let notice = match model_notice {
+                    ModelFallbackNotice::Off => None,
+                    ModelFallbackNotice::Redacted => Some(channel_runtime_cli_string(
+                        "channel-runtime-model-fallback-redacted",
+                    )),
+                    ModelFallbackNotice::Detailed => Some(channel_runtime_cli_string_with_args(
+                        "turn-model-fallback-notice",
+                        &[
+                            ("requested_model", fallback.requested_model.as_str()),
+                            ("requested_provider", fallback.requested_provider.as_str()),
+                            ("actual_model", fallback.actual_model.as_str()),
+                            ("actual_provider", fallback.actual_provider.as_str()),
+                        ],
+                    )),
+                };
+                if let Some(notice) = notice {
+                    response.push_str("\n\n---\n");
+                    response.push_str(&notice);
+                }
             }
         }
         _ => {}
@@ -10388,10 +10410,12 @@ async fn process_channel_message_body(
             // The runtime commits this candidate only after semantic acceptance.
             // This renderer must therefore receive only the final accepted route.
             let history_response = delivered_response.clone();
+            let model_notice = ctx.live_config.read().channels.model_fallback_notice;
             delivered_response = append_provider_fallback_footer(
                 delivered_response,
                 fallback_info.as_ref(),
                 safeguard_notice.as_ref(),
+                model_notice,
             );
 
             ::zeroclaw_log::record!(
@@ -19402,16 +19426,77 @@ pub(crate) mod tests {
             actual_provider: "anthropic.backup".to_string(),
             actual_model: "model-b".to_string(),
         };
-        let delivered =
-            append_provider_fallback_footer("final response".to_string(), Some(&fallback), None);
+        let delivered = append_provider_fallback_footer(
+            "final response".to_string(),
+            Some(&fallback),
+            None,
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
+        );
         assert!(delivered.starts_with("final response\n\n---\n"));
         assert!(delivered.contains("openai.primary"));
         assert!(delivered.contains("anthropic.backup"));
         assert_eq!(delivered.matches("---").count(), 1);
         assert_eq!(
-            append_provider_fallback_footer("primary final".to_string(), None, None),
+            append_provider_fallback_footer(
+                "primary final".to_string(),
+                None,
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "primary final"
         );
+    }
+
+    #[test]
+    fn model_fallback_notice_modes_preserve_existing_delivery_contracts() {
+        use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+        let mut fallback = ProviderFallbackInfo {
+            requested_provider: "custom.private".into(),
+            requested_model: "model-a".into(),
+            actual_provider: "custom.private".into(),
+            actual_model: "model-b".into(),
+        };
+        for requested_provider in ["custom.private", "custom"] {
+            fallback.requested_provider = requested_provider.into();
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off),
+                "answer"
+            );
+            let redacted =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Redacted);
+            assert!(redacted.contains("fallback model"));
+            for identifier in [requested_provider, "custom.private", "model-a", "model-b"] {
+                assert!(!redacted.contains(identifier));
+            }
+            let detailed =
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, Detailed);
+            assert!(detailed.contains("model-a"));
+            assert!(detailed.contains("model-b"));
+            assert!(detailed.contains("custom.private"));
+            assert_eq!(detailed.matches("---").count(), 1);
+        }
+        fallback.requested_model = "model-b".into();
+        for mode in [Off, Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                "answer",
+                "same-model retry must stay silent"
+            );
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), None, None, mode),
+                "answer"
+            );
+        }
+        fallback.actual_provider = "anthropic.backup".into();
+        let existing = append_provider_fallback_footer("answer".into(), Some(&fallback), None, Off);
+        for mode in [Redacted, Detailed] {
+            assert_eq!(
+                append_provider_fallback_footer("answer".into(), Some(&fallback), None, mode),
+                existing,
+                "cross-family notices are independent of the new opt-in"
+            );
+        }
     }
 
     #[test]
@@ -19433,6 +19518,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert_eq!(delivered.matches("---").count(), 1);
@@ -19465,6 +19551,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&fallback),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
 
         assert!(delivered.starts_with("accepted response\n\n---\n"));
@@ -19492,7 +19579,12 @@ pub(crate) mod tests {
 
         // Without a safeguard leg the same-family switch stays silent as before.
         assert_eq!(
-            append_provider_fallback_footer("accepted response".to_string(), Some(&fallback), None),
+            append_provider_fallback_footer(
+                "accepted response".to_string(),
+                Some(&fallback),
+                None,
+                zeroclaw_config::schema::ModelFallbackNotice::Off
+            ),
             "accepted response"
         );
 
@@ -19507,6 +19599,7 @@ pub(crate) mod tests {
             "accepted response".to_string(),
             Some(&retry),
             Some(&safeguard),
+            zeroclaw_config::schema::ModelFallbackNotice::Off,
         );
         assert_eq!(delivered.matches("---").count(), 1, "{delivered}");
         assert_eq!(delivered.matches("🛡️").count(), 1);
@@ -26807,6 +26900,131 @@ BTC is currently around $65,000 based on latest tool output."#
         fn alias(&self) -> &str {
             "ModelAwareToolProvider"
         }
+    }
+
+    #[test]
+    fn process_channel_message_model_fallback_notices_are_live_and_delivery_only() {
+        run_channel_dispatch_test(|| async {
+            use zeroclaw_config::schema::ModelFallbackNotice::{Detailed, Off, Redacted};
+
+            #[derive(Default)]
+            struct PinnedFallbackProvider {
+                calls: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+            }
+
+            #[async_trait::async_trait]
+            impl ModelProvider for PinnedFallbackProvider {
+                async fn chat_with_system(
+                    &self,
+                    _system_prompt: Option<&str>,
+                    _message: &str,
+                    model: &str,
+                    _temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    if model == "model-a" {
+                        anyhow::bail!("primary model unavailable");
+                    }
+                    Ok("accepted answer".into())
+                }
+
+                async fn chat_with_history(
+                    &self,
+                    messages: &[ChatMessage],
+                    model: &str,
+                    temperature: Option<f64>,
+                ) -> anyhow::Result<String> {
+                    self.calls.lock().unwrap().push(messages.to_vec());
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+            impl zeroclaw_api::attribution::Attributable for PinnedFallbackProvider {
+                fn role(&self) -> zeroclaw_api::attribution::Role {
+                    zeroclaw_api::attribution::Role::Provider(
+                        zeroclaw_api::attribution::ProviderKind::Model(
+                            zeroclaw_api::attribution::ModelProviderKind::Custom,
+                        ),
+                    )
+                }
+
+                fn alias(&self) -> &str {
+                    "notice"
+                }
+            }
+
+            let inner = Arc::new(PinnedFallbackProvider::default());
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
+                "custom.notice",
+                vec![
+                    ("custom.notice", "notice", "model-a", inner.clone()),
+                    ("custom.notice", "notice", "model-b", inner.clone()),
+                ],
+                0,
+                1,
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(temp.path()).unwrap());
+            let channel = Arc::new(RecordingChannel::default());
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel.clone(),
+                Arc::new(reliable),
+                Config::default(),
+                Default::default(),
+                "custom.notice",
+                None,
+            );
+            Arc::make_mut(&mut ctx).session_store = Some(backend.clone());
+            Arc::make_mut(&mut ctx).workspace_dir = Arc::new(temp.path().to_path_buf());
+            Arc::make_mut(&mut ctx).model = Arc::new("model-a".into());
+            for (index, mode) in [Off, Redacted, Detailed, Off].into_iter().enumerate() {
+                if index != 0 {
+                    ctx.live_config.write().channels.model_fallback_notice = mode;
+                }
+                let msg = ChannelMessage {
+                    id: format!("notice-{index}"),
+                    sender: "test-sender".into(),
+                    reply_target: "test-room".into(),
+                    content: "hello".into(),
+                    channel: "test-channel".into(),
+                    explicitly_addressed: true,
+                    ..Default::default()
+                };
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                let delivered = channel.sent_messages.lock().await.last().unwrap().clone();
+                match mode {
+                    Off => assert_eq!(delivered, "test-room:accepted answer"),
+                    Redacted => {
+                        assert!(delivered.contains("fallback model"));
+                        for identifier in ["custom.notice", "model-a", "model-b"] {
+                            assert!(!delivered.contains(identifier));
+                        }
+                    }
+                    Detailed => {
+                        assert!(delivered.contains("model-a"));
+                        assert!(delivered.contains("model-b"));
+                        assert_eq!(delivered.matches("---").count(), 1);
+                    }
+                }
+                let stored = backend.load(&history_key);
+                let assistant: Vec<_> = stored.iter().filter(|m| m.role == "assistant").collect();
+                assert_eq!(assistant.len(), index + 1);
+                assert!(assistant.iter().all(|m| m.content == "accepted answer"));
+            }
+            let calls = inner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.iter().any(|m| m.role == "assistant"))
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.role == "assistant")
+                    .all(|m| m.content == "accepted answer")
+            );
+        });
     }
 
     #[derive(Default)]

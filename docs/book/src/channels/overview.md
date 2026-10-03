@@ -125,6 +125,28 @@ Secrets (bot tokens, API keys, passwords) are stored encrypted; set them through
 
 Inbound senders are gated through [peer groups](./peer-groups.md), not a per-channel field.
 
+### Model fallback notices
+
+`channels.model_fallback_notice` controls notices for ordinary fallback to a different model within the same provider family. The default is `off`. Cross-family fallback notices and safeguard notices keep their existing behavior in every mode.
+
+| Mode | Delivered notice |
+|---|---|
+| `off` | No ordinary same-family model fallback notice |
+| `redacted` | A generic notice that a fallback model served the reply, without provider or model identifiers |
+| `detailed` | The requested and served provider/model identifiers |
+
+The setting applies globally to all channels that use the shared channel orchestrator. Choose the mode for every audience that can receive a reply, including shared rooms and public channels. `detailed` exposes routing identifiers to those audiences; `redacted` reports recovery without those identifiers. There are no per-channel overrides.
+
+Set the mode through ZeroCode Config or another supported config editor, or use:
+
+```bash
+zeroclaw config set channels.model_fallback_notice redacted
+```
+
+The orchestrator reads the current live config when it delivers the reply, so a published mode change can affect a turn already in progress. Saving a file alone does not update a running daemon's live config. Use the existing config publication and reload paths described in [Config lifecycle](../architecture/config-lifecycle.md#saved-vs-applied); standalone CLI writes take effect on the next load or reload.
+
+These notices are added only to outbound delivery. Stored assistant history keeps the model's response without the notice, so later turns do not receive this delivery metadata as conversation content. Attribution must identify a successful fallback to a different model before a notice is added; same-family, same-model profile changes remain indistinguishable in the current attribution record.
+
 ## Streaming capability
 
 Channels declare what kind of streaming they support: see [Providers → Streaming](../providers/streaming.md) for the capability matrix and what `supports_draft_updates` / `supports_multi_message_streaming` mean.

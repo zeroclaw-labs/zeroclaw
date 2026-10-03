@@ -15779,6 +15779,22 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Notice policy for ordinary same-family, different-model channel fallback.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackNotice {
+    /// Omit ordinary same-family model fallback notices.
+    #[default]
+    Off,
+    /// Report fallback without exposing provider or model identifiers.
+    Redacted,
+    /// Include requested and served provider/model identifiers.
+    Detailed,
+}
+
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -15960,6 +15976,13 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Notice mode for ordinary same-family, different-model fallback: `off`
+    /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
+    /// channels and is read from live config at outbound delivery. Detailed
+    /// notices expose requested and served provider/model identifiers to the
+    /// channel audience. Cross-family and safeguard notices are unchanged.
+    #[serde(default)]
+    pub model_fallback_notice: ModelFallbackNotice,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -16423,6 +16446,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -32817,6 +32841,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
@@ -34991,6 +35016,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -35011,6 +35037,68 @@ allowed_users = ["@u:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_empty());
         assert!(c.matrix.is_empty());
+    }
+
+    #[test]
+    async fn model_fallback_notice_defaults_round_trips_and_configurable_values() {
+        let parsed: Config = toml::from_str("[channels]").unwrap();
+        assert_eq!(
+            parsed.channels.model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+        assert_eq!(
+            ChannelsConfig::default().model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+
+        let mut config = Config::default();
+        for (value, mode) in [
+            ("off", ModelFallbackNotice::Off),
+            ("redacted", ModelFallbackNotice::Redacted),
+            ("detailed", ModelFallbackNotice::Detailed),
+        ] {
+            config
+                .set_prop("channels.model_fallback_notice", value)
+                .unwrap();
+            assert_eq!(config.channels.model_fallback_notice, mode);
+            assert_eq!(
+                config.get_prop("channels.model_fallback_notice").unwrap(),
+                value
+            );
+
+            let serialized = toml::to_string(&config.channels).unwrap();
+            assert!(serialized.contains(&format!("model_fallback_notice = \"{value}\"")));
+            let round_trip: ChannelsConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(round_trip.model_fallback_notice, mode);
+        }
+
+        assert!(toml::from_str::<ChannelsConfig>("model_fallback_notice = \"verbose\"").is_err());
+        assert!(
+            config
+                .set_prop("channels.model_fallback_notice", "verbose")
+                .is_err()
+        );
+        assert_eq!(
+            config.channels.model_fallback_notice,
+            ModelFallbackNotice::Detailed
+        );
+
+        #[cfg(feature = "schema-export")]
+        {
+            let field = config
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "channels.model_fallback_notice")
+                .unwrap();
+            assert_eq!(
+                field.enum_variants.unwrap()(),
+                vec![
+                    "off".to_string(),
+                    "redacted".to_string(),
+                    "detailed".to_string()
+                ]
+            );
+        }
     }
 
     // ── Edge cases: serde(default) for non-secret optional fields ─────
@@ -35547,6 +35635,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
