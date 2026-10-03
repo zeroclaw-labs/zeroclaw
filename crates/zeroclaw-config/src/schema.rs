@@ -4172,11 +4172,13 @@ pub struct AliasedAgentConfig {
     /// listed bundle.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(SkillBundles)]
     pub skill_bundles: Vec<String>,
     /// Knowledge bundle aliases. Additive: the agent loads every listed
     /// bundle.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(KnowledgeBundles)]
     pub knowledge_bundles: Vec<String>,
     /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
     /// group of MCP servers. Secure by default: an agent is granted only the
@@ -4185,6 +4187,7 @@ pub struct AliasedAgentConfig {
     /// `Config::mcp_servers_for_agent`.
     #[tab(Bundles)]
     #[serde(default)]
+    #[alias_source(McpBundles)]
     pub mcp_bundles: Vec<String>,
     /// Initialize this agent's `mcp_bundles` tools when it serves an ACP
     /// (`session/new`) session.
@@ -4405,7 +4408,8 @@ impl Config {
     /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
-    /// `PropKind::AliasRef` pickers and validation.
+    /// reference scalar/array pickers and validation. MCP server IDs come
+    /// from the natural `name` keys of `mcp.servers`.
     #[must_use]
     pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
         let section = source.section_path();
@@ -14813,9 +14817,11 @@ pub struct KnowledgeBundleConfig {
 #[serde(default)]
 pub struct McpBundleConfig {
     /// MCP server IDs (`[mcp.servers].name`) granted by this bundle.
+    #[alias_source(McpServers)]
     pub servers: Vec<String>,
     /// MCP server IDs removed from the grant. Deny wins: a name listed here is
     /// excluded even if another referenced bundle includes it.
+    #[alias_source(McpServers)]
     pub exclude: Vec<String>,
 }
 
