@@ -12,11 +12,14 @@
 //! cache).
 //!
 //! Writes go through the shared live-config authority the orchestrator wires
-//! into each channel: acquire its mutation witness, clone and mutate a
-//! snapshot, persist its peer policy, then publish it in memory.
-//! Channels constructed without the handle (tests, one-shot CLI runs) skip
-//! persistence with a warning: pairing still works for the process lifetime,
-//! it just isn't durable.
+//! into each channel: admit one serialized config commit, clone and mutate a
+//! snapshot, persist its peer policy with `Config::save_dirty()`, then publish
+//! the committed snapshot under the commit's allocated revision. The irreversible phase
+//! runs retained, so a dropped pairing continuation cannot strand a
+//! committed identity write without its publication. Channels constructed
+//! without the authority (tests, one-shot CLI runs) skip persistence with a
+//! warning: pairing still works for the process lifetime, it just isn't
+//! durable.
 
 use zeroclaw_config::schema::Config;
 #[cfg(any(
@@ -320,54 +323,63 @@ pub(crate) async fn persist_external_peer_with_cancellation(
         );
         return Ok(());
     };
-    let config_write_lock = authority.config_write_lock();
-    let _config_write_guard = match cancellation {
+    let commit = match cancellation {
         Some(cancel) => {
-            let guard = tokio::select! {
+            let commit = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => anyhow::bail!("pairing listener retired before persistence"),
-                guard = config_write_lock.lock() => guard,
+                commit = authority.begin_config_commit() => commit,
             };
-            // Gateway generation retirement holds this same lock. Logout/drop
+            // The config commit holds writer serialization. Logout/drop
             // only stops admission; an already-admitted save must finish.
             anyhow::ensure!(
                 !cancel.is_cancelled(),
                 "pairing listener retired before persistence"
             );
-            guard
+            commit
         }
-        None => config_write_lock.lock().await,
-    };
-    let config = authority.config();
-    let mut staged = config.read().clone();
-    // Standalone compatibility handles can predate the persisted peer policy.
-    // Refresh it under the writer before checking denies or choosing a group.
-    if let Some(persisted) =
-        zeroclaw_config::schema::persisted_peer_groups(&staged.config_path).await?
-    {
-        staged.peer_groups = persisted;
+        None => authority.begin_config_commit().await,
     }
-    if merge_external_peer(&mut staged, channel_type, alias, identity, &match_fn)?.is_none() {
+    .with_context(|| format!("Failed to admit the {channel_type} peer config commit"))?;
+    let mut snapshot = commit.current_config();
+    // Compatibility authorities can predate persisted policy. Refresh it
+    // under the shared writer before checking denies or choosing a group.
+    if let Some(persisted) =
+        zeroclaw_config::schema::persisted_peer_groups(&snapshot.config_path).await?
+    {
+        snapshot.peer_groups = persisted;
+    }
+    if merge_external_peer(&mut snapshot, channel_type, alias, identity, &match_fn)?.is_none() {
         return Ok(());
     }
-    // Incremental: only `peer_groups` is applied onto the current on-disk
-    // document, so the rest of this snapshot — which is still whatever this
-    // handle last saw — cannot drop another writer's keys. The refresh above is
-    // what makes this sufficient; on its own it would still rewrite the policy
-    // table from stale state.
-    staged.mark_dirty("peer_groups");
-    staged
-        .save_dirty()
-        .await
-        .with_context(|| format!("Failed to persist {channel_type} peer to config.toml"))?;
-    config.write().peer_groups = staged.peer_groups;
+    // Incremental peer-policy persistence preserves unrelated keys written
+    // through another compatibility authority.
+    snapshot.mark_dirty("peer_groups");
+    // Checked revision before the irreversible save.
+    let revision = commit
+        .next_revision()
+        .with_context(|| format!("Failed to allocate a revision for the {channel_type} peer"))?;
+    let persist_channel_type = channel_type.to_string();
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            snapshot.save_dirty().await.with_context(|| {
+                format!("Failed to persist {persist_channel_type} peer to config.toml")
+            })?;
+            // Publish the committed snapshot so the runtime reader sees the
+            // new peer without a reload.
+            commit
+                .publish(revision, snapshot)
+                .with_context(|| "Failed to publish the paired identity to the live config")?;
+            Ok::<(), anyhow::Error>(())
+        }));
+    task.await
+        .with_context(|| "Paired-identity persistence task failed")??;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// Stands in for a channel whose identities are compared verbatim, for the
     /// group-selection tests where the matcher is not what is under test.
@@ -831,8 +843,8 @@ mod tests {
         config.config_path = temp.path().join("config.toml");
         config.data_dir = temp.path().join("data");
         let authority = LiveConfigAuthority::new(config);
-        let config_write_lock = authority.config_write_lock();
-        let guard = config_write_lock.lock().await;
+        let initial_revision = authority.published_revision();
+        let guard = authority.begin_config_commit().await.unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let listener_guard = cancel.clone().drop_guard();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
@@ -890,7 +902,8 @@ mod tests {
         )
         .await
         .expect_err("late callback cannot write after retirement");
-        assert!(authority.config().read().peer_groups.is_empty());
+        assert!(authority.snapshot_config().peer_groups.is_empty());
+        assert_eq!(authority.published_revision(), initial_revision);
         assert!(!temp.path().join("config.toml").exists());
 
         let active = tokio_util::sync::CancellationToken::new();
@@ -906,8 +919,7 @@ mod tests {
         .expect("replacement listener can persist its own pairing");
         assert_eq!(
             authority
-                .config()
-                .read()
+                .snapshot_config()
                 .channel_external_peers("whatsapp", "admin"),
             vec!["+15551234567".to_string()]
         );
@@ -936,7 +948,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("whatsapp", "admin")
                 .is_empty()
@@ -964,8 +976,8 @@ mod tests {
         let config_path = blocker.join("config.toml");
         let mut config = config_with_whatsapp("admin");
         config.config_path = config_path.clone();
-        let shared = Arc::new(parking_lot::RwLock::new(config));
-        let authority = LiveConfigAuthority::from_config(Arc::clone(&shared));
+        let authority = LiveConfigAuthority::new(config);
+        let shared = authority.live_handle();
 
         let first =
             persist_external_peer(Some(&authority), "whatsapp", "admin", "+15551234567", exact)
@@ -1001,7 +1013,9 @@ mod tests {
         // Repointed at a writable path the same call succeeds, so the two
         // failures above came from the unwritable location and not from a
         // writer that could never have persisted anything.
-        shared.write().config_path = dir.path().join("config.toml");
+        let mut writable = authority.snapshot_config();
+        writable.config_path = dir.path().join("config.toml");
+        authority.publish_for_test(writable);
         persist_external_peer(Some(&authority), "whatsapp", "admin", "+15551234567", exact)
             .await
             .expect("the retry persists once the path is writable");
@@ -1073,10 +1087,8 @@ mod tests {
         let mut config = config_with_whatsapp("admin");
         config.config_path = config_path.clone();
         config.save().await.expect("seed the config file");
-        let shared = Arc::new(parking_lot::RwLock::new(config));
-        let authority = LiveConfigAuthority::from_config(Arc::clone(&shared));
-
-        let guard = authority.config_write_lock().lock_owned().await;
+        let authority = LiveConfigAuthority::new(config);
+        let guard = authority.begin_config_commit().await.unwrap();
 
         let pairing = {
             let authority = authority.clone();
@@ -1095,21 +1107,19 @@ mod tests {
             "pairing must not run its transaction while another writer holds the lock"
         );
 
-        // The competing writer, in the shape the gateway uses: mutate the live
-        // config, then save the whole snapshot.
-        {
-            let mut cfg = shared.write();
-            cfg.peer_groups.insert(
-                "whatsapp_admin_denies".to_string(),
-                PeerGroupConfig {
-                    channel: ChannelRef::new("whatsapp.admin".to_string()),
-                    ignore: vec![PeerUsername::new("+15559999999".to_string())],
-                    ..Default::default()
-                },
-            );
-        }
-        let competing = shared.read().clone();
+        // The competing writer persists and publishes under one admitted commit.
+        let mut competing = guard.current_config();
+        competing.peer_groups.insert(
+            "whatsapp_admin_denies".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                ignore: vec![PeerUsername::new("+15559999999".to_string())],
+                ..Default::default()
+            },
+        );
+        let revision = guard.next_revision().unwrap();
         competing.save().await.expect("the competing save lands");
+        guard.publish(revision, competing).unwrap();
 
         drop(guard);
         pairing
@@ -1141,7 +1151,7 @@ mod tests {
     /// operator had already saved.
     ///
     /// `a_competing_ignore_survives_a_pairing_write` cannot catch this: both of
-    /// its writers share one `Arc<RwLock<Config>>`, so pairing's snapshot sees
+    /// its writers share one read-only live handle, so pairing's snapshot sees
     /// the deny for free. Here the channel handle never sees it, and the repair
     /// has to come from re-reading the persisted policy under the lock.
     #[tokio::test]
@@ -1159,8 +1169,8 @@ mod tests {
         // Independent compatibility snapshots over one file, used sequentially.
         // Daemon writers instead share one live-config authority.
         let mut gateway = seed.clone();
-        let channel = Arc::new(parking_lot::RwLock::new(seed.clone()));
-        let channel_authority = LiveConfigAuthority::from_config(Arc::clone(&channel));
+        let channel_authority = LiveConfigAuthority::new(seed.clone());
+        let channel = channel_authority.live_handle();
 
         // The operator denies an account through the gateway and it lands.
         gateway.peer_groups.insert(
@@ -1242,8 +1252,8 @@ mod tests {
 
         // Sequential compatibility snapshots, not separate daemon authorities.
         let mut gateway = seed.clone();
-        let channel = Arc::new(parking_lot::RwLock::new(seed.clone()));
-        let channel_authority = LiveConfigAuthority::from_config(Arc::clone(&channel));
+        let channel_authority = LiveConfigAuthority::new(seed.clone());
+        let channel = channel_authority.live_handle();
 
         // A second channel instance is configured through the gateway, outside
         // `peer_groups` entirely.
@@ -1307,10 +1317,8 @@ mod tests {
         let mut config = config_with_whatsapp("admin");
         config.config_path = config_path.clone();
         config.save().await.expect("seed the config file");
-        let shared = Arc::new(parking_lot::RwLock::new(config));
-        let authority = LiveConfigAuthority::from_config(Arc::clone(&shared));
-
-        let guard = authority.config_write_lock().lock_owned().await;
+        let authority = LiveConfigAuthority::new(config);
+        let guard = authority.begin_config_commit().await.unwrap();
 
         let pairing = {
             let authority = authority.clone();
@@ -1323,21 +1331,18 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        {
-            let mut cfg = shared.write();
-            cfg.peer_groups.insert(
-                "whatsapp_admin_denies".to_string(),
-                PeerGroupConfig {
-                    channel: ChannelRef::new("whatsapp.admin".to_string()),
-                    ignore: vec![PeerUsername::new("+15551234567".to_string())],
-                    ..Default::default()
-                },
-            );
-        }
-        // Bound before the await: a `parking_lot` read guard must not be held
-        // across one.
-        let competing = shared.read().clone();
+        let mut competing = guard.current_config();
+        competing.peer_groups.insert(
+            "whatsapp_admin_denies".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                ignore: vec![PeerUsername::new("+15551234567".to_string())],
+                ..Default::default()
+            },
+        );
+        let revision = guard.next_revision().unwrap();
         competing.save().await.expect("the competing save lands");
+        guard.publish(revision, competing).unwrap();
 
         drop(guard);
         let err = pairing
@@ -1366,8 +1371,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = config_with_whatsapp("admin");
         config.config_path = dir.path().join("config.toml");
-        let shared = Arc::new(parking_lot::RwLock::new(config));
-        let authority = LiveConfigAuthority::from_config(Arc::clone(&shared));
+        let authority = LiveConfigAuthority::new(config);
+        let shared = authority.live_handle();
 
         persist_external_peer(Some(&authority), "whatsapp", "admin", "+15551234567", exact)
             .await

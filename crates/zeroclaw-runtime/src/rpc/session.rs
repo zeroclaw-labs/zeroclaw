@@ -1638,6 +1638,16 @@ impl SessionStore {
         self.sessions.lock().await.keys().cloned().collect()
     }
 
+    /// Keep incarnation retirement and its ledger projection under the same
+    /// map guard. The closure must not await or acquire this map again.
+    pub(crate) async fn with_current_sessions<R>(
+        &self,
+        read: impl FnOnce(&HashMap<String, RpcSession>) -> R,
+    ) -> R {
+        let sessions = self.sessions.lock().await;
+        read(&sessions)
+    }
+
     pub async fn list_ids_for_owner(&self, owner_tui_id: &str) -> Vec<String> {
         self.sessions
             .lock()

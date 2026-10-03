@@ -88,6 +88,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
+    pub const CONFIG_STATUS: &str = "config/status";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
@@ -2312,21 +2313,37 @@ impl RpcClient {
         Ok(result.entries)
     }
 
-    pub async fn config_set(&self, prop: &str, value: Value) -> Result<()> {
-        let _: ConfigSetResult = self
+    pub async fn config_set(
+        &self,
+        prop: &str,
+        value: Value,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigSetResult = self
             .call(
                 method::CONFIG_SET,
                 serde_json::json!({ "prop": prop, "value": value }),
             )
             .await?;
-        Ok(())
+        Ok(result.revision)
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
+    pub async fn config_delete(
+        &self,
+        prop: &str,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigDeleteResult = self
             .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
             .await?;
-        Ok(())
+        Ok(result.revision)
+    }
+
+    pub async fn config_status(&self) -> Result<crate::wire::ConfigStatusResult> {
+        self.call_with_timeout(
+            method::CONFIG_STATUS,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(3),
+        )
+        .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2385,24 +2402,32 @@ impl RpcClient {
         Ok(result.values)
     }
 
-    pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_create(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_CREATE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_DELETE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
     pub async fn config_map_key_rename(
@@ -3161,7 +3186,18 @@ pub struct ConfigListResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigSetResult {}
+pub struct ConfigSetResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyMutationResult {
+    #[serde(default, alias = "created", alias = "deleted")]
+    pub changed: bool,
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
@@ -3279,7 +3315,10 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

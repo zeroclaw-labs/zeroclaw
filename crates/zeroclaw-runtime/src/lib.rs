@@ -54,3 +54,5 @@ pub mod tunnel;
 pub mod verifiable_intent;
 
 pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};
+
+pub mod config_application;

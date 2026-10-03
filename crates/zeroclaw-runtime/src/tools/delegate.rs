@@ -334,7 +334,7 @@ pub struct DelegateTool {
     /// config reloads and credential rotation instead of the startup snapshot.
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// Authority capability used to admit every independent target execution.
     execution_capability: Option<AgentExecutionCapability>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
@@ -672,7 +672,10 @@ impl DelegateTool {
     /// one-shot behavior and keeps the snapshot fallback; dropping the handle
     /// when the caller has one silently pins delegated plugin tools to startup
     /// config for the parent's whole lifetime.
-    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+    pub fn with_live_config(
+        mut self,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    ) -> Self {
         self.live_config = live_config;
         self
     }
@@ -18244,7 +18247,7 @@ command = "rm independent-delegate-marker"
         hop_ceiling_cents: u32,
     ) -> (
         DelegateCostFixture,
-        Arc<RwLock<Config>>,
+        Arc<zeroclaw_config::live::LiveConfig>,
         Arc<dyn TaskRegistry>,
     ) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
@@ -18328,12 +18331,14 @@ command = "rm independent-delegate-marker"
         root_config.agents.insert("target2".to_string(), leaf);
 
         let root_config = Arc::new(root_config);
-        let live_config = Arc::new(RwLock::new((*root_config).clone()));
+        let live_config = Arc::new(zeroclaw_config::live::LiveConfig::new(
+            (*root_config).clone(),
+        ));
         let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
         let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
             .with_root_config(Arc::clone(&root_config))
-            .with_live_config(Some(Arc::clone(&live_config)))
+            .with_live_config(Some(live_config.handle()))
             .with_task_control_plane(task_control_plane(Arc::clone(&task_store)))
             .with_workspace_dir(workspace_dir)
             .with_runtime(Arc::new(DelegateTestRuntime))
@@ -18360,7 +18365,7 @@ command = "rm independent-delegate-marker"
     /// call it more than once (the leaf hops inherit it) keep the flipped
     /// mode.
     struct LiveConfigModeFlipTool {
-        live_config: Arc<RwLock<Config>>,
+        live_config: Arc<zeroclaw_config::live::LiveConfig>,
         disable_enabled: bool,
         disable_track_per_agent: bool,
         flipped: Arc<std::sync::atomic::AtomicBool>,
@@ -18383,14 +18388,15 @@ command = "rm independent-delegate-marker"
         }
 
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            let mut reloaded = self.live_config.read().clone();
+            let mut reloaded = self.live_config.snapshot();
             if self.disable_enabled {
                 reloaded.cost.enabled = false;
             }
             if self.disable_track_per_agent {
                 reloaded.cost.track_per_agent = false;
             }
-            *self.live_config.write() = reloaded;
+            let revision = self.live_config.next_revision()?;
+            self.live_config.publish(revision, reloaded)?;
             self.flipped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolResult {

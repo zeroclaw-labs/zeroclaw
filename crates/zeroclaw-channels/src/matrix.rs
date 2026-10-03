@@ -7193,7 +7193,7 @@ mod tests {
                 },
             );
 
-            let config_arc = Arc::new(parking_lot::RwLock::new(config));
+            let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
             let channel = {
                 let config = config_arc.read();
                 crate::orchestrator::build_configured_matrix_channel(
