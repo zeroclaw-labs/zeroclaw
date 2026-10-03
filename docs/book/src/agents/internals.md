@@ -23,6 +23,14 @@ The read-only allowlist is honored by `file_read` and other read-side tools, inc
 
 SubAgent spawns enforce the rule that a child cannot escalate beyond its parent. The validator's full axis list and the budget-sharing behavior are documented at [Delegation → Permission inheritance](./delegation.md#permission-inheritance).
 
+## Repeated tool calls
+
+Configured Agent turns use the root `[pacing]` policy, refreshed from live config at the start of each turn. With loop detection enabled, identical successful calls and results receive at most one advisory per turn; polling and changing results can continue. Identical completed failures reach a correction at `loop_detection_max_repeats`, which defaults to three. The next provider request receives that correction and may make one further identical retry. If it fails identically without another useful completed call in the round, the turn returns a visible stop reason and preserves every completed result. A successful retry or changed approach can continue, and a new user turn starts with a fresh retry budget.
+
+This result-aware guard uses `loop_detection_enabled`, `loop_detection_max_repeats`, and `loop_ignore_tools`. Tool identity and ignore matching use the executed tool's canonical name, so an activated tool's short alias and full name share one retry budget. The legacy channel detector retains its window, no-progress and elapsed-output checks; `loop_detection_min_elapsed_secs` does not delay Agent failure recovery.
+
+Approval denials, hook cancellations and unavailable tools do not count as executed failures. Standalone Agent builders without full or live config retain disabled pacing. Legacy channel loop detection is unchanged.
+
 ## Memory model
 
 Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory::create_memory_for_agent`) dispatches by backend kind:

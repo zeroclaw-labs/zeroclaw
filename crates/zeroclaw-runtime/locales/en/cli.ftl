@@ -1435,3 +1435,9 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+# Result-aware Agent loop recovery
+turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
+turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
+turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
+turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
