@@ -19,14 +19,10 @@ impl ImageInfoTool {
         Self { security }
     }
 
+    /// Delegates to the canonical marker-path normalizer shared with the
+    /// content-addressed upload writer.
     fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
-        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            std::borrow::Cow::Owned(format!(r"\\{rest}"))
-        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-            std::borrow::Cow::Borrowed(rest)
-        } else {
-            std::borrow::Cow::Borrowed(path)
-        }
+        crate::embedded_resource::strip_windows_verbatim_prefix(path)
     }
 
     /// Detect image format from first few bytes (magic numbers).
