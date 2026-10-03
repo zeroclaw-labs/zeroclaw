@@ -1,6 +1,6 @@
 # Skill: squash-merge
 
-Squash-merge a PR into `zeroclaw-labs/zeroclaw` `master` with fully preserved commit history in the squash message body. Use this skill when the user explicitly mentions squash-merging, merging a specific PR number, landing a PR, or 合入 — e.g. "squash-merge #123", "merge PR 456", "land #789", "合入 #123", "/squash-merge 123". Do **not** trigger on vague phrases like "ship it" or "merge it" without a PR number or clear upstream-merge context.
+Squash-merge a PR into `zeroclaw-labs/zeroclaw` `master` through the merge queue, after release-line, review, CI, and attribution checks. Use this skill when the user explicitly mentions squash-merging, merging a specific PR number, landing a PR, or 合入 — e.g. "squash-merge #123", "merge PR 456", "land #789", "合入 #123", "/squash-merge 123". Do **not** trigger on vague phrases like "ship it" or "merge it" without a PR number or clear upstream-merge context.
 
 ## Related Skills
 
@@ -28,7 +28,16 @@ Do not skip straight to merge if no PR exists yet.
 
 ## Why This Exists
 
-GitHub's default squash merge omits the PR number from the commit subject and formats the commit body inconsistently with project conventions. Direct-pushing a squash to master bypasses the PR merge mechanism entirely: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge commit association). This skill produces both: the purple **Merged** badge and a conventionally formatted squash commit with full commit history in the body.
+`master` requires the GitHub merge queue, configured to squash. The queue tests
+each PR against the exact result it will land on and merges it only if that
+run is green, so it is the freshness check: the skill does not judge whether
+older green checks are still current. The queue does not check release-line
+holds, milestones, review state, or attribution, so the skill does that before
+it enqueues.
+
+The squash commit is title-only. The repository's squash settings use the PR
+title (GitHub appends ` (#N)`) and a blank body, so the PR title is the whole
+commit message on `master`, and commit bodies and trailers do not land.
 
 ## Prerequisites
 
@@ -70,7 +79,7 @@ Run pre-flight checks. **Stop at the first stop condition** and explain clearly:
 | No merge conflicts | `mergeable == "CONFLICTING"` or `mergeStateStatus == "DIRTY"` | Stop: "PR #$NUMBER has merge conflicts or a dirty merge state with master. The author must refresh or resolve conflicts before this can merge." |
 | Merge state known | `mergeStateStatus == "UNKNOWN"` | Refresh/retry once; if still unknown, stop and report that GitHub has not computed mergeability yet. |
 | Not blocked or draft | `mergeStateStatus` is `BLOCKED` / `DRAFT` | Stop and report the blocking gate or draft state. |
-| Behind or unstable | `mergeStateStatus` is `BEHIND` / `UNSTABLE` | Continue to Step 1c, but do not use old green branch checks alone as the freshness basis. |
+| Behind or unstable | `mergeStateStatus` is `BEHIND` / `UNSTABLE` | Continue. `BEHIND` needs no branch update because the queue tests the merge result. For `UNSTABLE`, report the failing non-required checks in the confirmation. |
 
 Then fetch the review decision:
 
@@ -136,7 +145,7 @@ When the current milestone is `Parking Lot` or `Icebox`, do not continue until a
 1. **Allow on the active line.** Record the public evidence for the active line, why the change is compatible with it, and how the public milestone or tracker placement matches that decision. An additive change is not automatically eligible for an active patch line; consider the patch line's promised scope, stability, migration, defaults, dependencies, and release risk.
 2. **Hold for the future line.** Keep or assign the intended future milestone, add both `do-not-merge` and `status:blocked`, and leave one durable public comment that states why the PR cannot land on the active line and the concrete condition that will clear both labels. Reuse an existing sufficient comment instead of duplicating it. The hold remains a hard stop until that condition clears, both labels are deliberately removed, and the current merge gates are rechecked.
 
-Label, milestone, and comment changes are separate public mutations. Show their exact text and commands and obtain explicit approval before applying them. Apply only the approved changes, read back the live labels, milestone, and relevant comment, then restart at Step 1 and rerun the complete review, required-CI, mergeability, and freshness preflight. Rebuild the final merge packet if any fact changed.
+Label, milestone, and comment changes are separate public mutations. Show their exact text and commands and obtain explicit approval before applying them. Apply only the approved changes, read back the live labels, milestone, and relevant comment, then restart at Step 1 and rerun the complete review, required-CI, mergeability, and attribution preflight. Rebuild the final merge packet if any fact changed.
 
 Save one evidence-backed `$RELEASE_LINE_DISPOSITION` for every PR and carry it into the mandatory confirmation packet: the selected future-release or holding-milestone outcome, the reconciled named gate for `release-gate`, or a statement that no future-line trigger applies with the live milestone or lack of one. Save the sorted closing-issue number set as `$RELEASE_CLOSING_ISSUES`. When the disposition depends on a fact from the PR body, a closing issue, a linked tracker, or a durable comment, save that source identity and the exact placement fact used as `$RELEASE_EVIDENCE_STATE`; do not copy unrelated body, issue, or comment content. Also save the current head, release labels, and milestone for the final pre-merge readback:
 
@@ -181,7 +190,7 @@ gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 
 | Bucket value | Action |
 |---|---|
-| `pass` for every required check, including the repo's required aggregate gate (currently `CI Required Gate`) | Proceed to Step 1c |
+| `pass` for every required check, including the repo's required aggregate gate (currently `CI Required Gate`) | Proceed to Step 2 |
 | `fail` or `cancel` for any required check | Stop — report failing or cancelled check names; do not merge |
 | `pending` for any required check | Stop — tell user to wait for CI; offer to retry later |
 | `skipping` for any required check | Stop — report the skipped required check names and ask whether the skip is expected before proceeding |
@@ -189,138 +198,54 @@ gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 
 Failed or cancelled required checks must be resolved before merging.
 
-### Step 1c: Establish the Freshness Basis
+### Step 2: Check the Title and Attribution
 
-Before deriving or confirming the merge command, record why the merge is current
-enough to run. Do not merge merely because the PR branch had green checks at
-some earlier point. This is a merge-readiness gate, not a code-review blocker:
-being behind `master` can require fresh merge evidence before merging without
-making the reviewed implementation itself wrong.
-
-Set `$FRESHNESS_BASIS` to one concrete sentence that names the selected basis
-and evidence. Do not leave it as an option list.
-
-Use one of these freshness bases:
-
-1. **Current official checks** — GitHub reports the PR cleanly mergeable against
-   current `master` (`mergeStateStatus` is `CLEAN` or `HAS_HOOKS`), and all
-   required checks on the current `$HEAD_SHA` are successful.
-2. **Exact queued/merge-result checks** — a merge queue, merge group, or
-   equivalent exact-result CI path has validated the result that will land.
-3. **Exact merge-result smoke** — you locally construct or inspect the exact
-   merge result that will be created, then run an appropriate compile/test smoke
-   for the touched surface. Use this only after the user approves the validation
-   scope, and see the `BEHIND`/`UNSTABLE` constraint below before choosing it
-   over official CI.
-4. **Explicit stale-risk acceptance** — if checks or merge-result validation are
-   stale or unavailable, tell the user exactly what is stale or unverified and
-   get explicit approval to accept that risk for this PR.
-
-When the PR is `BEHIND` or `UNSTABLE`, do not treat old green branch checks as
-merge readiness. If current `master` changed the same files or high-risk shared
-surfaces such as build/CI/config, generated artifacts, public interfaces,
-security or authorization boundaries, provider/channel/runtime paths, or
-required test harnesses, prefer updating the branch and waiting for official CI.
-If updating is unavailable or intentionally skipped, use exact queued or
-merge-result validation, or get explicit stale-risk acceptance that names the
-unverified overlap. Do not run local merge-result smoke as a default substitute
-for official CI.
-
-Carry the selected freshness basis into the confirmation prompt in Step 4.
-
-### Step 2: Get Commit History
-
-```bash
-COMMITS=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
-  --json commits \
-  --jq '[.commits[] | "- \(.oid[:7]) \(.messageHeadline)"] | join("\n")')
-```
-
-If `gh` returns no commit data or hashes are missing, fall back to local git. This requires the contributor's branch to be locally available — fetch first:
-
-```bash
-BASE_REF=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json baseRefName --jq '.baseRefName')
-HEAD_REF=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json headRefName --jq '.headRefName')
-
-git fetch upstream
-git fetch origin
-
-COMMITS=$(git log "upstream/${BASE_REF}..origin/${HEAD_REF}" --format="- %h %s")
-```
-
-If `origin/${HEAD_REF}` doesn't exist (contributor's branch is on their own fork), the fallback cannot be used — stick with the `gh` API output.
-
-**Single-commit PRs:** If `$COMMITS` is exactly one line, use the full commit body instead of the bullet list. Get it with:
-
-```bash
-COMMITS=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json commits --jq '.commits[0].messageBody')
-```
-
-Leave `$COMMITS` empty if there is no commit body. A one-item bullet list adds no information.
-
-Note: commits from the API are in API order, which is typically chronological but not guaranteed for rebased histories. Use the `git log` fallback if ordering looks wrong.
-
-### Step 3: Derive the Squash Commit Subject
-
-Before deriving the final merge command, sanitize `$COMMITS`: strip bot/AI
-`Co-authored-by` trailers and generated tool footers, while preserving human
-co-author trailers only when they credit incorporated contributor work under the
-superseding and privacy rules. Then verify the body before asking for merge
-confirmation:
-
-```bash
-printf '%s\n' "$COMMITS" | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
-```
-
-If this prints anything, stop and strip the remaining bot attribution or
-generated footer before continuing.
-
-Save the sanitized body in a private scratch directory outside the checkout before confirmation and show that file's contents with the merge command:
-
-```bash
-umask 077
-BODY_DIR=$(mktemp -d /tmp/zeroclaw-merge.XXXXXX) || exit 1
-BODY_FILE="$BODY_DIR/body.md"
-printf '%s' "$COMMITS" > "$BODY_FILE" || exit 1
-```
-
-Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
+The PR title becomes the squash commit subject, so it must be in conventional
+commit format, e.g. `feat(scope): description` or `fix: short message`, without
+a ` (#N)` suffix (GitHub adds it). If it is not, flag it, suggest a corrected
+title, and do not continue until the title is fixed. Editing the title is a
+separate public change that needs the user's approval.
 
 ```bash
 PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
 SUBJECT="${PR_TITLE} (#${NUMBER})"
 ```
 
-The title should follow conventional commit format, e.g. `feat(scope): description` or `fix: short message`. If it does not, flag it to the user and suggest a corrected title. Do not proceed until the subject is in conventional commit format.
+Then check that neither the title nor the PR's commits carry bot or AI
+attribution. Commit bodies do not land on `master` under the current squash
+settings, but the rule against AI attribution applies to the PR's history as
+well, and the check keeps it true if those settings change:
 
-### Step 4: Confirm — MANDATORY, NO EXCEPTIONS
+```bash
+gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title,commits \
+  --jq '.title, (.commits[] | .messageHeadline, .messageBody, (.authors[] | "Co-authored-by: \(.login) <\(.email)>"))' \
+  | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+```
 
-**This step is non-negotiable.** A squash merge into `upstream/master` cannot be undone without a revert commit.
+If this prints anything, stop and report it. The author removes the
+attribution (rewording the commits or the title) before the PR is enqueued.
 
-Present the following to the user with `$NUMBER`, `$HEAD_SHA`, `$SUBJECT`, `$BODY_FILE`, `$COMMITS`, `$FRESHNESS_BASIS`, and `$RELEASE_LINE_DISPOSITION` substituted with their actual values. Never show variable names or placeholder text:
+### Step 3: Confirm — MANDATORY, NO EXCEPTIONS
+
+**This step is non-negotiable.** Once the queue merges the PR, undoing it takes a revert commit.
+
+Present the following to the user with `$NUMBER`, `$HEAD_SHA`, `$SUBJECT`, and `$RELEASE_LINE_DISPOSITION` substituted with their actual values. Never show variable names or placeholder text:
 
 ---
 
 **About to run:**
 ```
-gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
-  --match-head-commit "$HEAD_SHA" \
-  --subject "$SUBJECT" \
-  --body-file "$BODY_FILE"
+gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash --auto \
+  --match-head-commit "$HEAD_SHA"
 ```
 
 **Effect:**
-- PR #$NUMBER will be permanently merged (state → Merged, purple badge)
-- Issues referenced with closing keywords will auto-close
+- PR #$NUMBER joins the `master` merge queue (or auto-merge is enabled and it joins once required checks pass). The queue tests the exact merge result and squash-merges it if green (state → Merged, purple badge), or removes it from the queue if not
+- Issues referenced with closing keywords will auto-close on merge
 - PR head SHA: `$HEAD_SHA`
-- Freshness basis: `$FRESHNESS_BASIS`
 - Release-line disposition: `$RELEASE_LINE_DISPOSITION`
-- Squash commit subject: `$SUBJECT`
-- Squash commit body:
-  ```
-  $COMMITS
-  ```
-- Bot/AI attribution has been stripped from the squash commit body.
+- Squash commit: `$SUBJECT` with an empty body
+- The title and the PR's commits carry no bot or AI attribution
 
 Run this command? (yes/no)
 
@@ -328,11 +253,11 @@ Run this command? (yes/no)
 
 Do not infer consent from silence, prior approval of the commit message, or any earlier step. The user must respond with an unambiguous "yes" (or "y", "go", "do it") **in direct reply to this prompt**. Any other response — including silence, redirection, or "yes but first..." — means stop.
 
-### Step 5: Execute
+### Step 4: Enqueue
 
-Only after explicit confirmation in Step 4:
+Only after explicit confirmation in Step 3:
 
-Immediately before merge, reread the current PR body and closing references and rerun Step 1a's complete release-line classification from the refreshed body, every closing issue, labels, milestone, and any deeper public evidence it triggers. Set `$CURRENT_RELEASE_LINE_DISPOSITION` from that recomputation; merely fetching the sources is not sufficient. Stop if the recomputed disposition is absent or ambiguous. The no-signal fast path must satisfy its complete predicate again. If `$RELEASE_EVIDENCE_STATE` names a PR-body, closing-issue, linked-tracker, or comment fact, reread that source and compare the exact placement fact as well. Also reread the current head, `do-not-merge`, `status:blocked`, and `release-gate` labels and milestone, and save the current sorted closing-issue number set as `$CURRENT_RELEASE_CLOSING_ISSUES`. If the guard state, derived disposition, closing-issue set, or any relied-upon fact changed or became ambiguous, stop without merging, restart at Step 1, and build a new confirmation packet. Unrelated body or issue wording that leaves the release disposition and relied-upon facts unchanged does not invalidate the packet. This is a bounded last-moment consistency check, not an atomic lock: `--match-head-commit` protects the source head but does not detect concurrent metadata or evidence changes after the read.
+Immediately before enqueuing, reread the current PR body and closing references and rerun Step 1a's complete release-line classification from the refreshed body, every closing issue, labels, milestone, and any deeper public evidence it triggers. Set `$CURRENT_RELEASE_LINE_DISPOSITION` from that recomputation; merely fetching the sources is not sufficient. Stop if the recomputed disposition is absent or ambiguous. The no-signal fast path must satisfy its complete predicate again. If `$RELEASE_EVIDENCE_STATE` names a PR-body, closing-issue, linked-tracker, or comment fact, reread that source and compare the exact placement fact as well. Also reread the current head, `do-not-merge`, `status:blocked`, and `release-gate` labels and milestone, and save the current sorted closing-issue number set as `$CURRENT_RELEASE_CLOSING_ISSUES`. If the guard state, derived disposition, closing-issue set, or any relied-upon fact changed or became ambiguous, stop without merging, restart at Step 1, and build a new confirmation packet. Unrelated body or issue wording that leaves the release disposition and relied-upon facts unchanged does not invalidate the packet. This is a bounded last-moment consistency check, not an atomic lock: `--match-head-commit` protects the source head but does not detect concurrent metadata or evidence changes after the read.
 
 ```bash
 if ! CURRENT_RELEASE_GUARD_STATE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
@@ -360,28 +285,56 @@ if [[ -z "$CURRENT_RELEASE_LINE_DISPOSITION" || "$CURRENT_RELEASE_LINE_DISPOSITI
 fi
 ```
 
-Only then reread `$BODY_FILE` and confirm it still matches the approved body. If it changed, restart Step 3 to sanitize the intended body, save it in a new private scratch directory, and obtain confirmation again. Submit the same file unchanged:
+Then enqueue:
 
 ```bash
-gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash \
-  --match-head-commit "$HEAD_SHA" \
-  --subject "$SUBJECT" \
-  --body-file "$BODY_FILE"
+gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash --auto \
+  --match-head-commit "$HEAD_SHA"
 ```
 
 If the command exits non-zero, stop and report the full error output verbatim. Do not retry or attempt to work around failures.
 
-### Step 6: Verify
+### Step 5: Verify
+
+The queue merges the PR when its queue run passes, which can take a full
+required CI run plus the queue's batching wait. Check its status until it is
+`MERGED` or has left the queue:
 
 ```bash
-gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
-  --json state,mergedAt,mergeCommit \
-  --jq '"State: \(.state) | Merged at: \(.mergedAt) | Commit: \(if .mergeCommit then .mergeCommit.oid[:7] else "N/A" end)"'
+gh api graphql -F n="$NUMBER" -f query='
+query($n: Int!) {
+  repository(owner: "zeroclaw-labs", name: "zeroclaw") {
+    pullRequest(number: $n) {
+      state
+      mergeCommit { oid }
+      isInMergeQueue
+      mergeQueueEntry { state position }
+      autoMergeRequest { enabledAt }
+      timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT], last: 1) {
+        nodes { ... on RemovedFromMergeQueueEvent { reason createdAt } }
+      }
+    }
+  }
+}' --jq '.data.repository.pullRequest'
 ```
 
-If `state` is not `MERGED`, report the discrepancy and stop — do not assume success.
+- `state` is `MERGED`: report the merge commit SHA and PR URL.
+- `isInMergeQueue` is true, or `autoMergeRequest` is set while checks run:
+  still pending. Report the queue position and check again later. Do not
+  enqueue it again.
+- `state` is `OPEN`, the PR is not in the queue, and `autoMergeRequest` is
+  null: the queue removed it. Report the `reason` and time from
+  `timelineItems`, and the failing queue run if there is one, then stop.
+  Enqueuing it again is a new merge and restarts at Step 1.
 
-Report to the user: merge commit SHA and PR URL. After verification, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
+**Bypassing the queue.** An admin merge (`--admin`) skips the queue's
+merge-result test. Do it only when the user explicitly asks for it for this
+PR, never as a fallback because the queue is slow or removed the PR. Before
+confirming, state the stale risk: the PR's checks ran against an older
+`master`, and nothing has tested the result that will land.
+
+**Merging several PRs in one session:** enqueue each one after its own
+preflight and confirmation. The queue serializes them.
 
 **Post-merge (optional, only if user asks):**
 - Fetch latest master: `git checkout master && git pull upstream master` (or `origin master` if no upstream remote)
@@ -389,7 +342,7 @@ Report to the user: merge commit SHA and PR URL. After verification, remove only
 
 **Never delete contributor branches.** Do not suggest, offer, or run any branch deletion command — not on the upstream remote, not on forks. Branch cleanup is the contributor's responsibility and is always a human decision.
 
-### Step 7: Public Tracker Follow-Through
+### Step 6: Public Tracker Follow-Through
 
 After a verified merge, do a final-status pass for public tracker follow-through
 only when the PR is already tied to a public milestone, release, recovery, RFC,
@@ -416,16 +369,12 @@ leaving a known public tracker stale.
 
 - **Require a PR number or explicit squash-merge context before triggering** — do not invoke on vague phrases without a clear target.
 - **Never push squash commits directly to `upstream/master`** — always use `gh pr merge`. Direct push produces "Closed" not "Merged", breaks issue auto-close, and loses PR association.
-- **Always supply `--subject` and `--body-file` with `gh pr merge --squash`.** The auto-generated message omits the PR number and uses inconsistent formatting.
-- **Never let GitHub auto-generate the squash message** — no web UI merge, no merge button clicks.
-- **Always strip bot/AI attribution from the squash body** before confirmation.
-  Preserve intentional human co-author trailers only under the superseding and
-  privacy rules.
-- **Keep the subject in a shell variable and submit the unchanged checked body file.** Never interpolate untrusted content into shell command text.
+- **Enqueue through the merge queue** with `gh pr merge --squash --auto --match-head-commit`. The PR title is the squash commit message, so it must be conventional before enqueuing.
+- **Refuse bot or AI attribution** in the PR title or commits before enqueuing.
+- **Never bypass the queue unless the user explicitly asks** for that PR, and state the stale risk when they do.
 - **Always run pre-flight checks** (merge conflicts, review decision, labels, milestone, release-line placement, and CI status) before confirming — do not skip them even if the user says "just merge it."
-- **Always record a freshness basis before confirming** — refreshed official checks, exact queued/merge-result checks, exact merge-result smoke, or explicit stale-risk acceptance. Do not treat old green branch checks as merge readiness when current `master` could invalidate them.
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.
-- **If the merge command fails, stop and report verbatim** — do not retry or work around failures automatically.
+- **If the merge command fails, or the queue removes the PR, stop and report verbatim** — do not retry, enqueue again, or bypass the queue automatically.
 - **Always handle public tracker follow-through after a verified merge** — update relevant public trackers with approval, or report that none apply.
 - **Never delete branches** — not on upstream, not on forks. Branch cleanup is always the contributor's decision. Never suggest a deletion command.
 - **Self-merge note:** Maintainers routinely merge their own PRs. If the user is the PR author, proceed normally — just note it in the confirmation summary so it's visible in the audit trail.
