@@ -3476,7 +3476,7 @@ impl RpcDispatcher {
             // own stack frame.
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
-            Method::ConfigValidate => self.handle_config_validate(),
+            Method::ConfigValidate => self.handle_config_validate(params),
             Method::ConfigReload => self.handle_config_reload(),
             Method::ConfigList => self.handle_config_list(params),
             Method::ConfigDelete => Box::pin(self.handle_config_delete(params)).await,

@@ -25944,6 +25944,7 @@ impl Config {
     /// The edited field itself never qualifies -- if the value just written is
     /// the empty one, that is this write's own error.
     fn is_complementary_required_agent_field(
+        &self,
         edited_path: &str,
         error: &crate::api_error::ConfigApiError,
     ) -> bool {
@@ -25955,6 +25956,28 @@ impl Config {
         let Some(error_path) = error.path.as_deref() else {
             return false;
         };
+
+        // Staged model/embedding routes mirror staged agents: a route completed
+        // field-by-field is invalid between writes. `validate()` reports route
+        // fields by array index, while the RPC edit path is hint-keyed, so the
+        // edited hint is resolved to its index before the comparison.
+        if let Some((kind, hint, edited_field)) = Self::route_required_field(edited_path) {
+            let Some(edited_index) = self.route_index(kind, hint) else {
+                return false;
+            };
+            let Some((error_kind, error_index, error_field)) = Self::route_error_field(error_path)
+            else {
+                return false;
+            };
+            if kind != error_kind {
+                return false;
+            }
+            if edited_index != error_index {
+                return true;
+            }
+            return edited_field != error_field;
+        }
+
         let Some((edited_agent, edited_field)) = Self::agent_required_field(edited_path) else {
             return false;
         };
@@ -25966,6 +25989,55 @@ impl Config {
             return true;
         }
         edited_field != error_field
+    }
+
+    /// Parse a route required-field edit path `model_routes.<hint>.<field>` or
+    /// `embedding_routes.<hint>.<field>` into `(kind, hint, field)`.
+    fn route_required_field(path: &str) -> Option<(&str, &str, &str)> {
+        let mut parts = path.split('.');
+        let (Some(kind), Some(hint), Some(field), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        if kind != "model_routes" && kind != "embedding_routes" {
+            return None;
+        }
+        if hint.is_empty() {
+            return None;
+        }
+        matches!(field, "model_provider" | "model").then_some((kind, hint, field))
+    }
+
+    /// Parse a route required-field *error* path emitted by `validate()`, which
+    /// is index-keyed: `model_routes[<i>].<field>` / `embedding_routes[<i>].<field>`.
+    fn route_error_field(path: &str) -> Option<(&str, usize, &str)> {
+        let (kind, rest) = path.split_once('[')?;
+        if kind != "model_routes" && kind != "embedding_routes" {
+            return None;
+        }
+        let (index_text, rest) = rest.split_once(']')?;
+        let index = index_text.parse::<usize>().ok()?;
+        let field = rest.strip_prefix('.')?;
+        if field.is_empty() {
+            return None;
+        }
+        matches!(field, "model_provider" | "model").then_some((kind, index, field))
+    }
+
+    /// Resolve a route hint to its index in the matching route vec.
+    fn route_index(&self, kind: &str, hint: &str) -> Option<usize> {
+        match kind {
+            "model_routes" => self
+                .model_routes
+                .iter()
+                .position(|route| route.hint.trim() == hint),
+            "embedding_routes" => self
+                .embedding_routes
+                .iter()
+                .position(|route| route.hint.trim() == hint),
+            _ => None,
+        }
     }
 
     fn validate_edited_agent_required_reference(&self, path: &str) -> Result<()> {
@@ -26056,7 +26128,7 @@ impl Config {
         candidate.validate_edited_agent_required_reference(name)?;
         if let Err(error) = candidate.validate() {
             let api_error = crate::api_error::ConfigApiError::from_validation(error);
-            if !Self::is_complementary_required_agent_field(name, &api_error) {
+            if !self.is_complementary_required_agent_field(name, &api_error) {
                 return Err(anyhow::Error::new(api_error));
             }
             // The surfaced error is a still-empty complementary field on the
@@ -26069,7 +26141,7 @@ impl Config {
                 && let Err(error) = probe.validate()
             {
                 let api_error = crate::api_error::ConfigApiError::from_validation(error);
-                if !Self::is_complementary_required_agent_field(name, &api_error) {
+                if !self.is_complementary_required_agent_field(name, &api_error) {
                     return Err(anyhow::Error::new(api_error));
                 }
             }
@@ -26095,6 +26167,11 @@ impl Config {
     /// placeholder is available, in which case the caller keeps its original
     /// decision.
     fn probe_with_complementary_agent_fields_filled(&self, edited_path: &str) -> Option<Self> {
+        // Staged routes: fill the empty companion field on the edited route so
+        // the next `validate()` moves past it and judges the value just written.
+        if let Some((kind, hint, edited_field)) = Self::route_required_field(edited_path) {
+            return self.probe_route_companion(kind, hint, edited_field);
+        }
         let (edited_agent, edited_field) = Self::agent_required_field(edited_path)?;
         self.agents.get(edited_agent)?;
 
@@ -26120,6 +26197,41 @@ impl Config {
             }
         }
 
+        Some(probe)
+    }
+
+    /// Clones `self` with the edited route's empty companion required field
+    /// filled with a placeholder, so a re-validation can reach the check of the
+    /// value just written. The edited field keeps the caller's value.
+    fn probe_route_companion(&self, kind: &str, hint: &str, edited_field: &str) -> Option<Self> {
+        let index = self.route_index(kind, hint)?;
+        let mut probe = self.clone();
+        let fill_provider = |route: &mut String| {
+            let (family, provider_alias) = self.any_configured_model_provider()?;
+            *route = format!("{family}.{provider_alias}");
+            Some(())
+        };
+        match kind {
+            "model_routes" => {
+                let route = probe.model_routes.get_mut(index)?;
+                if route.model_provider.trim().is_empty() && edited_field != "model_provider" {
+                    fill_provider(&mut route.model_provider)?;
+                }
+                if route.model.trim().is_empty() && edited_field != "model" {
+                    route.model = "staged-probe-model".into();
+                }
+            }
+            "embedding_routes" => {
+                let route = probe.embedding_routes.get_mut(index)?;
+                if route.model_provider.trim().is_empty() && edited_field != "model_provider" {
+                    fill_provider(&mut route.model_provider)?;
+                }
+                if route.model.trim().is_empty() && edited_field != "model" {
+                    route.model = "staged-probe-model".into();
+                }
+            }
+            _ => return None,
+        }
         Some(probe)
     }
 
@@ -31160,6 +31272,66 @@ enabled = true
             .agents
             .insert("worker".to_string(), AliasedAgentConfig::default());
         config
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_staged_model_route_completion() {
+        // A model route created field-by-field is invalid between writes: the
+        // companion required field stays empty until the next write. The staged
+        // exception must tolerate that companion error, exactly as it does for
+        // staged agents, while still leaving the route incomplete until both
+        // fields are populated.
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+            "#,
+        )
+        .unwrap();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            ..ModelRouteConfig::default()
+        });
+
+        config
+            .set_prop_persistent_validated(
+                "model_routes.reasoning.model_provider",
+                "openai.primary",
+            )
+            .expect("the staged route provider write must succeed");
+        assert_eq!(config.model_routes[0].model_provider, "openai.primary");
+        assert!(
+            config.validate().is_err(),
+            "a route with only its provider set must stay incomplete"
+        );
+
+        config
+            .set_prop_persistent_validated("model_routes.reasoning.model", "gpt-test")
+            .expect("completing the staged route must succeed");
+        assert!(config.validate().is_ok(), "the route is now complete");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_staged_route_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+            "#,
+        )
+        .unwrap();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            ..ModelRouteConfig::default()
+        });
+
+        let err = config
+            .set_prop_persistent_validated("model_routes.reasoning.model_provider", "nope.missing")
+            .expect_err("a dangling route provider must be rejected even while staged");
+        assert!(err.to_string().contains("nope.missing"));
+        assert_eq!(config.model_routes[0].model_provider, "");
     }
 
     #[test]
