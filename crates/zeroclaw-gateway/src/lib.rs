@@ -939,6 +939,41 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
         ))
 }
 
+/// Choose the gateway's memory backend from config.
+///
+/// No agents configured means memory is intentionally off: a silent no-op
+/// (`NoneMemory`) is the correct behavior. A configured backend that fails to
+/// build is a different state: the gateway must still boot (config editor and
+/// repair endpoints), but every memory operation must fail loudly instead of
+/// acknowledging writes that were never stored — hence `FailedMemory`, never
+/// `NoneMemory`, for construction errors.
+fn select_gateway_memory(
+    config: &zeroclaw_config::schema::Config,
+    api_key: Option<&str>,
+) -> Arc<dyn Memory> {
+    if config.agents.is_empty() {
+        return Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+    }
+    match zeroclaw_memory::create_memory_from_config(config, api_key) {
+        Ok(m) => Arc::from(m),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "Gateway: memory backend failed to construct; memory operations will \
+                 return errors until the backend is fixed. Fix [memory] and \
+                 POST /admin/reload."
+            );
+            Arc::new(zeroclaw_memory::FailedMemory::new(
+                &config.memory.backend,
+                &e,
+            ))
+        }
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 // One parameter per daemon-owned dependency; a bundling struct would only
@@ -1187,28 +1222,8 @@ pub async fn run_gateway_with_plugin_webhooks(
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
     let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
-    let mem: Arc<dyn Memory> = if config.agents.is_empty() {
-        Arc::new(zeroclaw_memory::NoneMemory::new("none"))
-    } else {
-        match zeroclaw_memory::create_memory_from_config(
-            &config,
-            fallback.and_then(|e| e.api_key.as_deref()),
-        ) {
-            Ok(m) => Arc::from(m),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                    "Gateway: memory backend failed to construct; falling back to \
-                     NoneMemory so the gateway can still boot. Fix [memory] and \
-                     POST /admin/reload."
-                );
-                Arc::new(zeroclaw_memory::NoneMemory::new("none"))
-            }
-        }
-    };
+    let mem: Arc<dyn Memory> =
+        select_gateway_memory(&config, fallback.and_then(|e| e.api_key.as_deref()));
     let runtime: Arc<dyn platform::RuntimeAdapter> = match platform::create_runtime(&config.runtime)
     {
         Ok(r) => Arc::from(r),
@@ -13542,5 +13557,69 @@ mod gmail_bearer_tests {
     #[test]
     fn missing_bearer_never_matches_a_configured_secret() {
         assert!(!gmail_bearer_matches("", "s3cret-token"));
+    }
+}
+
+#[cfg(test)]
+mod select_gateway_memory_tests {
+    use super::select_gateway_memory;
+    use zeroclaw_config::schema::{AliasedAgentConfig, Config, MemoryConfig};
+
+    fn config_with_backend(backend: &str, data_dir: &std::path::Path) -> Config {
+        let mut config = Config {
+            memory: MemoryConfig {
+                backend: backend.into(),
+                ..MemoryConfig::default()
+            },
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "main".to_string(),
+            AliasedAgentConfig {
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn unknown_backend_installs_failed_memory_not_none() {
+        // A construction failure used to install NoneMemory, so
+        // `POST /api/memory` answered 200 ok while nothing was stored.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_backend("sqilte", tmp.path());
+        let mem = select_gateway_memory(&config, None);
+        assert_eq!(mem.name(), "failed", "failed builds must fail loudly");
+    }
+
+    #[test]
+    fn malformed_dotted_reference_installs_failed_memory() {
+        // `.default` used to classify as the blank-disables input and
+        // silently disable persistence.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_backend(".default", tmp.path());
+        let mem = select_gateway_memory(&config, None);
+        assert_eq!(mem.name(), "failed");
+    }
+
+    #[test]
+    fn no_agents_still_selects_none_memory() {
+        let mut config = Config {
+            data_dir: std::env::temp_dir(),
+            ..Config::default()
+        };
+        config.agents.clear();
+        let mem = select_gateway_memory(&config, None);
+        assert_eq!(mem.name(), "none");
+    }
+
+    #[test]
+    fn healthy_markdown_backend_still_constructs() {
+        // Control: a valid backend must not be affected by the failure path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_with_backend("markdown", tmp.path());
+        let mem = select_gateway_memory(&config, None);
+        assert_eq!(mem.name(), "markdown");
     }
 }
