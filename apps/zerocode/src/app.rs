@@ -2118,8 +2118,8 @@ pub async fn run(
                 ephemeral_daemon_pid_alive,
             ) {
                 ephemeral_respawn_done = true;
-                if let crate::ConnectTarget::LocalSocket(socket) = target {
-                    match crate::spawn_owned_ephemeral_daemon(config_dir, socket) {
+                if let crate::ConnectTarget::LocalSocket(endpoints) = target {
+                    match crate::spawn_owned_ephemeral_daemon(config_dir, &endpoints.primary) {
                         Ok(daemon) => pending_respawn = Some(daemon),
                         Err(_) => record_automatic_respawn_failure(
                             &mut owned_daemon_pid,

@@ -361,7 +361,9 @@ impl WssRoute {
 /// Where zerocode should connect.
 #[derive(Clone)]
 pub(crate) enum ConnectTarget {
-    LocalSocket(PathBuf),
+    /// The daemon's local endpoint, with the pre-stable-hash Windows pipe as a
+    /// fallback for a daemon an older binary started.
+    LocalSocket(zeroclaw_api::rpc_endpoint::ClientEndpoints),
     // Boxed: `WssRoute` is much larger than the local-socket variant.
     Wss(Box<WssRoute>),
 }
@@ -370,7 +372,7 @@ impl ConnectTarget {
     /// Human-readable label for the dashboard Status box.
     pub(crate) fn label(&self) -> String {
         match self {
-            Self::LocalSocket(p) => format!("local:{}", p.display()),
+            Self::LocalSocket(endpoints) => format!("local:{}", endpoints.primary.display()),
             Self::Wss(route) => match (&route.direct_url, &route.relay) {
                 (Some(url), Some(r)) => format!("{url} (relay {} fallback)", r.relay_addr),
                 (Some(url), None) => url.clone(),
@@ -394,8 +396,9 @@ impl ConnectTarget {
         prev_sig: Option<&str>,
     ) -> anyhow::Result<(client::RpcClient, ActiveLeg)> {
         match self {
-            Self::LocalSocket(socket) => {
-                let client = client::RpcClient::connect(socket, prev_id, prev_sig).await?;
+            Self::LocalSocket(endpoints) => {
+                let client =
+                    client::RpcClient::connect_endpoints(endpoints, prev_id, prev_sig).await?;
                 Ok((client, ActiveLeg::Local))
             }
             Self::Wss(route) => route.connect_preferred(prev_id, prev_sig).await,
@@ -1092,8 +1095,7 @@ async fn run() -> anyhow::Result<()> {
                 auth_provider,
             }))
         } else {
-            let socket = client::resolve_socket_path(&config_dir)?;
-            ConnectTarget::LocalSocket(socket)
+            ConnectTarget::LocalSocket(client::resolve_socket_endpoints(&config_dir))
         }
     };
 
@@ -1107,16 +1109,19 @@ async fn run() -> anyhow::Result<()> {
     // gated on the liveness/grace check in app.rs.
     let mut owned_daemon_pid: Option<u32> = None;
     let (rpc, initial_leg) = match &target {
-        ConnectTarget::LocalSocket(socket) => {
+        ConnectTarget::LocalSocket(endpoints) => {
+            // A spawned daemon binds the primary endpoint.
+            let socket = &endpoints.primary;
             #[cfg(unix)]
             let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
             #[cfg(unix)]
             let initial_connection = tokio::select! {
-                result = client::RpcClient::connect(socket, None, None) => result,
+                result = client::RpcClient::connect_endpoints(endpoints, None, None) => result,
                 _ = shutdown_signals.recv() => return Ok(()),
             };
             #[cfg(not(unix))]
-            let initial_connection = client::RpcClient::connect(socket, None, None).await;
+            let initial_connection =
+                client::RpcClient::connect_endpoints(endpoints, None, None).await;
 
             let client = match initial_connection {
                 Ok(c) => c,

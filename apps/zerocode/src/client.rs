@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use zeroclaw_api::rpc_endpoint;
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -80,6 +81,15 @@ async fn open_local_stream(path: &Path) -> Result<LocalStream> {
         }
     }
     anyhow::bail!("named pipe {name} never became available")
+}
+
+/// Whether `error` means nothing is listening at the endpoint at all, as
+/// opposed to a daemon that refused or failed the connection.
+fn is_missing_endpoint(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 // ── Wire method names used by the TUI ────────────────────────────
@@ -163,32 +173,12 @@ pub mod method {
 
 // ── Socket path resolution ───────────────────────────────────────
 
-/// Resolve the daemon's local IPC endpoint path.
-/// CLI flag > `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock` on Unix
-/// or a `\\.\pipe\zeroclaw-<hash>` derived name on Windows.
-pub fn resolve_socket_path(config_dir: &Path) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
-        let p = p.trim();
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    #[cfg(unix)]
-    {
-        Ok(config_dir.join("data").join("daemon.sock"))
-    }
-    #[cfg(windows)]
-    {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let data_dir = config_dir.join("data");
-        let mut hasher = DefaultHasher::new();
-        data_dir.hash(&mut hasher);
-        Ok(PathBuf::from(format!(
-            r"\\.\pipe\zeroclaw-{:x}",
-            hasher.finish()
-        )))
-    }
+/// The daemon endpoints to dial for `config_dir`, resolved by the resolver
+/// the daemon itself uses: a non-blank `$ZEROCLAW_SOCKET`, else
+/// `<config_dir>/data/daemon.sock` on Unix or the data directory's stable
+/// pipe name on Windows, with the pre-stable-hash pipe name as a fallback.
+pub fn resolve_socket_endpoints(config_dir: &Path) -> rpc_endpoint::ClientEndpoints {
+    rpc_endpoint::client_endpoints(&config_dir.join("data"))
 }
 
 /// Resolve config dir: CLI flag > `$ZEROCLAW_CONFIG_DIR` > home directory.
@@ -1641,6 +1631,30 @@ pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<Enrollme
 }
 
 impl RpcClient {
+    /// Connect to the first of `endpoints` that has a daemon behind it and
+    /// complete the handshake. The legacy endpoint is tried only when nothing
+    /// is listening at the primary; when neither is, the primary's error is
+    /// the one reported. A daemon found at the legacy endpoint still has to
+    /// pass [`Self::connect`]'s version check.
+    pub async fn connect_endpoints(
+        endpoints: &rpc_endpoint::ClientEndpoints,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+    ) -> Result<Self> {
+        match Self::connect(&endpoints.primary, prev_tui_id, prev_tui_sig).await {
+            Err(primary_error) if is_missing_endpoint(&primary_error) => {
+                let Some(legacy) = endpoints.legacy.as_deref() else {
+                    return Err(primary_error);
+                };
+                match Self::connect(legacy, prev_tui_id, prev_tui_sig).await {
+                    Err(legacy_error) if is_missing_endpoint(&legacy_error) => Err(primary_error),
+                    result => result,
+                }
+            }
+            result => result,
+        }
+    }
+
     /// Connect to the daemon's local IPC endpoint and complete the
     /// `initialize` handshake.
     ///
@@ -3162,6 +3176,156 @@ pub struct ConfigListResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigSetResult {}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn resolves_the_shared_endpoints_for_the_config_dirs_data_dir() {
+        // zerocode picks its data directory itself, as `<config_dir>/data`,
+        // so the table's entries stand in for config directories here. This
+        // shows that zerocode derives the endpoint the way the daemon does
+        // for that data directory; it does not show that both pick the same
+        // data directory.
+        for dir in rpc_endpoint::AGREEMENT_DATA_DIRS {
+            let config_dir = Path::new(dir);
+            let data_dir = config_dir.join("data");
+            let endpoints = resolve_socket_endpoints(config_dir);
+            assert_eq!(
+                endpoints,
+                rpc_endpoint::client_endpoints(&data_dir),
+                "{dir}"
+            );
+            assert_eq!(endpoints.primary, rpc_endpoint::resolve_endpoint(&data_dir));
+        }
+    }
+
+    #[test]
+    fn a_missing_endpoint_is_told_apart_from_a_refused_one() {
+        let missing = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("connecting to the daemon");
+        assert!(is_missing_endpoint(&missing));
+        let refused =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("connecting to the daemon");
+        assert!(!is_missing_endpoint(&refused));
+    }
+
+    /// A daemon at `path` that answers one `initialize`, as `server_version`
+    /// or with a refusal, and records whether a client reached it.
+    #[cfg(unix)]
+    fn initialize_peer(
+        path: &Path,
+        server_version: &'static str,
+        refuse: bool,
+    ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        let peer_reached = Arc::clone(&reached);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            peer_reached.store(true, Ordering::SeqCst);
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read_half).lines();
+            let request = lines.next_line().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let response = if refuse {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32010, "message": "credential refused"},
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {
+                        "protocol_version": 1,
+                        "server_version": server_version,
+                        "server_pid": 42,
+                        "commands": [],
+                    },
+                })
+            };
+            write_half
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            // Hold the connection open until the client is done with it.
+            let _ = lines.next_line().await;
+        });
+        (reached, task)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_same_version_daemon_at_the_legacy_endpoint_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.sock");
+        let (reached, peer) = initialize_peer(&legacy, env!("CARGO_PKG_VERSION"), false);
+        let endpoints = rpc_endpoint::ClientEndpoints {
+            primary: dir.path().join("primary.sock"),
+            legacy: Some(legacy),
+        };
+        let client = RpcClient::connect_endpoints(&endpoints, None, None)
+            .await
+            .expect("the legacy endpoint answers when nothing listens at the primary");
+        assert!(reached.load(Ordering::SeqCst));
+        client.shutdown();
+        peer.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_previous_release_daemon_at_the_legacy_endpoint_is_found_and_refused() {
+        // The fallback finds an older daemon; zerocode's version gate then
+        // refuses it as before. Finding it is still the point: zerocode
+        // reports the mismatch, which is terminal, instead of missing the
+        // daemon and starting a second one over the same data directory.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.sock");
+        let (reached, peer) = initialize_peer(&legacy, "0.0.0-previous", false);
+        let endpoints = rpc_endpoint::ClientEndpoints {
+            primary: dir.path().join("primary.sock"),
+            legacy: Some(legacy),
+        };
+        let Err(error) = RpcClient::connect_endpoints(&endpoints, None, None).await else {
+            panic!("a daemon from another release is refused");
+        };
+        assert!(reached.load(Ordering::SeqCst));
+        let mismatch = error
+            .downcast_ref::<DaemonVersionMismatch>()
+            .unwrap_or_else(|| panic!("expected a version mismatch, got {error:#}"));
+        assert_eq!(mismatch.server_version(), "0.0.0-previous");
+        peer.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusing_primary_is_reported_without_dialing_the_legacy_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary.sock");
+        let legacy = dir.path().join("legacy.sock");
+        let (_, primary_peer) = initialize_peer(&primary, env!("CARGO_PKG_VERSION"), true);
+        let (legacy_reached, legacy_peer) =
+            initialize_peer(&legacy, env!("CARGO_PKG_VERSION"), false);
+        let endpoints = rpc_endpoint::ClientEndpoints {
+            primary,
+            legacy: Some(legacy),
+        };
+        let result = RpcClient::connect_endpoints(&endpoints, None, None).await;
+        assert!(result.is_err(), "the primary refused the handshake");
+        assert!(
+            !legacy_reached.load(Ordering::SeqCst),
+            "a refusal at the primary must not send the client to another daemon"
+        );
+        primary_peer.abort();
+        legacy_peer.abort();
+    }
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
