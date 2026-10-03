@@ -55,6 +55,103 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 }
 
 impl SqliteSessionBackend {
+    fn metadata_on(
+        conn: &Connection,
+        session_key: &str,
+    ) -> rusqlite::Result<Option<SessionMetadata>> {
+        conn.query_row(
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
+             FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let key: String = row.get(0)?;
+                let created_str: String = row.get(1)?;
+                let activity_str: String = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let name: Option<String> = row.get(4)?;
+                let agent_alias: Option<String> = row.get(5)?;
+                let channel_id: Option<String> = row.get(6)?;
+                let room_id: Option<String> = row.get(7)?;
+                let sender_id: Option<String> = row.get(8)?;
+                let principal_id: Option<String> = row.get(9)?;
+
+                let created = DateTime::parse_from_rfc3339(&created_str)
+                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error)))?
+                    .with_timezone(&Utc);
+                let activity = DateTime::parse_from_rfc3339(&activity_str)
+                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error)))?
+                    .with_timezone(&Utc);
+
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(SessionMetadata {
+                    file_identity: None,
+                    key,
+                    name,
+                    created_at: created,
+                    last_activity: activity,
+                    message_count: count as usize,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
+                    principal_id,
+                })
+            },
+        )
+        .optional()
+    }
+
+    fn read_snapshot(
+        &self,
+        session_key: &str,
+        after_metadata: impl FnOnce(),
+    ) -> io::Result<Option<crate::session_backend::SessionSnapshot>> {
+        use crate::session_backend::{SessionSnapshot, TimestampedMessage};
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(io::Error::other)?;
+        let Some(metadata) = Self::metadata_on(&tx, session_key).map_err(io::Error::other)? else {
+            return Ok(None);
+        };
+        after_metadata();
+        let messages = {
+            let mut stmt = tx.prepare("SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC").map_err(io::Error::other)?;
+            let rows = stmt
+                .query_map(params![session_key], |row| {
+                    let created: String = row.get(2)?;
+                    let created_at = DateTime::parse_from_rfc3339(&created)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?
+                        .with_timezone(&Utc);
+                    Ok(TimestampedMessage {
+                        message: ChatMessage {
+                            role: row.get(0)?,
+                            content: row.get(1)?,
+                        },
+                        created_at: Some(created_at),
+                    })
+                })
+                .map_err(io::Error::other)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(io::Error::other)?
+        };
+        let state = tx.query_row("SELECT state, turn_id, turn_started_at FROM session_metadata WHERE session_key = ?1", params![session_key], |row| {
+            let started: Option<String> = row.get(2)?;
+            let turn_started_at = started.as_deref().map(DateTime::parse_from_rfc3339).transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error)))?.map(|at| at.with_timezone(&Utc));
+            Ok(SessionState { state: row.get(0)?, turn_id: row.get(1)?, turn_started_at })
+        }).optional().map_err(io::Error::other)?;
+        tx.commit().map_err(io::Error::other)?;
+        Ok(Some(SessionSnapshot {
+            metadata,
+            messages,
+            state,
+        }))
+    }
+
     /// Open or create the sessions database.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
@@ -895,6 +992,49 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    fn read_session_snapshot(
+        &self,
+        session_key: &str,
+    ) -> io::Result<Option<crate::session_backend::SessionSnapshot>> {
+        self.read_snapshot(session_key, || {})
+    }
+
+    fn delete_session_matching(
+        &self,
+        session_key: &str,
+        created_at: &str,
+        owner: Option<&str>,
+        _file_identity: Option<&crate::session_backend::SessionFileIdentity>,
+        can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
+    ) -> io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(io::Error::other)?;
+        let matches = Self::metadata_on(&tx, session_key)
+            .map_err(io::Error::other)?
+            .is_some_and(|meta| {
+                meta.created_at.to_rfc3339() == created_at
+                    && meta.principal_id.as_deref() == owner
+                    && can_delete(&meta)
+            });
+        if !matches {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(io::Error::other)?;
+        tx.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(io::Error::other)?;
+        tx.commit().map_err(io::Error::other)?;
+        Ok(true)
+    }
+
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
@@ -1082,6 +1222,7 @@ impl SessionBackend for SqliteSessionBackend {
 
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1279,47 +1420,14 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)
     }
 
+    fn try_get_session_metadata(&self, key: &str) -> io::Result<Option<SessionMetadata>> {
+        Self::metadata_on(&self.conn.lock(), key).map_err(io::Error::other)
+    }
+
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, principal_id
-             FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-            |row| {
-                let key: String = row.get(0)?;
-                let created_str: String = row.get(1)?;
-                let activity_str: String = row.get(2)?;
-                let count: i64 = row.get(3)?;
-                let name: Option<String> = row.get(4)?;
-                let agent_alias: Option<String> = row.get(5)?;
-                let channel_id: Option<String> = row.get(6)?;
-                let room_id: Option<String> = row.get(7)?;
-                let sender_id: Option<String> = row.get(8)?;
-                let principal_id: Option<String> = row.get(9)?;
-
-                let created = DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let activity = DateTime::parse_from_rfc3339(&activity_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                Ok(SessionMetadata {
-                    key,
-                    name,
-                    created_at: created,
-                    last_activity: activity,
-                    message_count: count as usize,
-                    agent_alias,
-                    channel_id,
-                    room_id,
-                    sender_id,
-                    principal_id,
-                })
-            },
-        )
-        .ok()
+        Self::metadata_on(&self.conn.lock(), session_key)
+            .ok()
+            .flatten()
     }
 
     fn set_session_state(
@@ -1401,6 +1509,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .unwrap_or_else(|_| Utc::now());
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1453,6 +1562,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .unwrap_or_else(|_| Utc::now());
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
+                file_identity: None,
                 key,
                 name,
                 created_at: created,
@@ -1521,6 +1631,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let sender_id: Option<String> = row.get(7)?;
                         let principal_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
+                            file_identity: None,
                             key: key.clone(),
                             name,
                             created_at: DateTime::parse_from_rfc3339(&created_str)
@@ -1648,6 +1759,97 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
+
+    #[test]
+    fn session_snapshot_stays_on_one_sqlite_transaction_during_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let reader = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let writer = SqliteSessionBackend::new(tmp.path()).unwrap();
+        reader
+            .append("boundary", &ChatMessage::user("original"))
+            .unwrap();
+        reader
+            .set_session_principal("boundary", "user:alice")
+            .unwrap();
+        reader.set_session_state("boundary", "idle", None).unwrap();
+        let snapshot = reader
+            .read_snapshot("boundary", || {
+                // WAL permits another connection to commit after this read's
+                // metadata query has established its SQLite snapshot.
+                writer.delete_session("boundary").unwrap();
+                writer
+                    .append("boundary", &ChatMessage::user("replacement"))
+                    .unwrap();
+                writer
+                    .set_session_principal("boundary", "user:bob")
+                    .unwrap();
+                writer
+                    .set_session_state("boundary", "running", Some("new-turn"))
+                    .unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.metadata.principal_id.as_deref(),
+            Some("user:alice")
+        );
+        assert_eq!(snapshot.messages[0].message.content, "original");
+        assert_eq!(snapshot.state.unwrap().state, "idle");
+        assert_eq!(reader.load("boundary")[0].content, "replacement");
+        assert_eq!(
+            reader
+                .get_session_metadata("boundary")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("user:bob")
+        );
+    }
+
+    #[test]
+    fn conditional_session_delete_requires_the_authorized_sqlite_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("boundary", &ChatMessage::user("original"))
+            .unwrap();
+        backend
+            .set_session_principal("boundary", "user:alice")
+            .unwrap();
+        let created = backend
+            .get_session_metadata("boundary")
+            .unwrap()
+            .created_at
+            .to_rfc3339();
+        assert!(
+            !backend
+                .delete_session_matching("boundary", &created, Some("user:bob"), None, &|_| true)
+                .unwrap()
+        );
+        backend.delete_session("boundary").unwrap();
+        backend
+            .append("boundary", &ChatMessage::user("replacement"))
+            .unwrap();
+        backend
+            .set_session_principal("boundary", "user:alice")
+            .unwrap();
+        assert!(
+            !backend
+                .delete_session_matching("boundary", &created, Some("user:alice"), None, &|_| true)
+                .unwrap()
+        );
+        assert_eq!(backend.load("boundary")[0].content, "replacement");
+        let created = backend
+            .get_session_metadata("boundary")
+            .unwrap()
+            .created_at
+            .to_rfc3339();
+        assert!(
+            backend
+                .delete_session_matching("boundary", &created, Some("user:alice"), None, &|_| true)
+                .unwrap()
+        );
+    }
 
     #[test]
     fn round_trip_sqlite() {

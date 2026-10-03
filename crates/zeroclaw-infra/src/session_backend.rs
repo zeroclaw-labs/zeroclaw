@@ -3,6 +3,12 @@
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
 
+/// A borrowed operating-system file identity. Keeping the canonical file open
+/// prevents inode reuse while an admitted request waits; this creates no stored
+/// identity, cache or sidecar. Comparisons use the platform file identifier.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionFileIdentity(pub(crate) same_file::Handle);
+
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
@@ -12,6 +18,9 @@ pub struct SessionMetadata {
     pub name: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
+    /// Canonical file handle for JSONL incarnation checks. SQL-backed rows
+    /// use their persisted creation identity and return `None`.
+    pub file_identity: Option<std::sync::Arc<SessionFileIdentity>>,
     /// When the last message was appended.
     pub last_activity: DateTime<Utc>,
     /// Total number of messages in the session.
@@ -69,6 +78,14 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// One consistent read of a durable chat row. Metadata, transcript and state
+/// come from the same backend transaction or mutation guard.
+pub struct SessionSnapshot {
+    pub metadata: SessionMetadata,
+    pub messages: Vec<TimestampedMessage>,
+    pub state: Option<SessionState>,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -97,6 +114,35 @@ pub trait SessionBackend: Send + Sync {
                 created_at: None,
             })
             .collect()
+    }
+
+    /// Read metadata, transcript and state from one storage snapshot. A
+    /// backend without this boundary refuses rather than composing unrelated
+    /// owner and transcript reads.
+    fn read_session_snapshot(
+        &self,
+        _session_key: &str,
+    ) -> std::io::Result<Option<SessionSnapshot>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Session snapshots are unsupported",
+        ))
+    }
+
+    /// Delete only the row whose creation time, owner and file identity were authorized.
+    /// The comparison and deletion share the backend's write boundary.
+    fn delete_session_matching(
+        &self,
+        _session_key: &str,
+        _created_at: &str,
+        _owner: Option<&str>,
+        _file_identity: Option<&SessionFileIdentity>,
+        _can_delete: &dyn Fn(&crate::session_backend::SessionMetadata) -> bool,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Conditional session deletion is unsupported",
+        ))
     }
 
     /// Append a single message to a session.
@@ -143,6 +189,7 @@ pub trait SessionBackend: Send + Sync {
             .map(|key| {
                 let messages = self.load(&key);
                 SessionMetadata {
+                    file_identity: None,
                     key,
                     name: None,
                     created_at: Utc::now(),
@@ -321,12 +368,21 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Resolve metadata without treating a storage or parse failure as absence.
+    fn try_get_session_metadata(
+        &self,
+        session_key: &str,
+    ) -> std::io::Result<Option<SessionMetadata>> {
+        Ok(self.get_session_metadata(session_key))
+    }
+
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let messages = self.load(session_key);
         if messages.is_empty() {
             return None;
         }
         Some(SessionMetadata {
+            file_identity: None,
             key: session_key.to_string(),
             name: self.get_session_name(session_key).ok().flatten(),
             created_at: Utc::now(),
@@ -415,6 +471,7 @@ mod tests {
     #[test]
     fn session_metadata_is_constructible() {
         let meta = SessionMetadata {
+            file_identity: None,
             key: "test".into(),
             name: None,
             created_at: Utc::now(),

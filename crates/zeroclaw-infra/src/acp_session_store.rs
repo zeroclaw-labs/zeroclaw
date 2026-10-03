@@ -718,6 +718,54 @@ impl AcpSessionStore {
         Ok(rows > 0)
     }
 
+    /// Delete only the expected owner whose current agent passes `can_delete`.
+    /// The selector and delete share one immediate transaction.
+    pub fn delete_session_for_owner_and_agent(
+        &self,
+        session_uuid: &str,
+        owner: Option<&str>,
+        can_delete: &dyn Fn(&str) -> bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT principal_id, agent_alias FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((actual_owner, agent)) = row else {
+            return Ok(false);
+        };
+        if actual_owner.as_deref() != owner || !can_delete(&agent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Session not found or not owned by this principal",
+            )
+            .into());
+        }
+        let changed = tx.execute(
+            "DELETE FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    /// Read the canonical agent attribution without decoding message history.
+    pub fn session_agent_alias(&self, session_uuid: &str) -> Result<Option<String>> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT agent_alias FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to resolve ACP session agent")
+    }
+
     /// The owning principal of a session, for authorization on mutation paths
     /// (RFC 7141 F2) without hydrating its full message history. Returns
     /// `Ok(None)` when the session does not exist, `Ok(Some(None))` for a
@@ -2408,6 +2456,23 @@ impl AcpSessionStore {
         interruption_marker: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<bool> {
+        self.recover_turn_checkpoint_for_owner_and_agent(
+            session_uuid,
+            interruption_marker,
+            owner_principal_id,
+            &|_| true,
+        )
+    }
+
+    /// Recover only a currently permitted agent, under the checkpoint writer
+    /// transaction as well as the caller's accepted-policy hold.
+    pub fn recover_turn_checkpoint_for_owner_and_agent(
+        &self,
+        session_uuid: &str,
+        interruption_marker: &str,
+        owner_principal_id: Option<&str>,
+        can_recover: &dyn Fn(&str) -> bool,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn.lock();
         let tx = conn
@@ -2415,16 +2480,23 @@ impl AcpSessionStore {
             .context("Failed to begin ACP turn checkpoint recovery")?;
         let session_id = tx
             .query_row(
-                "SELECT id FROM acp_sessions
+                "SELECT id, agent_alias FROM acp_sessions
                  WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
                 params![session_uuid, owner_principal_id],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .context("Failed to find ACP session for checkpoint recovery")?;
-        let Some(session_id) = session_id else {
+        let Some((session_id, agent)) = session_id else {
             return Ok(false);
         };
+        if !can_recover(&agent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Session not found or not owned by this principal",
+            )
+            .into());
+        }
         let killed_at: Option<String> = tx
             .query_row(
                 "SELECT killed_at FROM acp_sessions WHERE id = ?1",
