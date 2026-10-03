@@ -167,8 +167,24 @@ Send a message to the agent and receive a response.
 
 ## WebSocket Chat
 
-### GET /ws/chat?token=<bearer_token>
+### GET /ws/chat?token=<bearer_token>&session_id=<id>&agent=<alias>
 Streaming agent chat over WebSocket.
+
+**Server → Client (greeting, sent before the client sends anything):**
+```json
+{"type": "session_start", "session_id": "abc123", "resumed": false, "message_count": 0}
+```
+The greeting is pushed as soon as the connection is up. Its `session_id` is
+the `session_id` query parameter when supplied, otherwise a UUID minted by the
+gateway. This identity is fixed for the life of the connection.
+
+**Client → Server (optional):**
+```json
+{"type": "connect", "session_id": "abc123", "cwd": "/path/to/workspace"}
+```
+`session_id` may only echo the identity from the greeting — a different id is
+rejected with `INVALID_SESSION_ID`. A `connect` frame is acknowledged with
+`{"type": "connected", "message": "Connection established"}`.
 
 **Client → Server:**
 ```json

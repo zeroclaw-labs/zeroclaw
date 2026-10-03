@@ -8864,7 +8864,7 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("transport test temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.ws-to.sse";
+        let session_id = "transport-ws-to-sse";
         let session_key = gateway_cancel_key(session_id);
 
         // This URL connects only to the test's loopback listener. Keep the
@@ -9035,7 +9035,7 @@ data: [DONE]\n\n";
     }
 
     #[test]
-    fn websocket_resumes_seeded_legacy_dotted_session_transcript() {
+    fn websocket_resumes_seeded_canonical_session_transcript() {
         std::thread::Builder::new()
             .name("gateway-ws-legacy-resume".to_string())
             .stack_size(8 * 1024 * 1024)
@@ -9044,14 +9044,14 @@ data: [DONE]\n\n";
                     .enable_all()
                     .build()
                     .expect("test runtime")
-                    .block_on(websocket_resumes_seeded_legacy_dotted_session_inner());
+                    .block_on(websocket_resumes_seeded_canonical_session_inner());
             })
             .expect("spawn WS legacy-resume test thread")
             .join()
             .expect("WS legacy-resume test thread must not panic");
     }
 
-    async fn websocket_resumes_seeded_legacy_dotted_session_inner() {
+    async fn websocket_resumes_seeded_canonical_session_inner() {
         use futures_util::StreamExt;
         use tokio_tungstenite::connect_async;
 
@@ -9064,20 +9064,27 @@ data: [DONE]\n\n";
                 zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
                     .expect("sqlite session backend"),
             );
-        // Seed the transcript under the legacy raw gateway key: dot-bearing
-        // display ids persisted this exact key before cancellation keys were
-        // normalized, so a reconnect must resume it unchanged.
-        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        // Seed an already-owned transcript under a canonical gateway key so the
+        // connection's claim passes instead of hitting the ownerless-non-empty
+        // `NeedsMigration` refusal. The non-canonical (dotted) case is pinned by
+        // `websocket_refuses_seeded_legacy_dotted_session_transcript` below.
+        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport-legacy-resume");
         backend
             .append(
                 &legacy_key,
                 &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
             )
             .expect("seed legacy transcript");
+        assert_eq!(
+            backend
+                .adopt_session_agent_alias(&legacy_key, "web")
+                .unwrap(),
+            zeroclaw_infra::session_backend::AdoptOutcome::Adopted,
+        );
         state.session_backend = Some(backend);
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.legacy-resume";
+        let session_id = "transport-legacy-resume";
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
         // non-production fixture.
@@ -9100,9 +9107,101 @@ data: [DONE]\n\n";
         assert_eq!(session_start["type"], "session_start");
         assert_eq!(
             session_start["resumed"], true,
-            "legacy raw-key transcript must resume for a dotted display id"
+            "seeded transcript must resume for the owned canonical display id"
         );
         assert_eq!(session_start["message_count"], 1);
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    /// Pins the upgrade consequence of the canonical-id rule: a session whose
+    /// display id is not `[A-Za-z0-9_-]` (here a dotted one, as a pre-change
+    /// client left it) can no longer be resumed over the WebSocket. The
+    /// connection is refused with `INVALID_SESSION_ID` before any claim, and the
+    /// stored transcript is left exactly as it is. Nothing re-keys stored
+    /// sessions, so such a history stays on disk unreachable over the WebSocket
+    /// until an operator re-imports it under a canonical id.
+    #[test]
+    fn websocket_refuses_seeded_legacy_dotted_session_transcript() {
+        std::thread::Builder::new()
+            .name("gateway-ws-legacy-dotted-refused".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_refuses_seeded_legacy_dotted_session_inner());
+            })
+            .expect("spawn WS legacy-dotted test thread")
+            .join()
+            .expect("WS legacy-dotted test thread must not panic");
+    }
+
+    async fn websocket_refuses_seeded_legacy_dotted_session_inner() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let tmp = tempfile::tempdir().expect("legacy-dotted temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("legacy-dotted session db");
+        let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            std::sync::Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                    .expect("sqlite session backend"),
+            );
+        // Seed under the raw, dotted `gw_` key exactly as a pre-change client
+        // left it, and deliberately without adopting an owner: the refusal must
+        // happen before the claim, so the transcript must come back untouched.
+        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        backend
+            .append(
+                &legacy_key,
+                &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
+            )
+            .expect("seed legacy transcript");
+        state.session_backend = Some(std::sync::Arc::clone(&backend));
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.legacy-resume";
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let first = websocket
+            .next()
+            .await
+            .expect("first WS frame")
+            .expect("first WS transport")
+            .into_text()
+            .expect("first frame text");
+        let first: serde_json::Value = serde_json::from_str(&first).expect("first frame json");
+        assert_ne!(
+            first["type"], "session_start",
+            "a non-canonical id must not be greeted"
+        );
+        assert_eq!(first["type"], "error");
+        assert_eq!(first["code"], "INVALID_SESSION_ID");
+
+        // The refusal precedes the claim, so neither the transcript nor its
+        // (absent) owner changes.
+        let stored = backend
+            .try_load(&legacy_key)
+            .expect("reload seeded transcript");
+        assert_eq!(stored.len(), 1, "seeded transcript must be left untouched");
+        assert_eq!(
+            backend.get_session_agent_alias(&legacy_key).unwrap(),
+            None,
+            "no owner may be recorded for a refused id"
+        );
 
         drop(websocket);
         gateway_server.abort();
@@ -9140,7 +9239,7 @@ data: [DONE]\n\n";
             as std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>);
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.api-delivery";
+        let session_id = "transport-api-delivery";
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
         // non-production fixture.

@@ -543,6 +543,29 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
+A separate, per-session axis records the **owning agent alias**. Persistent RPC
+Chat and gateway WebSocket admission claim it atomically before transcript
+restoration or live session publication.
+On these paths, a caller-supplied session id cannot reassign ownership and then
+read another agent's history:
+the claim refuses a session owned by a different alias, and it refuses an
+unowned session that already has history rather than silently adopting it.
+Those ownerless histories are adopted deliberately, with an explicit target
+agent, by `zeroclaw migrate session-ownership`. Session ids are also required
+to be canonical before chat ownership admission or transcript restoration, so
+a display id can never collapse onto another session's key. That rule reaches
+existing sessions too: a gateway session whose display id is not canonical, for
+example one containing a dot, can no longer be resumed over the WebSocket, and
+reconnecting with that id is refused with `INVALID_SESSION_ID` before the
+session is reached. Nothing re-keys stored sessions, so the transcript is left
+on disk untouched and stops being reachable through admission; recovering it
+means reading the stored history directly rather than re-keying it. A backend
+that cannot enforce the claim (raw JSONL)
+is refused for every caller on these paths, empty and non-empty sessions alike,
+rather than admitting a session whose owner cannot outlive the process. With
+the configured SQLite default, the factory imports legacy JSONL history on
+construction and preserves it for explicit ownership migration.
+
 Every authenticated principal gets PRIVATE memory: their memory operations
 read and write a per-principal plane whose owner travels in every storage
 statement, composed with the agent, namespace and tenant dimensions (the
