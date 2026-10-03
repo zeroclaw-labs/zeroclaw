@@ -1,0 +1,24 @@
+# Standalone PoC workspace — deliberately NOT a member of the zeroclaw
+# workspace so the default build is untouched. Tracked in the web UI
+# evaluation issue.
+
+[workspace]
+
+[package]
+name = "skills_poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { version = "=0.7.10", default-features = false, features = ["minimal", "web"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

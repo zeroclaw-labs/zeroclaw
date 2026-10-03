@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Skills — WASM PoC (RFC #8132 Phase 1)</title>
+  <link rel="stylesheet" href="/static/poc.css" />
+  <script>
+    // Point this at the running zeroclaw gateway for same-origin testing,
+    // or set it to e.g. "http://127.0.0.1:42617" if the gateway allows CORS.
+    window.__ZC_API_ORIGIN__ = "";
+  </script>
+</head>
+<body>
+  <div id="main"></div>
+  <script type="module">
+    import init from "./pkg/skills_poc.js";
+    init().catch((e) => console.error("wasm init failed:", e));
+  </script>
+</body>
+</html>
