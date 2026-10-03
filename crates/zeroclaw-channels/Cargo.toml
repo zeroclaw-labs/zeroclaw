@@ -54,7 +54,7 @@ directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = [
   "sink",
 ] }
-hmac = "0.12"
+hmac = "0.13"
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
