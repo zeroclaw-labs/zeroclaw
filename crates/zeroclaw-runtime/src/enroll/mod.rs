@@ -34,7 +34,11 @@ use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
 
 use crate::security::cert_ledger::{CertLedger, CertStatus, IssuanceActor, LedgerEntry};
 
+mod frontdoor_link;
 mod paircode_admin;
+pub use frontdoor_link::{
+    FrontdoorHintText, frontdoor_link, render_terminal_qr, write_frontdoor_hint,
+};
 pub use paircode_admin::{GeneratedEnrollmentPaircode, request_new_paircode};
 
 /// Maximum bytes accepted for an enrollment request (headers + body). A CSR is a

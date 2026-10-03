@@ -81,6 +81,8 @@ toml = "1.0"
 toml_edit = "0.25"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
+# Terminal QR of the relay frontdoor enrollment link (unicode renderer only).
+qrcode = { version = "0.14", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
