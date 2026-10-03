@@ -5,6 +5,11 @@ domain socket on Unix and a named pipe on Windows. This is the primary
 transport for local clients like zerocode. The HTTP/WS gateway remains for
 webhooks, the web dashboard, and remote REST consumers.
 
+The [core-to-gateway IPC contract](core-gateway-ipc-contract.md) is the
+normative companion to this page: it specifies the framing, handshake,
+identity, discovery, versioning, errors, turn lifetime and ingress rules a
+separate gateway process relies on, and records errata against this page.
+
 ## Endpoint resolution
 
 Each data directory gets its own endpoint, so multiple daemon instances on the
