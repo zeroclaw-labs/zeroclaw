@@ -317,6 +317,57 @@ impl Default for PerSenderTracker {
     }
 }
 
+/// The command-policy fields of ONE delegating caller, carried by every policy
+/// derived below it.
+///
+/// A bounded delegate target runs commands under its OWN policy, but the
+/// delegation contract makes the caller's command policy authoritative for
+/// what the target may run. A command therefore has to clear the target's
+/// policy AND each caller's, root first; neither side can widen the other.
+/// [`SecurityPolicy::validate_command_execution_for_shell`] is the one place
+/// that enforces it, so every consumer that validates a command against a
+/// derived policy (the target's `shell`, the scheduler tools that store a
+/// command for later, a `spawn_subagent` child that inherits the policy, a
+/// further delegation hop) is bound without having to know about it.
+///
+/// Only the four fields `validate_command_execution_for_shell` reads are
+/// carried: paths, roots and sandbox stay the target's, so a command is still
+/// judged against the target's workspace, never the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerCommandBound {
+    pub autonomy: AutonomyLevel,
+    pub allowed_commands: Vec<String>,
+    pub block_high_risk_commands: bool,
+    pub require_approval_for_medium_risk: bool,
+}
+
+impl CallerCommandBound {
+    /// The bound a caller with this policy places on its delegates.
+    #[must_use]
+    pub fn from_caller(caller: &SecurityPolicy) -> Self {
+        Self {
+            autonomy: caller.autonomy,
+            allowed_commands: caller.allowed_commands.clone(),
+            block_high_risk_commands: caller.block_high_risk_commands,
+            require_approval_for_medium_risk: caller.require_approval_for_medium_risk,
+        }
+    }
+
+    /// `policy` with this caller's command fields laid over it and its own
+    /// chain cleared, so validating against the result checks exactly this
+    /// caller's command policy on the policy's own paths.
+    fn overlay(&self, policy: &SecurityPolicy) -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: self.autonomy,
+            allowed_commands: self.allowed_commands.clone(),
+            block_high_risk_commands: self.block_high_risk_commands,
+            require_approval_for_medium_risk: self.require_approval_for_medium_risk,
+            caller_command_bounds: Vec::new(),
+            ..policy.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
@@ -380,10 +431,48 @@ pub struct SecurityPolicy {
     /// built-in default; carried here so status surfaces report the image the
     /// sandbox will actually run rather than assuming the default.
     pub sandbox_image: Option<String>,
+    /// Command-policy bounds of every delegating caller above this policy,
+    /// root first. Empty for a policy that is not a bounded delegate target.
+    /// See [`CallerCommandBound`]. Cloning a policy carries the chain, so a
+    /// policy derived from a bounded target's by cloning or struct update is
+    /// bound by default. Anything that instead REBUILDS a policy from config
+    /// (`for_agent`, `from_profiles`) starts with an empty chain: the scheduler
+    /// does when a job fires (by design, see `delegation.md`), and so does any
+    /// turn started for another agent that receives only tool names from its
+    /// sender. Such a path must be handed the chain explicitly.
+    pub caller_command_bounds: Vec<CallerCommandBound>,
     pub tracker: PerSenderTracker,
 }
 
 impl SecurityPolicy {
+    /// Synthesize a [`crate::schema::SandboxConfig`] from this policy's own
+    /// `sandbox_enabled`/`sandbox_backend`/`firejail_args` fields — mirrors
+    /// `RiskProfileConfig::sandbox_config()` exactly, for callers (like a
+    /// `Bounded` delegate's target reconstruction) that only have a
+    /// `SecurityPolicy`, not the `RiskProfileConfig` it was built from.
+    #[must_use]
+    pub fn sandbox_config(&self) -> crate::schema::SandboxConfig {
+        let backend = self
+            .sandbox_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::schema::parse_sandbox_backend)
+            .unwrap_or_default();
+        crate::schema::SandboxConfig {
+            enabled: self.sandbox_enabled,
+            backend,
+            firejail_args: self.firejail_args.clone(),
+            image: self
+                .sandbox_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::schema::DEFAULT_SANDBOX_IMAGE.to_string()),
+        }
+    }
+
     /// True when `name` is admissible under the current policy.
     /// `allowed_tools = None` is unrestricted; `Some(list)` is the
     /// allowlist. `excluded_tools` always subtracts.
@@ -688,6 +777,11 @@ pub enum EscalationViolation {
     /// (parent) to `false`, bypassing the human-in-the-loop step the
     /// parent required.
     RequireApprovalDisabledByChild,
+    /// Child drops a caller command bound the parent carries. Like
+    /// `forbidden_paths`, the chain runs parent ⊆ child: a child can add
+    /// bounds but never shed one, or it would run commands a caller above the
+    /// parent withholds.
+    CallerCommandBoundDroppedByChild,
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -744,6 +838,10 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent attempts to set require_approval_for_medium_risk=false but the parent enforces it"
             ),
+            Self::CallerCommandBoundDroppedByChild => write!(
+                f,
+                "subagent drops a caller command bound the parent carries"
+            ),
         }
     }
 }
@@ -779,6 +877,7 @@ impl Default for SecurityPolicy {
             sandbox_backend: None,
             firejail_args: vec![],
             sandbox_image: None,
+            caller_command_bounds: Vec::new(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -3281,7 +3380,30 @@ impl SecurityPolicy {
     /// The dialect decides platform-specific redirect safety (e.g. the Windows
     /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
     /// under a POSIX shell).
+    ///
+    /// A policy that belongs to a bounded delegate target also carries the
+    /// command policy of every caller above it
+    /// ([`SecurityPolicy::caller_command_bounds`]); the command must clear its
+    /// own policy and each of those, so no caller's restriction is lost by
+    /// running the command one hop further down. The returned risk level is the
+    /// policy's own.
     pub fn validate_command_execution_for_shell(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        let risk = self.validate_own_command_execution_for_shell(command, approved, dialect)?;
+        for bound in &self.caller_command_bounds {
+            bound
+                .overlay(self)
+                .validate_own_command_execution_for_shell(command, approved, dialect)?;
+        }
+        Ok(risk)
+    }
+
+    /// The policy's own allowlist and risk gate, without the caller chain.
+    fn validate_own_command_execution_for_shell(
         &self,
         command: &str,
         approved: bool,
@@ -4619,6 +4741,16 @@ impl SecurityPolicy {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
         }
 
+        // The caller chain runs in the same direction as `forbidden_paths`:
+        // every bound the parent carries must still be on the child.
+        if parent
+            .caller_command_bounds
+            .iter()
+            .any(|bound| !self.caller_command_bounds.contains(bound))
+        {
+            return Err(EscalationViolation::CallerCommandBoundDroppedByChild);
+        }
+
         Ok(())
     }
 
@@ -4696,6 +4828,7 @@ impl SecurityPolicy {
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
+            caller_command_bounds: Vec::new(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -10289,5 +10422,192 @@ mod tests {
         );
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
+    }
+
+    // ── caller command bounds ───────────────────────────────────────────────
+
+    fn command_policy(commands: &[&str]) -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    fn bound_of(commands: &[&str]) -> CallerCommandBound {
+        CallerCommandBound::from_caller(&command_policy(commands))
+    }
+
+    fn validate(policy: &SecurityPolicy, command: &str, approved: bool) -> Result<(), String> {
+        policy
+            .validate_command_execution_for_shell(command, approved, ShellDialect::Posix)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn a_policy_without_a_chain_validates_exactly_as_it_did_before() {
+        // Broken state this pins: routing every policy through the chain would
+        // change the verdict of ordinary, unbounded validation.
+        // Literal verdicts, not a comparison against the policy's own core: the
+        // wrapper calls that core, so comparing them proves nothing.
+        let policy = command_policy(&["echo"]);
+        assert!(policy.caller_command_bounds.is_empty());
+        assert!(validate(&policy, "echo ok", false).is_ok());
+        assert!(
+            validate(&policy, "touch marker.txt", false)
+                .expect_err("outside the allowlist")
+                .contains("not allowed by security policy")
+        );
+        assert!(validate(&policy, "rm -rf /", false).is_err());
+
+        // The empty chain also leaves the risk level untouched.
+        let wide = command_policy(&["*"]);
+        assert_eq!(
+            wide.validate_command_execution_for_shell("echo ok", false, ShellDialect::Posix),
+            Ok(CommandRiskLevel::Low)
+        );
+    }
+
+    #[test]
+    fn a_callers_high_risk_block_binds_a_target_that_allows_high_risk_commands() {
+        // The target lets high-risk commands through; the caller blocks them.
+        let mut target = command_policy(&["*"]);
+        target.block_high_risk_commands = false;
+        assert!(
+            validate(&target, "curl https://example.com", false).is_ok(),
+            "control: the target alone admits the command"
+        );
+
+        target.caller_command_bounds = vec![CallerCommandBound {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: false,
+        }];
+        assert!(
+            validate(&target, "curl https://example.com", false)
+                .expect_err("the caller's high-risk block must bind")
+                .contains("high-risk"),
+        );
+    }
+
+    #[test]
+    fn a_read_only_caller_admits_no_command_through_a_full_autonomy_target() {
+        let mut target = command_policy(&["*"]);
+        assert!(
+            validate(&target, "echo ok", false).is_ok(),
+            "control: the target alone admits the command"
+        );
+
+        target.caller_command_bounds = vec![CallerCommandBound {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+        }];
+        assert!(
+            validate(&target, "echo ok", false).is_err(),
+            "a read-only caller must not gain command execution by delegating"
+        );
+    }
+
+    #[test]
+    fn a_caller_bound_narrows_a_wider_target() {
+        // The escape: the target admits `touch`, the caller does not.
+        let mut target = command_policy(&["*"]);
+        target.caller_command_bounds = vec![bound_of(&["echo"])];
+
+        assert!(validate(&target, "echo ok", false).is_ok());
+        let error = validate(&target, "touch marker.txt", false)
+            .expect_err("the caller's allowlist must bind the target");
+        assert!(error.contains("not allowed"), "{error}");
+    }
+
+    #[test]
+    fn a_wider_caller_cannot_widen_the_target() {
+        // Neither side widens the other: the bound is an AND, not a replacement.
+        let mut target = command_policy(&["echo"]);
+        target.caller_command_bounds = vec![bound_of(&["*"])];
+
+        assert!(validate(&target, "echo ok", false).is_ok());
+        assert!(
+            validate(&target, "touch marker.txt", false).is_err(),
+            "a permissive caller must not grant the target a command its own policy withholds"
+        );
+    }
+
+    #[test]
+    fn every_bound_in_the_chain_is_enforced_not_just_the_nearest() {
+        // Root first. The command clears the middle bound and fails the root's,
+        // then the other way round: dropping either end of the chain would
+        // pass one of the two.
+        let mut target = command_policy(&["*"]);
+        target.caller_command_bounds = vec![bound_of(&["echo"]), bound_of(&["*"])];
+        assert!(validate(&target, "touch marker.txt", false).is_err());
+
+        target.caller_command_bounds = vec![bound_of(&["*"]), bound_of(&["echo"])];
+        assert!(validate(&target, "touch marker.txt", false).is_err());
+
+        target.caller_command_bounds = vec![bound_of(&["echo", "touch"]), bound_of(&["touch"])];
+        assert!(
+            validate(&target, "touch marker.txt", false).is_ok(),
+            "control: a command every link admits must pass"
+        );
+    }
+
+    #[test]
+    fn a_callers_approval_requirement_composes_with_the_targets_autonomy() {
+        // The target runs under Full autonomy, which asks for no approval. The
+        // caller is Supervised and requires approval for medium-risk commands.
+        let mut target = command_policy(&["*"]);
+        target.caller_command_bounds = vec![CallerCommandBound {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+        }];
+
+        assert!(
+            validate(&target, "touch marker.txt", false)
+                .expect_err("the caller's approval gate must bind")
+                .contains("requires explicit approval"),
+        );
+        assert!(
+            validate(&target, "touch marker.txt", true).is_ok(),
+            "control: with approval the same command passes"
+        );
+    }
+
+    #[test]
+    fn cloning_a_policy_carries_the_chain() {
+        // A derived policy is bound by default: the field survives `clone()` and
+        // struct-update, so it can only be lost by rebuilding from config.
+        let mut target = command_policy(&["*"]);
+        target.caller_command_bounds = vec![bound_of(&["echo"])];
+
+        let derived = SecurityPolicy {
+            workspace_dir: PathBuf::from("/elsewhere"),
+            ..target.clone()
+        };
+        assert!(validate(&derived, "touch marker.txt", false).is_err());
+    }
+
+    #[test]
+    fn a_child_policy_cannot_drop_a_bound_its_parent_carries() {
+        let mut parent = command_policy(&["*"]);
+        parent.caller_command_bounds = vec![bound_of(&["echo"])];
+
+        let mut child = parent.clone();
+        child.caller_command_bounds.clear();
+        assert!(matches!(
+            child.ensure_no_escalation_beyond(&parent),
+            Err(EscalationViolation::CallerCommandBoundDroppedByChild)
+        ));
+
+        let mut child = parent.clone();
+        child.caller_command_bounds.push(bound_of(&["echo"]));
+        child
+            .ensure_no_escalation_beyond(&parent)
+            .expect("control: a child may ADD bounds while keeping the parent's");
     }
 }
