@@ -77,6 +77,12 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
 ///   text area (e.g. a PEM key body) instead of a single-line input.
+/// - `#[credential_url]` on a URL field whose userinfo, query or fragment may
+///   hold a credential (`String`, `Option<String>`, or another type that
+///   implements `CredentialUrlField`). Config reads (`mask_secrets`,
+///   `get_prop`, `prop_fields`) show those components masked; `set_prop` and
+///   `restore_secrets_from` put back any component a client echoes masked,
+///   and `set_prop` refuses a placeholder it cannot resolve.
 ///
 /// # Generated methods
 ///
@@ -149,7 +155,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         natural_key,
         tab,
         group,
-        multiline
+        multiline,
+        credential_url
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -201,7 +208,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut prop_names: Vec<String> = Vec::new();
     let mut prop_kind_tokens = Vec::new();
     let mut prop_display_secret_terminal_arms = Vec::new();
+    let mut prop_display_url_terminal_arms = Vec::new();
     let mut prop_is_option_flags = Vec::new();
+    let mut prop_credential_url_flags: Vec<bool> = Vec::new();
     let mut prop_is_secret_arms = Vec::new();
     let mut nested_prop_fields = Vec::new();
     let mut nested_get_prop = Vec::new();
@@ -231,6 +240,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut credential_url_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut credential_url_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -241,6 +252,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
         let is_multiline = has_attr(field, "multiline");
+        let is_credential_url = has_attr(field, "credential_url");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
@@ -250,6 +262,34 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             Some(variant) => quote! { crate::config::ConfigTab::#variant },
             None => quote! { crate::config::ConfigTab::None },
         };
+
+        if is_credential_url {
+            // A URL whose userinfo, query or fragment may hold a credential:
+            // reads mask those components, writes restore masked ones.
+            // The field's type must implement `CredentialUrlField`; a
+            // secret is masked whole already.
+            if is_secret {
+                return syn::Error::new_spanned(
+                    field,
+                    "#[credential_url] and #[secret] exclude each other: a secret is masked whole",
+                )
+                .to_compile_error()
+                .into();
+            }
+            mask_ops.push(quote! {
+                crate::traits::CredentialUrlField::mask_url_credentials(&mut self.#field_ident);
+            });
+            restore_ops.push(quote! {
+                crate::traits::CredentialUrlField::restore_url_credentials(
+                    &mut self.#field_ident,
+                    &current.#field_ident,
+                );
+            });
+            let terminal_name = field_ident.to_string();
+            credential_url_terminal_pushes.push(quote! {
+                out.push(#terminal_name);
+            });
+        }
 
         if is_secret {
             let field_name_kebab = snake_to_kebab(&field_ident.to_string());
@@ -523,6 +563,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     });
                     secret_terminal_recurse.push(quote! {
                         out.extend(<#inner_ty>::secret_field_terminals());
+                    });
+                    credential_url_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty>::credential_url_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner_map in self.#field_ident.values_mut() {
@@ -867,6 +910,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     });
                     secret_terminal_recurse.push(quote! {
                         out.extend(<#value_ty>::secret_field_terminals());
+                    });
+                    credential_url_terminal_recurse.push(quote! {
+                        out.extend(<#value_ty>::credential_url_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner in self.#field_ident.values_mut() {
@@ -1223,6 +1269,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     secret_terminal_recurse.push(quote! {
                         out.extend(<#inner_ty_tokens>::secret_field_terminals());
                     });
+                    credential_url_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty_tokens>::credential_url_field_terminals());
+                    });
 
                     // Recurse: pull the inner type's map_key_sections + create_map_key.
                     map_key_recurse.push(quote! {
@@ -1245,6 +1294,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 });
                 secret_terminal_recurse.push(quote! {
                     out.extend(<#vec_inner_ty>::secret_field_terminals());
+                });
+                credential_url_terminal_recurse.push(quote! {
+                    out.extend(<#vec_inner_ty>::credential_url_field_terminals());
                 });
                 nested_set.push(quote! {
                     for inner in self.#field_ident.iter_mut() {
@@ -1651,6 +1703,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 secret_terminal_recurse.push(quote! {
                     out.extend(<#plain_field_ty>::secret_field_terminals());
                 });
+                credential_url_terminal_recurse.push(quote! {
+                    out.extend(<#plain_field_ty>::credential_url_field_terminals());
+                });
                 nested_set.push(quote! {
                     if let Ok(()) = self.#field_ident.set_secret(name, value.clone()) {
                         return Ok(());
@@ -1991,9 +2046,30 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_display_secret_terminal_arms.push(quote! {
             #prop_idx => <#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
         });
+        prop_display_url_terminal_arms.push(quote! {
+            #prop_idx => <#inner_ty as crate::config::HasPropKind>::display_credential_url_terminals(),
+        });
         prop_is_option_flags.push(is_option);
+        prop_credential_url_flags.push(is_credential_url);
 
         if is_vec {
+            let vector_display = if is_credential_url {
+                quote! {
+                    let mut masked = v.clone();
+                    crate::traits::CredentialUrlField::mask_url_credentials(&mut masked);
+                    match toml::Value::try_from(&masked) {
+                        Ok(tv) => tv.to_string(),
+                        Err(_) => "[]".to_string(),
+                    }
+                }
+            } else {
+                quote! {
+                    match toml::Value::try_from(v) {
+                        Ok(tv) => tv.to_string(),
+                        Err(_) => "[]".to_string(),
+                    }
+                }
+            };
             let inner_value_expr = if is_option {
                 quote! { self.#field_ident.as_ref() }
             } else {
@@ -2009,12 +2085,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 crate::config::object_array_json_display_value(
                                     v,
                                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+                                    &<#inner_ty as crate::config::HasPropKind>::display_credential_url_terminals(),
                                 )
                             }
-                            _ => match toml::Value::try_from(v) {
-                                Ok(tv) => tv.to_string(),
-                                Err(_) => "[]".to_string(),
-                            },
+                            _ => { #vector_display },
                         },
                     };
                     crate::config::PropFieldInfo {
@@ -2052,6 +2126,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                     #alias_source_expr,
                     #is_multiline,
+                    #is_credential_url,
+                    &<#inner_ty as crate::config::HasPropKind>::display_credential_url_terminals(),
                 )
             });
         }
@@ -2117,6 +2193,16 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 out
             }
 
+            /// Terminal names of the `#[credential_url]` fields on this struct
+            /// and nested children: the keys whose URLs an object or
+            /// object-array display shows with their credential parts masked.
+            pub fn credential_url_field_terminals() -> Vec<&'static str> {
+                let mut out: Vec<&'static str> = Vec::new();
+                #(#credential_url_terminal_pushes)*
+                #(#credential_url_terminal_recurse)*
+                out
+            }
+
             /// Encrypt all secret fields in place using the provided store.
             pub fn encrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
                 #(#encrypt_ops)*
@@ -2161,10 +2247,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #(#dynamic_secret_map_get_prop)*
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
+                const CREDENTIAL_URL: &[bool] = &[#(#prop_credential_url_flags),*];
                 let idx = KNOWN.iter().position(|&n| n == name)
                     .ok_or_else(|| ::anyhow::Error::msg(::std::format!("Unknown property '{}'", name)))?;
                 let display_secret_terminals = match idx {
                     #(#prop_display_secret_terminal_arms)*
+                    _ => Vec::new(),
+                };
+                let display_url_terminals = match idx {
+                    #(#prop_display_url_terminal_arms)*
                     _ => Vec::new(),
                 };
                 crate::config::serde_get_prop(
@@ -2172,8 +2263,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     Self::configurable_prefix(),
                     name,
                     Self::prop_is_secret(name),
+                    CREDENTIAL_URL[idx],
                     KINDS[idx],
                     &display_secret_terminals,
+                    &display_url_terminals,
                 )
             }
 
@@ -2184,9 +2277,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
                 const IS_OPTION: &[bool] = &[#(#prop_is_option_flags),*];
+                const CREDENTIAL_URL: &[bool] = &[#(#prop_credential_url_flags),*];
                 let idx = KNOWN.iter().position(|&n| n == name)
                     .ok_or_else(|| ::anyhow::Error::msg(::std::format!("Unknown property '{}'", name)))?;
-                crate::config::serde_set_prop(self, Self::configurable_prefix(), name, value_str, KINDS[idx], IS_OPTION[idx])
+                crate::config::serde_set_prop(
+                    self,
+                    Self::configurable_prefix(),
+                    name,
+                    value_str,
+                    KINDS[idx],
+                    IS_OPTION[idx],
+                    CREDENTIAL_URL[idx],
+                )
             }
 
             /// Check if a property name refers to a secret field (static, no instance needed).

@@ -1,7 +1,7 @@
 //! Config types that were originally defined in their home modules (agent, channels, tools, trust)
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
-use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+use crate::traits::{ChannelConfig, CredentialUrlField, HasPropKind, PropKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -533,6 +533,26 @@ pub struct EmailOAuth2Config {
     pub scopes: Vec<String>,
 }
 
+impl EmailOAuth2Config {
+    /// The members that are URLs whose userinfo, query or fragment may hold
+    /// a credential. The settings are one opaque property (`oauth2`), so its
+    /// reads mask these members and its writes restore them.
+    pub const CREDENTIAL_URL_FIELDS: [&'static str; 2] = ["token_url", "device_code_url"];
+}
+
+impl CredentialUrlField for EmailOAuth2Config {
+    fn mask_url_credentials(&mut self) {
+        self.token_url.mask_url_credentials();
+        self.device_code_url.mask_url_credentials();
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        self.token_url.restore_url_credentials(&current.token_url);
+        self.device_code_url
+            .restore_url_credentials(&current.device_code_url);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
@@ -585,6 +605,7 @@ pub struct EmailConfig {
     /// XOAUTH2 instead of plain LOGIN. Required for providers like
     /// Outlook/Hotmail that have deprecated password auth.
     #[serde(default)]
+    #[credential_url]
     pub oauth2: Option<EmailOAuth2Config>,
     /// When true, the daemon observes new mail but never modifies any IMAP flag.
     #[serde(default)]
@@ -648,8 +669,12 @@ pub struct GmailPushConfig {
     #[secret]
     pub oauth_token: String,
     #[serde(default)]
+    #[credential_url]
     pub webhook_url: String,
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub webhook_secret: String,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -761,6 +786,9 @@ pub struct VoiceCallConfig {
     #[serde(default)]
     pub model_provider: VoiceProvider,
     pub account_id: String,
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_token: String,
     pub from_number: String,
     #[serde(default = "default_webhook_port")]
@@ -774,6 +802,7 @@ pub struct VoiceCallConfig {
     #[serde(default = "default_max_call_duration")]
     pub max_call_duration_secs: u64,
     #[serde(default)]
+    #[credential_url]
     pub webhook_base_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools

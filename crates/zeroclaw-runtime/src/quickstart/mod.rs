@@ -1297,15 +1297,7 @@ fn apply_model_provider(
             // Auto-populate context_window from provider's /models endpoint if supported.
             // Silently ignores failures (falls back to config default).
             // Only runs on multi-threaded Tokio runtime (actual CLI), not single-threaded test runtime.
-            let provider_config = zeroclaw_config::schema::ModelProviderConfig {
-                model: Some(choice.model.clone()),
-                uri: config.get_prop(&format!("{prefix}.uri")).ok(),
-                api_key: choice
-                    .fields
-                    .get("api_key")
-                    .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) }),
-                ..Default::default()
-            };
+            let provider_config = config.providers.models.find(provider_type, &choice.alias);
             if tokio::runtime::Handle::try_current()
                 .map(|h| {
                     matches!(
@@ -1314,10 +1306,11 @@ fn apply_model_provider(
                     )
                 })
                 .unwrap_or(false)
+                && let Some(provider_config) = provider_config
                 && let Some(ctx) = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(fetch_quickstart_context_window(
                         provider_type,
-                        &provider_config,
+                        provider_config,
                     ))
                 })
             {
@@ -4027,6 +4020,54 @@ mod tests {
                 .expect("configured Hailo catalog should succeed");
         assert!(live);
         assert_eq!(models, vec!["qwen3:1.7b"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quickstart_discovery_uses_the_stored_url_credentials() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("token", "quickstart-url-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "credential-model", "context_length": 12345}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let choice = SelectorChoice::Fresh(ModelProviderChoice {
+            provider_type: "openrouter".into(),
+            alias: "credential_url".into(),
+            model: "credential-model".into(),
+            fields: std::collections::HashMap::from([(
+                "uri".into(),
+                format!("{}/models?token=quickstart-url-token", server.uri()),
+            )]),
+        });
+        let mut config = Config::default();
+        let mut errors = Vec::new();
+        assert_eq!(
+            apply_model_provider(&mut config, &choice, &mut errors, None).as_deref(),
+            Some("openrouter.credential_url")
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("openrouter", "credential_url")
+                .unwrap()
+                .context_window,
+            Some(12345)
+        );
+        assert!(
+            !config
+                .get_prop("providers.models.openrouter.credential_url.uri")
+                .unwrap()
+                .contains("quickstart-url-token")
+        );
+        server.verify().await;
     }
 
     #[tokio::test]

@@ -1227,7 +1227,7 @@ cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and 
 cli-agent-export-secrets-entry = {"  "}{$path}
 cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
 cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
-cli-agent-export-scrub-scope = ⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential detection: other config values travel as written, so a token in an MCP server's url, or a credential in its command or args, is carried and repeated in the manifest's risk flags.
+cli-agent-export-scrub-scope = ⚠️  Scrubbing blanks the fields the schema marks secret and cuts endpoint URLs with a userinfo, query or fragment down to their endpoint. It is not credential detection: other config values travel as written, so a token in a URL's path, or a credential in an MCP server's command or args, is carried, and command lines are repeated in the manifest's risk flags.
 cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote will be contained in the export.
 cli-agent-export-review-hint = Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before sharing it.
 

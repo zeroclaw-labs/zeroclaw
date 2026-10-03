@@ -65,7 +65,9 @@ pub async fn handle_sop_trigger_sources(
 }
 
 /// `GET /api/sops/decision-models`: the `[decision_models]` aliases an SOP's
-/// `[decision] model` can select, sorted by alias. Never includes the API key.
+/// `[decision] model` can select, sorted by alias. Never includes the API key,
+/// and a `base_url` shows its userinfo, query and fragment masked, as config
+/// reads show it.
 pub async fn handle_sop_decision_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -84,7 +86,7 @@ pub async fn handle_sop_decision_models(
                     "alias": alias,
                     "provider": m.provider,
                     "model": model,
-                    "base_url": base_url,
+                    "base_url": zeroclaw_config::url_credentials::mask(&base_url),
                 }))
             })
             .collect()
@@ -1438,6 +1440,46 @@ mod tests {
         );
         assert!(!sops_dir.join("deploy-before").exists());
         assert!(sops_dir.join("deploy-after").exists());
+    }
+
+    /// The SOP editor's model picker shows a `base_url` as config reads do:
+    /// the endpoint stays readable, its userinfo and query are masked.
+    #[tokio::test]
+    async fn decision_models_mask_the_credentials_a_base_url_carries() {
+        let token = "author-token";
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.decision_models.insert(
+            "custom-decider".into(),
+            zeroclaw_config::schema::SopDecisionModelConfig {
+                provider: zeroclaw_config::schema::SopDecisionProvider::Custom,
+                base_url: Some(
+                    "https://review-user:pw-decider-11388@decide.example/v1?key=q-decider-11388"
+                        .into(),
+                ),
+                model: Some("decider".into()),
+                ..Default::default()
+            },
+        );
+        let mut state = crate::api::test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+
+        let resp = handle_sop_decision_models(State(state), bearer(token)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !text.contains("pw-decider-11388") && !text.contains("q-decider-11388"),
+            "{text}"
+        );
+        let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            listed["models"][0]["base_url"],
+            "https://***MASKED***@decide.example/v1?***MASKED***"
+        );
     }
 
     #[tokio::test]

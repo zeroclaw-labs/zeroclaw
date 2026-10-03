@@ -292,7 +292,14 @@ fn error_response(err: ConfigApiError) -> Response {
 /// else falls through to ValidationFailed.
 fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
     let msg = err.to_string();
-    if msg.starts_with("Unknown property") {
+    if err
+        .downcast_ref::<zeroclaw_config::url_credentials::UnresolvedMask>()
+        .is_some()
+    {
+        // A masked placeholder no stored value can resolve: the caller has
+        // to send the full URL.
+        ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(path)
+    } else if msg.starts_with("Unknown property") {
         ConfigApiError::path_not_found(path)
     } else {
         ConfigApiError::from_validation(err).with_path(path)
@@ -904,6 +911,21 @@ pub(crate) async fn try_compute_drift(
             .map(|p| (p.name.clone(), p))
             .collect();
 
+    // Display values intentionally discard URL credentials. Compare the
+    // canonical serialized values internally when display masking obscures
+    // a change, and retain the redacted displays in the returned diagnostics.
+    let raw_memory = toml::Value::try_from(in_memory).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot serialize in-memory config for comparison",
+        )
+    })?;
+    let raw_disk = toml::Value::try_from(&on_disk).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot serialize on-disk config for comparison",
+        )
+    })?;
     let mut drift: Vec<DriftEntry> = Vec::new();
     let mut all_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     all_names.extend(in_memory_props.keys().map(String::as_str));
@@ -926,7 +948,21 @@ pub(crate) async fn try_compute_drift(
             .map(|p| p.display_value.as_str())
             .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
         if mem_display == disk_display {
-            continue;
+            if !zeroclaw_config::url_credentials::carries_mask(mem_display) {
+                continue;
+            }
+            let mem_raw = zeroclaw_config::schema::url_prop_value_for_comparison(&raw_memory, name);
+            let disk_raw = zeroclaw_config::schema::url_prop_value_for_comparison(&raw_disk, name);
+            if mem_raw.is_none() || disk_raw.is_none() {
+                return Err(ConfigApiError::new(
+                    ConfigApiCode::ConfigChangedExternally,
+                    "cannot resolve a masked config property for comparison",
+                )
+                .with_path(name));
+            }
+            if mem_raw == disk_raw {
+                continue;
+            }
         }
         let is_sensitive = mem
             .or(disk)
@@ -2410,7 +2446,7 @@ pub async fn handle_refresh_context_window(
     // for the duration -- a self-inflicted availability bottleneck.
     let provider_config = {
         let snapshot = state.config.read();
-        if snapshot.get_prop(&format!("{path}.model")).is_err() {
+        let Some(provider) = snapshot.providers.models.find(&provider_type, &alias) else {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
@@ -2418,27 +2454,8 @@ pub async fn handle_refresh_context_window(
                 )
                 .with_path(&path),
             );
-        }
-        let model = snapshot
-            .get_prop(&format!("{path}.model"))
-            .ok()
-            .unwrap_or_default();
-        let uri = snapshot.get_prop(&format!("{path}.uri")).ok();
-        // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
-        let api_key = serde_json::to_value(&snapshot.providers)
-            .ok()
-            .and_then(|v| {
-                v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && *s != "<unset>")
-                    .map(String::from)
-            });
-        zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model),
-            uri,
-            api_key,
-            ..Default::default()
-        }
+        };
+        provider.clone()
     };
 
     // Fetch context window from provider. No lock -- neither `config` nor
@@ -2544,7 +2561,10 @@ pub async fn handle_patch(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if !override_drift {
-        let drifted = compute_drift(&working).await;
+        let drifted = match try_compute_drift(&working).await {
+            Ok(drifted) => drifted,
+            Err(error) => return error_response(error),
+        };
         if !drifted.is_empty() {
             let touched: std::collections::HashSet<String> = ops
                 .iter()
@@ -3545,6 +3565,315 @@ mod tests {
     // tests below fall through into real persistence (`persist_and_swap` ->
     // `save_dirty`), and a bare `Config::default()` would write the developer's
     // live `~/.zeroclaw/config.toml`.
+
+    /// A provider URI's password and query credential reach neither the
+    /// whole-config read nor the property read: the shared config projection
+    /// masks them before any HTTP body is built.
+    #[tokio::test]
+    async fn config_reads_withhold_a_provider_uris_embedded_credentials() {
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}\"\n"
+        ))
+        .unwrap();
+        let state = test_state(config);
+
+        let whole = handle_config_get(State(state.clone())).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        let whole = String::from_utf8(
+            whole
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let (status, prop) = response_json(
+            handle_prop_get(
+                State(state),
+                Query(PropQuery {
+                    path: "providers.models.custom.credential_url.uri".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prop = prop.to_string();
+
+        assert_eq!(
+            [
+                whole.contains(PASSWORD),
+                whole.contains(QUERY),
+                prop.contains(PASSWORD),
+                prop.contains(QUERY),
+            ],
+            [false; 4],
+            "userinfo and query secrets must be withheld: {whole}\n{prop}"
+        );
+        assert!(
+            prop.contains("http://***MASKED***@127.0.0.1:9/v1?***MASKED***"),
+            "{prop}"
+        );
+    }
+
+    /// A provider URI written back through the property route as reads show
+    /// it keeps the stored credentials. A placeholder that no stored value
+    /// can resolve is refused as `validation_failed` and stores nothing.
+    #[tokio::test]
+    async fn prop_put_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
+        const PATH: &str = "providers.models.custom.credential_url.uri";
+        let stored =
+            "http://review-user:uri-password-654738@127.0.0.1:9/v1?credential=uri-query-938472";
+        let tmp = tempfile::tempdir().unwrap();
+        let base = temp_config(&tmp);
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        config.config_path = base.config_path;
+        config.data_dir = base.data_dir;
+        let state = test_state(config);
+        let uri = || {
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .and_then(|provider| provider.uri.clone())
+        };
+        let put = |value: &str| {
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: PATH.to_string(),
+                    value: serde_json::json!(value),
+                    comment: None,
+                }),
+            )
+        };
+
+        let (status, json) =
+            response_json(put("http://***MASKED***@127.0.0.1:9/v1?***MASKED***").await).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let (status, json) = response_json(put("http://***MASKED***.example/v1").await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed", "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn patch_refuses_credential_only_disk_drift_and_keeps_rotated_credentials() {
+        const PROP: &str = "providers.models.custom.credential_url.uri";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.models.custom", "credential_url")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                PROP,
+                "https://reader:old-password@example.invalid/v1?token=old-query",
+            )
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        assert!(try_compute_drift(&config).await.unwrap().is_empty());
+        let mut disk = config.clone();
+        disk.set_prop_persistent(
+            PROP,
+            "https://reader:rotated-password@example.invalid/v1?token=rotated-query",
+        )
+        .unwrap();
+        disk.save_dirty().await.unwrap();
+        let disk_before = tokio::fs::read(&config.config_path).await.unwrap();
+        let drift = try_compute_drift(&config).await.unwrap();
+        assert!(drift.iter().any(|entry| entry.path == PROP));
+        let diagnostic = serde_json::to_string(&drift).unwrap();
+        for secret in [
+            "old-password",
+            "old-query",
+            "rotated-password",
+            "rotated-query",
+        ] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+        let state = test_state(config);
+        let (status, body) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace", "path": "/providers/models/custom/credential_url/uri",
+                    "value": "https://***MASKED***@example.invalid/v2?***MASKED***"
+                }])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "config_changed_externally");
+        assert_eq!(
+            tokio::fs::read(&disk.config_path).await.unwrap(),
+            disk_before
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .unwrap()
+                .uri
+                .as_ref()
+                .unwrap()
+                .contains("old-password")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_context_window_uses_stored_url_credentials() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("token", "refresh-url-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "credential-model", "context_length": 12345}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("providers.models.openrouter", "credential_url")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openrouter.credential_url.model",
+                "credential-model",
+            )
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openrouter.credential_url.uri",
+                &format!("{}/models?token=refresh-url-token", server.uri()),
+            )
+            .unwrap();
+        let state = test_state(config);
+        let (status, body) = response_json(
+            handle_refresh_context_window(
+                State(state),
+                None,
+                axum::extract::Path(("openrouter".into(), "credential_url".into())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["context_window"], 12345);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn real_http_reads_withhold_persisted_malformed_url_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut exposures = Vec::new();
+        for (case, raw) in [
+            (
+                "canonical",
+                "custom:http://reader:http-invalid-password@valid.example.invalid/v1?key=http-invalid-query",
+            ),
+            (
+                "wrapped_bad_host",
+                "custom:h\tttp://reader:http-invalid-password@bad host.invalid/v1?key=http-invalid-query",
+            ),
+            (
+                "plain_bad_host",
+                "h\tttp://reader:http-invalid-password@bad host.invalid/v1?key=http-invalid-query",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = temp_config(&tmp);
+            config
+                .set_prop_persistent("memory.embedding_provider", raw)
+                .unwrap();
+            config.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&config.config_path)
+                .await
+                .unwrap();
+            let mut loaded: zeroclaw_config::schema::Config = toml::from_str(&saved).unwrap();
+            loaded.config_path = config.config_path.clone();
+            loaded.data_dir = config.data_dir.clone();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            let app = axum::Router::new()
+                .route("/api/config", axum::routing::get(handle_config_get))
+                .route("/api/config/prop", axum::routing::get(handle_prop_get))
+                .route("/api/config/list", axum::routing::get(handle_list))
+                .with_state(test_state(loaded));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            for route in [
+                "/api/config",
+                "/api/config/prop?path=memory.embedding_provider",
+                "/api/config/list?prefix=memory",
+            ] {
+                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                let request =
+                    format!("GET {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.read_to_end(&mut response),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let response = String::from_utf8(response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                if ["http-invalid-password", "http-invalid-query"]
+                    .iter()
+                    .any(|marker| json.to_string().contains(marker))
+                {
+                    exposures.push((case, route));
+                }
+                if route == "/api/config" && case == "canonical" {
+                    assert_eq!(
+                        json["memory"]["embedding_provider"],
+                        "custom:http://***MASKED***@valid.example.invalid/v1?***MASKED***"
+                    );
+                }
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+        assert!(
+            exposures.is_empty(),
+            "real HTTP password exposure boundaries: {exposures:?}"
+        );
+    }
 
     #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {
@@ -4973,6 +5302,46 @@ mod tests {
         assert!(entry.drifted);
         assert!(entry.in_memory_value.is_some());
         assert!(entry.on_disk_value.is_some());
+    }
+
+    #[tokio::test]
+    async fn drift_detects_url_rotation_in_named_lists_without_secret_encryption_noise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.create_map_key("mcp.servers", "search").unwrap();
+        config
+            .set_prop_persistent("mcp.servers.search.transport", "http")
+            .unwrap();
+        config
+            .set_prop_persistent(
+                "mcp.servers.search.url",
+                "https://search.example.invalid/mcp?token=original-token",
+            )
+            .unwrap();
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".into(), "ordinary-header-secret".into());
+        config.mark_dirty("mcp.servers.search");
+        config.save_dirty().await.unwrap();
+        assert!(try_compute_drift(&config).await.unwrap().is_empty());
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(!raw.contains("ordinary-header-secret"));
+        let rotated = raw.replace("original-token", "rotated-token");
+        tokio::fs::write(&config.config_path, rotated)
+            .await
+            .unwrap();
+        let drift = try_compute_drift(&config).await.unwrap();
+        assert!(
+            drift
+                .iter()
+                .any(|entry| entry.path == "mcp.servers.search.url")
+        );
+        let json = serde_json::to_string(&drift).unwrap();
+        for secret in ["ordinary-header-secret", "original-token", "rotated-token"] {
+            assert!(!json.contains(secret), "{json}");
+        }
     }
 
     #[tokio::test]

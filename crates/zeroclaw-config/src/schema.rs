@@ -907,6 +907,7 @@ pub struct ModelProviderConfig {
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL; there is no separate path-suffix field.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub uri: Option<String>,
     /// Model identifier to send with each request: the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[tab(Model)]
@@ -1437,6 +1438,7 @@ pub struct QwenModelProviderConfig {
     /// `endpoint`-derived URL (or the cached `resource_url` when reading
     /// from `~/.qwen/oauth_creds.json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub oauth_resource_url: Option<String>,
 }
 
@@ -5610,6 +5612,7 @@ pub struct TranscriptionConfig {
     pub api_key: Option<String>,
     /// Whisper API endpoint URL (Groq transcription provider).
     #[serde(default = "default_transcription_api_url")]
+    #[credential_url]
     pub api_url: String,
     /// Whisper model name (Groq transcription provider).
     #[serde(default = "default_transcription_model")]
@@ -5786,6 +5789,7 @@ pub struct McpServerConfig {
     pub transport: McpTransport,
     /// URL for HTTP/SSE transports.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
     /// Executable to spawn for stdio transport.
     #[serde(default)]
@@ -6125,6 +6129,7 @@ pub struct TtsProviderConfig {
     /// proxies). Set to the **full** URL — there is no separate path-suffix
     /// field. Renamed from `api_url` for parity with `ModelProviderConfig.uri`.
     #[serde(alias = "api_url")]
+    #[credential_url]
     pub uri: Option<String>,
 }
 
@@ -6466,6 +6471,7 @@ impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
 #[prefix = "providers.transcription.local_whisper"]
 pub struct LocalWhisperTranscriptionProviderConfig {
     /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    #[credential_url]
     pub uri: String,
     /// Bearer token for endpoint authentication. Omit for unauthenticated
     /// local endpoints.
@@ -6640,6 +6646,7 @@ pub struct GoogleSttConfig {
 #[prefix = "transcription.local_whisper"]
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    #[credential_url]
     pub url: String,
     /// Bearer token for endpoint authentication.
     /// Omit for unauthenticated local endpoints.
@@ -6931,6 +6938,28 @@ pub struct ExternalRegistry {
     pub enabled: bool,
 }
 
+/// A registry's git URL can carry an access token (`https://token@host/...`):
+/// whole-config reads mask it like any other credential URL, and an echoed
+/// mask is restored from the stored registry of the same name.
+impl crate::traits::CredentialUrlField for Vec<ExternalRegistry> {
+    fn mask_url_credentials(&mut self) {
+        for registry in self.iter_mut() {
+            registry.url = crate::url_credentials::mask(&registry.url);
+        }
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        for registry in self.iter_mut() {
+            if let Some(stored) = current.iter().find(|stored| stored.name == registry.name)
+                && let Ok(restored) =
+                    crate::url_credentials::restore(&registry.url, Some(&stored.url))
+            {
+                registry.url = restored;
+            }
+        }
+    }
+}
+
 impl ExternalRegistry {
     /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
     ///
@@ -6965,11 +6994,13 @@ pub struct SkillsConfig {
     /// URL of the skills registry repository for bare-name installs.
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
+    #[credential_url]
     pub registry_url: Option<String>,
     /// Additional user-configured skill registries, installed via
     /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_url]
     pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt. Omission
     /// defaults to `full` throughout the v0.8.x release line; `compact`
@@ -8241,6 +8272,7 @@ pub struct RelayConfig {
     pub enabled: bool,
     /// Relay address to connect to, as `host:port`.
     #[serde(default)]
+    #[credential_url]
     pub url: String,
     /// Opaque node-id this daemon registers under (clients dial this id). Leave
     /// empty (recommended) to auto-mint and persist a random 128-bit capability at
@@ -8535,6 +8567,7 @@ impl Default for SecretsConfig {
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
     #[serde(default = "default_browser_computer_use_endpoint")]
+    #[credential_url]
     pub endpoint: String,
     /// Optional bearer token for computer-use sidecar
     #[serde(default)]
@@ -8627,6 +8660,7 @@ pub struct BrowserConfig {
     pub native_headless: bool,
     /// WebDriver endpoint URL for rust-native backend (e.g. `http://127.0.0.1:9515`)
     #[serde(default = "default_browser_webdriver_url")]
+    #[credential_url]
     pub native_webdriver_url: String,
     /// Optional Chrome/Chromium executable path for rust-native backend
     #[serde(default)]
@@ -8852,6 +8886,7 @@ pub struct FirecrawlConfig {
     pub api_key_env: String,
     /// Firecrawl API base URL
     #[serde(default = "default_firecrawl_api_url")]
+    #[credential_url]
     pub api_url: String,
     /// Firecrawl extraction mode
     #[serde(default)]
@@ -9098,6 +9133,7 @@ pub struct WebSearchConfig {
     pub keenable_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
+    #[credential_url]
     pub searxng_instance_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
@@ -9168,6 +9204,7 @@ pub struct ProjectIntelConfig {
     pub include_jira_data: bool,
     /// Jira instance base URL (required if include_jira_data is true).
     #[serde(default)]
+    #[credential_url]
     pub jira_base_url: Option<String>,
 }
 
@@ -10202,6 +10239,7 @@ impl Default for ImageGenConfig {
 pub struct FileUploadConfig {
     /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// HTTP method. Only `POST` (default) and `PUT` are accepted.
@@ -10275,6 +10313,7 @@ impl Default for FileUploadConfig {
 pub struct FileUploadBundleConfig {
     /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// HTTP method. Only `POST` (default) and `PUT` are accepted.
@@ -10377,6 +10416,7 @@ pub struct FileDownloadConfig {
     /// Download endpoint URL. Tool is disabled when this is `None` or empty.
     /// The file to fetch is selected by the `document_id` query parameter.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// Maximum download size in bytes. Enforced while streaming: the transfer
@@ -10982,12 +11022,15 @@ pub struct ProxyConfig {
     pub enabled: bool,
     /// Proxy URL for HTTP requests (supports http, https, socks5, socks5h).
     #[serde(default)]
+    #[credential_url]
     pub http_proxy: Option<String>,
     /// Proxy URL for HTTPS requests (supports http, https, socks5, socks5h).
     #[serde(default)]
+    #[credential_url]
     pub https_proxy: Option<String>,
     /// Fallback proxy URL for all schemes.
     #[serde(default)]
+    #[credential_url]
     pub all_proxy: Option<String>,
     /// No-proxy bypass list. Same format as NO_PROXY.
     #[serde(default)]
@@ -12499,6 +12542,7 @@ impl Default for PostgresStorageConfig {
 pub struct QdrantStorageConfig {
     /// Qdrant server URL (e.g. `"http://localhost:6333"`).
     /// Use `ZEROCLAW_storage__qdrant__<alias>__url=...` for env injection.
+    #[credential_url]
     pub url: Option<String>,
     /// Collection name for storing memories.
     /// Use `ZEROCLAW_storage__qdrant__<alias>__collection=...` for env injection.
@@ -12631,6 +12675,7 @@ pub struct MemoryConfig {
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
+    #[credential_url]
     pub embedding_provider: String,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
@@ -13406,6 +13451,7 @@ pub struct ObservabilityConfig {
 
     /// OTLP endpoint (e.g. `"http://localhost:4318"`). Only used when backend = `"otel"`.
     #[serde(default)]
+    #[credential_url]
     pub otel_endpoint: Option<String>,
 
     /// Service name reported to the OTel collector. Defaults to "zeroclaw".
@@ -13700,6 +13746,7 @@ pub struct WebhookAuditConfig {
     pub enabled: bool,
     /// Target URL that will receive the audit POST requests.
     #[serde(default)]
+    #[credential_url]
     pub url: String,
     /// Glob patterns for tool names to audit (e.g. `["Bash", "Write"]`).
     /// An empty list means **no** tools are audited.
@@ -13893,6 +13940,7 @@ pub struct OidcConfig {
     /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
     /// from `<issuer>/.well-known/openid-configuration` and its `issuer`
     /// field must match this value exactly.
+    #[credential_url]
     pub issuer: String,
     /// Audience the token must carry in its `aud` claim for this daemon
     /// (typically the client ID or resource identifier registered at the
@@ -15771,6 +15819,7 @@ pub struct CustomTunnelConfig {
     pub start_command: String,
     /// Optional URL to check tunnel health
     #[serde(default)]
+    #[credential_url]
     pub health_url: Option<String>,
     /// Optional regex to extract public URL from command stdout
     #[serde(default)]
@@ -16654,6 +16703,7 @@ pub struct TelegramConfig {
     /// set to a local Bot API server URL when self-hosting Telegram's bot API.
     #[tab(Connection)]
     #[serde(default = "default_telegram_api_base_url")]
+    #[credential_url]
     pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[tab(Behavior)]
@@ -16733,6 +16783,7 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// How long (seconds) to wait for the operator to tap an inline-keyboard
     /// button on a tool approval prompt before auto-denying. Default: 120.
@@ -16906,6 +16957,7 @@ pub struct DiscordConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Streaming mode for progressive response delivery.
     /// `off` (default): single message. `partial`: editable draft updates.
@@ -17095,6 +17147,7 @@ pub struct SlackConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Enable progressive draft message streaming via `chat.update`.
     #[tab(Behavior)]
@@ -17244,6 +17297,7 @@ pub struct MattermostConfig {
     pub enabled: bool,
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     #[tab(Connection)]
+    #[credential_url]
     pub url: String,
     /// Mattermost bot access token. When unset, the channel falls back to
     /// the login flow using `login_id` + `password`.
@@ -17310,6 +17364,7 @@ pub struct MattermostConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Listen mode: `"polling"` (REST API every 3s, default) or `"websocket"`
@@ -17421,6 +17476,7 @@ pub struct WebhookConfig {
     /// URL to POST/PUT outbound messages to.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub send_url: Option<String>,
     /// HTTP method for outbound messages (`POST` or `PUT`). Default: `POST`.
     #[tab(Advanced)]
@@ -17547,6 +17603,7 @@ pub struct MatrixConfig {
     /// `"https://matrix.example.org"`). Server names use standard
     /// `/.well-known/matrix/client` discovery.
     #[tab(Connection)]
+    #[credential_url]
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel
     /// falls back to password login using `user_id` + `password`.
@@ -17807,6 +17864,7 @@ pub struct SignalConfig {
     pub enabled: bool,
     /// Base URL for the signal-cli HTTP daemon (e.g. `"http://127.0.0.1:8686"`).
     #[tab(Connection)]
+    #[credential_url]
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
     #[tab(Connection)]
@@ -17836,6 +17894,7 @@ pub struct SignalConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
@@ -18091,6 +18150,7 @@ pub struct WhatsAppConfig {
     /// default endpoint that ships with `wa-rs`.
     #[tab(Connection)]
     #[serde(default)]
+    #[credential_url]
     pub ws_url: Option<String>,
     /// Display name announced to contacts (Web mode, optional)
     /// Applied on connect when it differs from the name the linked device
@@ -18177,6 +18237,7 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
@@ -18300,6 +18361,7 @@ pub struct NextcloudTalkConfig {
     pub enabled: bool,
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     #[tab(Connection)]
+    #[credential_url]
     pub base_url: String,
     /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
     /// OCS bearer auth (see `webhook_secret`); this field is only accepted so
@@ -18341,6 +18403,7 @@ pub struct NextcloudTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Display name of the bot in Nextcloud Talk (e.g. "zeroclaw").
     /// Used to filter out the bot's own messages and prevent feedback loops.
@@ -18491,6 +18554,7 @@ pub struct MqttConfig {
     /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
     /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
     #[tab(Connection)]
+    #[credential_url]
     pub broker_url: String,
     /// MQTT client ID (must be unique per broker).
     #[tab(Advanced)]
@@ -19142,6 +19206,7 @@ pub struct LarkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -19296,6 +19361,7 @@ pub struct LineConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Display name shown as the sender in LINE chat bubbles.
@@ -19851,6 +19917,7 @@ pub struct DingTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -19959,6 +20026,7 @@ pub struct WeComWsConfig {
     pub stream_mode: StreamMode,
     /// Optional per-channel proxy override. Falls back to the global proxy config when empty.
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -20012,10 +20080,12 @@ pub struct WeChatConfig {
     /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub api_base_url: Option<String>,
     /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub cdn_base_url: Option<String>,
     /// Directory to persist bot token and sync cursor.
     /// Default: `~/.zeroclaw/wechat/`.
@@ -20063,6 +20133,7 @@ pub struct QQConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -20129,6 +20200,7 @@ pub struct MochatConfig {
     pub enabled: bool,
     /// Mochat API base URL
     #[tab(Advanced)]
+    #[credential_url]
     pub api_url: String,
     /// Mochat API token
     #[secret]
@@ -20308,6 +20380,7 @@ pub struct GitConfig {
     /// never named. Gitea/Forgejo provider only.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub api_base_url: Option<String>,
     /// Personal access token for Gitea/Forgejo API requests. The token needs
     /// repository read access plus issue/PR comment write access for replies
@@ -20341,6 +20414,7 @@ pub struct GitConfig {
     /// Per-channel proxy override for GitHub API requests.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Per-event routing table, keyed by normalized event type
     /// (`"issue_comment.created"`, `"pull_request.opened"`,
@@ -20573,6 +20647,7 @@ pub struct NostrConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub private_key: String,
     /// Relay URLs (wss://). Defaults to popular public relays if omitted.
+    #[credential_url]
     #[tab(Advanced)]
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
@@ -20697,6 +20772,7 @@ pub struct JiraConfig {
     pub enabled: bool,
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
+    #[credential_url]
     pub base_url: String,
     /// Jira account email used for Basic auth (Cloud).
     /// Omit for Server/DC deployments using Bearer token auth.
@@ -20967,6 +21043,7 @@ pub struct SecurityOpsConfig {
     pub report_output_dir: String,
     /// Optional SIEM webhook URL for alert ingestion.
     #[serde(default)]
+    #[credential_url]
     pub siem_integration: Option<String>,
 }
 
@@ -27180,6 +27257,41 @@ fn prune_empty_leaves(value: &mut toml::Value) {
     }
 }
 
+/// Resolve a property for internal URL drift comparison using the same
+/// dotted-key and natural-key routing as configuration writes. Ordinary
+/// secret members are redacted within the resolved property, so ciphertext
+/// does not create false URL drift. Never display or log this value: URL
+/// credentials remain raw for equality checks.
+pub fn url_prop_value_for_comparison(root: &toml::Value, path: &str) -> Option<toml::Value> {
+    let mut value = serialized_prop_value(root, path)?.clone();
+    crate::helpers::redact_toml_display_secrets(&mut value, &Config::secret_field_terminals(), &[]);
+    Some(value)
+}
+
+fn serialized_prop_value<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+    let table = root.as_table()?;
+    if let Some(section) = find_natural_key_section_for_path(path) {
+        let section_segments: Vec<&str> = section.section_path.split('.').collect();
+        let entries = lookup_path_in_table(table, &section_segments)?.as_array()?;
+        let keys = entries.iter().enumerate().filter_map(|(index, entry)| {
+            entry
+                .get(section.natural_key_field)?
+                .as_str()
+                .map(|key| (index, key))
+        });
+        return match crate::helpers::route_vec_path(path, "", section.section_path, "", keys) {
+            crate::helpers::VecRoute::Hit { index, inner_name } => {
+                serialized_prop_value(entries.get(index)?, &inner_name)
+            }
+            _ => None,
+        };
+    }
+    let raw: Vec<&str> = path.split('.').collect();
+    let segments = resolve_dirty_segments(table, &raw);
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    lookup_path_in_table(table, &segments)
+}
+
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
     resolve_dirty_segments_from_sources(Some(root), None, raw)
 }
@@ -27605,6 +27717,7 @@ pub struct SopDecisionModelConfig {
     pub provider: SopDecisionProvider,
     /// Endpoint base URL. Defaults from `provider`; required for `custom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub base_url: Option<String>,
     /// Model id sent with each request. Defaults from `provider`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42956,6 +43069,676 @@ stream_tool_arguments = [
         ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
         assert!(!Config::prop_is_secret("file_download.headers"));
+    }
+
+    // ── Credential-bearing URLs ───────────────────────────────
+
+    fn custom_uri(config: &Config) -> Option<String> {
+        config
+            .providers
+            .models
+            .find("custom", "credential_url")
+            .and_then(|provider| provider.uri.clone())
+    }
+
+    /// A provider URI carrying a password and a query credential reads back
+    /// masked through every config read (the whole-config projection, one
+    /// property, the property listing), and an echoed masked value writes
+    /// back as the stored URL, never as the placeholder.
+    #[::core::prelude::v1::test]
+    fn credential_urls_are_masked_on_every_read_and_restored_on_write_back() {
+        use crate::traits::MaskSecrets;
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let stored = format!("http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}");
+        let mut config: Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        let path = "providers.models.custom.credential_url.uri";
+        let shown = "http://***MASKED***@127.0.0.1:9/v1?***MASKED***";
+
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        assert!(
+            !whole.contains(PASSWORD) && !whole.contains(QUERY),
+            "{whole}"
+        );
+        assert_eq!(custom_uri(&masked).as_deref(), Some(shown));
+        assert_eq!(config.get_prop(path).unwrap(), shown);
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the uri is a listed property");
+        assert_eq!(listed.display_value, shown);
+
+        // The masked value written back is the stored URL; a new host keeps
+        // the stored credentials.
+        config.set_prop(path, shown).unwrap();
+        assert_eq!(custom_uri(&config), Some(stored.clone()));
+        config
+            .set_prop(path, "http://***MASKED***@10.0.0.2:9/v1?***MASKED***")
+            .unwrap();
+        assert_eq!(
+            custom_uri(&config).as_deref(),
+            Some(
+                format!("http://review-user:{PASSWORD}@10.0.0.2:9/v1?credential={QUERY}").as_str()
+            )
+        );
+        // A placeholder with nothing stored behind it is refused, not stored.
+        config.set_prop(path, "http://10.0.0.2:9/v1").unwrap();
+        assert!(
+            config
+                .set_prop(path, "http://***MASKED***@10.0.0.2:9/v1")
+                .is_err()
+        );
+        assert_eq!(custom_uri(&config).as_deref(), Some("http://10.0.0.2:9/v1"));
+
+        // `restore_secrets_from` puts the stored components back too.
+        let original: Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        masked.restore_secrets_from(&original);
+        assert_eq!(custom_uri(&masked), Some(stored));
+    }
+
+    #[::core::prelude::v1::test]
+    fn relay_url_lists_mask_every_read_and_restore_by_endpoint() {
+        use crate::traits::MaskSecrets;
+        let original: Config = toml::from_str(r#"
+            [channels.nostr.review]
+            private_key = ""
+            relays = ["wss://reader:relay-password@relay.example.invalid/events?token=relay-query#relay-fragment", "wss://public.example.invalid/events"]
+        "#).unwrap();
+        let path = "channels.nostr.review.relays";
+        let mut config = original.clone();
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        let shown = original.get_prop(path).unwrap();
+        let listed = original
+            .prop_fields()
+            .into_iter()
+            .find(|p| p.name == path)
+            .unwrap()
+            .display_value;
+        for read in [&whole, &shown, &listed] {
+            for marker in ["relay-password", "relay-query", "relay-fragment"] {
+                assert!(!read.contains(marker), "{read}");
+            }
+        }
+        config.set_prop(path, &shown).unwrap();
+        assert_eq!(
+            config.channels.nostr["review"].relays,
+            original.channels.nostr["review"].relays
+        );
+        let mut reordered = masked.channels.nostr["review"].relays.clone();
+        reordered.reverse();
+        config
+            .set_prop(path, &serde_json::to_string(&reordered).unwrap())
+            .unwrap();
+        let mut expected = original.channels.nostr["review"].relays.clone();
+        expected.reverse();
+        assert_eq!(config.channels.nostr["review"].relays, expected);
+        reordered[1] = reordered[1].replace("relay.example.invalid", "different.example.invalid");
+        assert!(
+            config
+                .set_prop(path, &serde_json::to_string(&reordered).unwrap())
+                .is_err()
+        );
+        assert_eq!(config.channels.nostr["review"].relays, expected);
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            masked.channels.nostr["review"].relays,
+            original.channels.nostr["review"].relays
+        );
+
+        // Two stored credentials behind the same displayed endpoint have no
+        // stable identity; neither may be chosen when the list is echoed.
+        let mut ambiguous = original.clone();
+        ambiguous
+            .channels
+            .nostr
+            .get_mut("review")
+            .unwrap()
+            .relays
+            .push(
+                original.channels.nostr["review"].relays[0]
+                    .replace("relay-password", "other-password"),
+            );
+        let shown = ambiguous.get_prop(path).unwrap();
+        assert!(ambiguous.set_prop(path, &shown).is_err());
+        let mut empty = original.clone();
+        empty
+            .channels
+            .nostr
+            .get_mut("review")
+            .unwrap()
+            .relays
+            .clear();
+        assert!(
+            empty
+                .set_prop(path, &original.get_prop(path).unwrap())
+                .is_err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn wrapped_embedding_url_controls_do_not_escape_config_reads() {
+        use crate::traits::MaskSecrets;
+        let mut config = Config::default();
+        let stored = "custom:\thttp://reader:embedding-password@example.invalid/v1";
+        config.memory.embedding_provider = stored.to_string();
+        let shown = config.get_prop("memory.embedding_provider").unwrap();
+        assert!(!shown.contains("embedding-password"));
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert!(
+            !serde_json::to_string(&masked)
+                .unwrap()
+                .contains("embedding-password")
+        );
+        config
+            .set_prop("memory.embedding_provider", &shown)
+            .unwrap();
+        assert_eq!(config.memory.embedding_provider, stored);
+    }
+
+    #[::core::prelude::v1::test]
+    fn url_comparison_resolves_credential_named_aliases() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.custom", "api_key")
+            .unwrap();
+        let path = "providers.models.custom.api_key.uri";
+        config
+            .set_prop(
+                path,
+                "https://reader:comparison-password@example.invalid/v1?token=comparison-query",
+            )
+            .unwrap();
+        let root = toml::Value::try_from(&config).unwrap();
+        assert_eq!(
+            url_prop_value_for_comparison(&root, path).unwrap().as_str(),
+            Some("https://reader:comparison-password@example.invalid/v1?token=comparison-query")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_url_persistence_withholds_all_five_read_boundaries() {
+        use crate::traits::{MASKED_SECRET, MaskSecrets};
+        let mut exposures = Vec::new();
+        for (case, raw) in [
+            (
+                "wrapped_tab",
+                "custom:h\tttp://reader:persist-invalid-password@bad host.invalid/v1?key=persist-invalid-query#persist-invalid-fragment",
+            ),
+            (
+                "wrapped_nul",
+                "custom:\0http://reader:persist-invalid-password@bad host.invalid/v1?key=persist-invalid-query",
+            ),
+            (
+                "wrapped_vt",
+                "custom:\x0bhttp://reader:persist-invalid-password@bad host.invalid/v1",
+            ),
+            (
+                "plain_tab",
+                "h\tttp://reader:persist-invalid-password@bad host.invalid/v1",
+            ),
+        ] {
+            assert!(reqwest::Url::parse(raw.strip_prefix("custom:").unwrap_or(raw)).is_err());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Default::default()
+            };
+            config
+                .set_prop_persistent("memory.embedding_provider", raw)
+                .unwrap();
+            config.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&config.config_path)
+                .await
+                .unwrap();
+            let mut loaded: Config = toml::from_str(&saved).unwrap();
+            loaded.config_path = config.config_path.clone();
+            loaded.data_dir = config.data_dir.clone();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            let shown = loaded.get_prop("memory.embedding_provider").unwrap();
+            let listed = loaded
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "memory.embedding_provider")
+                .unwrap()
+                .display_value;
+            let mut projection = loaded.clone();
+            projection.mask_secrets();
+            let reads = [
+                ("helper", crate::url_credentials::mask(raw)),
+                ("endpoint", crate::url_credentials::endpoint(raw)),
+                ("getter", shown.clone()),
+                ("listing", listed),
+                ("whole", serde_json::to_string(&projection).unwrap()),
+            ];
+            for (boundary, value) in reads {
+                if [
+                    "persist-invalid-password",
+                    "persist-invalid-query",
+                    "persist-invalid-fragment",
+                ]
+                .iter()
+                .any(|marker| value.contains(marker))
+                {
+                    exposures.push((case, boundary));
+                }
+            }
+            // An existing malformed operational value is preserved by a
+            // backed whole-mask echo; this fix changes only its projection.
+            loaded
+                .set_prop_persistent("memory.embedding_provider", MASKED_SECRET)
+                .unwrap();
+            assert_eq!(loaded.memory.embedding_provider, raw);
+            loaded.save_dirty().await.unwrap();
+            let saved = tokio::fs::read_to_string(&loaded.config_path)
+                .await
+                .unwrap();
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.memory.embedding_provider, raw);
+            projection.restore_secrets_from(&loaded);
+            assert_eq!(projection.memory.embedding_provider, raw);
+        }
+        assert!(
+            exposures.is_empty(),
+            "password exposure boundaries: {exposures:?}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn accepted_url_controls_keep_all_twenty_four_native_round_trips() {
+        use crate::traits::MaskSecrets;
+        let mut cases = 0;
+        for start in [
+            "http://",
+            "http:///",
+            "http:/",
+            "http:////",
+            "https:\\\\",
+            "h\tttp://",
+            "ht\ntps://",
+            "\0http://",
+            "\x0bhttp://",
+            "\x01http://",
+            "\thttp://",
+            " \r\nhttp://",
+        ] {
+            for wrapper in ["", "custom:"] {
+                let tail = format!(
+                    "{start}reader:accepted-password@example.invalid/v1?key=accepted-query#accepted-fragment"
+                );
+                assert_eq!(
+                    reqwest::Url::parse(&tail).unwrap().password(),
+                    Some("accepted-password")
+                );
+                let raw = format!("{wrapper}{tail}");
+                let mut config = Config::default();
+                config.set_prop("memory.embedding_provider", &raw).unwrap();
+                let shown = config.get_prop("memory.embedding_provider").unwrap();
+                let listed = config
+                    .prop_fields()
+                    .into_iter()
+                    .find(|field| field.name == "memory.embedding_provider")
+                    .unwrap()
+                    .display_value;
+                let mut projected = config.clone();
+                projected.mask_secrets();
+                for read in [
+                    crate::url_credentials::mask(&raw),
+                    crate::url_credentials::endpoint(&raw),
+                    shown.clone(),
+                    listed,
+                    serde_json::to_string(&projected).unwrap(),
+                ] {
+                    for marker in ["accepted-password", "accepted-query", "accepted-fragment"] {
+                        assert!(!read.contains(marker), "{raw:?}: {read:?}");
+                    }
+                }
+                config
+                    .set_prop("memory.embedding_provider", &shown)
+                    .unwrap();
+                assert_eq!(config.memory.embedding_provider, raw);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 24);
+    }
+
+    /// The credential URLs declared outside this module: the A2A server's
+    /// public base and a peer's base, the email OAuth endpoints (members of
+    /// one opaque `oauth2` property), the Gmail push webhook and the voice
+    /// webhook base. The whole-config projection, every listed property and
+    /// every single-property read hide their credentials, and writing each
+    /// property back as shown leaves the config exactly as stored.
+    #[::core::prelude::v1::test]
+    fn credential_urls_outside_the_schema_module_are_masked_and_restored() {
+        use crate::traits::MaskSecrets;
+        const MARKERS: [&str; 6] = [
+            "pw-a2a-server",
+            "q-a2a-peer",
+            "pw-email-token",
+            "q-email-device",
+            "pw-gmail-hook",
+            "q-voice-base",
+        ];
+        let stored = "\
+            [a2a.server]\n\
+            public_base_url = \"https://pub:pw-a2a-server@a2a.example/base\"\n\
+            [[a2a.client.peers]]\n\
+            name = \"team\"\n\
+            base_url = \"https://peer.example/a2a?key=q-a2a-peer\"\n\
+            [channels.email.ops]\n\
+            imap_host = \"imap.example\"\n\
+            smtp_host = \"smtp.example\"\n\
+            username = \"ops\"\n\
+            password = \"\"\n\
+            from_address = \"ops@example.invalid\"\n\
+            [channels.email.ops.oauth2]\n\
+            client_id = \"client\"\n\
+            token_url = \"https://tok:pw-email-token@login.example/token\"\n\
+            device_code_url = \"https://login.example/devicecode?key=q-email-device\"\n\
+            scopes = [\"offline_access\"]\n\
+            [channels.gmail_push.inbox]\n\
+            topic = \"projects/p/topics/t\"\n\
+            webhook_url = \"https://hook:pw-gmail-hook@hooks.example/gmail\"\n\
+            [channels.voice_call.calls]\n\
+            account_id = \"account\"\n\
+            auth_token = \"\"\n\
+            from_number = \"+15550100\"\n\
+            webhook_base_url = \"https://voice.example/base?key=q-voice-base\"\n";
+        let original: Config = toml::from_str(stored).unwrap();
+        let leaks = |text: &str| -> Vec<&str> {
+            MARKERS
+                .into_iter()
+                .filter(|marker| text.contains(marker))
+                .collect()
+        };
+        assert_eq!(
+            leaks(&toml::to_string(&original).unwrap()),
+            MARKERS,
+            "every fixture is a field the config parses"
+        );
+
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        assert!(leaks(&whole).is_empty(), "{:?}", leaks(&whole));
+        assert_eq!(
+            masked.a2a.server.public_base_url,
+            "https://***MASKED***@a2a.example/base"
+        );
+
+        let mut config = original.clone();
+        let mut written_back = 0;
+        for field in original.prop_fields() {
+            let read = original.get_prop(&field.name).unwrap_or_default();
+            assert!(leaks(&field.display_value).is_empty(), "{}", field.name);
+            assert!(leaks(&read).is_empty(), "{}: {read}", field.name);
+            if crate::url_credentials::carries_mask(&field.display_value) {
+                // An object property reads as a TOML inline table and is
+                // written as JSON, as the dashboard writes it back.
+                let written =
+                    toml::from_str::<toml::Table>(&format!("value = {}", field.display_value))
+                        .ok()
+                        .filter(|parsed| parsed["value"].is_table())
+                        .map_or_else(
+                            || field.display_value.clone(),
+                            |parsed| serde_json::to_string(&parsed["value"]).unwrap(),
+                        );
+                config
+                    .set_prop(&field.name, &written)
+                    .unwrap_or_else(|error| panic!("{}: {error}", field.name));
+                written_back += 1;
+            }
+        }
+        // Five properties: the two OAuth endpoints are one `oauth2` object.
+        assert_eq!(written_back, 5, "each masked property is written back");
+        assert_eq!(
+            toml::to_string(&config).unwrap(),
+            toml::to_string(&original).unwrap(),
+            "writing back what reads show changes nothing"
+        );
+
+        // `restore_secrets_from` puts every stored component back too.
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            toml::to_string(&masked).unwrap(),
+            toml::to_string(&original).unwrap()
+        );
+    }
+
+    /// The Gmail push webhook secret and the voice-call auth token are
+    /// credentials. Config reads (the whole-config projection, the property
+    /// listing and each property read) hide them as they hide every secret,
+    /// both are classified secret, which is what makes `config/set` and the
+    /// HTTP property writes refuse their masked form, and a masked config
+    /// written back restores them from the stored one.
+    #[::core::prelude::v1::test]
+    fn gmail_push_and_voice_call_credentials_are_secret() {
+        use crate::traits::MaskSecrets;
+        const MARKERS: [&str; 2] = ["whsec-gmail-11388", "voice-token-11388"];
+        let original: Config = toml::from_str(
+            "[channels.gmail_push.inbox]\n\
+             topic = \"projects/p/topics/t\"\n\
+             webhook_secret = \"whsec-gmail-11388\"\n\
+             [channels.voice_call.calls]\n\
+             account_id = \"account\"\n\
+             auth_token = \"voice-token-11388\"\n\
+             from_number = \"+15550100\"\n",
+        )
+        .unwrap();
+        let leaks = |text: &str| -> Vec<&str> {
+            MARKERS
+                .into_iter()
+                .filter(|marker| text.contains(marker))
+                .collect()
+        };
+        assert_eq!(
+            leaks(&toml::to_string(&original).unwrap()),
+            MARKERS,
+            "both fixtures are fields the config parses"
+        );
+        // Every way a reader can see the two values, collected before any
+        // assertion so a failure names each exposure.
+        let mut exposed = Vec::new();
+        let mut masked = original.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        for marker in leaks(&whole) {
+            exposed.push(format!("the masked whole config shows {marker}"));
+        }
+        let listed: Vec<_> = original
+            .prop_fields()
+            .into_iter()
+            .filter(|field| {
+                field.name == "channels.gmail_push.inbox.webhook_secret"
+                    || field.name == "channels.voice_call.calls.auth_token"
+            })
+            .collect();
+        assert_eq!(
+            listed.len(),
+            2,
+            "{:?}",
+            listed.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        for field in &listed {
+            for marker in leaks(&field.display_value) {
+                exposed.push(format!("the listing shows {} as {marker}", field.name));
+            }
+            let read = original.get_prop(&field.name).unwrap();
+            for marker in leaks(&read) {
+                exposed.push(format!("reading {} returns {marker}", field.name));
+            }
+            if !field.is_secret || !Config::prop_is_secret(&field.name) {
+                exposed.push(format!("{} is not classified secret", field.name));
+            }
+        }
+        for (secret, path) in [
+            (
+                crate::scattered_types::GmailPushConfig::prop_is_secret(
+                    "channels.gmail.webhook_secret",
+                ),
+                "channels.gmail.webhook_secret",
+            ),
+            (
+                crate::scattered_types::VoiceCallConfig::prop_is_secret(
+                    "channels.voice_call.auth_token",
+                ),
+                "channels.voice_call.auth_token",
+            ),
+        ] {
+            if !secret {
+                exposed.push(format!("{path} is not classified secret"));
+            }
+        }
+        assert!(
+            exposed.is_empty(),
+            "credentials exposed:\n{}",
+            exposed.join("\n")
+        );
+
+        masked.restore_secrets_from(&original);
+        assert_eq!(
+            toml::to_string(&masked).unwrap(),
+            toml::to_string(&original).unwrap(),
+            "the masked config written back keeps the stored credentials"
+        );
+    }
+
+    /// The email OAuth settings are one object property: a member written
+    /// with the placeholder and nothing stored behind it is refused.
+    #[::core::prelude::v1::test]
+    fn an_oauth_endpoint_placeholder_with_nothing_stored_is_refused() {
+        let mut config: Config = toml::from_str(
+            "[channels.email.ops]\nimap_host = \"i\"\nsmtp_host = \"s\"\nusername = \"u\"\n\
+             password = \"\"\nfrom_address = \"a@example.invalid\"\n",
+        )
+        .unwrap();
+        let path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.ends_with("oauth2"))
+            .expect("the oauth2 settings are a listed property");
+        let error = config
+            .set_prop(
+                &path,
+                r#"{"client_id": "c", "token_url": "https://***MASKED***@login.example/token", "device_code_url": "https://login.example/devicecode", "scopes": []}"#,
+            )
+            .expect_err("nothing stored to restore from");
+        assert!(
+            error
+                .downcast_ref::<crate::url_credentials::UnresolvedMask>()
+                .is_some(),
+            "{error}"
+        );
+    }
+
+    /// A skill registry's git URL can carry an access token: every read masks
+    /// it, and the list written back as shown restores each entry's token
+    /// from the stored registry of the same name.
+    #[::core::prelude::v1::test]
+    fn registry_urls_are_masked_on_read_and_restored_by_name() {
+        use crate::traits::MaskSecrets;
+        const TOKEN: &str = "ghp_registrytoken123";
+        let mut config: Config = toml::from_str(&format!(
+            "[[skills.extra_registries]]\nname = \"team\"\nurl = \"https://{TOKEN}@github.com/org/skills.git\"\n\n\
+             [[skills.extra_registries]]\nname = \"public\"\nurl = \"https://github.com/org/public.git\"\n"
+        ))
+        .unwrap();
+        let path = "skills.extra_registries";
+
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert!(!serde_json::to_string(&masked).unwrap().contains(TOKEN));
+        assert_eq!(
+            masked.skills.extra_registries[0].url,
+            "https://***MASKED***@github.com/org/skills.git"
+        );
+        assert_eq!(
+            masked.skills.extra_registries[1].url,
+            "https://github.com/org/public.git"
+        );
+        let read = config.get_prop(path).unwrap();
+        assert!(
+            !read.contains(TOKEN) && read.contains("github.com/org/skills.git"),
+            "{read}"
+        );
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the registries are a listed property");
+        assert!(
+            !listed.display_value.contains(TOKEN),
+            "{}",
+            listed.display_value
+        );
+
+        // The listing written back as shown keeps the stored token.
+        config.set_prop(path, &listed.display_value).unwrap();
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+        // So does one with another field of that registry changed: the
+        // entry is matched by its name.
+        let mut edited: serde_json::Value = serde_json::from_str(&listed.display_value).unwrap();
+        edited[0]["enabled"] = serde_json::Value::Bool(false);
+        config.set_prop(path, &edited.to_string()).unwrap();
+        assert!(!config.skills.extra_registries[0].enabled);
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+        // An entry renamed while masked matches no stored registry: refused.
+        let renamed = listed.display_value.replace("\"team\"", "\"other\"");
+        assert!(config.set_prop(path, &renamed).is_err());
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+    }
+
+    /// An MCP server's URL, addressed through the server's name, reads
+    /// masked wherever the config is read, and the value written back as
+    /// shown keeps the stored URL.
+    #[::core::prelude::v1::test]
+    fn mcp_server_urls_are_masked_and_restored_by_server_name() {
+        use crate::traits::MaskSecrets;
+        const TOKEN: &str = "mcp-url-token-73519";
+        let stored = format!("https://search.example/mcp?token={TOKEN}");
+        let mut config: Config = toml::from_str(&format!(
+            "[[mcp.servers]]\nname = \"search\"\ntransport = \"http\"\nurl = \"{stored}\"\n"
+        ))
+        .unwrap();
+        let path = "mcp.servers.search.url";
+        let shown = "https://search.example/mcp?***MASKED***";
+
+        assert_eq!(config.get_prop(path).unwrap(), shown);
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the server's url is a listed property");
+        assert_eq!(listed.display_value, shown);
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert_eq!(masked.mcp.servers[0].url.as_deref(), Some(shown));
+
+        config.set_prop(path, shown).unwrap();
+        assert_eq!(config.mcp.servers[0].url.as_deref(), Some(stored.as_str()));
     }
 
     #[test]
