@@ -823,8 +823,14 @@ only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
 cannot extend the host deadline. An interrupted warm store is never resumed:
 channels recreate it from host-owned inputs on the next call, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+instances remain unavailable until their owner rebuilds them. Memory treats a
+call that failed inside Wasmtime the same way. After a guest trap, exhausted
+fuel, or a failed host import, Wasmtime refuses every later call into the
+store, and a result it could not lift skips the export's post-return cleanup.
+Either way the host discards the store, and later calls that reach the plugin
+fail with the error a missed deadline leaves. A rebuilt memory instance starts
+empty, because the memory world gives a plugin no storage outside its own
+instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)

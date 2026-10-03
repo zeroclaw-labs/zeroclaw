@@ -28,6 +28,13 @@ use zeroclaw_api::memory_traits::{
 };
 
 /// A memory backend backed by a WIT component-model plugin.
+///
+/// The plugin keeps every entry in its own linear memory: the memory world
+/// imports no host storage, and the store's WASI context preopens nothing. A
+/// call that fails inside Wasmtime or misses its deadline discards the
+/// instance, and nothing rebuilds it: later calls that need the plugin fail
+/// rather than reach a fresh instance that would answer as if nothing had been
+/// stored.
 pub struct WasmMemory {
     scope: PluginInstanceScope,
     capabilities: MemoryCapabilities,
@@ -196,17 +203,15 @@ impl Memory for WasmMemory {
         let wit_cat = to_wit_category(category);
         call_plugin!(
             self,
+            "memory.store-entry trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_store_entry(store, &key, &content, &wit_cat, session_id.as_deref())
-                        .await,
-                    "memory.store-entry trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_store_entry(store, &key, &content, &wit_cat, session_id.as_deref())
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn recall(
@@ -224,45 +229,41 @@ impl Memory for WasmMemory {
             until.map(str::to_string),
         );
         let limit = limit as u64;
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.recall trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_recall(
-                            store,
-                            &query,
-                            limit,
-                            session_id.as_deref(),
-                            since.as_deref(),
-                            until.as_deref(),
-                        )
-                        .await,
-                    "memory.recall trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(from_wit_entries(out))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_recall(
+                        store,
+                        &query,
+                        limit,
+                        session_id.as_deref(),
+                        since.as_deref(),
+                        until.as_deref(),
+                    )
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(from_wit_entries(out))
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         let key = key.to_string();
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.get trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_get(store, &key)
-                        .await,
-                    "memory.get trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out.map(from_wit_entry))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_get(store, &key)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out.map(from_wit_entry))
     }
 
     async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
@@ -274,20 +275,18 @@ impl Memory for WasmMemory {
             return Ok(hit.filter(|e| e.agent_id.as_deref() == Some(agent_id)));
         }
         let (key, agent_id) = (key.to_string(), agent_id.to_string());
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.get-for-agent trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_get_for_agent(store, &key, &agent_id)
-                        .await,
-                    "memory.get-for-agent trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out.map(from_wit_entry))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_get_for_agent(store, &key, &agent_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out.map(from_wit_entry))
     }
 
     async fn list(
@@ -297,54 +296,48 @@ impl Memory for WasmMemory {
     ) -> Result<Vec<MemoryEntry>> {
         let wit_cat = category.cloned().map(to_wit_category);
         let session_id = session_id.map(str::to_string);
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.list-entries trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_list_entries(store, wit_cat.as_ref(), session_id.as_deref())
-                        .await,
-                    "memory.list-entries trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(from_wit_entries(out))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_list_entries(store, wit_cat.as_ref(), session_id.as_deref())
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(from_wit_entries(out))
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
         let key = key.to_string();
         call_plugin!(
             self,
+            "memory.forget trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_forget(store, &key)
-                        .await,
-                    "memory.forget trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_forget(store, &key)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
         let (key, agent_id) = (key.to_string(), agent_id.to_string());
         call_plugin!(
             self,
+            "memory.forget-for-agent trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_forget_for_agent(store, &key, &agent_id)
-                        .await,
-                    "memory.forget-for-agent trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_forget_for_agent(store, &key, &agent_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
@@ -355,20 +348,18 @@ impl Memory for WasmMemory {
             anyhow::bail!("purge_namespace not supported by this memory backend");
         }
         let namespace = namespace.to_string();
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.purge-namespace trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_purge_namespace(store, &namespace)
-                        .await,
-                    "memory.purge-namespace trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_purge_namespace(store, &namespace)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn purge_session(&self, session_id: &str) -> Result<usize> {
@@ -379,20 +370,18 @@ impl Memory for WasmMemory {
             anyhow::bail!("purge_session not supported by this memory backend");
         }
         let session_id = session_id.to_string();
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.purge-session trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_purge_session(store, &session_id)
-                        .await,
-                    "memory.purge-session trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_purge_session(store, &session_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
@@ -403,20 +392,18 @@ impl Memory for WasmMemory {
             anyhow::bail!("purge_session_for_agent not supported by this memory backend");
         }
         let (session_id, agent_id) = (session_id.to_string(), agent_id.to_string());
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.purge-session-for-agent trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_purge_session_for_agent(store, &session_id, &agent_id)
-                        .await,
-                    "memory.purge-session-for-agent trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_purge_session_for_agent(store, &session_id, &agent_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
@@ -424,47 +411,41 @@ impl Memory for WasmMemory {
             anyhow::bail!("purge_agent not supported by this memory backend");
         }
         let agent_alias = agent_alias.to_string();
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.purge-agent trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_purge_agent(store, &agent_alias)
-                        .await,
-                    "memory.purge-agent trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_purge_agent(store, &agent_alias)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn count(&self) -> Result<usize> {
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.count trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings.zeroclaw_plugin_memory().call_count(store).await,
-                    "memory.count trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings.zeroclaw_plugin_memory().call_count(store).await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn health_check(&self) -> bool {
         let result: Result<bool> = call_plugin!(
             self,
+            "memory.health-check failed",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_health_check(store)
-                        .await,
-                    "memory.health-check failed",
-                )
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_health_check(store)
+                    .await
             }
         );
         result.unwrap_or(false)
@@ -474,17 +455,15 @@ impl Memory for WasmMemory {
         if !self.capabilities.contains(MemoryCapabilities::REINDEX) {
             return Ok(0);
         }
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.reindex trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings.zeroclaw_plugin_memory().call_reindex(store).await,
-                    "memory.reindex trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out as usize)
+                bindings.zeroclaw_plugin_memory().call_reindex(store).await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(out as usize)
     }
 
     async fn store_procedural(
@@ -502,17 +481,15 @@ impl Memory for WasmMemory {
         let session_id = session_id.map(str::to_string);
         call_plugin!(
             self,
+            "memory.store-procedural trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_store_procedural(store, &wit_msgs, session_id.as_deref())
-                        .await,
-                    "memory.store-procedural trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_store_procedural(store, &wit_msgs, session_id.as_deref())
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn recall_namespaced(
@@ -545,28 +522,26 @@ impl Memory for WasmMemory {
             until.map(str::to_string),
         );
         let limit = limit as u64;
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.recall-namespaced trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_recall_namespaced(
-                            store,
-                            &namespace,
-                            &query,
-                            limit,
-                            session_id.as_deref(),
-                            since.as_deref(),
-                            until.as_deref(),
-                        )
-                        .await,
-                    "memory.recall-namespaced trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(from_wit_entries(out))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_recall_namespaced(
+                        store,
+                        &namespace,
+                        &query,
+                        limit,
+                        session_id.as_deref(),
+                        since.as_deref(),
+                        until.as_deref(),
+                    )
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(from_wit_entries(out))
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
@@ -596,20 +571,18 @@ impl Memory for WasmMemory {
                 .collect());
         }
         let wit_filter = to_wit_export_filter(filter);
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.export-entries trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_export_entries(store, &wit_filter)
-                        .await,
-                    "memory.export-entries trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(from_wit_entries(out))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_export_entries(store, &wit_filter)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(from_wit_entries(out))
     }
 
     async fn store_with_metadata(
@@ -636,25 +609,23 @@ impl Memory for WasmMemory {
         let wit_cat = to_wit_category(category);
         call_plugin!(
             self,
+            "memory.store-with-metadata trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_store_with_metadata(
-                            store,
-                            &key,
-                            &content,
-                            &wit_cat,
-                            session_id.as_deref(),
-                            namespace.as_deref(),
-                            importance,
-                        )
-                        .await,
-                    "memory.store-with-metadata trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_store_with_metadata(
+                        store,
+                        &key,
+                        &content,
+                        &wit_cat,
+                        session_id.as_deref(),
+                        namespace.as_deref(),
+                        importance,
+                    )
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn store_with_agent(
@@ -677,26 +648,24 @@ impl Memory for WasmMemory {
         let wit_cat = to_wit_category(category);
         call_plugin!(
             self,
+            "memory.store-with-agent trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_store_with_agent(
-                            store,
-                            &key,
-                            &content,
-                            &wit_cat,
-                            session_id.as_deref(),
-                            namespace.as_deref(),
-                            importance,
-                            agent_id.as_deref(),
-                        )
-                        .await,
-                    "memory.store-with-agent trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_store_with_agent(
+                        store,
+                        &key,
+                        &content,
+                        &wit_cat,
+                        session_id.as_deref(),
+                        namespace.as_deref(),
+                        importance,
+                        agent_id.as_deref(),
+                    )
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn recall_for_agents(
@@ -716,28 +685,26 @@ impl Memory for WasmMemory {
             until.map(str::to_string),
         );
         let limit = limit as u64;
-        call_plugin!(
+        let out = call_plugin!(
             self,
+            "memory.recall-for-agents trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_recall_for_agents(
-                            store,
-                            &wit_agents,
-                            &query,
-                            limit,
-                            session_id.as_deref(),
-                            since.as_deref(),
-                            until.as_deref(),
-                        )
-                        .await,
-                    "memory.recall-for-agents trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(from_wit_entries(out))
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_recall_for_agents(
+                        store,
+                        &wit_agents,
+                        &query,
+                        limit,
+                        session_id.as_deref(),
+                        since.as_deref(),
+                        until.as_deref(),
+                    )
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(from_wit_entries(out))
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
@@ -750,17 +717,15 @@ impl Memory for WasmMemory {
         let alias = alias.to_string();
         call_plugin!(
             self,
+            "memory.ensure-agent-uuid trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut MemoryPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_memory()
-                        .call_ensure_agent_uuid(store, &alias)
-                        .await,
-                    "memory.ensure-agent-uuid trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_ensure_agent_uuid(store, &alias)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 }
 

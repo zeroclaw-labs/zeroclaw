@@ -775,7 +775,8 @@ pub(crate) fn call_timeout_error(deadline: Duration) -> anyhow::Error {
     ))
 }
 
-/// Error returned after an interrupted warm instance has been discarded.
+/// Error returned after a warm instance has been discarded because a call into
+/// it was interrupted or failed inside Wasmtime.
 pub(crate) fn unavailable_instance_error() -> anyhow::Error {
     anyhow::Error::msg(
         "plugin instance is unavailable: a previous call was interrupted before completion",
@@ -827,8 +828,18 @@ fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
 /// interrupted store is discarded (the slot is left empty) rather than resumed.
 /// The `ActivePluginCall` frame refuels the store and exposes the phase's
 /// config/secrets for the call, then clears that transient view on drop.
+///
+/// `$body` returns the export's own Wasmtime result. `Err` means the call
+/// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
+/// or a result that could not be lifted. Wasmtime refuses every later call
+/// into a store after the first three, and the last skips the export's
+/// post-return cleanup, so the store is discarded as an interrupted one is,
+/// and the error is reported with `$context`. An error the export itself
+/// returns arrives inside `Ok`, and the store goes back to its slot. Return a
+/// host-side failure inside `Ok` as well: `?` turns any `std::error::Error`
+/// into a Wasmtime error, which would discard a healthy store.
 macro_rules! call_plugin_frame {
-    ($self:expr, $constructor:ident, $body:expr) => {{
+    ($self:expr, $constructor:ident, $context:expr, $body:expr) => {{
         let mut guard = $self.state.lock().await;
         match guard.take() {
             None => Err(crate::component::unavailable_instance_error()),
@@ -836,18 +847,17 @@ macro_rules! call_plugin_frame {
                 let deadline = store.data().call_timeout();
                 let mut active_call = crate::component::ActivePluginCall::$constructor(&mut store);
                 let f = $body;
-                match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings))
-                    .await
-                {
-                    Ok(result) => {
-                        drop(active_call);
+                let outcome =
+                    ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings))
+                        .await;
+                drop(active_call);
+                match outcome {
+                    Ok(Ok(value)) => {
                         *guard = Some((store, bindings));
-                        result
+                        Ok(value)
                     }
-                    Err(_) => {
-                        drop(active_call);
-                        Err(crate::component::call_timeout_error(deadline))
-                    }
+                    Ok(Err(error)) => crate::component::wt(Err(error), $context),
+                    Err(_) => Err(crate::component::call_timeout_error(deadline)),
                 }
             }
         }
@@ -856,12 +866,12 @@ macro_rules! call_plugin_frame {
 pub(crate) use call_plugin_frame;
 
 macro_rules! call_plugin {
-    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $body) }};
+    ($self:expr, $context:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, new, $context, $body) }};
 }
 pub(crate) use call_plugin;
 
 macro_rules! call_tool_execute {
-    ($self:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, tool_execute, $body) }};
+    ($self:expr, $context:expr, $body:expr) => {{ crate::component::call_plugin_frame!($self, tool_execute, $context, $body) }};
 }
 pub(crate) use call_tool_execute;
 
