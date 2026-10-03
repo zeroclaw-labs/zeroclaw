@@ -580,6 +580,11 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// The session memory route this factory's memory-starting tools share
+    /// (`spawn_subagent` here, and the pipeline `assemble` mints). The sealed
+    /// registry keeps it and pins it when its session is pinned to an owner.
+    /// `None` when the tool set was not built by this factory.
+    pub session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -615,6 +620,7 @@ impl AllToolsResult {
             channel_room_handle: None,
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
             #[cfg(test)]
@@ -1327,6 +1333,18 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    // One route for the tools here that start memory work of their own; the
+    // sealed registry pins it when its session is pinned to an owner.
+    let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+    // A registry built over memory that is already an owner's plane (a
+    // delegated target, a SOP step, or a child run of an owned session)
+    // belongs to that owner from the start. Pin its route now: nothing pins
+    // it later, and an empty route reads as an unowned session, so its
+    // spawner and pipeline would fall back to the agent's shared memory.
+    if memory.principal_scope().is_some() {
+        let pinned = session_memory.pin(Arc::clone(&memory), Arc::clone(security));
+        debug_assert!(pinned.is_ok(), "a fresh route holds no other handle");
+    }
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool
@@ -1416,7 +1434,8 @@ fn all_tools_with_runtime_on_thread(
                 security.clone(),
             )
             .with_subagent_caller(is_subagent_caller)
-            .with_execution_capability(execution_capability.clone()),
+            .with_execution_capability(execution_capability.clone())
+            .with_session_memory(Arc::clone(&session_memory)),
         ),
         Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
@@ -2161,18 +2180,25 @@ fn all_tools_with_runtime_on_thread(
     if let Some(ref sop_engine) = sop_engine {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
+            // The audit logger follows the session too: once it is pinned to an
+            // owner, run payloads and step outputs are audited on that owner's
+            // plane rather than through the shared logger captured here.
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
                     .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory))
                     .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine))
                     .with_agent_alias(agent_alias)
-                    .with_audit(Arc::clone(sop_audit)),
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
         } else {
             tool_arcs.push(Arc::new(
@@ -2292,6 +2318,7 @@ fn all_tools_with_runtime_on_thread(
                     channel_room_handle,
                     reaction_handle,
                     poll_handle: Some(poll_handle),
+                    session_memory: Some(session_memory),
                     escalate_handle,
                 };
             }
@@ -2508,6 +2535,7 @@ fn all_tools_with_runtime_on_thread(
         channel_room_handle,
         reaction_handle,
         poll_handle: Some(poll_handle),
+        session_memory: Some(session_memory),
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,

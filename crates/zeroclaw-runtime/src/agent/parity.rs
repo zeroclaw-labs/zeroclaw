@@ -258,6 +258,7 @@ fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         ask_user_handle: None,
         reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         poll_handle: None,
+        session_memory: None,
         escalate_handle: None,
         channel_room_handle: None,
         unfiltered_tool_arcs: Vec::new(),
@@ -387,6 +388,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
         None,
         "restricted",
         Arc::clone(&engine),
+        None,
         None,
         None,
     )
