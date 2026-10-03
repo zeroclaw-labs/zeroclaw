@@ -223,6 +223,87 @@ fn signal_daemon_reload(state: &AppState) -> bool {
 // `zeroclaw_runtime::quickstart::snapshot_state` so both transports
 // share one implementation.
 
+// ── Through the core (the standalone gateway) ───────────────────────
+//
+// Each route asks the core's `quickstart/*` method and answers with its
+// result, which is the route's body. The core validates and applies a
+// submission as the terminal surface, which only labels its telemetry: the
+// answer is the same as the web surface's.
+
+/// `GET /api/quickstart/state` through the core.
+pub(crate) async fn state_through_core(
+    core: &crate::core_rpc::CoreCall,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    let body = core
+        .request(
+            zeroclaw_rpc_client::Method::QuickstartState,
+            serde_json::json!({}),
+        )
+        .await?;
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /api/quickstart/fields` through the core.
+pub(crate) async fn fields_through_core(
+    core: &crate::core_rpc::CoreCall,
+    req: FieldsRequest,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    let body = core
+        .request(
+            zeroclaw_rpc_client::Method::QuickstartFields,
+            serde_json::json!({ "section": req.section, "type_key": req.type_key }),
+        )
+        .await?;
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /api/quickstart/validate` through the core.
+pub(crate) async fn validate_through_core(
+    core: &crate::core_rpc::CoreCall,
+    submission: BuilderSubmission,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    let body = core
+        .request(
+            zeroclaw_rpc_client::Method::QuickstartValidate,
+            serde_json::json!({ "submission": submission }),
+        )
+        .await?;
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /api/quickstart/apply` through the core. The core reloads after a
+/// successful apply, which ends this gateway's core connections; the next
+/// request dials again.
+pub(crate) async fn apply_through_core(
+    core: &crate::core_rpc::CoreCall,
+    submission: BuilderSubmission,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    let body = core
+        .request(
+            zeroclaw_rpc_client::Method::QuickstartApply,
+            serde_json::json!({ "submission": submission }),
+        )
+        .await?;
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// `POST /api/quickstart/dismiss` through the core.
+pub(crate) async fn dismiss_through_core(
+    core: &crate::core_rpc::CoreCall,
+    req: DismissRequest,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    core.request(
+        zeroclaw_rpc_client::Method::QuickstartDismiss,
+        serde_json::json!({
+            "run_id": req.run_id,
+            "surface": req.surface,
+            "last_step": req.last_step,
+        }),
+    )
+    .await?;
+    Ok((StatusCode::NO_CONTENT, ()).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1005,27 +1005,14 @@ fn scrub_url_credentials(input: &str) -> String {
 
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
-        let url_token = &input[url_start..url_end];
-        let sensitive_suffix_start = [url_token.find('?'), url_token.find('#')]
-            .into_iter()
-            .flatten()
-            .min();
-        let without_query_or_fragment =
-            sensitive_suffix_start.map_or(url_token, |suffix_start| &url_token[..suffix_start]);
-        let scheme_end = without_query_or_fragment
-            .find("://")
-            .map_or(0, |separator| separator + 3);
-        let authority_end = without_query_or_fragment[scheme_end..]
-            .find('/')
-            .map_or(without_query_or_fragment.len(), |end| scheme_end + end);
-        let authority = &without_query_or_fragment[scheme_end..authority_end];
-        if let Some(userinfo_end) = authority.rfind('@') {
-            scrubbed.push_str(&without_query_or_fragment[..scheme_end]);
+        // The components config reads mask are the ones dropped here: the
+        // userinfo, the query and the fragment.
+        let parts = zeroclaw_config::url_credentials::split(&input[url_start..url_end]);
+        scrubbed.push_str(parts.scheme);
+        if parts.userinfo.is_some() {
             scrubbed.push_str("[REDACTED]@");
-            scrubbed.push_str(&without_query_or_fragment[scheme_end + userinfo_end + 1..]);
-        } else {
-            scrubbed.push_str(without_query_or_fragment);
         }
+        scrubbed.push_str(parts.location);
         cursor = url_end;
     }
 

@@ -129,6 +129,42 @@ Provider/model views are prepared from the complete candidate and installed
 after the successful commit. Deletes and map-key operations are not part of
 this method.
 
+### Refusal reasons
+
+A method error keeps its JSON-RPC `code`. When one code covers several
+outcomes, the error also names the outcome in `data.reason`:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32602,"message":"SOP 'nightly': ...","data":{"reason":"not_found"}},"id":7}
+```
+
+| `reason` | Meaning |
+|---|---|
+| `not_found` | The named resource does not exist. |
+| `unowned` | The resource exists, but nothing the request names owns it (a SOP step with no agent, started from outside an agent turn). |
+| `conflict` | The request conflicts with the resource's current state. |
+| `disabled` | The subsystem that serves the method is off. |
+| `deferred` | Accepted but not acted on yet; retrying later can succeed unchanged. |
+| `capacity` | A concurrency or size limit refused the request. |
+| `forbidden` | The caller's principal may not perform the operation. |
+| `invalid` | The request is malformed or names an invalid value. |
+| `blocked` | A safety screen refused the request's content. |
+| `malformed` | The resource exists, but what is stored for it does not parse. |
+| `entry_exceeds_max_bytes` | One entry alone is larger than the size bound the caller set (`session/messages` `max_bytes`); `data.index` and `data.bytes` name it. |
+
+The values are `RefusalReason` in `zeroclaw_rpc_proto::error_reasons`, which
+also spells each one as a string constant.
+
+A refused config operation also carries `data.config_error`, the structured
+config error (`code`, `message`, `path`) the config surfaces report.
+
+`data` is optional and additive. A daemon that predates it, and every error
+it does not classify, sends no `data`. Clients must keep code-based handling
+for those, ignore a `reason` they do not know, and ignore members they do not
+know. Values are never removed or renamed. The transport's own `id: null`
+frames ([Connection limits](#connection-limits)) use their own
+`data.reason` values, which are not part of this set.
+
 ### Bidirectional requests
 
 Either side may send a request on the established socket. The receiver must
@@ -261,6 +297,16 @@ explicitly stopped.
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
+- Clients built on `zeroclaw-rpc-client` verify the endpoint before sending a
+  credential. When `initialize` would carry an `auth_token`, a TUI signature
+  or forwarded environment, the kernel's peer uid for the connected socket
+  must be the expected account (the client's own by default, or a uid the
+  launcher passes), and the socket's directory must belong to that account
+  with no group or other write access. A sticky shared directory such as
+  `/tmp` does not qualify. The check runs on every dial. On Windows,
+  credential-bearing dials are refused until the client can check the pipe
+  server's account. Dials that carry none of these are not gated. The only
+  other public constructor runs over the daemon's in-process duplex.
 
 ## Quick test
 
@@ -298,17 +344,34 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names,
+the error codes and the schema of a refusal's `error.data` (`x-error-data`)
+are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |

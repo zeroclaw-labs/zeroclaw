@@ -249,6 +249,9 @@ pub struct RpcContext {
     /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
     #[cfg(test)]
     pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+    /// Test-only hold after a patch transaction is admitted, before persistence.
+    #[cfg(test)]
+    pub config_patch_enqueued_pause: Option<Arc<ConfigCommitPause>>,
 }
 
 /// Test-only pause point inside `commit_config_with_live_session_refresh`:
@@ -314,6 +317,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit,
             auth,
         })
@@ -346,6 +351,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -386,6 +393,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit,
             auth,
         })
@@ -468,6 +477,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -504,6 +515,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -545,6 +558,8 @@ impl RpcContext {
             sop_audit: Some(sop_audit),
             hooks: None,
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -581,6 +596,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -617,6 +634,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -654,6 +673,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })
@@ -691,6 +712,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             cert_audit: None,
             auth,
         })

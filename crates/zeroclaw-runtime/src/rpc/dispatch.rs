@@ -20,7 +20,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 use zeroclaw_config::schema::Config;
+use zeroclaw_rpc_proto::error_reasons::{RefusalData, RefusalReason};
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -33,8 +35,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +54,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +90,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +105,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -499,7 +228,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -517,6 +246,40 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+/// [`rpc_err`] that also names why the call was refused, in `error.data`.
+/// The code stays the one the site always returned; the reason lets a client
+/// that answers over another protocol (the gateway's HTTP routes) tell
+/// outcomes apart that share a code, without reading the message.
+fn refused(code: i32, reason: RefusalReason, msg: impl Into<String>) -> JsonRpcError {
+    reason.error(code, msg)
+}
+
+/// A refused config operation: the code and message the method has always
+/// answered, carrying in `error.data` the structured config error the
+/// dashboard's config routes answer with, and the reason its code names.
+fn config_refused(code: i32, msg: impl Into<String>, error: ConfigApiError) -> JsonRpcError {
+    RefusalData::config_error(code, msg, error)
+}
+
+/// A refused `config/set-many` `ops` batch: invalid params carrying the
+/// config error the dashboard's config routes answer with (an internal
+/// failure keeps the internal-error code).
+fn config_patch_refused(error: ConfigApiError) -> JsonRpcError {
+    let code = match error.code {
+        ConfigApiCode::InternalError | ConfigApiCode::ReloadFailed => INTERNAL_ERROR,
+        _ => INVALID_PARAMS,
+    };
+    config_refused(code, error.message.clone(), error)
+}
+
+/// `error` re-worded as `msg`, keeping its code and its data.
+fn reworded(error: JsonRpcError, msg: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        message: msg.into(),
+        ..error
     }
 }
 
@@ -588,6 +351,37 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
         return None;
     }
     Some(grants.allowed_tools.clone())
+}
+
+/// The `clientCapabilities.client_kind` a connection declared, kept only for
+/// a kind the core knows. `tui/list` reports it so a listing can tell a
+/// gateway's connections from terminals; nothing authorizes on it.
+/// The additive extensions this core advertises on `initialize`, each
+/// listed only beside the behaviour it names and the test that proves it:
+///
+/// - `tui.client_kind`: `tui/list` reports the kind a connection declared
+///   (`tui_list_labels_only_a_declared_gateway_connection`).
+/// - `config.patch_ops`: `config/set-many` applies a JSON Patch (`ops`, with
+///   `drift_guard`) and reports each operation and the warnings
+///   (`config_patch_needs_the_verb_each_effect_implies`).
+/// - `config.skill_bundle_dir`: `config/map-key-create` under `skill_bundles`
+///   creates the bundle's directory
+///   (`config_map_key_create_scaffolds_a_skill_bundle_directory`).
+/// - `config.remote_admin_reload`: remote HTTP reload admission uses the
+///   live core policy (`config_reload_remote_admin_checks_live_policy`).
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::CONFIG_PATCH_OPS,
+    zeroclaw_rpc_proto::feature::CONFIG_SKILL_BUNDLE_DIR,
+    zeroclaw_rpc_proto::feature::CONFIG_REMOTE_ADMIN_RELOAD,
+];
+
+fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
+    capabilities?
+        .get("client_kind")?
+        .as_str()
+        .filter(|kind| *kind == CLIENT_KIND_GATEWAY)
+        .map(str::to_owned)
 }
 
 fn not_yet_implemented(method: Method) -> RpcResult {
@@ -877,8 +671,24 @@ fn rename_error_to_rpc(
         RenameError::PostCondition(_) => INTERNAL_ERROR,
         _ => INVALID_PARAMS,
     };
-    rpc_err(code, format!("{path}.{from}: {err}"))
+    config_refused(
+        code,
+        format!("{path}.{from}: {err}"),
+        err.api_error(path, from),
+    )
 }
+
+/// The remote HTTP reload refusal when the operator did not opt in.
+pub const REMOTE_ADMIN_RELOAD_DISABLED: &str = "Remote admin reload is disabled. Call from localhost, \
+     or set gateway.allow_remote_admin = true (with pairing \
+     enabled, then pair) to allow authenticated remote reloads.";
+
+/// The remote HTTP reload refusal when the actual pairing guard is disabled.
+pub const REMOTE_ADMIN_RELOAD_NO_PAIRING: &str = "Remote admin reload requires pairing. \
+    gateway.allow_remote_admin is enabled but \
+    gateway.require_pairing is off, so remote callers \
+    cannot be authenticated. Enable require_pairing, or \
+    call /admin/reload from localhost.";
 
 async fn move_renamed_agent_workspace(
     old_workspace: &std::path::Path,
@@ -1729,13 +1539,21 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let job = crate::cron::get_job(config, id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        // A job the principal may not see is refused exactly as a missing
+        // one, reason included, so neither reveals that the job exists.
+        let job = crate::cron::get_job(config, id).map_err(|e| {
+            refused(
+                INVALID_PARAMS,
+                RefusalReason::NotFound,
+                format!("Cron job not found: {e}"),
+            )
+        })?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
-        let denied = rpc_err(
+        let denied = refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("Cron job not found: {}", crate::cron::job_not_found(id)),
         );
         self.audit_auth_denial(
@@ -3431,7 +3249,7 @@ impl RpcDispatcher {
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
-                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                            Err(e) => handle.send_rpc_error(id_clone, e).await,
                         }
                     }
                 });
@@ -3469,9 +3287,9 @@ impl RpcDispatcher {
             // Config
             Method::ConfigGet => self.handle_config_get(params),
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
-            Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
+            Method::ConfigSetMany => self.handle_config_set_many(params).await,
             Method::ConfigValidate => self.handle_config_validate(),
-            Method::ConfigReload => self.handle_config_reload(),
+            Method::ConfigReload => self.handle_config_reload(params),
             Method::ConfigList => self.handle_config_list(params),
             Method::ConfigDelete => Box::pin(self.handle_config_delete(params)).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(params),
@@ -3572,7 +3390,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -3606,6 +3424,7 @@ impl RpcDispatcher {
             .and_then(|c| c.get("elicitation"));
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+        let client_kind = declared_client_kind(req.client_capabilities.as_ref());
 
         // Authenticate FIRST: bind a principal or reject, before any
         // registry mutation. The tui_id/tui_sig continuity below grants no
@@ -3665,6 +3484,7 @@ impl RpcDispatcher {
                     .to_string(),
                 peer_label: self.peer_label.clone(),
                 env,
+                client_kind,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -3726,6 +3546,10 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
+            features: ADVERTISED_FEATURES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         })
     }
 
@@ -4003,6 +3827,7 @@ impl RpcDispatcher {
                     connected_at_unix: e.connected_at.timestamp(),
                     peer_label: e.peer_label,
                     transport: e.transport,
+                    client_kind: e.client_kind,
                 })
                 .collect(),
         })
@@ -4278,7 +4103,7 @@ impl RpcDispatcher {
                     .session_queue
                     .acquire(&session_id)
                     .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                    .map_err(Self::session_busy)?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
                     self.selector_session_agent_with_grants(
@@ -4356,7 +4181,7 @@ impl RpcDispatcher {
                 .session_queue
                 .acquire(&session_id)
                 .await
-                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                .map_err(Self::session_busy)?
         };
 
         // A durable row can appear while admission is queued. Resolve its
@@ -5227,7 +5052,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         if current_identity != requested_identity {
             if current_identity.is_none() && requested_identity.is_some() {
@@ -5372,7 +5197,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(sid)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await
@@ -6128,7 +5953,7 @@ impl RpcDispatcher {
                 live_generation_at_entry,
                 cancel.clone(),
             ) => {
-                result.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                result.map_err(Self::session_busy)?
             }
         };
         if self.connection_cancel.is_cancelled() {
@@ -7393,7 +7218,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         let req: SessionListParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let visible_ids = self.owner_visible_session_ids().await;
@@ -7667,21 +7492,23 @@ impl RpcDispatcher {
                         "cursor pagination requires an ACP session",
                     ));
                 }
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|row| MessageEntry {
+                        role: row.message.role,
+                        content: row.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: row.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -7693,7 +7520,7 @@ impl RpcDispatcher {
                     ));
                 }
                 if self.ctx.session_backend.is_none() && self.ctx.acp_session_store.is_none() {
-                    return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
+                    return Err(Self::session_persistence_disabled());
                 }
                 Vec::new()
             }
@@ -7781,7 +7608,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
             match backend.get_session_state(&key) {
                 Ok(Some(ss)) => {
@@ -7844,7 +7671,8 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
+
         let record = match self
             .revalidate_admitted_session(&req.session_id, authorized.as_ref())
             .await
@@ -7917,10 +7745,11 @@ impl RpcDispatcher {
                 })?
             }
             Some(DurableSession::Chat { key }) => {
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 match expected_owner.as_deref() {
                     Some(owner) => backend.delete_session_owned(&key, owner),
                     None => backend.delete_session(&key),
@@ -8020,11 +7849,13 @@ impl RpcDispatcher {
         requested_agent: Option<&str>,
         private_plane: bool,
     ) -> Result<(Arc<dyn zeroclaw_api::memory_traits::Memory>, Option<String>), JsonRpcError> {
-        let memory = self
-            .ctx
-            .memory
-            .clone()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let memory = self.ctx.memory.clone().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Memory subsystem is not available",
+            )
+        })?;
         let Some(alias) = requested_agent
             .map(str::trim)
             .filter(|alias| !alias.is_empty())
@@ -8034,8 +7865,9 @@ impl RpcDispatcher {
         self.selector_agent(method, alias)?;
         let config = self.ctx.config.read().clone();
         if !config.agents.contains_key(alias) {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
             ));
         }
@@ -8141,8 +7973,9 @@ impl RpcDispatcher {
         };
         match entry {
             Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
-            None => Err(rpc_err(
+            None => Err(refused(
                 INTERNAL_ERROR,
+                RefusalReason::NotFound,
                 format!("Memory key `{}` not found", req.key),
             )),
         }
@@ -8379,9 +8212,10 @@ impl RpcDispatcher {
         let req: ConfigGetParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         if let Some(prop) = req.prop {
-            let val = config
-                .get_prop(&prop)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
+            let val = config.get_prop(&prop).map_err(|e| {
+                let msg = format!("Unknown prop: {e}");
+                config_refused(INVALID_PARAMS, msg, ConfigApiError::for_prop(e, &prop))
+            })?;
             to_result(ConfigGetPropResult { prop, value: val })
         } else {
             // Return full config, masked.
@@ -8505,138 +8339,449 @@ impl RpcDispatcher {
     /// is held, so an unbounded batch would let one frame hold every other
     /// config writer off for as long as it liked. Real batches are a form's
     /// worth of fields; an over-long batch is a caller error like an empty one.
-    async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
-        let req: ConfigSetManyParams = parse_params(params)?;
-        if req.sets.is_empty() {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                crate::i18n::get_required_cli_string("rpc-config-set-many-empty"),
-            ));
-        }
-        if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+    fn handle_config_set_many<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let req: ConfigSetManyParams = parse_params(params)?;
+            if let Some(ops) = req.ops {
+                if !req.sets.is_empty() {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "config/set-many takes `sets` or `ops`, not both",
+                    ));
+                }
+                return self.handle_config_patch(ops, req.drift_guard).await;
+            }
+            if req.drift_guard {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "config/set-many `drift_guard` applies to an `ops` batch",
+                ));
+            }
+            if req.sets.is_empty() {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    crate::i18n::get_required_cli_string("rpc-config-set-many-empty"),
+                ));
+            }
+            if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-limit",
+                        &[
+                            ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
+                            ("count", &req.sets.len().to_string()),
+                        ],
+                    ),
+                ));
+            }
+            for (index, entry) in req.sets.iter().enumerate() {
+                self.selector_config_write(Method::ConfigSetMany, &entry.prop)
+                    .map_err(|e| {
+                        rpc_err(
+                            e.code,
+                            crate::i18n::get_required_cli_string_with_args(
+                                "rpc-config-set-many-entry-rejected",
+                                &[
+                                    ("index", &index.to_string()),
+                                    ("prop", &entry.prop),
+                                    ("reason", &e.message),
+                                ],
+                            ),
+                        )
+                    })?;
+            }
+            let aliases: std::collections::BTreeSet<_> = req
+                .sets
+                .iter()
+                .filter_map(|entry| {
+                    zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop)
+                })
+                .collect();
+            let _agent_config_reservations: Vec<_> = aliases
+                .into_iter()
+                .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
+                .collect::<Result<_, _>>()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+            let channel_agents: std::collections::BTreeSet<_> = req
+                .sets
+                .iter()
+                .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
+                .collect();
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            for (index, entry) in req.sets.iter().enumerate() {
+                self.recheck_config_write_authority(
+                    Method::ConfigSetMany,
+                    Some(&entry.prop),
+                    &config_write_guard,
+                )
+                .map_err(|e| {
+                    let msg = crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    );
+                    reworded(e, msg)
+                })?;
+            }
+            // Boxed for the same stack-frame reason as in `handle_config_set`.
+            let old_config = self.ctx.config.read().clone();
+            let channel_generation_revocation = self.prepare_channel_generation_revocation(
+                req.sets
+                    .iter()
+                    .any(|entry| is_channel_generation_prop(&entry.prop)),
+                &old_config,
+            )?;
+            let mut config = Box::new(old_config.clone());
+            for (index, entry) in req.sets.iter().enumerate() {
+                Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
+                    let msg = crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    );
+                    reworded(e, msg)
+                })?;
+            }
+            // The request paths describe the affected live views; the candidate
+            // config remains their canonical source. Prepare all affected sessions
+            // before the one commit, including batches that change several routes.
+            let scopes: Vec<_> = req
+                .sets
+                .iter()
+                .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
+                .collect();
+            if scopes.is_empty() {
+                self.save_and_swap_config(*config, &config_write_guard)
+                    .await?;
+            } else {
+                Box::pin(self.commit_config_with_live_session_refresh(
+                    *config,
+                    &config_write_guard,
+                    &LiveSessionRefreshScope::Batch(scopes),
+                ))
+                .await?;
+            }
+            let _config_write_guard = self
+                .finish_channel_generation_mutation(
+                    channel_generation_revocation,
+                    config_write_guard,
+                )
+                .await?;
+            let new_config = self.ctx.config.read().clone();
+            for alias in channel_agents {
+                self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+                    .await;
+            }
+            let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
+            let providers: std::collections::BTreeSet<_> = props
+                .iter()
+                .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+                .collect();
+            for provider in providers {
+                self.refresh_memory_embedder_for_model_provider(&provider);
+            }
+            to_result(ConfigSetManyResult {
+                props,
+                set: true,
+                results: Vec::new(),
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    /// `config/set-many` with `ops`: a JSON Patch staged as the dashboard's
+    /// `PATCH /api/config` stages one (`crate::config_ops::patch`), then
+    /// committed once through this dispatcher's config-write path, like a
+    /// `sets` batch.
+    ///
+    /// Each step follows the route, in its order, so the two refuse the same
+    /// patch the same way: the drift guard, the operations, the validation of
+    /// the result, the authorization of its write set, the agents' lifecycle
+    /// reservations. The write set is authorized by effect on grants
+    /// re-resolved after the last await, under the config write lock: each
+    /// path needs the Config verb its effect implies (a new map entry is a
+    /// create, a `remove` a delete) and a matching path selector.
+    ///
+    /// Boxed where it is built, so its large state never sits in the frame
+    /// of `config/set-many`, which every `sets` batch also runs through.
+    fn handle_config_patch(&self, ops: Vec<ConfigPatchOp>, drift_guard: bool) -> BoxRpcFuture<'_> {
+        Box::pin(async move { self.config_patch(ops, drift_guard).await })
+    }
+
+    async fn config_patch(&self, ops: Vec<ConfigPatchOp>, drift_guard: bool) -> RpcResult {
+        use crate::config_ops::patch;
+
+        if ops.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 crate::i18n::get_required_cli_string_with_args(
                     "rpc-config-set-many-limit",
                     &[
                         ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
-                        ("count", &req.sets.len().to_string()),
+                        ("count", &ops.len().to_string()),
                     ],
                 ),
             ));
         }
-        for (index, entry) in req.sets.iter().enumerate() {
-            self.selector_config_write(Method::ConfigSetMany, &entry.prop)
-                .map_err(|e| {
-                    rpc_err(
-                        e.code,
-                        crate::i18n::get_required_cli_string_with_args(
-                            "rpc-config-set-many-entry-rejected",
-                            &[
-                                ("index", &index.to_string()),
-                                ("prop", &entry.prop),
-                                ("reason", &e.message),
-                            ],
-                        ),
-                    )
-                })?;
-        }
-        let aliases: std::collections::BTreeSet<_> = req
-            .sets
-            .iter()
-            .filter_map(|entry| zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop))
-            .collect();
-        let _agent_config_reservations: Vec<_> = aliases
-            .into_iter()
-            .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
-            .collect::<Result<_, _>>()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let channel_agents: std::collections::BTreeSet<_> = req
-            .sets
-            .iter()
-            .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
-            .collect();
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        for (index, entry) in req.sets.iter().enumerate() {
-            self.recheck_config_write_authority(
-                Method::ConfigSetMany,
-                Some(&entry.prop),
-                &config_write_guard,
-            )
-            .map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
-            })?;
+        let old_config = self.ctx.config.read().clone();
+        if drift_guard {
+            let drifted = crate::config_ops::drift::compute_drift(&old_config).await;
+            if let Some(conflict) =
+                patch::drift_conflict(drifted.iter().map(|entry| entry.path.as_str()), &ops)
+            {
+                return Err(config_patch_refused(conflict));
+            }
         }
         // Boxed for the same stack-frame reason as in `handle_config_set`.
-        let old_config = self.ctx.config.read().clone();
+        let mut working = Box::new(old_config.clone());
+        let results = {
+            let authority = self.ctx.auth.hold_authority();
+            self.authorize_config_patch_paths(&ops, &authority)?;
+            patch::apply_patch_ops(&mut working, &ops).map_err(config_patch_refused)?
+        };
+        let scoped_validation_warnings =
+            patch::scoped_validate(&working).map_err(config_patch_refused)?;
+        let annotations = patch::annotations(&ops, &results);
+        let config_path = working.config_path.clone();
+        let mut warnings = working.collect_warnings();
+        warnings.extend(scoped_validation_warnings);
+        let agent_config_reservations: Vec<_> = patch::agent_aliases(&ops)
+            .into_iter()
+            .map(|alias| {
+                self.ctx
+                    .agent_lifecycle
+                    .reserve_config_mutation(&alias)
+                    .map_err(|error| {
+                        config_patch_refused(
+                            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                                .with_path(format!("agents.{alias}")),
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let props: Vec<String> = results
+            .iter()
+            .filter(|result| matches!(result.op.as_str(), "add" | "replace" | "remove"))
+            .map(|result| result.path.clone())
+            .collect();
         let channel_generation_revocation = self.prepare_channel_generation_revocation(
-            req.sets
-                .iter()
-                .any(|entry| is_channel_generation_prop(&entry.prop)),
+            props.iter().any(|prop| is_channel_generation_prop(prop)),
             &old_config,
         )?;
-        let mut config = Box::new(old_config.clone());
-        for (index, entry) in req.sets.iter().enumerate() {
-            Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
-            })?;
-        }
-        // The request paths describe the affected live views; the candidate
-        // config remains their canonical source. Prepare all affected sessions
-        // before the one commit, including batches that change several routes.
-        let scopes: Vec<_> = req
-            .sets
+        let scopes: Vec<_> = props
             .iter()
-            .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
+            .filter_map(|prop| LiveSessionRefreshScope::for_prop(prop))
             .collect();
-        if scopes.is_empty() {
-            self.save_and_swap_config(*config, &config_write_guard)
-                .await?;
+        let prepared = if scopes.is_empty() {
+            Vec::new()
         } else {
-            Box::pin(self.commit_config_with_live_session_refresh(
-                *config,
-                &config_write_guard,
+            Self::prepare_live_sessions_refresh(
+                Arc::clone(&self.ctx),
+                &working,
                 &LiveSessionRefreshScope::Batch(scopes),
-            ))
-            .await?;
+            )
+            .await?
+        };
+        #[cfg(test)]
+        if let Some(pause) = self.ctx.config_commit_pause.as_ref() {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
         }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        let new_config = self.ctx.config.read().clone();
-        for alias in channel_agents {
-            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+
+        // Preparation may wait on live sessions. Admit only after those waits,
+        // holding the accepted policy through the synchronous task enqueue.
+        // The retained task owns the writer and reservations until publication.
+        let commit = {
+            let authority = self.ctx.auth.hold_authority();
+            self.authorize_config_patch_paths(&ops, &authority)?;
+            self.authorize_config_write_effects(
+                Method::ConfigSetMany,
+                &old_config,
+                &working,
+                &patch::removed_paths(&ops),
+                &authority,
+            )?;
+            let dispatcher = self.spawn_handle();
+            crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+                let _agent_config_reservations = agent_config_reservations;
+                #[cfg(test)]
+                if let Some(pause) = dispatcher.ctx.config_patch_enqueued_pause.as_ref() {
+                    pause.arrived.notify_one();
+                    pause.release.notified().await;
+                }
+                dispatcher
+                    .save_and_swap_config(*working, &config_write_guard)
+                    .await?;
+                let config_generation = Arc::new(dispatcher.ctx.config.read().clone());
+                Self::apply_prepared_live_sessions_refresh(
+                    Arc::clone(&dispatcher.ctx),
+                    prepared,
+                    config_generation,
+                )
                 .await;
+                let _config_write_guard = dispatcher
+                    .finish_channel_generation_mutation(
+                        channel_generation_revocation,
+                        config_write_guard,
+                    )
+                    .await?;
+                if !annotations.is_empty()
+                    && let Err(error) =
+                        zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations)
+                            .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "failed to apply config/set-many op comments to config.toml"
+                    );
+                }
+                let new_config = dispatcher.ctx.config.read().clone();
+                let channel_agents: std::collections::BTreeSet<_> = props
+                    .iter()
+                    .filter_map(|prop| agent_alias_from_channel_auth_prop(prop))
+                    .collect();
+                for alias in channel_agents {
+                    dispatcher
+                        .refresh_live_channel_handles_between_configs(
+                            &old_config,
+                            &new_config,
+                            &alias,
+                        )
+                        .await;
+                }
+                let providers: std::collections::BTreeSet<_> = props
+                    .iter()
+                    .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+                    .collect();
+                for provider in providers {
+                    dispatcher.refresh_memory_embedder_for_model_provider(&provider);
+                }
+                to_result(ConfigSetManyResult {
+                    props,
+                    set: true,
+                    results,
+                    warnings,
+                })
+            }))
+        };
+        commit.await.map_err(|error| {
+            rpc_err(INTERNAL_ERROR, format!("Config patch task failed: {error}"))
+        })?
+    }
+
+    /// Every operation names a config path, including comparisons and
+    /// annotations that do not dirty a value. Check those selectors before
+    /// staging can reveal a value and again at the final transaction admission.
+    fn authorize_config_patch_paths(
+        &self,
+        ops: &[ConfigPatchOp],
+        authority: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+        let method = Method::ConfigSetMany;
+        let refuse = |denied: AuthDenied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            ))
+        })?;
+        let grants = current_authority_under(authority, auth, method).map_err(refuse)?;
+        for op in ops {
+            let path = crate::config_ops::patch::json_pointer_to_dotted(&op.path);
+            if op.op == "test"
+                && !grants.permits(
+                    zeroclaw_api::grants::Resource::Config,
+                    zeroclaw_api::grants::Verb::Read,
+                )
+            {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal lacks the config read grant needed to compare `{path}`"
+                ))));
+            }
+            if !grants.may_write_config(&path) {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal's config path selectors do not cover `{path}`"
+                ))));
+            }
         }
-        let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
-        let providers: std::collections::BTreeSet<_> = props
-            .iter()
-            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
-            .collect();
-        for provider in providers {
-            self.refresh_memory_embedder_for_model_provider(&provider);
+        Ok(())
+    }
+
+    /// Authorize a staged config write by its effect, as the gateway's
+    /// principal gate authorizes the dashboard's config routes: every dirty
+    /// path of `working`, classified against `before` (plus each of
+    /// `deleted`, pinned as a deletion), needs the Config verb its effect
+    /// implies and a matching config path selector. Resolve grants from the
+    /// held authority lease after preparation's last await; keep the lease
+    /// until the transaction has been enqueued under the config write lock.
+    fn authorize_config_write_effects(
+        &self,
+        method: Method,
+        before: &Config,
+        working: &Config,
+        deleted: &[String],
+        authority: &crate::rpc::auth::AuthorityLease<'_>,
+    ) -> Result<(), JsonRpcError> {
+        use crate::config_ops::write_set;
+        use crate::rpc::auth::AuthDenied;
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
+        let grants = current_authority_under(authority, auth, method).map_err(refuse)?;
+        if grants.admin {
+            return Ok(());
         }
-        to_result(ConfigSetManyResult { props, set: true })
+        let mut writes = write_set::classify_by_effect(
+            before,
+            working,
+            working.dirty_paths.iter().map(String::as_str),
+        );
+        for path in deleted {
+            write_set::pin(&mut writes, path.clone(), Verb::Delete);
+        }
+        for (path, verb) in &writes {
+            if !grants.permits(Resource::Config, *verb) {
+                let verb = match verb {
+                    Verb::Create => "create",
+                    Verb::Read => "read",
+                    Verb::Update => "update",
+                    Verb::Delete => "delete",
+                    Verb::Execute => "execute",
+                };
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal lacks the config `{verb}` grant this mutation needs for `{path}`"
+                ))));
+            }
+            if !grants.may_write_config(path) {
+                return Err(refuse(AuthDenied::forbidden(format!(
+                    "Principal's config path selectors do not cover `{path}`"
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Stage one `config/set` entry on a working copy of the config:
@@ -8652,9 +8797,11 @@ impl RpcDispatcher {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
+            const RESERVED: &str = "alias `default` is reserved and cannot be created";
+            return Err(config_refused(
                 INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
+                RESERVED,
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, RESERVED).with_path(prop),
             ));
         }
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
@@ -8665,7 +8812,7 @@ impl RpcDispatcher {
                 other,
                 info.as_ref().map(|i| i.kind),
             )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+            .map_err(|e| config_refused(INVALID_PARAMS, e.message.clone(), e.with_path(prop)))?,
         };
         // Reject the masked sentinel for secrets — surfaces echo the
         // masked display value back when no real edit happened, and
@@ -8680,14 +8827,26 @@ impl RpcDispatcher {
                 || value_str == "****"
                 || value_str.is_empty())
         {
-            return Err(rpc_err(
+            let msg = format!("Refusing to overwrite secret `{prop}` with a masked or empty value");
+            return Err(config_refused(
                 INVALID_PARAMS,
-                format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
+                msg.clone(),
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(prop),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        config.set_prop_persistent(prop, &value_str).map_err(|e| {
+            // A masked placeholder that no stored value can resolve is the
+            // caller's to fix, as the HTTP routes answer it.
+            if e.downcast_ref::<zeroclaw_config::url_credentials::UnresolvedMask>()
+                .is_some()
+            {
+                let msg = e.to_string();
+                config_refused(INVALID_PARAMS, msg, ConfigApiError::for_prop(e, prop))
+            } else {
+                let msg = format!("Config set failed: {e}");
+                config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, prop))
+            }
+        })
     }
 
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
@@ -8987,9 +9146,43 @@ impl RpcDispatcher {
         }
     }
 
-    fn handle_config_reload(&self) -> RpcResult {
+    fn handle_config_reload(&self, params: &Value) -> RpcResult {
+        let req = if params.is_null() {
+            ConfigReloadParams::default()
+        } else {
+            parse_params::<ConfigReloadParams>(params)?
+        };
+        let authority = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            current_authority_under(&authority, auth, Method::ConfigReload).map_err(|denied| {
+                self.audit_auth_denial(Method::ConfigReload, &denied);
+                rpc_err(denied.code, denied.message)
+            })?;
+        }
+        // Keep canonical config still through the synchronous reload enqueue.
+        let config = self.ctx.config.read();
+        if req.remote_admin {
+            if !config.gateway.allow_remote_admin {
+                return Err(refused(
+                    FORBIDDEN,
+                    RefusalReason::Forbidden,
+                    REMOTE_ADMIN_RELOAD_DISABLED,
+                ));
+            }
+            if !self.ctx.auth.pairing().require_pairing() {
+                return Err(refused(
+                    FORBIDDEN,
+                    RefusalReason::Forbidden,
+                    REMOTE_ADMIN_RELOAD_NO_PAIRING,
+                ));
+            }
+        }
         if !self.schedule_daemon_reload("config") {
-            return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
+            return Err(refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Reload not available",
+            ));
         }
         to_result(ConfigReloadResult { reloading: true })
     }
@@ -9048,9 +9241,10 @@ impl RpcDispatcher {
             &old_config,
         )?;
         let mut working = old_config.clone();
-        working
-            .set_prop_persistent(&req.prop, "")
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        working.set_prop_persistent(&req.prop, "").map_err(|e| {
+            let msg = format!("Config delete failed: {e}");
+            config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, &req.prop))
+        })?;
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
@@ -9097,9 +9291,10 @@ impl RpcDispatcher {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let keys = config.get_map_keys(&req.path).ok_or_else(|| {
-            rpc_err(
+            config_refused(
                 INVALID_PARAMS,
                 format!("No map-keyed section at `{}`", req.path),
+                ConfigApiError::no_map_section(&req.path),
             )
         })?;
         to_result(ConfigMapKeysResult {
@@ -9108,58 +9303,119 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
-        let req: ConfigMapKeyCreateParams = parse_params(params)?;
-        let key_path = format!("{}.{}", req.path, req.key);
-        self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
-        let _agent_config_reservation = (req.path == "agents")
-            .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
-            .transpose()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        self.recheck_config_write_authority(
-            Method::ConfigMapKeyCreate,
-            Some(&key_path),
-            &config_write_guard,
-        )?;
-        let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
-            // Shared guarded boundary: enforces the reserved-agent rule (the
-            // `default` runtime fallback) on this surface too, so the RPC create
-            // path cannot author an `agents.default` the rename guard then traps.
-            let created =
-                zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-            if created {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
-            }
-            Ok(created)
-        };
-        let created = if touches_model_routes(&req.path) {
-            let mut working = self.ctx.config.read().clone();
-            let created = create(&mut working)?;
-            if created {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    &config_write_guard,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                ))
-                .await?;
-            }
-            created
-        } else {
-            let mut working = self.ctx.config.read().clone();
-            let created = create(&mut working)?;
-            if created {
-                self.save_and_swap_config(working, &config_write_guard)
+    fn handle_config_map_key_create<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let req: ConfigMapKeyCreateParams = parse_params(params)?;
+            let key_path = format!("{}.{}", req.path, req.key);
+            self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
+            let _agent_config_reservation = (req.path == "agents")
+                .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
+                .transpose()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            self.recheck_config_write_authority(
+                Method::ConfigMapKeyCreate,
+                Some(&key_path),
+                &config_write_guard,
+            )?;
+            let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
+                // Shared guarded boundary: enforces the reserved-agent rule (the
+                // `default` runtime fallback) on this surface too, so the RPC create
+                // path cannot author an `agents.default` the rename guard then traps.
+                let created = zeroclaw_config::alias_refs::create_map_key_checked(
+                    config, &req.path, &req.key,
+                )
+                .map_err(|e| {
+                    config_refused(
+                        INVALID_PARAMS,
+                        e.to_string(),
+                        e.api_error(&req.path, &req.key),
+                    )
+                })?;
+                if created {
+                    config.mark_dirty(&format!("{}.{}", req.path, req.key));
+                }
+                Ok(created)
+            };
+            let created = if touches_model_routes(&req.path) {
+                let mut working = self.ctx.config.read().clone();
+                let created = create(&mut working)?;
+                if created {
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        &config_write_guard,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                    ))
                     .await?;
-            }
-            created
-        };
-        to_result(ConfigMapKeyCreateResult {
-            path: req.path,
-            key: req.key,
-            created,
+                }
+                created
+            } else {
+                let before = self.ctx.config.read().clone();
+                let mut working = before.clone();
+                let created = create(&mut working)?;
+                if created {
+                    if req.path == "skill_bundles" {
+                        // Directory creation and persistence are one admitted job.
+                        let commit = {
+                            let authority = self.ctx.auth.hold_authority();
+                            self.authorize_config_write_effects(
+                                Method::ConfigMapKeyCreate,
+                                &before,
+                                &working,
+                                &[],
+                                &authority,
+                            )?;
+                            let dispatcher = self.spawn_handle();
+                            let key = req.key.clone();
+                            crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+                                async move {
+                                    Self::scaffold_skill_bundle_dir(&working, &key).await;
+                                    dispatcher
+                                        .save_and_swap_config(working, &config_write_guard)
+                                        .await
+                                },
+                            ))
+                        };
+                        commit.await.map_err(|error| {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Skill bundle create task failed: {error}"),
+                            )
+                        })??;
+                    } else {
+                        self.save_and_swap_config(working, &config_write_guard)
+                            .await?;
+                    }
+                }
+                created
+            };
+            to_result(ConfigMapKeyCreateResult {
+                path: req.path,
+                key: req.key,
+                created,
+            })
         })
+    }
+
+    /// Create a new skill bundle's directory before the configuration naming
+    /// it is saved, so its skills have a home at once, as the dashboard's
+    /// create route does. A failure is logged and the bundle still created.
+    async fn scaffold_skill_bundle_dir(config: &Config, alias: &str) {
+        let install_root = config.install_root_dir();
+        if let Ok(dir) =
+            zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
+            && let Err(e) = tokio::fs::create_dir_all(&dir).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "skill-bundle '{alias}' directory creation failed at {}: {e}",
+                    dir.display()
+                )
+            );
+        }
     }
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
@@ -9873,11 +10129,13 @@ impl RpcDispatcher {
         if let Some(agent) = req.agent.as_deref() {
             self.selector_agent(Method::CostQuery, agent)?;
         }
-        let tracker = self
-            .ctx
-            .cost_tracker
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
+        let tracker = self.ctx.cost_tracker.as_ref().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Cost tracking is not available",
+            )
+        })?;
         // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
         // Reports view, or an external CLI report) pull day/month/quarter/YTD
         // scalars rather than only the daemon's today/this-month aggregates.
@@ -9934,13 +10192,33 @@ impl RpcDispatcher {
 
     // ── Skills handlers ──────────────────────────────────────────
 
+    /// A skills service failure. A kind the caller can act on names its
+    /// reason and keeps the service's own words, as the dashboard reports
+    /// it; an I/O failure is the core's own, prefixed with what failed.
+    fn skills_failed(what: &str, error: crate::skills::service::ServiceError) -> JsonRpcError {
+        use crate::skills::service::ServiceError;
+        let reason = match &error {
+            ServiceError::Ref(_) | ServiceError::Bundle(_) | ServiceError::Scaffold(_) => {
+                Some(RefusalReason::Invalid)
+            }
+            ServiceError::DocumentParse(_) => Some(RefusalReason::Malformed),
+            ServiceError::NotFound(_) => Some(RefusalReason::NotFound),
+            ServiceError::NotEditable { .. } => Some(RefusalReason::Forbidden),
+            ServiceError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(INTERNAL_ERROR, reason, error.to_string()),
+            None => rpc_err(INTERNAL_ERROR, format!("{what}: {error}")),
+        }
+    }
+
     fn handle_skills_bundles(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let bundles: Vec<SkillBundleEntry> = svc
             .list_bundles()
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills bundles failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills bundles failed", e))?
             .into_iter()
             .map(|b| SkillBundleEntry {
                 alias: b.alias,
@@ -9959,7 +10237,7 @@ impl RpcDispatcher {
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skills: Vec<SkillListEntry> = svc
             .list_skills(req.bundle.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills list failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills list failed", e))?
             .into_iter()
             .map(|s| SkillListEntry {
                 bundle: s.r#ref.bundle().to_string(),
@@ -9979,7 +10257,7 @@ impl RpcDispatcher {
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = svc
             .read_skill(&skill_ref)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill read failed", e))?;
         to_result(SkillsReadResult {
             bundle: req.bundle,
             name: req.name,
@@ -9999,7 +10277,7 @@ impl RpcDispatcher {
             body: req.body,
         };
         svc.write_skill(&skill_ref, &doc)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill write failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill write failed", e))?;
         to_result(SkillsWriteResult {
             bundle: req.bundle,
             name: req.name,
@@ -10014,7 +10292,7 @@ impl RpcDispatcher {
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill delete failed", e))?;
         to_result(SkillsDeleteResult {
             bundle: req.bundle,
             name: req.name,
@@ -10894,14 +11172,23 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
-        let resp = JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            result: None,
-            error: Some(JsonRpcError {
+        self.send_rpc_error(
+            id,
+            JsonRpcError {
                 code,
                 message: message.to_string(),
                 data: None,
-            }),
+            },
+        )
+        .await;
+    }
+
+    /// Send a handler's error as it stands, its `data` included.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -11101,6 +11388,79 @@ impl RpcDispatcher {
         serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
     }
 
+    /// A session whose queue refused this request. A full queue is a
+    /// `capacity` refusal; a wait that timed out keeps the bare code, since no
+    /// listed reason means "gave up waiting".
+    fn session_busy(error: zeroclaw_infra::session_queue::SessionQueueError) -> JsonRpcError {
+        use zeroclaw_infra::session_queue::SessionQueueError;
+        let msg = format!("Session busy: {error}");
+        match error {
+            SessionQueueError::QueueFull { .. } => {
+                refused(SESSION_BUSY, RefusalReason::Capacity, msg)
+            }
+            SessionQueueError::Timeout { .. } => rpc_err(SESSION_BUSY, msg),
+        }
+    }
+
+    /// The refusal a session method answers when session persistence is off.
+    fn session_persistence_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "Session persistence is disabled",
+        )
+    }
+
+    /// The refusal every SOP method answers while the subsystem is off.
+    fn sop_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "SOP subsystem not enabled",
+        )
+    }
+
+    /// The refusal for a procedure that does not load by `name`. Missing,
+    /// malformed and badly named all answer `not_found`, as the dashboard's
+    /// routes do: there is no procedure by that name to act on.
+    fn sop_not_loaded(name: &str, error: &anyhow::Error) -> JsonRpcError {
+        refused(
+            INVALID_PARAMS,
+            RefusalReason::NotFound,
+            format!("SOP '{name}': {error}"),
+        )
+    }
+
+    /// A SOP authoring failure, answered with the `code` the method gives its
+    /// kind. Unless the method counts it as the core's own failure
+    /// (`INTERNAL_ERROR`), it names the kind as a reason: a missing procedure,
+    /// a name already taken, or a definition the caller must fix.
+    fn sop_author_refused(code: i32, error: &crate::sop::SopAuthorError) -> JsonRpcError {
+        use crate::sop::SopAuthorError;
+        let reason = match error {
+            _ if code == INTERNAL_ERROR => None,
+            SopAuthorError::NotFound(_) => Some(RefusalReason::NotFound),
+            SopAuthorError::AlreadyExists(_) => Some(RefusalReason::Conflict),
+            SopAuthorError::Other(_) => Some(RefusalReason::Invalid),
+            SopAuthorError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(code, reason, error.to_string()),
+            None => rpc_err(code, error.to_string()),
+        }
+    }
+
+    /// A run accessor's failure: a missing run is the caller's `not_found`;
+    /// anything else (a poisoned engine) is the core's own.
+    fn sop_run_lookup_failed(error: &anyhow::Error) -> JsonRpcError {
+        match error.downcast_ref::<crate::sop::RunLookupError>() {
+            Some(crate::sop::RunLookupError::NotFound(_)) => {
+                refused(INVALID_PARAMS, RefusalReason::NotFound, error.to_string())
+            }
+            _ => rpc_err(INTERNAL_ERROR, error.to_string()),
+        }
+    }
+
     fn handle_sops_list(&self) -> RpcResult {
         let (dir, mode) = self.sops_dir_and_mode();
         let sops = crate::sop::load_sops_from_directory(&dir, mode);
@@ -11111,7 +11471,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(sop)
     }
 
@@ -11119,7 +11479,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(crate::sop::SopGraph::from_sop_with_specs(
             &sop,
             &self.sop_tool_specs(),
@@ -11133,14 +11493,18 @@ impl RpcDispatcher {
             && !payload.trim().is_empty()
             && serde_json::from_str::<Value>(payload).is_err()
         {
-            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+            return Err(refused(
+                INVALID_PARAMS,
+                RefusalReason::Invalid,
+                "payload is not valid JSON",
+            ));
         }
 
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         // The run executes as the procedure's agents, so the principal must be
         // entitled to every one of them before anything is dispatched.
         if self.stamped_grants().is_some() {
@@ -11153,11 +11517,20 @@ impl RpcDispatcher {
                 self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
             }
         }
-        let audit = self
-            .ctx
-            .sop_audit
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self.ctx.sop_audit.as_ref().ok_or_else(Self::sop_disabled)?;
+        // A run started here has no agent turn behind it: the driver started
+        // below executes its steps, so a procedure with no owner for an
+        // execute step would start, take a run id and fail that step. Refuse
+        // it first, on the ownership rule the driver itself applies, at the
+        // point the dashboard's run route does.
+        let ownership_refusal = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_sop(&req.name)
+            .and_then(crate::sop::headless_ownership_refusal);
+        if let Some(refusal) = ownership_refusal {
+            return Err(refused(INVALID_PARAMS, RefusalReason::Unowned, refusal));
+        }
 
         let payload = req
             .payload
@@ -11172,8 +11545,9 @@ impl RpcDispatcher {
             .filter(|key| !key.is_empty());
         if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
         {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!(
                     "dedup_key exceeds {} bytes",
                     crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
@@ -11250,12 +11624,26 @@ impl RpcDispatcher {
                         run_id: run_id.clone(),
                     });
                 }
-                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
-                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
+                        reason.clone(),
+                    ));
+                }
+                crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Blocked,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Deferred,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Coalesced {
                     existing_run_id, ..
@@ -11268,8 +11656,9 @@ impl RpcDispatcher {
             }
         }
 
-        Err(rpc_err(
+        Err(refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("SOP '{}' has no matching manual trigger", req.name),
         ))
     }
@@ -11280,7 +11669,7 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
@@ -11311,16 +11700,9 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
         to_result(serde_json::json!({ "run": detail }))
     }
@@ -11329,21 +11711,14 @@ impl RpcDispatcher {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -11351,20 +11726,21 @@ impl RpcDispatcher {
         let req: SopDecideRequest = parse_params(params)?;
         let decision: crate::sop::approval::ApprovalDecision =
             serde_json::from_value(req.decision.clone()).map_err(|e| {
-                rpc_err(
+                refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!("decision is not a valid approval decision: {e}"),
                 )
             })?;
 
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .ok_or_else(Self::sop_disabled)?
             .clone();
 
         let agent_alias = sop.agent.clone().unwrap_or_default();
@@ -11405,11 +11781,16 @@ impl RpcDispatcher {
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
                 .ok_or_else(|| {
-                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                    refused(
+                        INVALID_PARAMS,
+                        RefusalReason::NotFound,
+                        format!("run '{}' not found", req.run_id),
+                    )
                 })?;
             if run_sop_name != req.name {
-                return Err(rpc_err(
+                return Err(refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!(
                         "run '{}' belongs to SOP '{}', not '{}'",
                         req.run_id, run_sop_name, req.name
@@ -11432,11 +11813,28 @@ impl RpcDispatcher {
                 )
                 | BrokerOutcome::PendingQuorum { .. } => {}
                 BrokerOutcome::Resolved(
-                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
-                )
-                | BrokerOutcome::NotWaiting => {
-                    return Err(rpc_err(
+                    outcome @ (ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity),
+                ) => {
+                    // Approved but over the concurrency caps, the gate stays
+                    // waiting: a retry can clear it once a slot frees.
+                    let reason = if matches!(outcome, ResolveOutcome::DeferredAtCapacity) {
+                        RefusalReason::Deferred
+                    } else {
+                        RefusalReason::Conflict
+                    };
+                    return Err(refused(
                         INVALID_PARAMS,
+                        reason,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::NotWaiting => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
                         crate::i18n::get_required_cli_string_with_args(
                             "sop-rpc-decision-invalid-state",
                             &[("run_id", req.run_id.as_str())],
@@ -11488,15 +11886,8 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -11549,7 +11940,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
@@ -11564,7 +11955,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "created": sop.name }))
     }
@@ -11578,7 +11969,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
                 _ => INTERNAL_ERROR,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
     }
@@ -11611,7 +12002,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
@@ -11627,7 +12018,7 @@ impl RpcDispatcher {
         let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
         crate::sop::apply_wire(&mut sop, &edit)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))?;
         to_result(serde_json::json!({
             "sop": sop,
             "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
@@ -11838,6 +12229,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: None,
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -11851,6 +12243,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: None,
                     });
                 }
 
@@ -11871,6 +12264,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: None,
                     });
                 }
             }
@@ -11908,6 +12302,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: None,
                         });
                     }
                 }
@@ -12183,8 +12578,9 @@ fn resolve_skill_ref(
             format!("Invalid skill ref: {name:?} is not a single skill directory name"),
         ));
     }
+    // Worded as the service words it, which is how the dashboard reports it.
     svc.resolve_ref(name, Some(bundle))
-        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
+        .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -13930,6 +14326,95 @@ mod tests {
                 MethodAuthz::Requires(_, _) => {}
             }
         }
+    }
+
+    /// The core's `config/get` answers with a provider URI's password and
+    /// query credential masked, for the whole config and for the property
+    /// alone, so neither reaches an RPC client.
+    #[tokio::test]
+    async fn config_get_withholds_a_provider_uris_embedded_credentials() {
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}\"\n"
+        ))
+        .unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let whole = rpc(&mut operator, &mut rx, 1, "config/get", json!({})).await;
+        assert!(whole.get("result").is_some(), "{whole}");
+        let prop = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "config/get",
+            json!({"prop": "providers.models.custom.credential_url.uri"}),
+        )
+        .await;
+        let (whole, prop) = (whole.to_string(), prop.to_string());
+        assert_eq!(
+            [
+                whole.contains(PASSWORD),
+                whole.contains(QUERY),
+                prop.contains(PASSWORD),
+                prop.contains(QUERY),
+            ],
+            [false; 4],
+            "userinfo and query secrets must be withheld by the core: {whole}\n{prop}"
+        );
+        assert!(
+            whole.contains("127.0.0.1:9/v1"),
+            "the endpoint stays readable: {whole}"
+        );
+    }
+
+    /// `config/set` writing a provider URI back as `config/get` shows it keeps
+    /// the stored credentials. A placeholder that no stored value can resolve
+    /// is refused as invalid params, the caller's error, and stores nothing.
+    #[tokio::test]
+    async fn config_set_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
+        const PATH: &str = "providers.models.custom.credential_url.uri";
+        let stored =
+            "http://review-user:uri-password-654738@127.0.0.1:9/v1?credential=uri-query-938472";
+        let tmp = tempfile::tempdir().unwrap();
+        let source = format!("[providers.models.custom.credential_url]\nuri = \"{stored}\"\n");
+        std::fs::write(tmp.path().join("config.toml"), &source).unwrap();
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&source).unwrap();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().to_path_buf();
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let uri = || {
+            ctx.config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .and_then(|provider| provider.uri.clone())
+        };
+
+        let echoed = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/set",
+            json!({"prop": PATH, "value": "http://***MASKED***@127.0.0.1:9/v1?***MASKED***"}),
+        )
+        .await;
+        assert!(echoed.get("error").is_none(), "{echoed}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "config/set",
+            json!({"prop": PATH, "value": "http://***MASKED***.example/v1"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert_eq!(uri().as_deref(), Some(stored));
     }
 
     fn enforcement_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {
@@ -18503,6 +18988,7 @@ mod tests {
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+                client_kind: None,
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
     }
@@ -18710,6 +19196,7 @@ mod tests {
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
         let response = rpc(
@@ -18783,6 +19270,7 @@ mod tests {
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
         for id in [1, 2] {
@@ -24096,10 +24584,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
         let sop_name = "refused";
+        // Owned, so `sops/run` starts it; the refused driver never runs it.
         let step = crate::sop::types::SopStep {
             number: 1,
             title: "Step one".to_string(),
             body: "Do the work".to_string(),
+            agent: Some("ops".to_string()),
             ..crate::sop::types::SopStep::default()
         };
         let handles = crate::sop::SopDriverHandles::default();
@@ -25326,7 +25816,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
 
-        let result = dispatcher.handle_config_reload();
+        let result = dispatcher.handle_config_reload(&Value::Null);
         assert!(
             result.is_ok(),
             "config/reload should accept reload-capable contexts"
@@ -26730,6 +27220,7 @@ mod tests {
             commands: vec![],
             auth_methods: Vec::new(),
             principal_id: None,
+            features: Vec::new(),
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -26924,6 +27415,59 @@ mod tests {
         assert!(!dispatcher.client_elicitation_caps.url);
     }
 
+    /// `tui/list` labels a connection that declared itself a gateway on
+    /// `initialize`, and only that kind: a terminal, or a kind the core does
+    /// not know, is listed without a label.
+    #[tokio::test]
+    async fn tui_list_labels_only_a_declared_gateway_connection() {
+        let (lister, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&lister.ctx);
+        let mut registered = std::collections::HashMap::new();
+        for (peer, capabilities) in [
+            (
+                "unix:gateway",
+                serde_json::json!({ "client_kind": CLIENT_KIND_GATEWAY }),
+            ),
+            (
+                "unix:terminal",
+                serde_json::json!({ "elicitation": { "form": {} } }),
+            ),
+            (
+                "unix:unknown",
+                serde_json::json!({ "client_kind": "relay" }),
+            ),
+        ] {
+            let (writer_tx, _writer_rx) = mpsc::channel(8);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), writer_tx, peer.to_string());
+            client
+                .handle_initialize(&serde_json::json!({
+                    "protocol_version": RPC_PROTOCOL_VERSION,
+                    "clientCapabilities": capabilities,
+                }))
+                .await
+                .expect(peer);
+            let (id, _) = client.tui_registration().expect("registered");
+            registered.insert(id.to_string(), peer);
+        }
+
+        let listed: TuiListResult =
+            serde_json::from_value(lister.handle_tui_list().expect("tui/list")).unwrap();
+        let kinds: std::collections::HashMap<&str, Option<&str>> = listed
+            .tuis
+            .iter()
+            .map(|tui| (registered[&tui.tui_id], tui.client_kind.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashMap::from([
+                ("unix:gateway", Some(CLIENT_KIND_GATEWAY)),
+                ("unix:terminal", None),
+                ("unix:unknown", None),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn remote_initialize_fails_closed_without_identity_signing() {
         let (dispatcher, _sessions) =
@@ -26968,6 +27512,33 @@ mod tests {
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
                 {"id": "model", "name": "model"}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_every_feature_this_core_supports() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["features"], serde_json::json!(ADVERTISED_FEATURES));
+        for name in ADVERTISED_FEATURES {
+            assert!(
+                zeroclaw_rpc_proto::feature::KNOWN.contains(name),
+                "{name} is advertised but the protocol does not define it"
+            );
+        }
+        assert!(
+            result["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("tui.client_kind")),
+            "the core reports client_kind on tui/list: {result}"
         );
     }
 
@@ -33561,6 +34132,8 @@ mod tests {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: Some(control),
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -38314,6 +38887,8 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -38367,6 +38942,8 @@ mod tests {
         runner.register(Box::new(_hook));
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -38556,6 +39133,8 @@ mod tests {
 
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
+            #[cfg(test)]
+            config_patch_enqueued_pause: None,
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
@@ -39116,8 +39695,24 @@ mod tests {
         uid: u32,
         write_paths: &[&str],
     ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::Verb;
+        config_write_roster_config_with(
+            tmp,
+            uid,
+            write_paths,
+            &[Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+        )
+    }
+
+    /// [`config_write_roster_config`] granting `alice` only `verbs` on Config.
+    fn config_write_roster_config_with(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        write_paths: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
         use std::collections::HashMap;
-        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_api::grants::Resource;
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
 
         let mut config = make_two_provider_test_config(tmp);
@@ -39125,10 +39720,7 @@ mod tests {
             "config-writer".into(),
             PermissionProfileConfig {
                 config_write_paths: write_paths.iter().map(|p| (*p).to_string()).collect(),
-                grants: HashMap::from([(
-                    Resource::Config,
-                    vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
-                )]),
+                grants: HashMap::from([(Resource::Config, verbs.to_vec())]),
                 ..PermissionProfileConfig::default()
             },
         );
@@ -39322,6 +39914,373 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn config_patch_revoked_while_queued_on_the_write_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({"ops": [{
+                "op": "replace",
+                "path": "/providers/models/anthropic/default/model",
+                "value": "revoked-value"
+            }]});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set_many(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused patch must not reach disk"
+            );
+        });
+    }
+
+    #[test]
+    fn config_patch_revoked_after_live_session_preparation_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config.save().await.unwrap();
+            let before = std::fs::read_to_string(&config.config_path).unwrap();
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_commit_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "replace", "path": "/providers/models/anthropic/default/model",
+                        "value": "revoked-after-preparation"
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("patch reaches the prepared commit boundary");
+            revoke_alice_config_writes(&ctx);
+            pause.release.notify_one();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("revoked patch must be refused");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
+            let _guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Arc::clone(&ctx.config_write_lock).lock_owned(),
+            )
+            .await
+            .expect("refused patch releases the process-wide writer");
+        });
+    }
+
+    #[test]
+    fn config_patch_cancellation_after_enqueue_retains_the_writer_until_publication() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+            config.save().await.unwrap();
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_patch_enqueued_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let revision = ctx.auth.accepted_revision();
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "replace", "path": "/memory/backend", "value": "none"
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("patch is admitted into a retained task");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(
+                ctx.config_write_lock.try_lock().is_err(),
+                "retained save owns the writer"
+            );
+            pause.release.notify_one();
+            let _guard = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Arc::clone(&ctx.config_write_lock).lock_owned(),
+            )
+            .await
+            .expect("retained transaction finishes publication");
+            assert_eq!(ctx.config.read().memory.backend, "none");
+            assert_eq!(ctx.auth.accepted_revision(), revision + 1);
+            let saved = std::fs::read_to_string(&ctx.config.read().config_path).unwrap();
+            let saved: toml::Value = toml::from_str(&saved).unwrap();
+            assert_eq!(saved["memory"]["backend"].as_str(), Some("none"));
+        });
+    }
+
+    #[test]
+    fn config_reload_remote_admin_checks_live_policy() {
+        run_on_a_large_stack(|| async move {
+            let mut config = Config::default();
+            config.gateway.allow_remote_admin = true;
+            config.gateway.require_pairing = true;
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+            inner.reload_tx = Some(reload_tx);
+            let ctx = Arc::new(inner);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher =
+                RpcDispatcher::new(Arc::clone(&ctx), tx, "reload-policy-test".into());
+            dispatcher.set_authenticated_for_test();
+            // The request's origin is context, never a snapshot of the opt-in.
+            ctx.config.write().gateway.allow_remote_admin = false;
+            let denied = dispatcher
+                .handle_config_reload(&json!({"remote_admin": true}))
+                .expect_err("the live opt-out must refuse remote reload");
+            assert_eq!(denied.code, FORBIDDEN);
+            assert_eq!(denied.message, REMOTE_ADMIN_RELOAD_DISABLED);
+            assert!(!reload_rx.has_changed().unwrap());
+            dispatcher
+                .handle_config_reload(&Value::Null)
+                .expect("older local callers need no new params");
+            tokio::time::timeout(std::time::Duration::from_secs(10), reload_rx.changed())
+                .await
+                .expect("local reload is enqueued")
+                .unwrap();
+            assert!(*reload_rx.borrow());
+
+            let mut config = Config::default();
+            config.gateway.allow_remote_admin = true;
+            config.gateway.require_pairing = false;
+            let (mut dispatcher, _sessions) = make_acp_test_dispatcher(config);
+            dispatcher.set_authenticated_for_test();
+            let denied = dispatcher
+                .handle_config_reload(&json!({"remote_admin": true}))
+                .expect_err("opt-in without actual pairing must be refused");
+            assert_eq!(denied.code, FORBIDDEN);
+            assert_eq!(denied.message, REMOTE_ADMIN_RELOAD_NO_PAIRING);
+        });
+    }
+
+    #[test]
+    fn config_patch_comparisons_require_read_without_blocking_writes() {
+        use zeroclaw_api::grants::Verb;
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config =
+                config_write_roster_config_with(&tmp, 4242, &["memory.*"], &[Verb::Update]);
+            config.save().await.unwrap();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            alice
+                .handle_config_set_many(&json!({"ops": [{
+                    "op": "replace", "path": "memory.backend", "value": "none"
+                }]}))
+                .await
+                .expect("an update-only principal can still write its path");
+            let before = std::fs::read_to_string(&ctx.config.read().config_path).unwrap();
+            let error = alice
+                .handle_config_set_many(&json!({"ops": [{
+                    "op": "test", "path": "memory.backend", "value": "none"
+                }]}))
+                .await
+                .expect_err("comparisons must not reveal values without Config read");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert!(error.message.contains("config read"));
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn config_patch_read_revoked_after_preparation_is_refused() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+            let value = config.get_prop("memory.backend").unwrap();
+            config.save().await.unwrap();
+            let before = std::fs::read_to_string(&config.config_path).unwrap();
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let mut inner = Arc::try_unwrap(enforcement_ctx(config))
+                .unwrap_or_else(|_| panic!("fresh context is uniquely owned"));
+            inner.config_commit_pause = Some(Arc::clone(&pause));
+            let ctx = Arc::new(inner);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let task = zeroclaw_spawn::spawn!(async move {
+                alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": "test", "path": "memory.backend", "value": value
+                    }]}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+                .await
+                .expect("comparison reaches preparation boundary");
+            let mut narrowed = ctx.config.read().clone();
+            narrowed
+                .permission_profiles
+                .get_mut("config-writer")
+                .unwrap()
+                .grants
+                .get_mut(&Resource::Config)
+                .unwrap()
+                .retain(|verb| *verb != Verb::Read);
+            ctx.auth.refresh_from_config(&narrowed).unwrap();
+            pause.release.notify_one();
+            let error = task
+                .await
+                .unwrap()
+                .expect_err("revoked read must refuse the comparison result");
+            assert_eq!(error.code, FORBIDDEN, "{error:?}");
+            assert_eq!(
+                std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn config_patch_tests_and_comments_obey_path_selectors() {
+        run_on_a_large_stack(|| async move {
+            for operation in ["test", "comment"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = config_write_roster_config(&tmp, 4242, &["memory.*"]);
+                let value = config.get_prop("scheduler.max_run_history").unwrap();
+                config.save().await.unwrap();
+                let before = std::fs::read_to_string(&config.config_path).unwrap();
+                let ctx = enforcement_ctx(config);
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let error = alice
+                    .handle_config_set_many(&json!({"ops": [{
+                        "op": operation, "path": "/scheduler/max_run_history",
+                        "value": value, "comment": "outside the allowed paths"
+                    }]}))
+                    .await
+                    .expect_err("every operation must obey config path selectors");
+                assert_eq!(error.code, FORBIDDEN, "{operation}: {error:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&ctx.config.read().config_path).unwrap(),
+                    before
+                );
+            }
+        });
+    }
+
+    /// A patch's write set is authorized by effect, as the dashboard's config
+    /// routes authorize it: replacing a field needs `update`, clearing one
+    /// `delete`, and writing under a new alias `create`.
+    #[test]
+    fn config_patch_needs_the_verb_each_effect_implies() {
+        use zeroclaw_api::grants::Verb;
+        run_on_a_large_stack(|| async move {
+            for (case, op, refused_for) in [
+                (
+                    "a replace",
+                    json!({"op": "replace", "path": "/providers/models/anthropic/default/model", "value": "m"}),
+                    None,
+                ),
+                (
+                    "a remove",
+                    json!({"op": "remove", "path": "/providers/models/anthropic/default/model"}),
+                    Some("delete"),
+                ),
+                (
+                    "a write under a new alias",
+                    json!({"op": "add", "path": "/providers/models/openai/fresh/model", "value": "m"}),
+                    Some("create"),
+                ),
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let ctx = enforcement_ctx(config_write_roster_config_with(
+                    &tmp,
+                    4242,
+                    &["providers.*"],
+                    &[Verb::Read, Verb::Update],
+                ));
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let result = alice.handle_config_set_many(&json!({ "ops": [op] })).await;
+                match refused_for {
+                    None => {
+                        let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                        assert_eq!(result["results"][0]["op"], "replace", "{case}");
+                    }
+                    Some(verb) => {
+                        let err = result.expect_err(case);
+                        assert_eq!(err.code, FORBIDDEN, "{case}: {err:?}");
+                        assert!(
+                            err.message.contains(&format!("`{verb}`")),
+                            "{case}: {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn config_map_key_create_scaffolds_a_skill_bundle_directory() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["skill_bundles.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let created = alice
+                .handle_config_map_key_create(&json!({"path": "skill_bundles", "key": "extra"}))
+                .await
+                .expect("a skill bundle is created");
+            assert_eq!(created["created"], true);
+            let config = ctx.config.read().clone();
+            let dir = zeroclaw_config::skill_bundles::resolve_directory(
+                &config,
+                &config.install_root_dir(),
+                "extra",
+            )
+            .expect("the bundle's directory");
+            assert!(dir.is_dir(), "{} was not created", dir.display());
+        });
+    }
+
+    #[tokio::test]
+    async fn config_set_many_takes_sets_or_ops_and_guards_drift_only_for_ops() {
+        let (dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let both = dispatcher
+            .handle_config_set_many(&json!({
+                "sets": [{"prop": "memory.backend", "value": "none"}],
+                "ops": [{"op": "replace", "path": "/memory/backend", "value": "none"}],
+            }))
+            .await
+            .expect_err("sets and ops together are refused");
+        assert_eq!(both.code, INVALID_PARAMS);
+        let guarded_sets = dispatcher
+            .handle_config_set_many(&json!({
+                "sets": [{"prop": "memory.backend", "value": "none"}],
+                "drift_guard": true,
+            }))
+            .await
+            .expect_err("the drift guard needs an ops batch");
+        assert_eq!(guarded_sets.code, INVALID_PARAMS);
     }
 
     // ── session/new rechecks the agent selector after config-lock admission ──

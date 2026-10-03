@@ -907,6 +907,7 @@ pub struct ModelProviderConfig {
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL; there is no separate path-suffix field.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub uri: Option<String>,
     /// Model identifier to send with each request: the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[tab(Model)]
@@ -1437,6 +1438,7 @@ pub struct QwenModelProviderConfig {
     /// `endpoint`-derived URL (or the cached `resource_url` when reading
     /// from `~/.qwen/oauth_creds.json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub oauth_resource_url: Option<String>,
 }
 
@@ -5610,6 +5612,7 @@ pub struct TranscriptionConfig {
     pub api_key: Option<String>,
     /// Whisper API endpoint URL (Groq transcription provider).
     #[serde(default = "default_transcription_api_url")]
+    #[credential_url]
     pub api_url: String,
     /// Whisper model name (Groq transcription provider).
     #[serde(default = "default_transcription_model")]
@@ -5786,6 +5789,7 @@ pub struct McpServerConfig {
     pub transport: McpTransport,
     /// URL for HTTP/SSE transports.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
     /// Executable to spawn for stdio transport.
     #[serde(default)]
@@ -6125,6 +6129,7 @@ pub struct TtsProviderConfig {
     /// proxies). Set to the **full** URL — there is no separate path-suffix
     /// field. Renamed from `api_url` for parity with `ModelProviderConfig.uri`.
     #[serde(alias = "api_url")]
+    #[credential_url]
     pub uri: Option<String>,
 }
 
@@ -6466,6 +6471,7 @@ impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
 #[prefix = "providers.transcription.local_whisper"]
 pub struct LocalWhisperTranscriptionProviderConfig {
     /// Endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    #[credential_url]
     pub uri: String,
     /// Bearer token for endpoint authentication. Omit for unauthenticated
     /// local endpoints.
@@ -6640,6 +6646,7 @@ pub struct GoogleSttConfig {
 #[prefix = "transcription.local_whisper"]
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    #[credential_url]
     pub url: String,
     /// Bearer token for endpoint authentication.
     /// Omit for unauthenticated local endpoints.
@@ -6931,6 +6938,28 @@ pub struct ExternalRegistry {
     pub enabled: bool,
 }
 
+/// A registry's git URL can carry an access token (`https://token@host/...`):
+/// whole-config reads mask it like any other credential URL, and an echoed
+/// mask is restored from the stored registry of the same name.
+impl crate::traits::CredentialUrlField for Vec<ExternalRegistry> {
+    fn mask_url_credentials(&mut self) {
+        for registry in self.iter_mut() {
+            registry.url = crate::url_credentials::mask(&registry.url);
+        }
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        for registry in self.iter_mut() {
+            if let Some(stored) = current.iter().find(|stored| stored.name == registry.name)
+                && let Ok(restored) =
+                    crate::url_credentials::restore(&registry.url, Some(&stored.url))
+            {
+                registry.url = restored;
+            }
+        }
+    }
+}
+
 impl ExternalRegistry {
     /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
     ///
@@ -6965,11 +6994,13 @@ pub struct SkillsConfig {
     /// URL of the skills registry repository for bare-name installs.
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
+    #[credential_url]
     pub registry_url: Option<String>,
     /// Additional user-configured skill registries, installed via
     /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_url]
     pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt. Omission
     /// defaults to `full` throughout the v0.8.x release line; `compact`
@@ -8241,6 +8272,7 @@ pub struct RelayConfig {
     pub enabled: bool,
     /// Relay address to connect to, as `host:port`.
     #[serde(default)]
+    #[credential_url]
     pub url: String,
     /// Opaque node-id this daemon registers under (clients dial this id). Leave
     /// empty (recommended) to auto-mint and persist a random 128-bit capability at
@@ -8535,6 +8567,7 @@ impl Default for SecretsConfig {
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
     #[serde(default = "default_browser_computer_use_endpoint")]
+    #[credential_url]
     pub endpoint: String,
     /// Optional bearer token for computer-use sidecar
     #[serde(default)]
@@ -8627,6 +8660,7 @@ pub struct BrowserConfig {
     pub native_headless: bool,
     /// WebDriver endpoint URL for rust-native backend (e.g. `http://127.0.0.1:9515`)
     #[serde(default = "default_browser_webdriver_url")]
+    #[credential_url]
     pub native_webdriver_url: String,
     /// Optional Chrome/Chromium executable path for rust-native backend
     #[serde(default)]
@@ -8852,6 +8886,7 @@ pub struct FirecrawlConfig {
     pub api_key_env: String,
     /// Firecrawl API base URL
     #[serde(default = "default_firecrawl_api_url")]
+    #[credential_url]
     pub api_url: String,
     /// Firecrawl extraction mode
     #[serde(default)]
@@ -9098,6 +9133,7 @@ pub struct WebSearchConfig {
     pub keenable_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
+    #[credential_url]
     pub searxng_instance_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
@@ -9168,6 +9204,7 @@ pub struct ProjectIntelConfig {
     pub include_jira_data: bool,
     /// Jira instance base URL (required if include_jira_data is true).
     #[serde(default)]
+    #[credential_url]
     pub jira_base_url: Option<String>,
 }
 
@@ -10202,6 +10239,7 @@ impl Default for ImageGenConfig {
 pub struct FileUploadConfig {
     /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// HTTP method. Only `POST` (default) and `PUT` are accepted.
@@ -10275,6 +10313,7 @@ impl Default for FileUploadConfig {
 pub struct FileUploadBundleConfig {
     /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// HTTP method. Only `POST` (default) and `PUT` are accepted.
@@ -10377,6 +10416,7 @@ pub struct FileDownloadConfig {
     /// Download endpoint URL. Tool is disabled when this is `None` or empty.
     /// The file to fetch is selected by the `document_id` query parameter.
     #[serde(default)]
+    #[credential_url]
     pub url: Option<String>,
 
     /// Maximum download size in bytes. Enforced while streaming: the transfer
@@ -10982,12 +11022,15 @@ pub struct ProxyConfig {
     pub enabled: bool,
     /// Proxy URL for HTTP requests (supports http, https, socks5, socks5h).
     #[serde(default)]
+    #[credential_url]
     pub http_proxy: Option<String>,
     /// Proxy URL for HTTPS requests (supports http, https, socks5, socks5h).
     #[serde(default)]
+    #[credential_url]
     pub https_proxy: Option<String>,
     /// Fallback proxy URL for all schemes.
     #[serde(default)]
+    #[credential_url]
     pub all_proxy: Option<String>,
     /// No-proxy bypass list. Same format as NO_PROXY.
     #[serde(default)]
@@ -12499,6 +12542,7 @@ impl Default for PostgresStorageConfig {
 pub struct QdrantStorageConfig {
     /// Qdrant server URL (e.g. `"http://localhost:6333"`).
     /// Use `ZEROCLAW_storage__qdrant__<alias>__url=...` for env injection.
+    #[credential_url]
     pub url: Option<String>,
     /// Collection name for storing memories.
     /// Use `ZEROCLAW_storage__qdrant__<alias>__collection=...` for env injection.
@@ -12631,6 +12675,7 @@ pub struct MemoryConfig {
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
+    #[credential_url]
     pub embedding_provider: String,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
@@ -13406,6 +13451,7 @@ pub struct ObservabilityConfig {
 
     /// OTLP endpoint (e.g. `"http://localhost:4318"`). Only used when backend = `"otel"`.
     #[serde(default)]
+    #[credential_url]
     pub otel_endpoint: Option<String>,
 
     /// Service name reported to the OTel collector. Defaults to "zeroclaw".
@@ -13700,6 +13746,7 @@ pub struct WebhookAuditConfig {
     pub enabled: bool,
     /// Target URL that will receive the audit POST requests.
     #[serde(default)]
+    #[credential_url]
     pub url: String,
     /// Glob patterns for tool names to audit (e.g. `["Bash", "Write"]`).
     /// An empty list means **no** tools are audited.
@@ -13893,6 +13940,7 @@ pub struct OidcConfig {
     /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
     /// from `<issuer>/.well-known/openid-configuration` and its `issuer`
     /// field must match this value exactly.
+    #[credential_url]
     pub issuer: String,
     /// Audience the token must carry in its `aud` claim for this daemon
     /// (typically the client ID or resource identifier registered at the
@@ -15771,6 +15819,7 @@ pub struct CustomTunnelConfig {
     pub start_command: String,
     /// Optional URL to check tunnel health
     #[serde(default)]
+    #[credential_url]
     pub health_url: Option<String>,
     /// Optional regex to extract public URL from command stdout
     #[serde(default)]
@@ -16654,6 +16703,7 @@ pub struct TelegramConfig {
     /// set to a local Bot API server URL when self-hosting Telegram's bot API.
     #[tab(Connection)]
     #[serde(default = "default_telegram_api_base_url")]
+    #[credential_url]
     pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[tab(Behavior)]
@@ -16733,6 +16783,7 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// How long (seconds) to wait for the operator to tap an inline-keyboard
     /// button on a tool approval prompt before auto-denying. Default: 120.
@@ -16906,6 +16957,7 @@ pub struct DiscordConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Streaming mode for progressive response delivery.
     /// `off` (default): single message. `partial`: editable draft updates.
@@ -17095,6 +17147,7 @@ pub struct SlackConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Enable progressive draft message streaming via `chat.update`.
     #[tab(Behavior)]
@@ -17244,6 +17297,7 @@ pub struct MattermostConfig {
     pub enabled: bool,
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     #[tab(Connection)]
+    #[credential_url]
     pub url: String,
     /// Mattermost bot access token. When unset, the channel falls back to
     /// the login flow using `login_id` + `password`.
@@ -17310,6 +17364,7 @@ pub struct MattermostConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Listen mode: `"polling"` (REST API every 3s, default) or `"websocket"`
@@ -17421,6 +17476,7 @@ pub struct WebhookConfig {
     /// URL to POST/PUT outbound messages to.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub send_url: Option<String>,
     /// HTTP method for outbound messages (`POST` or `PUT`). Default: `POST`.
     #[tab(Advanced)]
@@ -17547,6 +17603,7 @@ pub struct MatrixConfig {
     /// `"https://matrix.example.org"`). Server names use standard
     /// `/.well-known/matrix/client` discovery.
     #[tab(Connection)]
+    #[credential_url]
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel
     /// falls back to password login using `user_id` + `password`.
@@ -17807,6 +17864,7 @@ pub struct SignalConfig {
     pub enabled: bool,
     /// Base URL for the signal-cli HTTP daemon (e.g. `"http://127.0.0.1:8686"`).
     #[tab(Connection)]
+    #[credential_url]
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
     #[tab(Connection)]
@@ -17836,6 +17894,7 @@ pub struct SignalConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
@@ -18091,6 +18150,7 @@ pub struct WhatsAppConfig {
     /// default endpoint that ships with `wa-rs`.
     #[tab(Connection)]
     #[serde(default)]
+    #[credential_url]
     pub ws_url: Option<String>,
     /// Display name announced to contacts (Web mode, optional)
     /// Applied on connect when it differs from the name the linked device
@@ -18177,6 +18237,7 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
@@ -18300,6 +18361,7 @@ pub struct NextcloudTalkConfig {
     pub enabled: bool,
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     #[tab(Connection)]
+    #[credential_url]
     pub base_url: String,
     /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
     /// OCS bearer auth (see `webhook_secret`); this field is only accepted so
@@ -18341,6 +18403,7 @@ pub struct NextcloudTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Display name of the bot in Nextcloud Talk (e.g. "zeroclaw").
     /// Used to filter out the bot's own messages and prevent feedback loops.
@@ -18491,6 +18554,7 @@ pub struct MqttConfig {
     /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
     /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
     #[tab(Connection)]
+    #[credential_url]
     pub broker_url: String,
     /// MQTT client ID (must be unique per broker).
     #[tab(Advanced)]
@@ -19142,6 +19206,7 @@ pub struct LarkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -19296,6 +19361,7 @@ pub struct LineConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Display name shown as the sender in LINE chat bubbles.
@@ -19851,6 +19917,7 @@ pub struct DingTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -19959,6 +20026,7 @@ pub struct WeComWsConfig {
     pub stream_mode: StreamMode,
     /// Optional per-channel proxy override. Falls back to the global proxy config when empty.
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -20012,10 +20080,12 @@ pub struct WeChatConfig {
     /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub api_base_url: Option<String>,
     /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub cdn_base_url: Option<String>,
     /// Directory to persist bot token and sync cursor.
     /// Default: `~/.zeroclaw/wechat/`.
@@ -20063,6 +20133,7 @@ pub struct QQConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
     #[serde(default)]
+    #[credential_url]
     pub proxy_url: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
@@ -20129,6 +20200,7 @@ pub struct MochatConfig {
     pub enabled: bool,
     /// Mochat API base URL
     #[tab(Advanced)]
+    #[credential_url]
     pub api_url: String,
     /// Mochat API token
     #[secret]
@@ -20308,6 +20380,7 @@ pub struct GitConfig {
     /// never named. Gitea/Forgejo provider only.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub api_base_url: Option<String>,
     /// Personal access token for Gitea/Forgejo API requests. The token needs
     /// repository read access plus issue/PR comment write access for replies
@@ -20341,6 +20414,7 @@ pub struct GitConfig {
     /// Per-channel proxy override for GitHub API requests.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub proxy_url: Option<String>,
     /// Per-event routing table, keyed by normalized event type
     /// (`"issue_comment.created"`, `"pull_request.opened"`,
@@ -20697,6 +20771,7 @@ pub struct JiraConfig {
     pub enabled: bool,
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
+    #[credential_url]
     pub base_url: String,
     /// Jira account email used for Basic auth (Cloud).
     /// Omit for Server/DC deployments using Bearer token auth.
@@ -20967,6 +21042,7 @@ pub struct SecurityOpsConfig {
     pub report_output_dir: String,
     /// Optional SIEM webhook URL for alert ingestion.
     #[serde(default)]
+    #[credential_url]
     pub siem_integration: Option<String>,
 }
 
@@ -27605,6 +27681,7 @@ pub struct SopDecisionModelConfig {
     pub provider: SopDecisionProvider,
     /// Endpoint base URL. Defaults from `provider`; required for `custom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[credential_url]
     pub base_url: Option<String>,
     /// Model id sent with each request. Defaults from `provider`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42956,6 +43033,176 @@ stream_tool_arguments = [
         ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
         assert!(!Config::prop_is_secret("file_download.headers"));
+    }
+
+    // ── Credential-bearing URLs ───────────────────────────────
+
+    fn custom_uri(config: &Config) -> Option<String> {
+        config
+            .providers
+            .models
+            .find("custom", "credential_url")
+            .and_then(|provider| provider.uri.clone())
+    }
+
+    /// A provider URI carrying a password and a query credential reads back
+    /// masked through every config read (the whole-config projection, one
+    /// property, the property listing), and an echoed masked value writes
+    /// back as the stored URL, never as the placeholder.
+    #[::core::prelude::v1::test]
+    fn credential_urls_are_masked_on_every_read_and_restored_on_write_back() {
+        use crate::traits::MaskSecrets;
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let stored = format!("http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}");
+        let mut config: Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        let path = "providers.models.custom.credential_url.uri";
+        let shown = "http://***MASKED***@127.0.0.1:9/v1?***MASKED***";
+
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        let whole = serde_json::to_string(&masked).unwrap();
+        assert!(
+            !whole.contains(PASSWORD) && !whole.contains(QUERY),
+            "{whole}"
+        );
+        assert_eq!(custom_uri(&masked).as_deref(), Some(shown));
+        assert_eq!(config.get_prop(path).unwrap(), shown);
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the uri is a listed property");
+        assert_eq!(listed.display_value, shown);
+
+        // The masked value written back is the stored URL; a new host keeps
+        // the stored credentials.
+        config.set_prop(path, shown).unwrap();
+        assert_eq!(custom_uri(&config), Some(stored.clone()));
+        config
+            .set_prop(path, "http://***MASKED***@10.0.0.2:9/v1?***MASKED***")
+            .unwrap();
+        assert_eq!(
+            custom_uri(&config).as_deref(),
+            Some(
+                format!("http://review-user:{PASSWORD}@10.0.0.2:9/v1?credential={QUERY}").as_str()
+            )
+        );
+        // A placeholder with nothing stored behind it is refused, not stored.
+        config.set_prop(path, "http://10.0.0.2:9/v1").unwrap();
+        assert!(
+            config
+                .set_prop(path, "http://***MASKED***@10.0.0.2:9/v1")
+                .is_err()
+        );
+        assert_eq!(custom_uri(&config).as_deref(), Some("http://10.0.0.2:9/v1"));
+
+        // `restore_secrets_from` puts the stored components back too.
+        let original: Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        masked.restore_secrets_from(&original);
+        assert_eq!(custom_uri(&masked), Some(stored));
+    }
+
+    /// A skill registry's git URL can carry an access token: every read masks
+    /// it, and the list written back as shown restores each entry's token
+    /// from the stored registry of the same name.
+    #[::core::prelude::v1::test]
+    fn registry_urls_are_masked_on_read_and_restored_by_name() {
+        use crate::traits::MaskSecrets;
+        const TOKEN: &str = "ghp_registrytoken123";
+        let mut config: Config = toml::from_str(&format!(
+            "[[skills.extra_registries]]\nname = \"team\"\nurl = \"https://{TOKEN}@github.com/org/skills.git\"\n\n\
+             [[skills.extra_registries]]\nname = \"public\"\nurl = \"https://github.com/org/public.git\"\n"
+        ))
+        .unwrap();
+        let path = "skills.extra_registries";
+
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert!(!serde_json::to_string(&masked).unwrap().contains(TOKEN));
+        assert_eq!(
+            masked.skills.extra_registries[0].url,
+            "https://***MASKED***@github.com/org/skills.git"
+        );
+        assert_eq!(
+            masked.skills.extra_registries[1].url,
+            "https://github.com/org/public.git"
+        );
+        let read = config.get_prop(path).unwrap();
+        assert!(
+            !read.contains(TOKEN) && read.contains("github.com/org/skills.git"),
+            "{read}"
+        );
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the registries are a listed property");
+        assert!(
+            !listed.display_value.contains(TOKEN),
+            "{}",
+            listed.display_value
+        );
+
+        // The listing written back as shown keeps the stored token.
+        config.set_prop(path, &listed.display_value).unwrap();
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+        // So does one with another field of that registry changed: the
+        // entry is matched by its name.
+        let mut edited: serde_json::Value = serde_json::from_str(&listed.display_value).unwrap();
+        edited[0]["enabled"] = serde_json::Value::Bool(false);
+        config.set_prop(path, &edited.to_string()).unwrap();
+        assert!(!config.skills.extra_registries[0].enabled);
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+        // An entry renamed while masked matches no stored registry: refused.
+        let renamed = listed.display_value.replace("\"team\"", "\"other\"");
+        assert!(config.set_prop(path, &renamed).is_err());
+        assert_eq!(
+            config.skills.extra_registries[0].url,
+            format!("https://{TOKEN}@github.com/org/skills.git")
+        );
+    }
+
+    /// An MCP server's URL, addressed through the server's name, reads
+    /// masked wherever the config is read, and the value written back as
+    /// shown keeps the stored URL.
+    #[::core::prelude::v1::test]
+    fn mcp_server_urls_are_masked_and_restored_by_server_name() {
+        use crate::traits::MaskSecrets;
+        const TOKEN: &str = "mcp-url-token-73519";
+        let stored = format!("https://search.example/mcp?token={TOKEN}");
+        let mut config: Config = toml::from_str(&format!(
+            "[[mcp.servers]]\nname = \"search\"\ntransport = \"http\"\nurl = \"{stored}\"\n"
+        ))
+        .unwrap();
+        let path = "mcp.servers.search.url";
+        let shown = "https://search.example/mcp?***MASKED***";
+
+        assert_eq!(config.get_prop(path).unwrap(), shown);
+        let listed = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("the server's url is a listed property");
+        assert_eq!(listed.display_value, shown);
+        let mut masked = config.clone();
+        masked.mask_secrets();
+        assert_eq!(masked.mcp.servers[0].url.as_deref(), Some(shown));
+
+        config.set_prop(path, shown).unwrap();
+        assert_eq!(config.mcp.servers[0].url.as_deref(), Some(stored.as_str()));
     }
 
     #[test]

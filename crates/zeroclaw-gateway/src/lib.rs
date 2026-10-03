@@ -33,12 +33,20 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+#[cfg(test)]
+mod config_write_parity;
+#[cfg(test)]
+mod core_parity_tests;
+pub mod core_rpc;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
+pub mod preview;
 pub mod principal_gate;
+#[cfg(test)]
+mod refusal_parity;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -1065,6 +1073,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         ),
         None => (None, None, None),
     };
+
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1720,6 +1729,20 @@ pub async fn run_gateway_with_plugin_webhooks(
             config.gateway.pairing_code,
         )
     }));
+    // The in-process RPC seam: when a supervised run provides the daemon's
+    // connector, routes that migrate onto RPC reach the core through it, each
+    // request on a connection bound to its caller's own credential. Nothing
+    // is dialed until such a request arrives, and never without a credential.
+    let core_rpc = match reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        Some(connector) => {
+            let pairing = Arc::clone(&pairing);
+            core_rpc::CoreRpc::inproc(connector, move || pairing.require_pairing())
+        }
+        None => core_rpc::CoreRpc::default(),
+    };
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -2430,7 +2453,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -4802,8 +4827,20 @@ fn require_gateway_admin_token(
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
+) -> Response {
+    admin_shutdown(&peer, &state.shutdown_tx)
+}
+
+/// The `/admin/shutdown` answer to a caller at `peer`: refused unless it is
+/// on loopback, otherwise a stop request on `shutdown`. The separate
+/// gateway answers with this too, so both stop the same way.
+pub(crate) fn admin_shutdown(
+    peer: &SocketAddr,
+    shutdown: &tokio::sync::watch::Sender<bool>,
+) -> Response {
+    if let Err(refusal) = require_localhost(peer) {
+        return refusal.into_response();
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -4815,9 +4852,9 @@ async fn handle_admin_shutdown(
         message: "Gateway shutdown initiated".to_string(),
     };
 
-    let _ = state.shutdown_tx.send(true);
+    let _ = shutdown.send(true);
 
-    Ok((StatusCode::OK, Json(body)))
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Authorization decision for `POST /admin/reload`, derived purely from the
@@ -4837,6 +4874,50 @@ enum AdminReloadGate {
     /// when pairing is off, so without this guard `allow_remote_admin` would
     /// expose reload to anonymous remote callers.
     ForbiddenNoPairing,
+}
+
+/// `/admin/reload`'s refusal of a remote caller the operator did not opt in.
+const REMOTE_ADMIN_RELOAD_DISABLED: &str =
+    zeroclaw_runtime::rpc::dispatch::REMOTE_ADMIN_RELOAD_DISABLED;
+
+/// `/admin/reload`'s answer when no daemon supervisor can reload.
+const NO_DAEMON_SUPERVISOR: &str = "no daemon supervisor — running as standalone gateway. \
+     Restart the process to pick up config changes.";
+
+/// `POST /admin/reload` through the core. The HTTP edge supplies the caller's
+/// loopback status; the core resolves remote-admin policy and actual pairing
+/// from canonical live state at reload admission.
+pub(crate) async fn admin_reload_through_core(
+    core: &crate::core_rpc::CoreCall,
+    is_loopback: bool,
+) -> Result<axum::response::Response, crate::core_rpc::CoreError> {
+    match core
+        .request(
+            zeroclaw_rpc_client::Method::ConfigReload,
+            serde_json::json!({ "remote_admin": !is_loopback }),
+        )
+        .await
+    {
+        Ok(_) => Ok((
+            StatusCode::OK,
+            Json(AdminResponse {
+                success: true,
+                message: "Daemon reload initiated".to_string(),
+            }),
+        )
+            .into_response()),
+        Err(error)
+            if error.reason()
+                == Some(zeroclaw_rpc_proto::error_reasons::RefusalReason::Disabled) =>
+        {
+            Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": NO_DAEMON_SUPERVISOR })),
+            )
+                .into_response())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn admin_reload_gate(
@@ -4875,22 +4956,14 @@ async fn handle_admin_reload(
         AdminReloadGate::Forbidden => {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "Remote admin reload is disabled. Call from localhost, \
-                              or set gateway.allow_remote_admin = true (with pairing \
-                              enabled, then pair) to allow authenticated remote reloads."
-                })),
+                Json(serde_json::json!({ "error": REMOTE_ADMIN_RELOAD_DISABLED })),
             ));
         }
         AdminReloadGate::ForbiddenNoPairing => {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
-                    "error": "Remote admin reload requires pairing. \
-                              gateway.allow_remote_admin is enabled but \
-                              gateway.require_pairing is off, so remote callers \
-                              cannot be authenticated. Enable require_pairing, or \
-                              call /admin/reload from localhost."
+                    "error": zeroclaw_runtime::rpc::dispatch::REMOTE_ADMIN_RELOAD_NO_PAIRING
                 })),
             ));
         }
@@ -4899,10 +4972,7 @@ async fn handle_admin_reload(
     let Some(reload_tx) = state.reload_tx.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "no daemon supervisor — running as standalone gateway. \
-                          Restart the process to pick up config changes."
-            })),
+            Json(serde_json::json!({ "error": NO_DAEMON_SUPERVISOR })),
         ));
     };
 
