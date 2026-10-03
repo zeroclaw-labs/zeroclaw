@@ -869,8 +869,13 @@ pub(crate) use call_tool_execute;
 /// call was interrupted and discarded, then run under the same
 /// discard-on-interruption rule as other warm instances, inside the
 /// channel-service frame.
+///
+/// The `discard_on_error` form also discards the instance when the call
+/// returns an error. Use it for an export with no error result of its own:
+/// every error there is a trap or a failed host call, after which Wasmtime
+/// refuses every later call into the store.
 macro_rules! call_channel {
-    ($self:expr, $body:expr) => {{
+    (@frame $self:expr, $keep:path, $body:expr) => {{
         'plugin_call: {
             let mut guard = $self.state.lock().await;
             if guard.is_none() {
@@ -889,7 +894,9 @@ macro_rules! call_channel {
             {
                 Ok(result) => {
                     drop(active_call);
-                    *guard = Some((store, bindings));
+                    if $keep(&result) {
+                        *guard = Some((store, bindings));
+                    }
                     break 'plugin_call result;
                 }
                 Err(_) => {
@@ -899,8 +906,20 @@ macro_rules! call_channel {
             }
         }
     }};
+    ($self:expr, discard_on_error, $body:expr) => {{
+        crate::component::call_channel!(@frame $self, ::std::result::Result::is_ok, $body)
+    }};
+    ($self:expr, $body:expr) => {{
+        crate::component::call_channel!(@frame $self, crate::component::keep_warm_instance, $body)
+    }};
 }
 pub(crate) use call_channel;
+
+/// `call_channel!` keeps the instance after any call that finished inside its
+/// deadline.
+pub(crate) fn keep_warm_instance<T>(_result: &T) -> bool {
+    true
+}
 
 /// Run one direct owned-store call inside its host-service frame, bounded by
 /// the wall-clock deadline. Used during instantiation and metadata probing,

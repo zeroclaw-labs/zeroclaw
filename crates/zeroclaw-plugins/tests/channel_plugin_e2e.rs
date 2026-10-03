@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use zeroclaw_api::attribution::Attributable;
-use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::channel::{Channel, ListenerHealth, SendMessage};
 use zeroclaw_api::webhook::{
     MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookIdempotency, WebhookOutcome, WebhookReject,
 };
@@ -221,6 +221,37 @@ async fn channel_with_timeout(binding: &str, timeout: Duration) -> WasmChannel {
         limits_with(u64::MAX, timeout),
     )
     .await
+}
+
+/// A host-enqueued inbound message whose content the fixture interprets.
+fn queued(id: &str, content: &str) -> HostInboundMessage {
+    HostInboundMessage {
+        id: id.to_string(),
+        sender: "tester".to_string(),
+        reply_target: "room".to_string(),
+        content: content.to_string(),
+        channel: "host-channel".to_string(),
+        timestamp: 1,
+        ..Default::default()
+    }
+}
+
+/// Read `listener_health` the way the channel supervisor does, as time passes,
+/// until it reports `expected` or `within` runs out.
+async fn wait_for_listener_health(
+    channel: &WasmChannel,
+    expected: ListenerHealth,
+    within: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    while channel.listener_health() != Some(expected) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener health stayed {:?} instead of {expected:?}",
+            channel.listener_health()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn outbound(content: &str, recipient: &str) -> SendMessage {
@@ -897,5 +928,161 @@ async fn interrupted_poll_preserves_backlog_but_not_the_dequeued_message() {
             .is_err(),
         "the interrupted message must not resurface later"
     );
+    listener.abort();
+}
+
+/// The listener asks the guest's `health-check` from its poll loop, at most
+/// once per interval, and `listener_health` reports the latest answer without
+/// calling the guest itself. The fixture's health flips during its own polls,
+/// the way a real plugin's connection state does.
+#[tokio::test]
+async fn listener_health_follows_the_guest_health_check_at_a_bounded_cadence() {
+    // The host's ask interval, `GUEST_HEALTH_INTERVAL` in `wasm_channel.rs`.
+    const ASK_INTERVAL: Duration = Duration::from_secs(30);
+    let channel = Arc::new(
+        channel("health")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    assert_eq!(
+        channel.listener_health(),
+        Some(ListenerHealth::Pending),
+        "the guest has not answered before the listener asks"
+    );
+
+    // Virtual time from here on. The fixture's polls and health checks never
+    // wait on a timer, so only the poll loop's back-off and the ask interval
+    // move the clock, and a minute of polling takes no wall time.
+    tokio::time::pause();
+    let inbound = channel.inbound();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(1)).await;
+
+    // The plugin sees its connection drop during a poll. The host keeps the
+    // answer it already has until the next ask, because it does not ask per
+    // poll.
+    inbound.enqueue(queued("down", "health:down"));
+    tokio::time::sleep(ASK_INTERVAL / 2).await;
+    assert_eq!(
+        inbound.pending(),
+        0,
+        "the plugin polled the control message"
+    );
+    assert_eq!(channel.listener_health(), Some(ListenerHealth::Healthy));
+
+    wait_for_listener_health(&channel, ListenerHealth::Unhealthy, ASK_INTERVAL).await;
+
+    inbound.enqueue(queued("up", "health:up"));
+    wait_for_listener_health(
+        &channel,
+        ListenerHealth::Healthy,
+        ASK_INTERVAL + Duration::from_secs(1),
+    )
+    .await;
+
+    // About a minute of polling every 50 to 500 ms drew three asks: one after
+    // the first poll, then one per interval.
+    inbound.enqueue(queued("count", "health:count"));
+    let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the ask count arrives")
+        .expect("listener remains connected");
+    assert_eq!(report.content, "health-checks:3");
+    listener.abort();
+}
+
+/// A poll bridge that keeps failing reports the listener unhealthy although the
+/// guest's own health check still answers `true`, and the listener recovers
+/// once polls succeed again, without waiting a full ask interval.
+#[tokio::test]
+async fn failing_polls_report_the_listener_unhealthy_despite_a_healthy_guest() {
+    // u64::MAX fuel so the wall-clock deadline, not fuel exhaustion, ends each
+    // spinning poll and discards the instance.
+    let channel = Arc::new(
+        channel_with(
+            "poll-failure",
+            vec![PluginPermission::HttpClient],
+            &HashMap::new(),
+            limits_with(u64::MAX, Duration::from_secs(1)),
+        )
+        .await
+        .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    // The first ask answers on the healthy instance. The next one is an
+    // interval away, so no ask runs during the failures below.
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(5)).await;
+
+    // Each `spin` message holds one poll until the deadline and discards the
+    // instance, so a run of them keeps the poll bridge failing for seconds.
+    let inbound = channel.inbound();
+    for index in 0..3 {
+        inbound.enqueue(queued(&format!("spin-{index}"), "spin until the deadline"));
+    }
+    wait_for_listener_health(&channel, ListenerHealth::Unhealthy, Duration::from_secs(5)).await;
+    // The guest's last answer still stands, so the first clean poll on a
+    // rebuilt instance restores the verdict without waiting for the next ask.
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(15)).await;
+    assert_eq!(
+        inbound.pending(),
+        0,
+        "every failing poll consumed its message"
+    );
+    listener.abort();
+}
+
+/// A trap leaves Wasmtime refusing every later call into that store. A
+/// `health-check` that traps must not take the channel down with it: the
+/// listener discards that instance, keeps delivering on a rebuilt one, reports
+/// the failed ask as unhealthy until a later ask succeeds, and backs off before
+/// asking again, because every failed ask costs a rebuild.
+#[tokio::test]
+async fn a_trapping_health_check_reads_unhealthy_without_disabling_the_channel() {
+    // The host's ask interval, `GUEST_HEALTH_INTERVAL` in `wasm_channel.rs`.
+    const ASK_INTERVAL: Duration = Duration::from_secs(30);
+    let channel = Arc::new(
+        channel("health-trap")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    // Virtual time; see `listener_health_follows_the_guest_health_check_at_a_bounded_cadence`.
+    tokio::time::pause();
+    let inbound = channel.inbound();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(1)).await;
+
+    inbound.enqueue(queued("trap", "health:trap"));
+    wait_for_listener_health(
+        &channel,
+        ListenerHealth::Unhealthy,
+        ASK_INTERVAL + Duration::from_secs(1),
+    )
+    .await;
+
+    inbound.enqueue(queued("after-trap", "delivered after the trap"));
+    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a rebuilt instance keeps polling after the trap")
+        .expect("listener remains connected");
+    assert_eq!(delivered.id, "after-trap");
+
+    // After a failed ask the next one waits two intervals, not one.
+    tokio::time::sleep(ASK_INTERVAL).await;
+    assert_eq!(channel.listener_health(), Some(ListenerHealth::Unhealthy));
+
+    // The rebuilt instance answers that later ask.
+    wait_for_listener_health(
+        &channel,
+        ListenerHealth::Healthy,
+        ASK_INTERVAL + Duration::from_secs(5),
+    )
+    .await;
     listener.abort();
 }
