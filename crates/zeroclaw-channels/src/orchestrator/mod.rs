@@ -2172,6 +2172,14 @@ fn build_channel_system_prompt(
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
         }
+        if instructions.contains("[DOCUMENT:") {
+            prompt.push_str(
+                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, save the \
+                 complete artifact inside the configured workspace instead of pasting it into chat. \
+                 Send a short summary plus the document marker described above, following this \
+                 channel's path and URL restrictions.",
+            );
+        }
     }
 
     if let Some(mention) = bot_mention {
@@ -45396,7 +45404,54 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0][0].1.contains("For media attachments use markers:"),
             "telegram media marker guidance should live in the system prompt"
         );
+        assert!(
+            calls[0][0]
+                .1
+                .contains("save the complete artifact inside the configured workspace"),
+            "generated artifact guidance should reach the provider's system message"
+        );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_guides_large_artifacts_only_for_document_channels() {
+        let base = "Base prompt with literal marker syntax: [DOCUMENT:example.txt]";
+        for channel_name in [
+            "matrix",
+            "discord",
+            "whatsapp",
+            "whatsapp-web",
+            "lark",
+            "feishu",
+            "telegram",
+            "qq",
+            "wechat",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                prompt.contains(base),
+                "{channel_name} must retain the base prompt"
+            );
+            assert!(
+                prompt.contains("save the complete artifact inside the configured workspace")
+                    && prompt.contains("instead of pasting it into chat")
+                    && prompt.contains("short summary plus the document marker")
+                    && prompt.contains("following this channel's path and URL restrictions"),
+                "{channel_name} must guide large artifacts through its existing document route"
+            );
+            assert_eq!(
+                prompt,
+                build_channel_system_prompt(base, channel_name, None),
+                "{channel_name} artifact guidance must remain byte-stable"
+            );
+        }
+        for channel_name in ["wecom_ws", "mattermost", "unknown"] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                !prompt.contains("short summary plus the document marker"),
+                "{channel_name} must not advertise document delivery from base-prompt marker text"
+            );
+        }
     }
 
     #[test]
