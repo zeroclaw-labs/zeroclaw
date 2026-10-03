@@ -31,6 +31,7 @@ pub mod schema;
 pub mod schema_markdown;
 pub mod secrets;
 pub mod sections;
+pub mod setup;
 pub mod skill_bundles;
 pub mod traits;
 pub mod typed_value;
