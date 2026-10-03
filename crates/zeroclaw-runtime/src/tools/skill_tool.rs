@@ -388,6 +388,18 @@ impl Tool for SkillBuiltinTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(
+            args,
+            &zeroclaw_api::tool::ToolExecutionContext::current().unwrap_or_default(),
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
         // at INFO with the delegation target and the locked scope keys.
@@ -403,7 +415,7 @@ impl Tool for SkillBuiltinTool {
             "skill-scoped elevated tool invoked"
         );
         let merged = merge_locked_args(&self.locked_args, args);
-        self.target_tool.execute(merged).await
+        self.target_tool.execute_with_context(merged, context).await
     }
 }
 

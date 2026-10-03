@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
 use crate::tool_search::ToolAccessPolicy;
@@ -146,6 +146,7 @@ impl PipelineTool {
         steps: &[PipelineStep],
     ) -> std::result::Result<Vec<StepResult>, PipelineError> {
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
@@ -155,14 +156,14 @@ impl PipelineTool {
             // Interpolate previous step results into args.
             let interpolated_args = interpolate_args(&step.args, &results);
 
-            let tool_result =
-                tool.execute(interpolated_args)
-                    .await
-                    .map_err(|e| PipelineError::StepFailed {
-                        index: i,
-                        tool: step.tool.clone(),
-                        message: e.to_string(),
-                    })?;
+            let tool_result = tool
+                .execute_with_context(interpolated_args, &context)
+                .await
+                .map_err(|e| PipelineError::StepFailed {
+                    index: i,
+                    tool: step.tool.clone(),
+                    message: e.to_string(),
+                })?;
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -193,6 +194,7 @@ impl PipelineTool {
         use tokio::task::JoinSet;
 
         let mut join_set = JoinSet::new();
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
@@ -207,8 +209,9 @@ impl PipelineTool {
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
 
             if let Some(tool_arc) = tool_arc {
+                let context = context.clone();
                 join_set.spawn(async move {
-                    let result = tool_arc.execute(args).await;
+                    let result = tool_arc.execute_with_context(args, &context).await;
                     (i, tool_name, result)
                 });
             }
@@ -448,6 +451,95 @@ fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ContextAwareStep {
+        tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextAwareStep);
+
+    #[async_trait]
+    impl Tool for ContextAwareStep {
+        fn name(&self) -> &str {
+            "context_step"
+        }
+        fn description(&self) -> &str {
+            "Records a pipeline step's execution context"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            anyhow::bail!("pipeline steps must receive an explicit context")
+        }
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<ToolResult> {
+            context
+                .run(async {
+                    let token = ToolExecutionContext::current()
+                        .unwrap()
+                        .cancellation_token()
+                        .unwrap()
+                        .clone();
+                    self.tokens.lock().unwrap().push(token);
+                    Ok(ToolResult::ok("step completed"))
+                })
+                .await
+        }
+    }
+
+    async fn assert_steps_inherit_context(parallel: bool) {
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["context_step".into()],
+            },
+            vec![Arc::new(ContextAwareStep {
+                tokens: tokens.clone(),
+            })],
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let result = tool
+            .execute_with_context(
+                serde_json::json!({
+                    "steps": [
+                        {"tool": "context_step", "args": {}},
+                        {"tool": "context_step", "args": {}}
+                    ],
+                    "parallel": parallel
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(ToolExecutionContext::current().is_none());
+        let tokens = tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| !token.is_cancelled()));
+        token.cancel();
+        assert!(
+            tokens
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_sequential_steps_inherit_token() {
+        assert_steps_inherit_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_parallel_steps_inherit_token() {
+        assert_steps_inherit_context(true).await;
+    }
 
     // ── Interpolation ──────────────────────────────────────
 
