@@ -3,6 +3,8 @@
 pub mod approval_channel;
 pub mod attachments;
 pub mod auth;
+#[cfg(test)]
+mod conformance_tests;
 pub mod context;
 pub mod dispatch;
 pub mod fs;
