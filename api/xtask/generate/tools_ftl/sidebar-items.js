@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SOURCE"],"fn":["render_file"]};

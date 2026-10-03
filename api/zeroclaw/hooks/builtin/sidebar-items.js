@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["command_logger","webhook_audit"],"struct":["CommandLoggerHook","WebhookAuditHook"]};

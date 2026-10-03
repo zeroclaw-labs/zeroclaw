@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_FILE_BYTES","MAX_REQUEST_BYTES"],"fn":["load_file_entry","persist_into_index","persist_upload_bytes","process_file_entry"],"struct":["AttachmentSource"]};

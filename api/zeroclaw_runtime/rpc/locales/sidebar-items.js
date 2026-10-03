@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_locales_fetch","handle_locales_list"]};

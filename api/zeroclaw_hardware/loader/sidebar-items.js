@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["plugin_tools_dir","scan_plugin_dir"],"struct":["LoadedPlugin"]};

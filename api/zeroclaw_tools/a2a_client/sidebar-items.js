@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["shared_a2a_route_cache"],"struct":["A2aCancelTool","A2aDiscoverTool","A2aGetTaskTool","A2aHttpClient","A2aSendTool","RouteHandle"],"type":["RouteCache"]};
