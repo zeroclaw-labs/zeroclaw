@@ -595,10 +595,7 @@ impl ZerocodePane {
         };
         crate::i18n::t_args(
             "zc-zerocode-agent-theme-hint",
-            &[
-                ("assign", &label(A::Enter)),
-                ("clear", &label(A::DeleteRow)),
-            ],
+            &[("assign", &label(A::Enter)), ("clear", &label(A::Reset))],
         )
     }
 
@@ -1132,12 +1129,12 @@ impl ZerocodePane {
                 }
                 self.leave_detail();
             }
-            Some(ConfigTabAction::DeleteRow)
+            Some(ConfigTabAction::Reset)
                 if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
             {
                 self.reset_row();
             }
-            Some(ConfigTabAction::DeleteRow) if self.focus == Focus::AgentTheme => {
+            Some(ConfigTabAction::Reset) if self.focus == Focus::AgentTheme => {
                 self.clear_agent_override();
             }
             _ => {}
@@ -1166,7 +1163,7 @@ impl ZerocodePane {
         self.theme_target_agent.is_some()
     }
 
-    /// Remove the highlighted agent's override (DeleteRow in the AgentTheme
+    /// Remove the highlighted agent's override (Reset in the AgentTheme
     /// section).
     fn clear_agent_override(&mut self) {
         let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
@@ -1695,7 +1692,7 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-pick-agent"),
                 ));
                 entries.push(E::new(
-                    keys(A::DeleteRow),
+                    keys(A::Reset),
                     crate::i18n::t("zc-zerocode-help-clear-agent-theme"),
                 ));
             }
@@ -1711,7 +1708,7 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-rebind"),
                 ));
                 entries.push(E::new(
-                    keys(A::DeleteRow),
+                    keys(A::Reset),
                     crate::i18n::t("zc-zerocode-help-reset-default"),
                 ));
             }

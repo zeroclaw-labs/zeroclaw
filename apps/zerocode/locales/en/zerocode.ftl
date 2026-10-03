@@ -637,6 +637,28 @@ zc-config-help-save-array = Save array
 zc-config-help-save-value = Save value
 zc-config-help-reset-default = Reset to default
 
+zc-config-confirm-delete-title = Confirm deletion
+zc-config-confirm-reset-title = Confirm reset
+zc-config-confirm-result-title = Config mutation result
+zc-config-confirm-result-hint = { $confirm }/{ $cancel }=dismiss  { $navigate }=scroll
+zc-config-confirm-reset-effect = Remove this configured value. Defaults or environment overrides may still determine its effective value.
+zc-config-confirm-preview-unavailable = This daemon cannot preview the cascade over RPC. Deleting may remove references or owned state. The daemon still checks the mutation when confirmed.
+zc-config-confirm-rechecked = The daemon checks current references and permissions again when confirmed.
+zc-config-confirm-blocked = Deletion is blocked. Resolve the blockers before trying again.
+zc-config-confirm-blocker = Blocked by: { $path }
+zc-config-confirm-scrub = Reference to remove: { $path }
+zc-config-confirm-live-sessions = Blocked by { $count } live ACP sessions.
+zc-config-confirm-owned-state = Agent deletion also archives and removes its workspace, memory, cron jobs and session history.
+zc-config-confirm-action-hint = { $confirm }=confirm  { $cancel }=cancel  { $navigate }=scroll
+zc-config-confirm-cancel-hint = { $cancel }=cancel  { $navigate }=scroll
+zc-config-confirm-preview-failed = Could not preview deletion: { $err }
+zc-config-confirm-target-mismatch = The daemon returned a different target. Reopen the section to reload before trying again.
+zc-config-confirm-not-applied = The daemon did not change { $target }.
+zc-config-confirm-deleted = Deleted { $target }
+zc-config-confirm-deleted-refresh-failed = Deleted { $target }, but refreshing the list failed: { $err }. Reopen the section to reload.
+zc-config-confirm-reset-refresh-failed = Reset { $target }, but refreshing the fields failed: { $err }. Reopen the section to reload.
+zc-config-confirm-warnings = Warnings: { $warnings }
+
 zc-config-status-alias-empty = Alias name cannot be empty
 zc-config-status-alias-deleted = Deleted { $alias }
 zc-config-status-alias-create-failed = Create failed: { $err }

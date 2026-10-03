@@ -2306,6 +2306,31 @@ pub async fn run(
             continue;
         }
 
+        // Config confirmation owns input before global pane/sidebar navigation.
+        // Paste cannot fall through and edit or confirm the underlying row.
+        if mode == Mode::Config
+            && config_app.has_mutation_dialog()
+            && matches!(
+                input_event,
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_)
+            )
+        {
+            if dispatch_state.rpc_allowed() || !config_app.has_pending_mutation() {
+                match input_event {
+                    Event::Key(key) => {
+                        config_app.handle_key(key, term).await?;
+                    }
+                    Event::Mouse(mouse) => {
+                        config_app.handle_mouse(mouse, content_area, term).await?;
+                    }
+                    _ => {}
+                }
+            } else {
+                config_app.cancel_mutation_dialog();
+            }
+            continue;
+        }
+
         match input_event {
             Event::Key(key) => {
                 dock.clear_capture();
