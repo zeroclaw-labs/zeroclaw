@@ -3042,7 +3042,24 @@ async fn connection_establishment_failure_does_not_quarantine_endpoint() {
     let addr = reservation.local_addr().expect("unused address");
 
     let endpoint = format!("http://{addr}");
-    let provider = hailo_provider(&endpoint);
+    // Whether connecting to a bound-but-not-listening socket is refused
+    // (Linux) or left pending until a timer fires (observed on macOS CI) is
+    // platform behavior. Keep the request timeout above the provider's fixed
+    // 10 s connect timeout so a pending connect ends as a connection failure,
+    // as in production, instead of the ambiguous request timeout that
+    // correctly quarantines the endpoint.
+    let provider = HailoOllamaModelProvider::new(
+        "edge",
+        Some(&endpoint),
+        15,
+        5,
+        OllamaTuning {
+            num_ctx: 2048,
+            num_predict: 64,
+            temperature_override: None,
+        },
+    )
+    .expect("valid fake Hailo URL");
     let first_error = provider
         .simple_chat("first", "qwen3:1.7b", Some(0.2))
         .await
