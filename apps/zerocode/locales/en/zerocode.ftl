@@ -46,6 +46,10 @@ zc-app-keybindings-title = Keybindings
 zc-app-help-filter-label = Filter
 zc-app-help-filter-placeholder = type a key or action…
 zc-app-help-no-matches = No matching keybindings
+zc-config-filter-sections = Filter sections
+zc-config-filter-list = Filter list
+zc-config-filter-options = Filter options
+zc-config-filter-no-matches = No matches
 zc-app-help-controls = { $cancel } clear/close · { $up }/{ $down } scroll · Type to filter
 
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every
