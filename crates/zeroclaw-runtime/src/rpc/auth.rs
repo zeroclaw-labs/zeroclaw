@@ -587,19 +587,32 @@ pub struct AuthorityLease<'a> {
 }
 
 impl AuthorityLease<'_> {
-    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
-    /// credential is unexpired and still paired, and the grants resolve under
-    /// the policy that stays in force until the lease is dropped.
-    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+    /// The accepted policy generation the lease holds.
+    pub fn generation(&self) -> u64 {
+        self.state.resolver.generation()
+    }
+
+    /// [`RpcInboundAuth::credential_is_live`] answered from the held
+    /// paired-token set: the credential is unexpired and, for a native
+    /// pairing token, still paired.
+    pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
         credential_unexpired(auth)?;
-        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
         if let Some(hash) = auth.native_token_hash.as_deref()
-            && !is_paired(hash)
+            && !self.pairings.contains_hash(hash)
         {
             return Err(AuthDenied::auth_required(
                 crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
             ));
         }
+        Ok(())
+    }
+
+    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
+    /// credential is unexpired and still paired, and the grants resolve under
+    /// the policy that stays in force until the lease is dropped.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        self.credential_is_live(auth)?;
+        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
         if auth.generation != self.state.resolver.generation() {
             self.state
                 .revalidates_local_evidence(
