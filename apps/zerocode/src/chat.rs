@@ -24,8 +24,9 @@ use crate::attachment::{
     CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
 };
 use crate::client::{
-    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionStateResult, SessionUpdate,
-    TurnEndOutcome, method, parse_session_update,
+    ApprovalDecision, RpcClient, RpcNotification, SessionCompactContextResult, SessionEntry,
+    SessionRestoreContextResult, SessionStateResult, SessionUpdate, TurnEndOutcome, method,
+    parse_session_update,
 };
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
@@ -436,6 +437,9 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    compaction_tx: mpsc::Sender<CompactionOpResult>,
+    compaction_rx: mpsc::Receiver<CompactionOpResult>,
+    compaction_pending: HashSet<(String, String)>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Live but unfocused sessions of this pane. Each keeps its full
@@ -758,6 +762,91 @@ struct PromptCompletion {
     transport_closed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionOpKind {
+    Compact,
+    Restore,
+}
+
+fn local_compaction_operation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("zc-ctx-{nanos}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+struct CompactionOpResult {
+    session_id: String,
+    operation_id: String,
+    result: Result<CompactionOpPayload, String>,
+}
+
+enum CompactionOpPayload {
+    Compact(SessionCompactContextResult),
+    Restore(SessionRestoreContextResult),
+}
+
+fn render_compact_result(result: &SessionCompactContextResult) -> String {
+    let mut message = if result.status == "activated" {
+        crate::i18n::t_args(
+            "zc-compact-context-done",
+            &[
+                ("turns", &result.covered_turns.to_string()),
+                ("rows", &result.covered_message_rows.to_string()),
+                ("before", &result.estimated_tokens_before.to_string()),
+                ("after", &result.estimated_tokens_after.to_string()),
+            ],
+        )
+    } else {
+        crate::i18n::t("zc-compact-context-already")
+    };
+    if let Some(usage) = result.usage.as_ref() {
+        let usage = match (usage.input_tokens, usage.output_tokens) {
+            (Some(input), Some(output)) => crate::i18n::t_args(
+                "zc-compact-context-usage",
+                &[
+                    ("input", &input.to_string()),
+                    ("output", &output.to_string()),
+                ],
+            ),
+            (Some(input), None) => crate::i18n::t_args(
+                "zc-compact-context-usage-input",
+                &[("input", &input.to_string())],
+            ),
+            _ => String::new(),
+        };
+        if !usage.is_empty() {
+            message.push('\n');
+            message.push_str(&usage);
+        }
+    }
+    if result.status == "activated" && !result.installed {
+        message.push('\n');
+        message.push_str(&crate::i18n::t("zc-compact-context-uninstalled"));
+    }
+    if !result.summary.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(&crate::i18n::t("zc-compact-context-summary-heading"));
+        message.push_str("\n\n");
+        message.push_str(&result.summary);
+    }
+    message
+}
+
+fn render_restore_result(result: &SessionRestoreContextResult) -> String {
+    if result.status == "deactivated" {
+        crate::i18n::t_args(
+            "zc-restore-context-done",
+            &[("turns", &result.covered_turns.unwrap_or(0).to_string())],
+        )
+    } else {
+        crate::i18n::t("zc-restore-context-none")
+    }
+}
+
 /// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
 /// Fluent key whose localized label describes that provenance. Unknown values
 /// (older or future daemons) fall back to a label-less render.
@@ -783,6 +872,7 @@ impl Chat {
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (compaction_tx, compaction_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -800,6 +890,9 @@ impl Chat {
             session_resync_in_flight: HashMap::new(),
             prompt_completion_tx,
             prompt_completion_rx,
+            compaction_tx,
+            compaction_rx,
+            compaction_pending: HashSet::new(),
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -3544,6 +3637,92 @@ impl Chat {
         }
     }
 
+    fn begin_context_compaction(
+        rpc: &Arc<RpcClient>,
+        tx: &mpsc::Sender<CompactionOpResult>,
+        pane_kind: PaneKind,
+        state: &mut ChatState,
+        kind: CompactionOpKind,
+    ) -> Option<(String, String)> {
+        if pane_kind != PaneKind::Acp {
+            state.set_info_notice(crate::i18n::t("zc-compaction-wrong-pane"));
+            return None;
+        }
+        if state.turn_in_flight {
+            state.set_info_notice(crate::i18n::t("zc-compaction-busy-local"));
+            return None;
+        }
+        let session_id = state.session_id.clone();
+        let operation_id = local_compaction_operation_id();
+        state
+            .entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                if kind == CompactionOpKind::Compact {
+                    "zc-compact-context-started"
+                } else {
+                    "zc-restore-context-started"
+                },
+            ))));
+        state.mark_dirty_append();
+        let rpc = Arc::clone(rpc);
+        let result_tx = tx.clone();
+        let pending = (session_id.clone(), operation_id.clone());
+        tokio::spawn(async move {
+            let result = match kind {
+                CompactionOpKind::Compact => rpc
+                    .session_compact_context(&session_id, &operation_id)
+                    .await
+                    .map(CompactionOpPayload::Compact),
+                CompactionOpKind::Restore => rpc
+                    .session_restore_context(&session_id, &operation_id)
+                    .await
+                    .map(CompactionOpPayload::Restore),
+            }
+            .map_err(|error| error.to_string());
+            let _ = result_tx
+                .send(CompactionOpResult {
+                    session_id,
+                    operation_id,
+                    result,
+                })
+                .await;
+        });
+        Some(pending)
+    }
+
+    fn drain_compaction_results(&mut self) {
+        while let Ok(update) = self.compaction_rx.try_recv() {
+            let key = (update.session_id.clone(), update.operation_id.clone());
+            if !self.compaction_pending.remove(&key) {
+                continue;
+            }
+            let Some(state) = self.state_for_session_mut(&update.session_id) else {
+                continue;
+            };
+            match update.result {
+                Ok(CompactionOpPayload::Compact(result)) => {
+                    state
+                        .entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                            render_compact_result(&result),
+                        )))
+                }
+                Ok(CompactionOpPayload::Restore(result)) => {
+                    state
+                        .entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                            render_restore_result(&result),
+                        )))
+                }
+                Err(error) => state.set_info_notice(crate::i18n::t_args(
+                    "zc-compaction-failed",
+                    &[("error", &error)],
+                )),
+            }
+            state.mark_dirty_append();
+        }
+    }
+
     fn apply_session_reattach_result(&mut self, update: SessionReattachResult) {
         self.session_reattach_in_flight.remove(&update.session_id);
         let Some(state) = self.state_for_session_mut(&update.session_id) else {
@@ -3627,6 +3806,7 @@ impl Chat {
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
+        self.drain_compaction_results();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -4277,6 +4457,30 @@ impl Chat {
                 }
                 InputBarAction::OpenHelp => {
                     self.help_requested = true;
+                    return false;
+                }
+                InputBarAction::CompactContext => {
+                    if let Some(key) = Self::begin_context_compaction(
+                        &self.rpc,
+                        &self.compaction_tx,
+                        self.pane_kind,
+                        state,
+                        CompactionOpKind::Compact,
+                    ) {
+                        self.compaction_pending.insert(key);
+                    }
+                    return false;
+                }
+                InputBarAction::RestoreContext => {
+                    if let Some(key) = Self::begin_context_compaction(
+                        &self.rpc,
+                        &self.compaction_tx,
+                        self.pane_kind,
+                        state,
+                        CompactionOpKind::Restore,
+                    ) {
+                        self.compaction_pending.insert(key);
+                    }
                     return false;
                 }
                 InputBarAction::ClearQueue(idx) => {
@@ -13387,6 +13591,22 @@ mod tests {
                 "/change-directory",
             ),
             InputBarAction::ChangeDirectory
+        ));
+    }
+
+    #[test]
+    fn context_commands_dispatch_as_actions_instead_of_prompts() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/compact-context"),
+            InputBarAction::CompactContext
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response, "/restore-context"),
+            InputBarAction::RestoreContext
         ));
     }
 

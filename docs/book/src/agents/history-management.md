@@ -135,3 +135,13 @@ Tool-result length limits are separate. `max_tool_result_chars` bounds an
 individual result when it is recorded; it does not trim conversation history.
 Provider-side context enforcement is also separate, though a provider overflow
 can trigger the runtime's reactive token-budget trim.
+
+## Manual recoverable compaction
+
+Native ZeroCode Code sessions expose `/compact-context` and `/restore-context`. Manual compaction is available only while the session is idle and summarizes every completed retained user turn except the newest one. It uses the session's current routed provider and model for one bounded request without tools.
+
+The durable transcript and canonical retained context remain summary-free. The ACP store records one derived checkpoint containing the exact covered-prefix identity and the summary projection. Provider history then contains the original opening user message, one clearly labeled assistant summary, and the original recent tail. `session/messages` continues to return the raw transcript.
+
+Compaction refuses malformed tool pairing, stale source identity, an in-flight durable turn, a summary that does not fit the current route budget, or a projection that does not reduce context usefully. Before the checkpoint commits, errors leave the prior projection unchanged. After commit, the checkpoint is authoritative; if the live generation cannot accept the projection, only that generation is removed and the next prompt rehydrates from the checkpoint.
+
+`/restore-context` removes the active checkpoint and reinstalls the retained originals plus every later turn. It does not rewind tool calls, file changes, or other external effects. Ordinary trimming still applies after compaction. If trimming removes the summary turn, the store retires the checkpoint instead of resurrecting the aged-out summary on reload.

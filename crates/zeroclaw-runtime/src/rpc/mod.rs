@@ -3,6 +3,7 @@
 pub mod approval_channel;
 pub mod attachments;
 pub mod auth;
+pub mod compaction;
 pub mod context;
 pub mod dispatch;
 pub mod fs;

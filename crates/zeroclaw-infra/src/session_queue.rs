@@ -177,6 +177,54 @@ impl SessionActorQueue {
         }
     }
 
+    /// Admit an idle-only operation without queueing or barging ahead of an
+    /// already registered waiter.
+    pub async fn try_acquire_idle(&self, session_id: &str) -> Option<SessionGuard> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionSlot {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    last_active: Mutex::new(Instant::now()),
+                    pending: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+
+        #[cfg(test)]
+        {
+            let registration_hook = match self.registration_hook.lock() {
+                Ok(hook) => hook,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(hook) = registration_hook.as_ref() {
+                hook();
+            }
+        }
+
+        let registration = PendingRegistration { slot: slot.clone() };
+        if slot.pending.fetch_add(1, Ordering::Relaxed) > 0 {
+            drop(registration);
+            return None;
+        }
+        match Arc::clone(&slot.semaphore).try_acquire_owned() {
+            Ok(permit) => {
+                *slot.last_active.lock().await = Instant::now();
+                drop(slots);
+                Some(SessionGuard {
+                    _permit: permit,
+                    _registration: registration,
+                    session_id: session_id.to_string(),
+                })
+            }
+            Err(_) => {
+                drop(registration);
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
     fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.registration_hook.lock().unwrap() = Some(hook);
@@ -266,6 +314,33 @@ mod tests {
         let result = queue.acquire("s1").await;
         assert!(matches!(result, Err(SessionQueueError::Timeout { .. })));
         assert!(start.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn idle_admission_refuses_an_existing_holder() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        let guard = queue.acquire("s1").await.unwrap();
+
+        assert!(queue.try_acquire_idle("s1").await.is_none());
+
+        drop(guard);
+        assert!(queue.try_acquire_idle("s1").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_admission_does_not_barge_a_registered_waiter() {
+        let queue = Arc::new(SessionActorQueue::new(8, 30, 600));
+        let guard = queue.acquire("s1").await.unwrap();
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = zeroclaw_spawn::spawn!(async move { waiter_queue.acquire("s1").await });
+        while queue.queue_depth("s1").await < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(queue.try_acquire_idle("s1").await.is_none());
+
+        drop(guard);
+        drop(waiter.await.unwrap().unwrap());
     }
 
     #[test]

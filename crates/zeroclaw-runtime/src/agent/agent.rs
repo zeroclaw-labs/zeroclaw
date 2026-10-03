@@ -451,6 +451,59 @@ async fn forward_history_trim_notice(
     }
 }
 
+/// Result of one bounded no-tool summarization operation.
+#[derive(Debug, Clone)]
+pub struct BoundedSummarization {
+    pub summary: String,
+    pub model_provider: String,
+    pub model: String,
+    pub usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+}
+
+/// Typed failures of a bounded summarization operation. Every variant leaves
+/// the admitted session and its durable projection unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedSummarizationError {
+    Cancelled,
+    Timeout,
+    Provider(String),
+    ToolCallsRejected,
+    EmptyOutput,
+    OutputTooLarge { length: usize, max: usize },
+}
+
+impl std::fmt::Display for BoundedSummarizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "summarization cancelled"),
+            Self::Timeout => write!(f, "summarization timed out"),
+            Self::Provider(detail) => write!(f, "summarization provider failure: {detail}"),
+            Self::ToolCallsRejected => {
+                write!(
+                    f,
+                    "summarization returned tool calls; refusing to execute them"
+                )
+            }
+            Self::EmptyOutput => write!(f, "summarization returned no usable text"),
+            Self::OutputTooLarge { length, max } => {
+                write!(f, "summarization output too large ({length} > {max} chars)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedSummarizationError {}
+
+/// Outcome of replacing the derived provider-history projection on one live
+/// Agent generation.
+#[derive(Debug)]
+pub enum HistoryProjectionInstall {
+    Installed,
+    LiveHistoryMismatch,
+    ProjectionDoesNotFit,
+    SystemPromptFailed,
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     /// Shared with the shell tool and RPC session admission; this is the
@@ -1438,6 +1491,167 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Replace only the live provider projection after confirming that the
+    /// admitted Agent still has the exact history captured by the caller.
+    /// Durable canonical context remains owned by `AcpSessionStore`.
+    pub fn install_conversation_history_projection(
+        &mut self,
+        expected_history: &[ConversationMessage],
+        projection: zeroclaw_api::agent::RetainedContextSnapshot,
+    ) -> HistoryProjectionInstall {
+        if self.history.len() != expected_history.len()
+            || !self
+                .history
+                .iter()
+                .zip(expected_history)
+                .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return HistoryProjectionInstall::LiveHistoryMismatch;
+        }
+        if !self.conversation_history_projection_fits(
+            &projection.retained_messages,
+            projection.breadcrumb,
+        ) {
+            return HistoryProjectionInstall::ProjectionDoesNotFit;
+        }
+
+        let rebuilt_system = self.build_system_prompt().ok();
+        let preserved_system = if rebuilt_system.is_none() {
+            match expected_history.first() {
+                Some(ConversationMessage::Chat(chat)) if chat.role == "system" => {
+                    Some(chat.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if rebuilt_system.is_none() && preserved_system.is_none() {
+            return HistoryProjectionInstall::SystemPromptFailed;
+        }
+
+        self.history.clear();
+        self.history_has_trim_breadcrumb = projection.breadcrumb;
+        if let Some(system) = rebuilt_system {
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(system)));
+        } else if let Some(system) = preserved_system {
+            self.history.push(ConversationMessage::Chat(system));
+        }
+        self.history
+            .extend(projection.retained_messages.into_iter().filter(
+            |message| !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system"),
+        ));
+        HistoryProjectionInstall::Installed
+    }
+
+    /// Estimate the provider-message form with the same flattening and token
+    /// heuristic used by the normal turn loop.
+    pub fn estimate_projection_tokens(&self, messages: &[ConversationMessage]) -> usize {
+        crate::agent::history::estimate_history_tokens(
+            &self.tool_dispatcher.to_provider_messages(messages),
+        )
+    }
+
+    /// Whether installing this projection would immediately trim one of its
+    /// turns under the live structured-history cap.
+    pub(crate) fn conversation_history_projection_fits(
+        &self,
+        messages: &[ConversationMessage],
+        breadcrumb: bool,
+    ) -> bool {
+        let max_turns = self
+            .structured_history_turn_limit_resolver
+            .as_ref()
+            .map_or(self.config.resolved.max_history_messages, |resolve| {
+                resolve()
+            });
+        !crate::agent::history_trim::trim_conversation_to_recent_turns(
+            messages.to_vec(),
+            max_turns,
+            breadcrumb,
+        )
+        .trimmed
+    }
+
+    /// Run one bounded provider call without tools or outer retries.
+    pub async fn run_bounded_summarization(
+        &self,
+        prompt: &str,
+        max_output_chars: usize,
+        deadline: std::time::Duration,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<BoundedSummarization, BoundedSummarizationError> {
+        let messages = [ChatMessage::user(prompt)];
+        let request = zeroclaw_providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let selected_route = self.model_route_resolver.resolve(&self.model_name);
+        let model_access = crate::agent::loop_::ResolvedModelAccess {
+            model_provider: self.model_provider.as_ref(),
+            provider_name: &selected_route.provider_name,
+            model: &selected_route.model,
+            dispatch_model: &self.model_name,
+            temperature: self.temperature,
+        };
+        let mut settled = Vec::new();
+        let call = model_access.run_model_query(request, &mut settled);
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(BoundedSummarizationError::Cancelled);
+            }
+            response = tokio::time::timeout(deadline, call) => match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    if error.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>() {
+                        return Err(BoundedSummarizationError::EmptyOutput);
+                    }
+                    return Err(BoundedSummarizationError::Provider(error.to_string()));
+                }
+                Err(_) => return Err(BoundedSummarizationError::Timeout),
+            },
+        };
+        if !response.tool_calls.is_empty() {
+            return Err(BoundedSummarizationError::ToolCallsRejected);
+        }
+        let summary = response.text.unwrap_or_default();
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err(BoundedSummarizationError::EmptyOutput);
+        }
+        let length = summary.chars().count();
+        if length > max_output_chars {
+            return Err(BoundedSummarizationError::OutputTooLarge {
+                length,
+                max: max_output_chars,
+            });
+        }
+        let sum =
+            |field: fn(&crate::agent::turn::execution::SettledAttemptSummary) -> Option<u64>| {
+                settled.iter().filter_map(field).reduce(u64::saturating_add)
+            };
+        let usage = (!settled.is_empty()).then(|| zeroclaw_api::model_provider::TokenUsage {
+            input_tokens: sum(|attempt| attempt.input_tokens),
+            output_tokens: sum(|attempt| attempt.output_tokens),
+            cached_input_tokens: sum(|attempt| attempt.cached_input_tokens),
+            cache_creation_input_tokens: None,
+        });
+        let accepted = settled
+            .iter()
+            .rev()
+            .find(|attempt| attempt.accepted)
+            .expect("successful model query records its accepted route");
+        Ok(BoundedSummarization {
+            summary: summary.to_string(),
+            model_provider: accepted.provider_ref.clone(),
+            model: accepted.model.clone(),
+            usage,
+        })
     }
 
     /// Return the owner-maintained structured history for native persistence.
