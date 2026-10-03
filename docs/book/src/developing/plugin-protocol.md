@@ -459,7 +459,11 @@ underscores. The channel instance is rejected when the claim is empty, invalid,
 or duplicated. All claims are resolved before the daemon replaces its route
 map, so manifest iteration order cannot select a winner and a failed rebuild
 cannot publish a partial generation. Publication carries a generation lease;
-a retiring older channel supervisor cannot clear a newer route set.
+a retiring older channel supervisor cannot clear a newer route set. The gateway
+queues each request on the owner that is live when it sends, not the owner it
+saw at lookup: across a route rebuild, a request reaches the new owner of an
+unchanged path and is refused when the path is no longer published, so a
+retiring channel never receives it.
 
 Webhook ingress requires the component's effective `config_read` grant. For
 each request, the gateway passes a typed `webhook-request` containing the HTTP
