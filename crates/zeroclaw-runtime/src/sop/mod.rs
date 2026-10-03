@@ -564,6 +564,25 @@ pub fn rename_sop_typed(
     to: &str,
     default_execution_mode: SopExecutionMode,
 ) -> std::result::Result<(), SopAuthorError> {
+    rename_sop_typed_admitted(sops_dir, from, to, default_execution_mode, |_| Some(()))
+}
+
+/// [`rename_sop_typed`], with `admit` asked inside the transaction whether
+/// the caller may move the definition it is about to move.
+///
+/// `admit` runs after the authoring lock is taken and the definition under
+/// `from` is loaded, so it sees exactly what the move will carry, after any
+/// wait for the lock. `Some(permit)` lets the rename proceed and keeps the
+/// permit until the move has committed or failed; `None` refuses it with
+/// nothing on disk changed, as `Other`, and the caller keeps its own record
+/// of why.
+pub fn rename_sop_typed_admitted<P>(
+    sops_dir: &Path,
+    from: &str,
+    to: &str,
+    default_execution_mode: SopExecutionMode,
+    admit: impl FnOnce(&Sop) -> Option<P>,
+) -> std::result::Result<(), SopAuthorError> {
     let to_dir = resolve_sop_dir(sops_dir, to).map_err(SopAuthorError::Other)?;
     if from == to {
         return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
@@ -583,9 +602,17 @@ pub fn rename_sop_typed(
         return Err(SopAuthorError::AlreadyExists(to.to_string()));
     }
 
+    let mut renamed = load_sop(&from_dir, default_execution_mode).map_err(classify_author_error)?;
+    // The caller's admission, against the definition this transaction moves.
+    // The permit is held to the end of the function, past the commit.
+    let Some(_permit) = admit(&renamed) else {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "renaming SOP '{from}' was refused"
+        ))));
+    };
+
     // Strict-save validation still applies: a rename cannot put a SOP back on
     // disk that `save_sop` would have refused to write in the first place.
-    let mut renamed = load_sop(&from_dir, default_execution_mode).map_err(classify_author_error)?;
     renamed.name = to.to_string();
     let validation = validate_sop_strict(&renamed);
     if !validation.is_ok() {

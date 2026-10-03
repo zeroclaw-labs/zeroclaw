@@ -33,8 +33,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +52,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +88,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +103,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -499,7 +226,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -588,6 +315,17 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
         return None;
     }
     Some(grants.allowed_tools.clone())
+}
+
+/// The `clientCapabilities.client_kind` a connection declared, kept only for
+/// a kind the core knows. `tui/list` reports it so a listing can tell a
+/// gateway's connections from terminals; nothing authorizes on it.
+fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
+    capabilities?
+        .get("client_kind")?
+        .as_str()
+        .filter(|kind| *kind == CLIENT_KIND_GATEWAY)
+        .map(str::to_owned)
 }
 
 fn not_yet_implemented(method: Method) -> RpcResult {
@@ -1467,6 +1205,29 @@ fn current_authority_under(
         )));
     }
     Ok(grants)
+}
+
+/// A `sops/run` caller's admission, checked by the SOP dispatcher where the
+/// run is committed ([`RpcDispatcher::admit_sop_run`]). A refusal is kept
+/// here for the handler to return.
+struct SopRunAdmission<'d> {
+    dispatcher: &'d RpcDispatcher,
+    refusal: parking_lot::Mutex<Option<JsonRpcError>>,
+}
+
+impl crate::sop::dispatch::SopRunAdmission for SopRunAdmission<'_> {
+    fn admit<'a>(
+        &'a self,
+        sop: &crate::sop::Sop,
+    ) -> Option<Box<dyn crate::sop::dispatch::HeldPermit + 'a>> {
+        match self.dispatcher.admit_sop_run(sop) {
+            Ok(lease) => Some(Box::new(lease)),
+            Err(refusal) => {
+                *self.refusal.lock() = Some(refusal);
+                None
+            }
+        }
+    }
 }
 
 impl RpcDispatcher {
@@ -3606,6 +3367,7 @@ impl RpcDispatcher {
             .and_then(|c| c.get("elicitation"));
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+        let client_kind = declared_client_kind(req.client_capabilities.as_ref());
 
         // Authenticate FIRST: bind a principal or reject, before any
         // registry mutation. The tui_id/tui_sig continuity below grants no
@@ -3665,6 +3427,7 @@ impl RpcDispatcher {
                     .to_string(),
                 peer_label: self.peer_label.clone(),
                 env,
+                client_kind,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -4003,6 +3766,7 @@ impl RpcDispatcher {
                     connected_at_unix: e.connected_at.timestamp(),
                     peer_label: e.peer_label,
                     transport: e.transport,
+                    client_kind: e.client_kind,
                 })
                 .collect(),
         })
@@ -7672,16 +7436,17 @@ impl RpcDispatcher {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|row| MessageEntry {
+                        role: row.message.role,
+                        content: row.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: row.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -11009,9 +10774,18 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
-        if auth.grants.admin
-            || auth
-                .grants
+        self.refuse_constrained_tool_selector_with(method, &auth.grants)
+    }
+
+    /// [`Self::refuse_constrained_tool_selector_for_sop`] against `grants`,
+    /// such as the ones a commit re-resolved.
+    fn refuse_constrained_tool_selector_with(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin
+            || grants
                 .allowed_tools
                 .iter()
                 .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
@@ -11043,6 +10817,104 @@ impl RpcDispatcher {
         let mut loaded = sop.clone();
         loaded.steps = crate::sop::parse_steps(&crate::sop::render_steps(&sop.steps));
         loaded
+    }
+
+    /// Admit a `sops/run` of `sop` where the run is committed (see
+    /// [`SopRunAdmission`]).
+    ///
+    /// The caller's authority is re-resolved from a held [`AuthorityLease`],
+    /// so a revocation or policy change that landed during the wait refuses
+    /// the run, and one that arrives now waits for the lease, which the
+    /// dispatcher holds until the run is committed. The procedure is the one
+    /// the engine holds now, so its agents and its headless ownership are
+    /// checked as they will run, not as they were before the wait.
+    ///
+    /// The configured agents are read before the lease is taken: a
+    /// publication may hold the config while it waits for the authority
+    /// state, so the config is never reached under the lease.
+    ///
+    /// Lock order: the dispatcher calls this under the SOP engine mutex, and
+    /// it takes the config read lock (released again) and then the authority
+    /// lease, so the order is engine, then config, then authority. No site
+    /// may hold the config lock while it takes the engine mutex: with a
+    /// publication queued for the config, that site and this one would wait
+    /// on each other.
+    ///
+    /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+    fn admit_sop_run(
+        &self,
+        sop: &crate::sop::Sop,
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let method = Method::SopsRun;
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method).map_err(|denied| {
+                self.audit_auth_denial(method, &denied);
+                rpc_err(denied.code, denied.message)
+            })?;
+            self.refuse_constrained_tool_selector_with(method, &grants)?;
+            for alias in &agents {
+                self.selector_session_agent_with_grants(method, &grants, alias)?;
+            }
+        }
+        if let Some(refusal) = crate::sop::headless_ownership_refusal(sop) {
+            return Err(rpc_err(INVALID_PARAMS, refusal));
+        }
+        Ok(lease)
+    }
+
+    /// Admit a `sops/rename` of `sop`, the definition the rename loaded under
+    /// the SOP authoring lock and is about to move.
+    ///
+    /// [`Self::authorize_existing_sop`] refuses early, before that lock, which
+    /// another writer can hold for seconds; a policy change can land
+    /// meanwhile. This re-resolves the caller's authority from a held
+    /// [`AuthorityLease`], which the rename keeps until its move has
+    /// committed, so a narrowing that arrives during the move waits for it.
+    /// The configured agents are read before the lease, for the reason
+    /// [`Self::admit_sop_run`] gives. An unbound dispatcher passes, as it does
+    /// the early check.
+    ///
+    /// [`AuthorityLease`]: crate::rpc::auth::AuthorityLease
+    fn admit_sop_rename(
+        &self,
+        sop: &crate::sop::Sop,
+    ) -> Result<Option<crate::rpc::auth::AuthorityLease<'_>>, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(None);
+        };
+        let method = Method::SopsRename;
+        let agents: Vec<(String, bool)> = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+                .into_iter()
+                .map(|alias| {
+                    let configured = config.agents.contains_key(&alias);
+                    (alias, configured)
+                })
+                .collect()
+        };
+        let lease = self.ctx.auth.hold_authority();
+        let grants = current_authority_under(&lease, auth, method).map_err(|denied| {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        })?;
+        // The plain agent selector, as authoring applies it: a wildcard
+        // covers the configured agents only.
+        for (alias, configured) in &agents {
+            if !((*configured || grants.admin) && grants.may_use_agent(alias)) {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal is not entitled to agent {alias:?}"
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(rpc_err(denied.code, denied.message));
+            }
+        }
+        Ok(Some(lease))
     }
 
     /// Hold a procedure a principal is about to write to its agent selector,
@@ -11141,16 +11013,23 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        // The run executes as the procedure's agents, so the principal must be
-        // entitled to every one of them before anything is dispatched.
-        if self.stamped_grants().is_some() {
-            let sop = engine
-                .lock()
-                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
-                .get_sop(&req.name)
-                .cloned();
-            if let Some(sop) = sop {
-                self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
+        let sop = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_sop(&req.name)
+            .cloned();
+        if let Some(sop) = &sop {
+            // The run executes as the procedure's agents, so the principal must
+            // be entitled to every one of them before anything is dispatched.
+            if self.stamped_grants().is_some() {
+                self.authorize_sop_agents(Method::SopsRun, sop, true)?;
+            }
+            // This run has no agent turn behind it: the driver started below
+            // executes its steps, so a procedure with no owner for an execute
+            // step would start, take a run id and fail that step. Refuse it
+            // first, on the ownership rule the driver itself applies.
+            if let Some(refusal) = crate::sop::headless_ownership_refusal(sop) {
+                return Err(rpc_err(INVALID_PARAMS, refusal));
             }
         }
         let audit = self
@@ -11188,14 +11067,20 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results = if let Some(dedup_key) = dedup_key {
-            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
-                engine, audit, event, &req.name, dedup_key,
-            )
-            .await
-        } else {
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        // The checks above refuse early. The run itself is admitted where it is
+        // committed, after the decision model's wait, against the caller's
+        // authority and the procedure as they are then.
+        let admission = SopRunAdmission {
+            dispatcher: self,
+            refusal: parking_lot::Mutex::new(None),
         };
+        let results = crate::sop::dispatch::dispatch_sop_event_to_admitted(
+            engine, audit, event, &req.name, dedup_key, &admission,
+        )
+        .await;
+        if let Some(refusal) = admission.refusal.into_inner() {
+            return Err(refusal);
+        }
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
@@ -11397,6 +11282,7 @@ impl RpcDispatcher {
         }
 
         let mut resolved_outcome = None;
+        let mut pending_quorum = false;
         {
             let mut guard = engine
                 .lock()
@@ -11417,7 +11303,7 @@ impl RpcDispatcher {
                 ));
             }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
-            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            let principal = self.approval_principal();
             match guard
                 .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
@@ -11429,8 +11315,9 @@ impl RpcDispatcher {
                     ResolveOutcome::Denied
                     | ResolveOutcome::AlreadyResolved
                     | ResolveOutcome::Revised,
-                )
-                | BrokerOutcome::PendingQuorum { .. } => {}
+                ) => {}
+                // The vote counted; the gate waits for the rest of its quorum.
+                BrokerOutcome::PendingQuorum { .. } => pending_quorum = true,
                 BrokerOutcome::Resolved(
                     ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
                 )
@@ -11443,10 +11330,13 @@ impl RpcDispatcher {
                         ),
                     ));
                 }
+                // The credential is valid; this principal may not decide this
+                // gate. That is a missing entitlement, not a credential to
+                // replace, so a client must not drop the credential over it.
                 BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
                 | BrokerOutcome::NotAuthorized { .. } => {
                     return Err(rpc_err(
-                        AUTH_REQUIRED,
+                        FORBIDDEN,
                         crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
                     ));
                 }
@@ -11497,7 +11387,34 @@ impl RpcDispatcher {
             };
             rpc_err(code, msg)
         })?;
-        to_result(overlay)
+        let Value::Object(overlay) = to_result(overlay)? else {
+            return Err(rpc_err(INTERNAL_ERROR, "run overlay is not an object"));
+        };
+        to_result(zeroclaw_rpc_proto::types::SopDecideResult {
+            overlay,
+            pending_quorum: pending_quorum.then_some(true),
+        })
+    }
+
+    /// The approval principal this connection decides as, derived from its
+    /// bound authentication and never from a client-claimed label such as
+    /// the TUI id. A native pairing bearer is the same paired-token subject
+    /// the gateway's HTTP and WebSocket surfaces derive from that token; any
+    /// other authenticated principal is its canonical principal id; the
+    /// unauthenticated shared operator is anonymous, so it satisfies no
+    /// required group.
+    fn approval_principal(&self) -> crate::sop::approval::ApprovalPrincipal {
+        use crate::sop::approval::ApprovalPrincipal;
+        let Some(auth) = self.auth.as_ref() else {
+            return ApprovalPrincipal::rpc_local_operator();
+        };
+        if let Some(subject) = auth.native_token_hash.as_deref() {
+            return ApprovalPrincipal::rpc_paired(subject.to_owned());
+        }
+        if auth.principal.is_authenticated() {
+            return ApprovalPrincipal::rpc_principal(auth.principal.id.as_str().to_owned());
+        }
+        ApprovalPrincipal::rpc_local_operator()
     }
 
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
@@ -11588,13 +11505,12 @@ impl RpcDispatcher {
     /// overwrite the SOP it was loaded from. Renaming is collision-checked
     /// and moves the definition; it never copies it.
     fn handle_sops_rename(&self, params: &Value) -> RpcResult {
-        // Local transports only, for the reason `sops/run-detail` gives: a
-        // remote WSS caller that has completed `initialize` has not
-        // established a principal this dispatcher can authorize a SOP
-        // identity change against, while local IPC is owner-scoped by the
-        // socket itself. Checked before the params are parsed so a refused
-        // caller learns nothing about which SOPs exist. Replace this with a
-        // principal check once there is one, rather than removing it.
+        // Not over remote WSS, for the reason `sops/run-detail` gives. A local
+        // transport is not ownership proof either: the gateway reaches the
+        // core over one on behalf of every HTTP user, so the procedure being
+        // moved is held to the caller's agent selector below, as save and
+        // delete hold it. Checked before the params are parsed so a refused
+        // caller learns nothing about which SOPs exist.
         if self.peer_label.starts_with("wss:") {
             return Err(rpc_err(
                 AUTH_REQUIRED,
@@ -11604,7 +11520,24 @@ impl RpcDispatcher {
         }
         let req: SopRenameRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
-        crate::sop::rename_sop_typed(&dir, &req.from, &req.to, mode).map_err(|e| {
+        // An early refusal only. The rename may then wait for the authoring
+        // lock, so the check that counts is the one inside the transaction.
+        self.authorize_existing_sop(Method::SopsRename, &dir, &req.from, mode)?;
+        let mut refusal = None;
+        let renamed =
+            crate::sop::rename_sop_typed_admitted(&dir, &req.from, &req.to, mode, |sop| match self
+                .admit_sop_rename(sop)
+            {
+                Ok(lease) => Some(lease),
+                Err(denied) => {
+                    refusal = Some(denied);
+                    None
+                }
+            });
+        if let Some(denied) = refusal {
+            return Err(denied);
+        }
+        renamed.map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
@@ -11838,6 +11771,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: None,
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -11851,6 +11785,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: None,
                     });
                 }
 
@@ -11871,6 +11806,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: None,
                     });
                 }
             }
@@ -11908,6 +11844,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: None,
                         });
                     }
                 }
@@ -18503,6 +18440,7 @@ mod tests {
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+                client_kind: None,
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
     }
@@ -18710,6 +18648,7 @@ mod tests {
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
         let response = rpc(
@@ -18783,6 +18722,7 @@ mod tests {
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
         for id in [1, 2] {
@@ -23842,12 +23782,16 @@ mod tests {
         );
     }
 
-    fn make_checkpoint_rpc_dispatcher(
+    /// A context whose SOP engine holds one run parked at a checkpoint that
+    /// the `prod` policy gates: `members` form its required group and
+    /// `quorum` distinct approvers clear it. `configure` adds the pairing
+    /// tokens or roster the test authenticates with.
+    fn make_checkpoint_rpc_fixture(
         quorum: u32,
         members: &[&str],
-        tui_id: &str,
+        configure: impl FnOnce(&mut zeroclaw_config::schema::Config),
     ) -> (
-        RpcDispatcher,
+        Arc<RpcContext>,
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
         tempfile::TempDir,
@@ -23916,6 +23860,7 @@ mod tests {
         let mut config = Config::default();
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         config.sop.approval = SopApprovalConfig { groups, policies };
+        configure(&mut config);
 
         let mut engine = crate::sop::SopEngine::new(config.sop.clone())
             .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
@@ -23941,10 +23886,37 @@ mod tests {
             Arc::new(SessionActorQueue::new(4, 10, 60)),
         ));
         let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        (ctx, engine, run_id, temp)
+    }
+
+    /// A remote connection authenticated with a native pairing bearer.
+    async fn paired_sop_dispatcher(ctx: &Arc<RpcContext>, token: &str) -> RpcDispatcher {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
-        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
-        (dispatcher, engine, run_id, temp)
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({ "auth_token": token }))
+            .await
+            .expect("the paired token authenticates");
+        dispatcher
+    }
+
+    fn paired_subject(token: &str) -> String {
+        zeroclaw_config::pairing::PairingGuard::token_hash(token)
+    }
+
+    fn run_status(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> Option<crate::sop::types::SopRunStatus> {
+        engine.lock().unwrap().get_run(run_id).map(|run| run.status)
+    }
+
+    fn checkpoint_decision(run_id: &str) -> Value {
+        json!({ "name": "rpc-checkpoint", "run_id": run_id, "decision": "approve" })
     }
 
     /// An RPC dispatcher over one SOP, with the driver handles under test.
@@ -24088,6 +24060,33 @@ mod tests {
         );
     }
 
+    /// `sops/run` has no agent turn behind it: the driver it starts executes
+    /// the steps. A procedure with an `execute` step no agent owns is refused
+    /// before dispatch, with the reason the headless driver would fail on,
+    /// and no run is started or recorded.
+    #[tokio::test]
+    async fn sops_run_refuses_a_procedure_the_headless_driver_cannot_run() {
+        let sop_name = "unowned";
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Step one".to_string(),
+            body: "Do the work".to_string(),
+            ..crate::sop::types::SopStep::default()
+        };
+        let sop = manual_sop(sop_name, false, step);
+        let refusal = crate::sop::headless_ownership_refusal(&sop).expect("the step is unowned");
+        let (dispatcher, engine, _temp) = sops_run_dispatcher(sop, None);
+        let error = dispatcher
+            .handle_sops_run(&json!({ "name": sop_name }))
+            .await
+            .expect_err("an unowned procedure must not start headlessly");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.message, refusal);
+        let guard = engine.lock().unwrap();
+        assert!(guard.active_runs().is_empty(), "no run was started");
+        assert!(guard.finished_runs(None).is_empty(), "no run id was burned");
+    }
+
     /// A shared producer key must only name a run something is advancing. When
     /// the daemon generation has already drained, the driver is refused and the
     /// run is settled, so the key must not be left pointing at it: the next Git
@@ -24096,10 +24095,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
         let sop_name = "refused";
+        // Owned, so `sops/run` starts it; the refused driver never runs it.
         let step = crate::sop::types::SopStep {
             number: 1,
             title: "Step one".to_string(),
             body: "Do the work".to_string(),
+            agent: Some("ops".to_string()),
             ..crate::sop::types::SopStep::default()
         };
         let handles = crate::sop::SopDriverHandles::default();
@@ -24121,49 +24122,187 @@ mod tests {
         );
     }
 
+    /// The group-approval policy sees the principal the connection
+    /// authenticated as. A native pairing bearer is the same paired-token
+    /// subject the gateway's HTTP and WebSocket surfaces derive, so an
+    /// `http:<subject>` member decides over RPC and a different paired device
+    /// does not. The refusal is a missing entitlement, not a credential to
+    /// replace.
     #[tokio::test]
-    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+    async fn sops_decide_sees_the_paired_subject_the_gateway_sees() {
         use crate::sop::types::SopRunStatus;
 
-        let (unauthorized, engine, run_id, _temp) =
-            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
-        let error = unauthorized
-            .handle_sops_decide(&json!({
-                "name": "rpc-checkpoint",
-                "run_id": run_id.clone(),
-                "decision": "approve",
-            }))
+        let member = format!("http:{}", paired_subject("zc_member"));
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], |config| {
+            config.gateway.paired_tokens = vec!["zc_member".into(), "zc_other".into()];
+        });
+
+        let outsider = paired_sop_dispatcher(&ctx, "zc_other").await;
+        let error = outsider
+            .handle_sops_decide(&checkpoint_decision(&run_id))
             .await
-            .expect_err("unauthorized RPC principal must be rejected");
-        assert_eq!(error.code, AUTH_REQUIRED);
+            .expect_err("a paired device outside the group must be refused");
+        assert_eq!(error.code, FORBIDDEN);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
         );
 
-        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
-            2,
-            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
-            "ZeroClawOperator",
-        );
-        pending
-            .handle_sops_decide(&json!({
-                "name": "rpc-checkpoint",
-                "run_id": run_id.clone(),
-                "decision": "approve",
-            }))
+        let member = paired_sop_dispatcher(&ctx, "zc_member").await;
+        let overlay = member
+            .handle_sops_decide(&checkpoint_decision(&run_id))
             .await
-            .expect("an authorized first vote returns the still-parked overlay");
+            .expect("the group member's paired device clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint),
+            "an approved checkpoint resumes the run"
+        );
+        assert!(
+            overlay
+                .get(zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM)
+                .is_none(),
+            "a decision that cleared the gate is not pending: {overlay}"
+        );
+    }
+
+    /// One paired credential is one quorum voter however often it votes, and
+    /// a second member's device completes the quorum. While the quorum is
+    /// pending the result says so, beside the run overlay.
+    #[tokio::test]
+    async fn sops_decide_counts_one_paired_credential_as_one_voter() {
+        use crate::sop::types::SopRunStatus;
+
+        let first = format!("http:{}", paired_subject("zc_first"));
+        let second = format!("http:{}", paired_subject("zc_second"));
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(2, &[&first, &second], |config| {
+                config.gateway.paired_tokens = vec!["zc_first".into(), "zc_second".into()];
+            });
+
+        let first = paired_sop_dispatcher(&ctx, "zc_first").await;
+        for _ in 0..2 {
+            let overlay = first
+                .handle_sops_decide(&checkpoint_decision(&run_id))
+                .await
+                .expect("a member's vote is accepted while quorum is pending");
+            assert_eq!(
+                run_status(&engine, &run_id),
+                Some(SopRunStatus::PausedCheckpoint),
+                "a repeated vote from the same credential must not meet a quorum of two"
+            );
+            assert_eq!(
+                overlay[zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM],
+                true,
+                "{overlay}"
+            );
+            assert_eq!(overlay["run_id"], run_id.as_str(), "the overlay is intact");
+        }
+
+        let second = paired_sop_dispatcher(&ctx, "zc_second").await;
+        let overlay = second
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect("the second member completes the quorum");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert!(
+            overlay
+                .get(zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM)
+                .is_none(),
+            "{overlay}"
+        );
+    }
+
+    /// An authenticated principal decides as its canonical principal id, so
+    /// a `principal:<id>` member is honoured and another roster user is not.
+    #[tokio::test]
+    async fn sops_decide_sees_the_authenticated_roster_principal() {
+        use crate::sop::types::SopRunStatus;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let roster = |config: &mut zeroclaw_config::schema::Config| {
+            config.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    allowed_tools: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Sops,
+                        vec![
+                            zeroclaw_api::grants::Verb::Read,
+                            zeroclaw_api::grants::Verb::Execute,
+                        ],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            for (name, uid) in [("alice", 4242u32), ("bob", 4343u32)] {
+                config.users.insert(
+                    name.into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(uid),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }
+        };
+        // Resolve alice's canonical id the way the daemon does, then gate the
+        // policy on it.
+        let (probe_ctx, _probe_engine, _probe_run, _probe_temp) =
+            make_checkpoint_rpc_fixture(1, &[], roster);
+        let alice_id = scoped_dispatcher(&probe_ctx, 4242)
+            .await
+            .owner_principal_id()
+            .expect("a roster user has a canonical id");
+        let member = format!("principal:{alice_id}");
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], roster);
+
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let error = bob
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect_err("a roster user outside the group must be refused");
+        assert_eq!(error.code, FORBIDDEN);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        alice
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect("the group member clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// A client-claimed TUI id is not an approval identity: the unauthenticated
+    /// shared operator is anonymous even when it claims a label a group lists,
+    /// so a policy with a required group fails closed for it.
+    #[tokio::test]
+    async fn sops_decide_ignores_a_claimed_tui_id() {
+        use crate::sop::types::SopRunStatus;
+
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(1, &["ZeroClawOperator", "cli:ZeroClawOperator"], |_| {});
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:test".into());
+        operator.set_authenticated_for_test();
+        operator.set_tui_id_for_test(Some("ZeroClawOperator".into()));
+        let error = operator
+            .handle_sops_decide(&checkpoint_decision(&run_id))
+            .await
+            .expect_err("a claimed TUI id must not satisfy group membership");
+        assert_eq!(error.code, FORBIDDEN);
+        assert_eq!(
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
         );
     }
@@ -24387,7 +24526,7 @@ mod tests {
             }))
             .await
             .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
-        assert_eq!(err.code, AUTH_REQUIRED);
+        assert_eq!(err.code, FORBIDDEN);
         assert!(
             err.message.contains(&crate::i18n::get_required_cli_string(
                 "sop-rpc-decision-unauthorized",
@@ -26922,6 +27061,59 @@ mod tests {
         assert!(result.is_ok(), "initialize should succeed; got {result:?}");
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    /// `tui/list` labels a connection that declared itself a gateway on
+    /// `initialize`, and only that kind: a terminal, or a kind the core does
+    /// not know, is listed without a label.
+    #[tokio::test]
+    async fn tui_list_labels_only_a_declared_gateway_connection() {
+        let (lister, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&lister.ctx);
+        let mut registered = std::collections::HashMap::new();
+        for (peer, capabilities) in [
+            (
+                "unix:gateway",
+                serde_json::json!({ "client_kind": CLIENT_KIND_GATEWAY }),
+            ),
+            (
+                "unix:terminal",
+                serde_json::json!({ "elicitation": { "form": {} } }),
+            ),
+            (
+                "unix:unknown",
+                serde_json::json!({ "client_kind": "relay" }),
+            ),
+        ] {
+            let (writer_tx, _writer_rx) = mpsc::channel(8);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), writer_tx, peer.to_string());
+            client
+                .handle_initialize(&serde_json::json!({
+                    "protocol_version": RPC_PROTOCOL_VERSION,
+                    "clientCapabilities": capabilities,
+                }))
+                .await
+                .expect(peer);
+            let (id, _) = client.tui_registration().expect("registered");
+            registered.insert(id.to_string(), peer);
+        }
+
+        let listed: TuiListResult =
+            serde_json::from_value(lister.handle_tui_list().expect("tui/list")).unwrap();
+        let kinds: std::collections::HashMap<&str, Option<&str>> = listed
+            .tuis
+            .iter()
+            .map(|tui| (registered[&tui.tui_id], tui.client_kind.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashMap::from([
+                ("unix:gateway", Some(CLIENT_KIND_GATEWAY)),
+                ("unix:terminal", None),
+                ("unix:unknown", None),
+            ])
+        );
     }
 
     #[tokio::test]

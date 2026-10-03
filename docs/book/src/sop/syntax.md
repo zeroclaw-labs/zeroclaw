@@ -115,7 +115,14 @@ Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
 (`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
 approval surfaces use the paired-token subject; the current CLI approval path
 (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
-membership yet.
+membership yet. Over the local RPC socket (`sops/decide`), a caller decides as
+its bound authentication: a paired bearer as `http:<subject>`, and an
+authenticated principal as `principal:<id>`, whether OIDC bound it or the
+local roster did. A local client such as `zerocode` sends no bearer, but its
+connection still binds a roster principal when a `[users.*]` entry names the
+connecting process's account (`uid`). Only a connection that binds no
+principal, the unauthenticated shared operator, decides as anonymous: it
+satisfies no required group, and no `cli:<tui-id>` member matches it.
 
 The paired-token subject is the lowercase SHA-256 hex digest of the bearer
 token. After pairing, copy the digest from the canonical
