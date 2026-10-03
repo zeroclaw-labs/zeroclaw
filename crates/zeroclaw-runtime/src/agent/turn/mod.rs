@@ -1458,6 +1458,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let mut hook_selected_model = None;
 
         if let Some(hooks) = base_ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            base_ctx.ensure_not_cancelled()?;
             let mut candidate_model = active_model.to_string();
             match hooks
                 .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
@@ -1476,6 +1477,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     anyhow::bail!("LLM call cancelled by hook: {reason}");
                 }
             }
+            base_ctx.ensure_not_cancelled()?;
         }
         // Capture hook-added suffix (messages appended after the original
         // prepared messages, with that original population otherwise intact
@@ -1869,6 +1871,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // first would claim the agent is waiting on a model that is never
         // called.
         enforce_tool_loop_budget()?;
+        ctx.ensure_not_cancelled()?;
 
         if strict_tool_parsing
             && !tool_specs.is_empty()
@@ -2808,6 +2811,13 @@ fn sop_step_excluded_tools(
 #[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    /// The owning run's cancellation token, when a supervisor (cron) owns this
+    /// run's lifecycle. A re-assembled step builds its own tool registry, so
+    /// without this the rebuilt `DelegateTool` would fall back to the
+    /// constructor's fresh token and its spawned background/parallel children
+    /// could outlive the supervised run — and the durable claim it releases.
+    /// Borrowed so nested reassembly uses the same cancellation owner.
+    pub run_cancellation: Option<&'a tokio_util::sync::CancellationToken>,
     pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
@@ -2894,7 +2904,9 @@ impl OwnedAgentExecution {
 /// (the agent's risk profile under `parent_approval`'s interactivity mode; no
 /// parent manager means non-interactive auto-deny, matching the headless
 /// driver). The live SOP engine/audit handles are threaded from the running
-/// SOP so the nested step keeps its SOP tools bound to the same engine. This
+/// SOP so the nested step keeps its SOP tools bound to the same engine, and
+/// `run_cancellation` carries the owning run's token into the rebuilt registry
+/// so a spawned delegate cannot outlive a supervised (cron) run. This
 /// connects MCP servers, so the driver memoizes the result per alias across a
 /// drain and re-assembles only on an alias change.
 #[cfg(test)]
@@ -2905,6 +2917,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    run_cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<OwnedAgentExecution> {
     assemble_owned_execution_with_admission(
         config,
@@ -2914,6 +2927,7 @@ pub(crate) async fn assemble_owned_execution(
         sop_audit,
         parent_approval,
         None,
+        run_cancellation,
     )
     .await
 }
@@ -2926,6 +2940,7 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
     execution_admission: Option<AgentExecutionAdmission>,
+    run_cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<OwnedAgentExecution> {
     if let Some(admission) = execution_admission.as_ref() {
         admission.revalidate().map_err(|error| {
@@ -3005,6 +3020,7 @@ pub(crate) async fn assemble_owned_execution_with_admission(
         execution_admission
             .as_ref()
             .map(AgentExecutionAdmission::capability),
+        run_cancellation,
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -3300,6 +3316,7 @@ async fn drive_live_sop_actions(
                                     queued.audit.clone(),
                                     approval,
                                     execution_admission.clone(),
+                                    reassembly.run_cancellation.cloned(),
                                 )
                                 .await
                                 {
@@ -5881,14 +5898,28 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader =
-            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
-                .await
-                .expect("reader assembles");
-        let writer =
-            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
-                .await
-                .expect("writer assembles");
+        let reader = assemble_owned_execution(
+            &config,
+            None,
+            "reader",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("reader assembles");
+        let writer = assemble_owned_execution(
+            &config,
+            None,
+            "writer",
+            Arc::clone(&engine),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -5977,6 +6008,7 @@ mod sop_step_reassembly_tests {
             Some(Arc::clone(&live_config)),
             "stepper",
             Arc::clone(&engine),
+            None,
             None,
             None,
         )
@@ -6076,6 +6108,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
         )
         .await
         .expect("restricted assembles");
@@ -7107,6 +7140,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7209,6 +7243,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7307,6 +7342,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7371,6 +7407,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7428,6 +7465,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            run_cancellation: None,
         };
 
         let parent_provider = TextProvider;
@@ -7491,6 +7529,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7548,6 +7587,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -7751,6 +7791,7 @@ mod sop_step_reassembly_tests {
         let config = zeroclaw_config::schema::Config::default();
         let handle = SopStepReassembly {
             config: &config,
+            run_cancellation: None,
             live_config: None,
         };
 
@@ -8760,6 +8801,116 @@ mod tool_lifecycle_abandonment_tests {
         assert!(
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
+        );
+    }
+    /// A cross-agent SOP step rebuilds its tool registry. The rebuilt delegate
+    /// tool must retain the outer cron scope so background delegation remains
+    /// fail-closed after reassembly.
+    #[tokio::test]
+    async fn reassembly_preserves_cron_scope_for_background_delegation_rejection() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, DelegateExecutionMode, DelegateTargetConfig,
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        let root = tempfile::tempdir().expect("temporary reassembly workspace");
+        let mut config = Config {
+            data_dir: root.path().join("data"),
+            config_path: root.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "step_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "step".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "step_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::None,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "target_profile".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::None,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let owned = assemble_owned_execution(
+            &config,
+            None,
+            "step",
+            engine,
+            None,
+            None,
+            Some(cancellation.clone()),
+        )
+        .await
+        .expect("step agent assembles");
+        let delegate = owned
+            .tools_registry
+            .iter()
+            .find(|tool| tool.name() == "delegate")
+            .expect("step registry includes delegate");
+
+        let rejected = delegate
+            .execute(serde_json::json!({
+                "agent": "target",
+                "prompt": "must not outlive the owning run",
+                "background": true
+            }))
+            .await
+            .expect("background rejection returns a tool result");
+        assert!(
+            !rejected.success,
+            "background delegation unexpectedly started"
+        );
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some(
+                "Background delegation is unavailable for supervised cron runs; use synchronous or parallel delegation instead."
+            )
         );
     }
 }

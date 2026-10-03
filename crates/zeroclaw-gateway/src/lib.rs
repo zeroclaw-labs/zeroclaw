@@ -1290,6 +1290,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                None,
             )?;
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -1423,6 +1424,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
             None,
         )?;
         // Same gated seam as the dashboard seed above, so this listing shows

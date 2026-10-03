@@ -13,11 +13,15 @@ use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+// Keep lock acquisition bounded below the scheduler's persistence deadline.
+// Immediate write transactions then serialize benign concurrent completions
+// instead of failing while upgrading a deferred read transaction.
+const CRON_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
 
 // A process-owned token is only safe to preserve during startup recovery while
-// its manual-run guard is still alive. The database cannot represent that
+// its scheduled or manual execution owner is still alive. The database cannot represent that
 // distinction, so keep the live set in process memory and fail closed for any
 // current-process token whose guard has terminated.
 static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
@@ -83,6 +87,85 @@ pub(crate) enum RunCompletionAction {
     Reschedule,
     Disable,
     Delete,
+}
+
+/// Opaque ownership proof for one cron execution claim.
+///
+/// `locked_at` records that a run is active, while this token is the canonical
+/// identity that fences every release and scheduled-result write. Claims do
+/// not expire inside a live process: only the owner may release them, and
+/// startup recovery clears claims left by a dead process.
+/// Shared lifetime of the canonical durable token; clones transfer ownership
+/// into side-effect workers and completed-result writers, never mint a token.
+#[derive(Clone, Debug)]
+pub(crate) struct CronClaimToken(std::sync::Arc<ClaimLifetime>);
+#[derive(Debug)]
+struct ClaimLifetime {
+    token: String,
+    binding: Option<(Config, String)>,
+    release_on_drop: bool,
+}
+impl Drop for ClaimLifetime {
+    fn drop(&mut self) {
+        if let Some((config, job_id)) = &self.binding {
+            if self.release_on_drop
+                && let Err(error) = release_job_for_token(config, job_id, &self.token)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(
+                            ::serde_json::json!({"job_id": job_id, "error": error.to_string()})
+                        ),
+                    "cron claim release failed"
+                );
+            }
+            finish_agent_claim(config, job_id, &self.token);
+        }
+    }
+}
+impl PartialEq for CronClaimToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for CronClaimToken {}
+impl CronClaimToken {
+    fn owned(config: &Config, job_id: &str, token: String, release_on_drop: bool) -> Self {
+        Self(std::sync::Arc::new(ClaimLifetime {
+            token,
+            binding: Some((config.clone(), job_id.to_string())),
+            release_on_drop,
+        }))
+    }
+    pub(crate) fn manual(config: &Config, job_id: &str, token: String) -> Self {
+        Self::owned(config, job_id, token, true)
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0.token
+    }
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test() -> Self {
+        Self(std::sync::Arc::new(ClaimLifetime {
+            token: "synthetic-test-claim".into(),
+            binding: None,
+            release_on_drop: false,
+        }))
+    }
+}
+
+pub(crate) mod claim_scope {
+    use super::CronClaimToken;
+    tokio::task_local! { static CLAIM: CronClaimToken; }
+    pub(crate) async fn scope<F: std::future::Future>(
+        claim: CronClaimToken,
+        future: F,
+    ) -> F::Output {
+        CLAIM.scope(claim, future).await
+    }
+    pub(crate) fn current() -> Option<CronClaimToken> {
+        CLAIM.try_with(Clone::clone).ok()
+    }
 }
 
 #[cfg(test)]
@@ -1041,16 +1124,29 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
     }
 }
 
+pub(crate) fn claim_job_with_token(
+    config: &Config,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<CronClaimToken>> {
+    let token = new_agent_lock_token();
+    register_live_agent_claim(config, job_id, &token);
+    let result = with_initialized_connection(config, |conn| {
+        let claimed = conn.execute("UPDATE cron_jobs SET locked_at = ?1, lock_token = ?2 WHERE id = ?3 AND locked_at IS NULL", params![now.to_rfc3339(), token, job_id])?;
+        Ok((claimed == 1).then(|| CronClaimToken::owned(config, job_id, token.clone(), false)))
+    });
+    if !matches!(result, Ok(Some(_))) {
+        finish_agent_claim(config, job_id, &token);
+    }
+    result
+}
+
+pub(crate) fn release_claim(config: &Config, job_id: &str, claim: &CronClaimToken) -> Result<bool> {
+    release_job_for_token(config, job_id, claim.as_str())
+}
+
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
-    with_initialized_connection(config, |conn| {
-        let claimed = conn
-            .execute(
-                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
-                params![now.to_rfc3339(), job_id],
-            )
-            .context("Failed to claim cron job for execution")?;
-        Ok(claimed == 1)
-    })
+    claim_job_with_token(config, job_id, now).map(|claim| claim.is_some())
 }
 
 /// Claim a job only while it is still owned by `agent_alias`.
@@ -1147,6 +1243,26 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn current_claim_for_test(config: &Config, job_id: &str) -> Result<CronClaimToken> {
+    let claim = with_read_connection(config, |conn| {
+        conn.query_row(
+            "SELECT lock_token FROM cron_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .map(|token| {
+            CronClaimToken(std::sync::Arc::new(ClaimLifetime {
+                token,
+                binding: None,
+                release_on_drop: false,
+            }))
+        })
+        .ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
+    })?;
+    claim.ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
+}
+
 fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Result<usize> {
     // Keep the registry lock through the snapshot and the cleanup UPDATE. A
     // new manual claim registers its token before writing the row; holding the
@@ -1237,7 +1353,7 @@ pub fn record_run(
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
         // cannot grow unboundedly.
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         insert_run_and_prune(
             &tx,
@@ -1289,8 +1405,11 @@ pub(crate) fn persist_manual_run_result(
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
+        if let Some(claim) = claim_scope::current() {
+            ensure_claim_is_current(&tx, &job.id, &claim)?;
+        }
         ensure_job_still_exists(&tx, &job.id)?;
 
         insert_run_and_prune(
@@ -1333,11 +1452,14 @@ pub(crate) fn persist_run_result(
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
+    claim: &CronClaimToken,
 ) -> Result<()> {
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
+
+        ensure_claim_is_current(&tx, &job.id, claim)?;
 
         ensure_job_still_exists(&tx, &job.id)?;
 
@@ -1363,6 +1485,8 @@ pub(crate) fn persist_run_result(
             action,
         )?;
 
+        release_claim_in_transaction(&tx, &job.id, action, claim)?;
+
         tx.commit()
             .context("Failed to commit cron run result transaction")?;
         Ok(())
@@ -1376,10 +1500,77 @@ pub(crate) fn persist_run_completion_state(
     status: &str,
     output: Option<&str>,
     action: RunCompletionAction,
+    claim: &CronClaimToken,
 ) -> Result<()> {
     with_initialized_connection(config, |conn| {
-        apply_run_completion_state(conn, job, job_state_at, status, output, action)
+        let tx = immediate_write_transaction(conn)?;
+        ensure_claim_is_current(&tx, &job.id, claim)?;
+        apply_run_completion_state(&tx, job, job_state_at, status, output, action)?;
+        release_claim_in_transaction(&tx, &job.id, action, claim)?;
+        tx.commit()
+            .context("Failed to commit cron completion-state transaction")
     })
+}
+
+fn migrate_legacy_claim_token(conn: &Connection) -> Result<()> {
+    let legacy = conn
+        .prepare("PRAGMA table_info(cron_jobs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "claim_token");
+    if !legacy {
+        return Ok(());
+    }
+    let tx = immediate_write_transaction(conn)?;
+    let divergent: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE claim_token IS NOT NULL AND lock_token IS NOT NULL AND claim_token != lock_token)", [], |row| row.get(0))?;
+    if divergent {
+        anyhow::bail!("conflicting legacy cron claim identities");
+    }
+    tx.execute("UPDATE cron_jobs SET lock_token = COALESCE(lock_token, claim_token), claim_token = NULL WHERE claim_token IS NOT NULL", [])?;
+    tx.commit()
+        .context("Failed to migrate legacy cron claim identity")
+}
+
+fn ensure_claim_is_current(conn: &Connection, job_id: &str, claim: &CronClaimToken) -> Result<()> {
+    let current = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM cron_jobs WHERE id = ?1 AND lock_token = ?2
+         )",
+        params![job_id, claim.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !current {
+        anyhow::bail!("cron claim for job '{job_id}' is stale");
+    }
+    Ok(())
+}
+
+fn immediate_write_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
+fn release_claim_in_transaction(
+    conn: &Connection,
+    job_id: &str,
+    action: RunCompletionAction,
+    claim: &CronClaimToken,
+) -> Result<()> {
+    if action == RunCompletionAction::Delete {
+        // A successful auto-delete removed the claimed row in this same
+        // transaction, so there is no lock left to clear.
+        return Ok(());
+    }
+    let released = conn.execute(
+        "UPDATE cron_jobs
+         SET locked_at = NULL, lock_token = NULL
+         WHERE id = ?1 AND lock_token = ?2",
+        params![job_id, claim.as_str()],
+    )?;
+    if released != 1 {
+        anyhow::bail!("cron claim for job '{job_id}' changed before release");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2135,7 +2326,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &
     }
 }
 
-fn cron_db_path(config: &Config) -> std::path::PathBuf {
+pub(crate) fn cron_db_path(config: &Config) -> std::path::PathBuf {
     config.data_dir.join("cron").join("jobs.db")
 }
 
@@ -2168,6 +2359,9 @@ fn with_existing_initialized_connection<T>(
             db_path.display().to_string()
         )
     })?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
+
     initialize_schema(&conn, config)?;
 
     f(&conn).map(Some)
@@ -2199,6 +2393,9 @@ pub(super) fn with_initialized_connection<T>(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
+
     initialize_schema(&conn, config)?;
 
     f(&conn)
@@ -2400,9 +2597,10 @@ fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()>
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "cron_jobs", "locked_at", "TEXT")?;
     // Agent-triggered claims also carry an opaque per-execution token. Startup
-    // recovery preserves only tokens whose manual-run guards are still live in
+    // recovery preserves only tokens whose execution owners are still live in
     // this process; all other locks are eligible for cleanup.
     add_column_if_missing(conn, "cron_jobs", "lock_token", "TEXT")?;
+    migrate_legacy_claim_token(conn)?;
     add_column_if_missing(
         conn,
         "cron_jobs",
@@ -3292,6 +3490,52 @@ mod tests {
     }
 
     #[test]
+    fn clear_stale_locks_serializes_scheduled_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        // A legacy/scheduled claim has no token and is eligible for startup
+        // recovery. The concurrent agent claim must not be able to register
+        // and write its replacement while recovery is between its snapshot and
+        // cleanup UPDATE.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let claim_job_id = job.id.clone();
+        let claim_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            claim_job_with_token(&claim_config, &claim_job_id, Utc::now())
+        });
+
+        let cleared = clear_stale_locks_inner(&config, || {
+            started_rx.recv().unwrap();
+            go_tx.send(()).unwrap();
+
+            // `claim_job_for_agent_with_token` has been released to run, but
+            // its registration must wait for recovery's registry guard.
+            assert!(LIVE_AGENT_CLAIM_TOKENS.try_lock().is_err());
+        })
+        .unwrap();
+        assert_eq!(cleared, 1, "the pre-existing stale claim should be cleared");
+
+        let token = claim_thread
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the new claim should win after recovery");
+        assert!(
+            !claim_job_for_agent(&config, &job.id, "owner-agent", Utc::now()).unwrap(),
+            "a second execution must remain blocked by the admitted claim"
+        );
+        assert!(release_claim(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
     fn agent_run_history_rechecks_owner_in_the_history_query() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3401,6 +3645,85 @@ mod tests {
             0,
             "clearing again when idle releases nothing"
         );
+    }
+
+    #[test]
+    fn active_claim_cannot_expire_or_be_replaced_in_process() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let old_claim = claim_job_with_token(&config, &job.id, started)
+            .unwrap()
+            .expect("first worker claims the job");
+
+        assert!(
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::days(365))
+                .unwrap()
+                .is_none(),
+            "wall-clock age must not erase ownership while the process is live"
+        );
+        assert!(release_claim(&config, &job.id, &old_claim).unwrap());
+        let replacement_claim =
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::seconds(2))
+                .unwrap()
+                .expect("replacement worker claims only after the owner releases");
+        assert_ne!(old_claim.as_str(), replacement_claim.as_str());
+
+        let finished = started + ChronoDuration::seconds(3);
+        let stale_error = persist_run_result(
+            &config,
+            &job,
+            started,
+            finished,
+            finished,
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some(&job.agent_alias),
+                job_source: Some(&job.source),
+            },
+            Some("late old result"),
+            3_000,
+            RunCompletionAction::Reschedule,
+            &old_claim,
+        )
+        .expect_err("the released owner must not write through the replacement claim");
+        assert!(stale_error.to_string().contains("stale"));
+        assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
+
+        persist_run_result(
+            &config,
+            &job,
+            started + ChronoDuration::seconds(2),
+            finished,
+            finished,
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some(&job.agent_alias),
+                job_source: Some(&job.source),
+            },
+            Some("replacement result"),
+            1_000,
+            RunCompletionAction::Reschedule,
+            &replacement_claim,
+        )
+        .expect("the current claim persists and releases atomically");
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some("replacement result"));
+        assert!(current_claim_for_test(&config, &job.id).is_err());
     }
 
     #[test]
@@ -7410,5 +7733,66 @@ schedule = { kind = "every", every_ms = 300000 }
         // it for API/admin visibility, but execution won't pick it up).
         let job = get_job(&config, "orphan-decl").unwrap();
         assert_eq!(job.source, "declarative");
+    }
+    #[test]
+    fn legacy_claim_migration_is_atomic_and_never_resurrects_released_tokens() {
+        for mode in ["legacy", "equal", "divergent", "failed"] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo history").unwrap();
+            let conn = Connection::open(cron_db_path(&config)).unwrap();
+            conn.execute_batch("ALTER TABLE cron_jobs ADD COLUMN claim_token TEXT;")
+                .unwrap();
+            conn.execute("UPDATE cron_jobs SET locked_at='2026-09-29T00:00:00Z', claim_token='original', lock_token=?1 WHERE id=?2", params![match mode { "equal" => Some("original"), "divergent" => Some("different"), _ => None }, job.id]).unwrap();
+            conn.execute("INSERT INTO cron_runs(job_id,started_at,finished_at,status,output,duration_ms) VALUES(?1,'2026-09-29T00:00:00Z','2026-09-29T00:00:01Z','ok','history',1000)", [&job.id]).unwrap();
+            if mode == "failed" {
+                conn.execute_batch("CREATE TRIGGER reject_legacy_retirement BEFORE UPDATE OF claim_token ON cron_jobs WHEN NEW.claim_token IS NULL BEGIN SELECT RAISE(ABORT, 'retirement refused'); END;").unwrap();
+            }
+            let result = get_job(&config, &job.id);
+            let (canonical, legacy, locked): (Option<String>, Option<String>, Option<String>) =
+                conn.query_row(
+                    "SELECT lock_token,claim_token,locked_at FROM cron_jobs WHERE id=?1",
+                    [&job.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert!(locked.is_some());
+            if matches!(mode, "divergent" | "failed") {
+                assert!(result.is_err());
+                assert_eq!(legacy.as_deref(), Some("original"));
+                assert_eq!(
+                    canonical.as_deref(),
+                    if mode == "divergent" {
+                        Some("different")
+                    } else {
+                        None
+                    }
+                );
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(canonical.as_deref(), Some("original"));
+                assert!(legacy.is_none());
+                release_job_for_token(&config, &job.id, "original").unwrap();
+                get_job(&config, &job.id).unwrap();
+                get_job(&config, &job.id).unwrap();
+                let state: (Option<String>, Option<String>) = conn
+                    .query_row(
+                        "SELECT lock_token,claim_token FROM cron_jobs WHERE id=?1",
+                        [&job.id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, (None, None));
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM cron_runs WHERE job_id=?1",
+                    [&job.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
     }
 }

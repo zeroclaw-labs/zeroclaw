@@ -7164,6 +7164,21 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
+        #[cfg(test)]
+        let _config_write_guard = {
+            let mut lock = Box::pin(Arc::clone(&self.ctx.config_write_lock).lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(lock.as_mut(), cx);
+                if result.is_pending() && !notified {
+                    self.ctx.sessions.configure_writer_waiting.notify_one();
+                    notified = true;
+                }
+                result
+            })
+            .await
+        };
+        #[cfg(not(test))]
         let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
 
         // Capture the session generation /before/ acquiring the per-session
@@ -20725,9 +20740,12 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting.notified())
+                .await
+                .expect("configure captured the generation and waits on the update lock");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
@@ -20747,6 +20765,51 @@ mod tests {
                 .and_then(|o| o.temperature),
             None,
             "bob's successor keeps its own overrides"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_refuses_replacement_before_generation_capture() {
+        use crate::rpc::types::ChatMode;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let writer = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let operation = alice.handle_session_configure(&params);
+        let replace = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sessions.configure_writer_waiting.notified(),
+            )
+            .await
+            .expect("configure passed initial authorization and is waiting before capture");
+            assert!(sessions.remove("cfg").await);
+            let successor =
+                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
+                    .await;
+            drop(writer);
+            successor
+        };
+        let (result, successor) = tokio::join!(operation, replace);
+        let err = result.expect_err("current foreign owner must be refused before capture");
+        assert_eq!(err.code, FORBIDDEN);
+        assert_eq!(
+            err.message,
+            "Session not found or not owned by this principal"
+        );
+        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+        assert_eq!(
+            sessions
+                .get_overrides("cfg")
+                .await
+                .and_then(|o| o.temperature),
+            None
         );
     }
 

@@ -2815,6 +2815,7 @@ impl Agent {
             live_config.clone(),
             execution_capability,
             acp_sessions,
+            None,
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -3951,6 +3952,7 @@ impl Agent {
                                 crate::agent::turn::SopStepReassembly {
                                     config,
                                     live_config: c.live_config.clone(),
+                                    run_cancellation: None,
                                 }
                             })
                         }),
@@ -4549,6 +4551,7 @@ impl Agent {
                                     crate::agent::turn::SopStepReassembly {
                                         config,
                                         live_config: c.live_config.clone(),
+                                        run_cancellation: None,
                                     }
                                 })
                             }),

@@ -1408,6 +1408,9 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+delegate-background-cron-owned-rejected = Background delegation is unavailable for supervised cron runs; use synchronous or parallel delegation instead.
+cron-result-persistence-failed = Cron result persistence failed; durable completion could not be confirmed.
+cron-result-persistence-pending = Cron result persistence is still pending; the job remains claimed until completion or restart recovery.
 # ── Peer-agent delivery ──
 peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
 peer-delivery-registration-failed = peer delivery rejected: {$error}

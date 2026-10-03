@@ -175,6 +175,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -681,6 +682,7 @@ pub fn all_tools(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1042,6 +1044,7 @@ pub fn all_tools_with_runtime(
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    run_cancellation: Option<CancellationToken>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_and_acp_sessions(
         config,
@@ -1066,6 +1069,7 @@ pub fn all_tools_with_runtime(
         sop_audit,
         live_config,
         None,
+        run_cancellation,
     )
 }
 
@@ -1102,6 +1106,9 @@ pub(crate) fn all_tools_with_runtime_context(
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    // Per-run cancellation owner. Cron supplies its supervised run token so
+    // spawned background and parallel delegates cannot outlive the claim.
+    run_cancellation: Option<CancellationToken>,
 ) -> anyhow::Result<AllToolsResult> {
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
@@ -1136,6 +1143,7 @@ pub(crate) fn all_tools_with_runtime_context(
             live_config,
             execution_capability,
             acp_sessions,
+            run_cancellation,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -1190,6 +1198,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     acp_sessions: Option<AcpSessionReadView>,
+    run_cancellation: Option<CancellationToken>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
         config,
@@ -1215,6 +1224,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         live_config,
         None,
         acp_sessions,
+        run_cancellation,
     )
 }
 
@@ -1248,6 +1258,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
     sop_audit: Option<Arc<SopAuditLogger>>,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     execution_capability: Option<AgentExecutionCapability>,
+    run_cancellation: Option<CancellationToken>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
         config,
@@ -1273,6 +1284,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
         live_config,
         execution_capability,
         None,
+        run_cancellation,
     )
 }
 
@@ -1306,6 +1318,9 @@ fn all_tools_with_runtime_on_thread(
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    // Per-run cancellation owner. Cron supplies its supervised run token so
+    // spawned background and parallel delegates cannot outlive the claim.
+    run_cancellation: Option<CancellationToken>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1418,12 +1433,18 @@ fn all_tools_with_runtime_on_thread(
             .with_subagent_caller(is_subagent_caller)
             .with_execution_capability(execution_capability.clone()),
         ),
-        Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
-            Arc::clone(&root_config_shared),
-            agent_alias,
-            live_config.clone(),
-            execution_capability.clone(),
-        )),
+        Arc::new({
+            let peer_tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+                Arc::clone(&root_config_shared),
+                agent_alias,
+                live_config.clone(),
+                execution_capability.clone(),
+            );
+            match run_cancellation.clone() {
+                Some(token) => peer_tool.with_run_owned_cancellation_token(token),
+                None => peer_tool,
+            }
+        }),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -2374,7 +2395,7 @@ fn all_tools_with_runtime_on_thread(
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
+        let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
             security.clone(),
@@ -2410,6 +2431,9 @@ fn all_tools_with_runtime_on_thread(
         .with_live_config(live_config.clone())
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
+        if let Some(cancellation) = run_cancellation {
+            delegate_tool = delegate_tool.with_run_owned_cancellation_token(cancellation);
+        }
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
         {
@@ -2790,6 +2814,7 @@ mod tests {
             &cfg,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -3844,6 +3869,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
@@ -3904,6 +3930,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -4054,6 +4081,7 @@ permissions = ["http_client"]
                 None,
                 None,
                 None,
+                None,
             )
             .expect("tool registry builds")
             .tools;
@@ -4144,6 +4172,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
@@ -4208,6 +4237,7 @@ permissions = ["http_client"]
             Some(engine),
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
@@ -4266,8 +4296,9 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         )
-        .expect("first tool registry builds");
+        .expect("tool registry builds");
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
             &security,
@@ -4290,8 +4321,9 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         )
-        .expect("second tool registry builds");
+        .expect("tool registry builds");
 
         for tools in [&session_a.tools, &session_b.tools] {
             assert!(tools.iter().any(|t| t.name() == "sop_status"));
@@ -4418,6 +4450,7 @@ permissions = ["http_client"]
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .expect("tool registry builds")
             .tools
@@ -4511,6 +4544,7 @@ permissions = ["http_client"]
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4612,6 +4646,7 @@ permissions = ["http_client"]
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -5181,6 +5216,7 @@ permissions = ["http_client"]
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .expect("tool registry builds")
@@ -5844,6 +5880,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .expect("tool registry builds")
         .tools;
@@ -5927,6 +5964,7 @@ permissions = ["http_client"]
             None,
             None,
             Some(live_config.clone()),
+            None,
         )
         .expect("tool registry should build")
         .tools;

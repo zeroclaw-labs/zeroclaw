@@ -18,55 +18,19 @@ pub struct CronRunTool {
 }
 
 struct ManualCronClaim {
-    config: Arc<Config>,
-    job_id: String,
-    agent_alias: String,
-    lock_token: String,
-    released: bool,
+    ownership: Option<crate::cron::CronClaimToken>,
 }
-
 impl ManualCronClaim {
-    fn new(config: Arc<Config>, job_id: String, agent_alias: String, lock_token: String) -> Self {
+    #[cfg(test)]
+    fn new(config: Arc<Config>, job_id: String, _agent_alias: String, lock_token: String) -> Self {
         Self {
-            config,
-            job_id,
-            agent_alias,
-            lock_token,
-            released: false,
+            ownership: Some(crate::cron::CronClaimToken::manual(
+                &config, &job_id, lock_token,
+            )),
         }
     }
-
     fn release(&mut self) {
-        if self.released {
-            return;
-        }
-
-        match cron::release_job_for_token(&self.config, &self.job_id, &self.lock_token) {
-            Ok(_) => self.released = true,
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "job_id": self.job_id,
-                        "agent_alias": self.agent_alias,
-                        "error": format!("{e}")
-                    })),
-                "agent cron_run: failed to release in-flight lock"
-            ),
-        }
-        // Once the manual run has finished (or cancellation has dropped this
-        // guard), recovery must be allowed to clear the token even if both
-        // release attempts fail.
-        cron::finish_agent_claim(&self.config, &self.job_id, &self.lock_token);
-    }
-}
-
-impl Drop for ManualCronClaim {
-    fn drop(&mut self) {
-        // Tool cancellation drops the execute future, so cleanup must live in
-        // this guard instead of only after the awaited manual run completes.
-        self.release();
+        self.ownership.take();
     }
 }
 
@@ -242,20 +206,21 @@ impl Tool for CronRunTool {
             });
         };
 
-        let mut claim = ManualCronClaim::new(
-            Arc::new(config.clone()),
-            job.id.clone(),
-            self.agent_alias.clone(),
-            lock_token,
-        );
-        let result = cron::scheduler::run_manual_job_with_runtime_and_selection(
-            config,
-            &job,
-            cron::scheduler::CronDeliveryContext::ToolManual,
-            &None,
-            self.runtime.as_ref(),
-            approved,
-            selection,
+        let owner = crate::cron::CronClaimToken::manual(config, &job.id, lock_token);
+        let mut claim = ManualCronClaim {
+            ownership: Some(owner.clone()),
+        };
+        let result = crate::cron::claim_scope::scope(
+            owner,
+            cron::scheduler::run_manual_job_with_runtime_and_selection(
+                config,
+                &job,
+                cron::scheduler::CronDeliveryContext::ToolManual,
+                &None,
+                self.runtime.as_ref(),
+                approved,
+                selection,
+            ),
         )
         .await;
 
