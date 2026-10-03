@@ -160,6 +160,7 @@ zc-queue-full = 队列已满（最多 { $cap } 条）。请等待消息发送。
 zc-queue-title = 队列（{ $count }）
 zc-queue-empty-list = 没有排队消息。
 zc-queue-paused-ghost = 队列已暂停 — 按 { $key } 或发送消息以恢复
+zc-queue-missing-completion-ghost = 未收到完成信号。按 { $key } 或发送消息以恢复队列。
 zc-queue-item-injected = （插入）
 zc-queue-resumed = 队列已恢复。
 zc-queue-clear-empty = 队列已经为空。
