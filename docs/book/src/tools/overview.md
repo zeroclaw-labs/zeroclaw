@@ -19,6 +19,8 @@ recorded in the inventory's
 [Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
 section.
 
+> **Build note:** the SaaS integration tools (`jira`, `notion`, `linkedin`, `composio`, `google_workspace`, `microsoft365`, `project_intel` with `report_template`) and the coding-CLI tools (`claude_code`, `claude_code_runner`, `codex_cli`, `gemini_cli`, `opencode_cli`) are not in the lean Cargo default build. Release binaries and container images include them. From source, build with `--features tools-saas`, `--features tools-coding-cli`, or a single `tool-<name>` feature such as `tool-jira`. A build without a tool's feature skips it and logs a warning if its config section is enabled.
+
 ## Built-in tools
 
 A minimal build ships with:

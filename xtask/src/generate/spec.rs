@@ -1437,6 +1437,20 @@ mod tests {
                 "channel-lark",
                 "channel-git",
                 "whatsapp-web",
+                // Out of Cargo `default`, still shipped until each has a
+                // plugin replacement.
+                "tool-jira",
+                "tool-notion",
+                "tool-linkedin",
+                "tool-composio",
+                "tool-google-workspace",
+                "tool-microsoft365",
+                "tool-project-intel",
+                "tool-claude-code",
+                "tool-claude-code-runner",
+                "tool-codex-cli",
+                "tool-gemini-cli",
+                "tool-opencode-cli",
             ]
             .map(str::to_owned),
         );

@@ -214,6 +214,8 @@ non_row_features = [
     "default",
     "default-channels",
     "channels-full",
+    "tools-saas",
+    "tools-coding-cli",
     "ci-all",
     "fantoccini",
     "landlock",
@@ -228,6 +230,20 @@ dist_extra_features = [
     "channel-lark",
     "channel-git",
     "whatsapp-web",
+    # The SaaS and coding-CLI tools left Cargo `default` but still ship in
+    # standard artifacts until each has a plugin replacement.
+    "tool-jira",
+    "tool-notion",
+    "tool-linkedin",
+    "tool-composio",
+    "tool-google-workspace",
+    "tool-microsoft365",
+    "tool-project-intel",
+    "tool-claude-code",
+    "tool-claude-code-runner",
+    "tool-codex-cli",
+    "tool-gemini-cli",
+    "tool-opencode-cli",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -291,6 +307,41 @@ channels-full = [
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
+
+# Opt-in SaaS integration tools. Not in `default`; standard distribution
+# artifacts include them through `dist_extra_features`.
+tools-saas = [
+    "tool-jira",
+    "tool-notion",
+    "tool-linkedin",
+    "tool-composio",
+    "tool-google-workspace",
+    "tool-microsoft365",
+    "tool-project-intel",
+]
+
+# Opt-in tools that delegate to external coding CLIs.
+tools-coding-cli = [
+    "tool-claude-code",
+    "tool-claude-code-runner",
+    "tool-codex-cli",
+    "tool-gemini-cli",
+    "tool-opencode-cli",
+]
+
+# Tools — each forwards to zeroclaw-runtime, which registers it.
+tool-jira = ["zeroclaw-runtime/tool-jira"]
+tool-notion = ["zeroclaw-runtime/tool-notion"]
+tool-linkedin = ["zeroclaw-runtime/tool-linkedin"]
+tool-composio = ["zeroclaw-runtime/tool-composio"]
+tool-google-workspace = ["zeroclaw-runtime/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-runtime/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-runtime/tool-project-intel"]
+tool-claude-code = ["zeroclaw-runtime/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-runtime/tool-claude-code-runner", "zeroclaw-gateway?/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-runtime/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
 
 # Major subsystems — each forwards to exactly ONE crate
 gateway = [
@@ -411,6 +462,7 @@ ci-all = [
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
+    "tools-saas", "tools-coding-cli",
 ]
 
 [profile.dev]

@@ -116,6 +116,8 @@ channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 gateway-voice-duplex = []
+# Serves the Claude Code runner's progress hooks at `/hooks/claude-code`.
+tool-claude-code-runner = ["zeroclaw-tools/tool-claude-code-runner"]
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
 # on; turning it off omits OPTIONS schema bodies (returns a small placeholder)

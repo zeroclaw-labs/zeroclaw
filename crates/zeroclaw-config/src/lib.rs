@@ -18,6 +18,7 @@ pub mod field_visibility;
 pub mod helpers;
 pub mod migration;
 pub mod multi_agent;
+pub mod opt_in_tools;
 pub mod pairing;
 pub mod paths;
 pub mod platform;

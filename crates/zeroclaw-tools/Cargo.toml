@@ -75,6 +75,22 @@ libc = "0.2"
 default = []
 browser-native = ["dep:fantoccini"]
 probe = ["dep:probe-rs"]
+# SaaS and coding-CLI integrations. Each is opt-in; the root crate forwards
+# one `tool-*` feature per integration and bundles them as `tools-saas` and
+# `tools-coding-cli`. Each also tells zeroclaw-config the tool is compiled
+# in, so config validation and diagnostics follow the build.
+tool-jira = ["zeroclaw-config/tool-jira"]
+tool-notion = ["zeroclaw-config/tool-notion"]
+tool-linkedin = ["zeroclaw-config/tool-linkedin"]
+tool-composio = ["zeroclaw-config/tool-composio"]
+tool-google-workspace = ["zeroclaw-config/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-config/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-config/tool-project-intel"]
+tool-claude-code = ["zeroclaw-config/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-config/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-config/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-config/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test
 # suites can build registry fixtures without spawning real stdio

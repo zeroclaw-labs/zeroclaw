@@ -1,6 +1,12 @@
 //! Tool subsystem for agent-callable capabilities.
 
 pub mod attribution;
+#[cfg(any(
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 pub(crate) mod coding_cli_executor;
 pub mod cron_add;
 pub(crate) mod cron_common;
@@ -50,12 +56,16 @@ pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
 pub use zeroclaw_tools::channel_room::ChannelRoomTool;
+#[cfg(feature = "tool-claude-code")]
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
+#[cfg(feature = "tool-claude-code-runner")]
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
 pub use zeroclaw_tools::cloud_ops::CloudOpsTool;
 pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
+#[cfg(feature = "tool-codex-cli")]
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
+#[cfg(feature = "tool-composio")]
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
@@ -68,10 +78,12 @@ pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
+#[cfg(feature = "tool-gemini-cli")]
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
+#[cfg(feature = "tool-google-workspace")]
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
@@ -79,8 +91,10 @@ pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
+#[cfg(feature = "tool-jira")]
 pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
+#[cfg(feature = "tool-linkedin")]
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
@@ -97,16 +111,21 @@ pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 pub use zeroclaw_tools::memory_recall::MemoryRecallTool;
 pub use zeroclaw_tools::memory_store::MemoryStoreTool;
+#[cfg(feature = "tool-microsoft365")]
 pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
+#[cfg(feature = "tool-notion")]
 pub use zeroclaw_tools::notion_tool::NotionTool;
+#[cfg(feature = "tool-opencode-cli")]
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
 pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
@@ -246,10 +265,51 @@ fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
 }
 
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
-    root_config.claude_code.enabled
-        || root_config.codex_cli.enabled
-        || root_config.gemini_cli.enabled
-        || root_config.opencode_cli.enabled
+    (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
+        || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
+        || (cfg!(feature = "tool-gemini-cli") && root_config.gemini_cli.enabled)
+        || (cfg!(feature = "tool-opencode-cli") && root_config.opencode_cli.enabled)
+}
+
+/// Whether the Composio tool is registered for `config`: compiled in and
+/// enabled. Prompt builders consult this so the model is never told about a
+/// tool this build does not carry.
+pub fn composio_tool_available(config: &Config) -> bool {
+    cfg!(feature = "tool-composio") && config.composio.enabled
+}
+
+/// An integration enabled in config whose tool this build was compiled
+/// without. Mirrors the channel orchestrator's "compiled without" notice, and
+/// carries the code `Config::collect_warnings` reports the same section under
+/// for `config/validate`, the config API and `doctor`.
+#[cfg(not(all(
+    feature = "tool-jira",
+    feature = "tool-notion",
+    feature = "tool-linkedin",
+    feature = "tool-composio",
+    feature = "tool-google-workspace",
+    feature = "tool-microsoft365",
+    feature = "tool-project-intel",
+    feature = "tool-claude-code",
+    feature = "tool-claude-code-runner",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+)))]
+fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
+    if tool.enabled_in(root_config) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": tool.section(),
+                    "feature": tool.feature(),
+                })),
+            "a tool is enabled in config but this build was compiled without its feature; skipping it"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1314,6 +1374,12 @@ fn all_tools_with_runtime_on_thread(
         shell_tool,
         sandbox,
     } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
+    #[cfg(any(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -1808,6 +1874,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Notion API tool (conditionally registered)
+    #[cfg(not(feature = "tool-notion"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Notion,
+    );
+    #[cfg(feature = "tool-notion")]
     if root_config.notion.enabled {
         let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
             std::env::var("NOTION_API_KEY").unwrap_or_default()
@@ -1827,6 +1899,9 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Jira integration (config-gated)
+    #[cfg(not(feature = "tool-jira"))]
+    warn_tool_compiled_out(root_config, zeroclaw_config::opt_in_tools::OptInTool::Jira);
+    #[cfg(feature = "tool-jira")]
     if root_config.jira.enabled {
         let api_token = if root_config.jira.api_token.trim().is_empty() {
             std::env::var("JIRA_API_TOKEN").unwrap_or_default()
@@ -1880,6 +1955,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Project delivery intelligence
+    #[cfg(not(feature = "tool-project-intel"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ProjectIntel,
+    );
+    #[cfg(feature = "tool-project-intel")]
     if root_config.project_intel.enabled {
         tool_arcs.push(Arc::new(ProjectIntelTool::new(
             root_config.project_intel.default_language.clone(),
@@ -1924,6 +2005,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Google Workspace CLI (gws) integration — requires shell access
+    #[cfg(not(feature = "tool-google-workspace"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GoogleWorkspace,
+    );
+    #[cfg(feature = "tool-google-workspace")]
     if root_config.google_workspace.enabled && has_shell_access {
         tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
             security.clone(),
@@ -1954,6 +2041,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Claude Code delegation tool
+    #[cfg(not(feature = "tool-claude-code"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCode,
+    );
+    #[cfg(feature = "tool-claude-code")]
     if register_coding_cli_tools && root_config.claude_code.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             ClaudeCodeTool::new_with_executor(
@@ -1966,6 +2059,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Claude Code task runner with Slack progress and SSH handoff
+    #[cfg(not(feature = "tool-claude-code-runner"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCodeRunner,
+    );
+    #[cfg(feature = "tool-claude-code-runner")]
     if root_config.claude_code_runner.enabled {
         let gateway_url = format!(
             "http://{}:{}",
@@ -1982,6 +2081,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Codex CLI delegation tool
+    #[cfg(not(feature = "tool-codex-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::CodexCli,
+    );
+    #[cfg(feature = "tool-codex-cli")]
     if register_coding_cli_tools && root_config.codex_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             CodexCliTool::new_with_executor(
@@ -1994,6 +2099,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Gemini CLI delegation tool
+    #[cfg(not(feature = "tool-gemini-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GeminiCli,
+    );
+    #[cfg(feature = "tool-gemini-cli")]
     if register_coding_cli_tools && root_config.gemini_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             GeminiCliTool::new_with_executor(
@@ -2006,6 +2117,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // OpenCode CLI delegation tool
+    #[cfg(not(feature = "tool-opencode-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::OpenCodeCli,
+    );
+    #[cfg(feature = "tool-opencode-cli")]
     if register_coding_cli_tools && root_config.opencode_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             OpenCodeCliTool::new_with_executor(
@@ -2058,6 +2175,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // LinkedIn integration (config-gated)
+    #[cfg(not(feature = "tool-linkedin"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::LinkedIn,
+    );
+    #[cfg(feature = "tool-linkedin")]
     if root_config.linkedin.enabled {
         tool_arcs.push(Arc::new(LinkedInTool::new(
             security.clone(),
@@ -2195,6 +2318,17 @@ fn all_tools_with_runtime_on_thread(
         }
     }
 
+    #[cfg(not(feature = "tool-composio"))]
+    {
+        // Reported whenever the section is enabled: the usual caller passes no
+        // key when the section has none, which is exactly when it matters.
+        let _ = (composio_key, composio_entity_id);
+        warn_tool_compiled_out(
+            root_config,
+            zeroclaw_config::opt_in_tools::OptInTool::Composio,
+        );
+    }
+    #[cfg(feature = "tool-composio")]
     if let Some(key) = composio_key
         && !key.is_empty()
     {
@@ -2254,6 +2388,12 @@ fn all_tools_with_runtime_on_thread(
     tool_arcs.push(Arc::new(escalate_tool));
 
     // Microsoft 365 Graph API integration
+    #[cfg(not(feature = "tool-microsoft365"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Microsoft365,
+    );
+    #[cfg(feature = "tool-microsoft365")]
     if root_config.microsoft365.enabled {
         let ms_cfg = &root_config.microsoft365;
         let tenant_id = ms_cfg
@@ -3930,11 +4070,23 @@ permissions = ["http_client"]
         );
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     struct CapturingRuntime {
         seen_command: Arc<Mutex<Option<String>>>,
         filesystem_access: bool,
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     impl RuntimeAdapter for CapturingRuntime {
         fn name(&self) -> &str {
             "capturing-test"
@@ -3975,6 +4127,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn registered_coding_cli_tools_use_configured_runtime_executor() {
         type EnableCodingCli = fn(&mut Config);
@@ -4089,6 +4247,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn docker_without_workspace_mount_does_not_register_coding_cli_tools() {
         let tmp = TempDir::new().unwrap();
@@ -4155,6 +4319,87 @@ permissions = ["http_client"]
                 "{tool_name} must not register without runtime filesystem access"
             );
         }
+        assert!(
+            names.contains(&"shell"),
+            "positive control: ordinary tools should still register"
+        );
+    }
+
+    /// An integration enabled in config registers only when its feature is
+    /// compiled in. A compiled-out tool is absent from the registry and from
+    /// the prompt's tool descriptions, never listed as a name that fails.
+    #[tokio::test]
+    async fn enabled_integrations_register_only_when_compiled_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "secret_test".into();
+        cfg.jira.enabled = true;
+        cfg.jira.api_token = "token".into();
+        cfg.jira.base_url = "https://example.atlassian.net".into();
+        cfg.project_intel.enabled = true;
+        cfg.composio.enabled = true;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("composio-key"),
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for (tool_name, compiled_in) in [
+            ("notion", cfg!(feature = "tool-notion")),
+            ("jira", cfg!(feature = "tool-jira")),
+            ("project_intel", cfg!(feature = "tool-project-intel")),
+            ("report_template", cfg!(feature = "tool-project-intel")),
+            ("composio", cfg!(feature = "tool-composio")),
+        ] {
+            assert_eq!(
+                names.contains(&tool_name),
+                compiled_in,
+                "{tool_name} must register exactly when its feature is compiled in"
+            );
+        }
+        assert_eq!(
+            composio_tool_available(&cfg),
+            cfg!(feature = "tool-composio"),
+            "the prompt must not describe a Composio tool this build lacks"
+        );
         assert!(
             names.contains(&"shell"),
             "positive control: ordinary tools should still register"

@@ -48,7 +48,7 @@
         # Default feature sets: zeroclaw uses canonical lean Dist,
         # zerocode uses its own package features (currently empty).
         # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "tool-claude-code" "tool-claude-code-runner" "tool-codex-cli" "tool-composio" "tool-gemini-cli" "tool-google-workspace" "tool-jira" "tool-linkedin" "tool-microsoft365" "tool-notion" "tool-opencode-cli" "tool-project-intel" "whatsapp-web" ];
         zerocodeDefaultFeatures = [  ];
         buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
