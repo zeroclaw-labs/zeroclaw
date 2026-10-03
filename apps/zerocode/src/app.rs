@@ -2032,10 +2032,10 @@ pub async fn run(
                 2
             };
 
-            let (ctx_input, ctx_max, ctx_model_window) = match mode {
+            let (ctx_input, ctx_input_source, ctx_max, ctx_model_window) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
-                _ => (None, None, None),
+                _ => (None, None, None, None),
             };
             let browse_mode = match mode {
                 Mode::Chat => chat_pane.in_browse_mode(),
@@ -2047,7 +2047,7 @@ pub async fn run(
                 chunks[status_idx],
                 &conn_state,
                 rpc.tui_id(),
-                CtxBar::new(ctx_input, ctx_max, ctx_model_window),
+                CtxBar::new(ctx_input, ctx_input_source, ctx_max, ctx_model_window),
                 needs_intervention,
                 browse_mode,
             );
@@ -5090,6 +5090,119 @@ mod tests {
         }
 
         assert_eq!(pane.selected_name(), Some("deploy"));
+    }
+
+    /// Render the real status bar through the production renderer and return
+    /// the final terminal cells a user sees. Reaches the outermost TUI
+    /// boundary for the context meter, not a component snapshot.
+    #[cfg(test)]
+    fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_status_bar(
+                    frame,
+                    frame.area(),
+                    &ConnectionState::Connected,
+                    Some("tui-1"),
+                    ctx,
+                    false,
+                    false,
+                );
+            })
+            .expect("draw status bar");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// User-boundary proof: an estimated context count reaches the real status
+    /// bar marked approximate, and a measured count does not.
+    #[test]
+    fn status_bar_marks_estimated_context_and_not_measured_context() {
+        let estimated = render_status_bar_cells(
+            CtxBar::new(
+                Some(100_000),
+                Some("estimate".to_string()),
+                Some(180_000),
+                Some(200_000),
+            ),
+            100,
+        );
+        let measured = render_status_bar_cells(
+            CtxBar::new(
+                Some(100_000),
+                Some("provider".to_string()),
+                Some(180_000),
+                Some(200_000),
+            ),
+            100,
+        );
+
+        assert!(
+            estimated.contains("~100,000 / 200,000"),
+            "estimated count must render approximate in the real status bar: {estimated:?}"
+        );
+        assert!(
+            estimated.contains("~50%"),
+            "estimated percentage must render approximate: {estimated:?}"
+        );
+        assert!(
+            measured.contains(" 100,000 / 200,000"),
+            "measured count keeps the reserved marker column blank: {measured:?}"
+        );
+        assert!(
+            !measured.contains('~'),
+            "measured usage must never render approximate: {measured:?}"
+        );
+    }
+
+    /// The marker occupies a reserved column, so enabling provenance must not
+    /// shift any following content in the status bar.
+    #[test]
+    fn approximation_marker_does_not_shift_status_bar_layout() {
+        for width in [80_u16, 100, 120] {
+            let estimated = render_status_bar_cells(
+                CtxBar::new(
+                    Some(100_000),
+                    Some("estimate".to_string()),
+                    Some(180_000),
+                    Some(200_000),
+                ),
+                width,
+            );
+            let measured = render_status_bar_cells(
+                CtxBar::new(
+                    Some(100_000),
+                    Some("provider".to_string()),
+                    Some(180_000),
+                    Some(200_000),
+                ),
+                width,
+            );
+            assert_eq!(
+                estimated.len(),
+                measured.len(),
+                "width {width}: estimated and measured rows must occupy the same cells"
+            );
+            // The only differing cells are the two reserved marker columns.
+            let diffs = estimated
+                .chars()
+                .zip(measured.chars())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                diffs, 2,
+                "width {width}: only the two marker columns may differ\n  est={estimated:?}\n  mea={measured:?}"
+            );
+        }
     }
 
     #[test]

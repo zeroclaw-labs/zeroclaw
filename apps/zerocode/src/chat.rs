@@ -5568,15 +5568,17 @@ impl Chat {
         }
     }
 
-    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, input_tokens_source, trim_budget, model_window)`
+    /// for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         match &self.phase {
             ChatPhase::Active(s) => (
                 s.context_input_tokens,
+                s.context_input_tokens_source.clone(),
                 s.context_max_tokens,
                 s.context_model_window,
             ),
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         }
     }
 
@@ -9466,6 +9468,10 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
+    /// Provenance of `context_input_tokens` ("provider" or "estimate"). An
+    /// estimated count must be rendered as approximate, never as measured
+    /// usage. Always set and cleared together with the count it describes.
+    pub context_input_tokens_source: Option<String>,
     /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
     /// Model's full context window; when present, the bar denominator so the
@@ -9588,6 +9594,7 @@ impl ChatState {
             cached_render_width: 0,
             cached_total_rows: 0,
             context_input_tokens: None,
+            context_input_tokens_source: None,
             context_max_tokens: None,
             context_model_window: None,
             message_queue: VecDeque::new(),
@@ -11302,11 +11309,16 @@ impl ChatState {
             }
             SessionUpdate::ContextUsage {
                 input_tokens,
+                input_tokens_source,
                 max_context_tokens,
                 model_context_window,
                 ..
             } => {
                 self.context_input_tokens = input_tokens;
+                // Provenance travels with the count it describes: an absent
+                // count must not keep a stale "estimate"/"provider" label, and
+                // an estimated count must never inherit a prior measured one.
+                self.context_input_tokens_source = input_tokens.and(input_tokens_source);
                 // Budget and capacity are one authoritative per-call snapshot.
                 // In particular, `None` capacity is meaningful: compatibility
                 // fallback routes omit it and must clear a prior configured
@@ -12404,6 +12416,7 @@ impl ChatState {
         // from the previous session before the first LLM call fires a new
         // ContextUsage event.
         self.context_input_tokens = None;
+        self.context_input_tokens_source = None;
         self.context_max_tokens = None;
         self.context_model_window = None;
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
@@ -13139,6 +13152,7 @@ mod tests {
         let mut state = state();
         state.apply_update(SessionUpdate::ContextUsage {
             session_id: "sess-1".to_string(),
+            input_tokens_source: None,
             input_tokens: Some(100_000),
             max_context_tokens: Some(180_000),
             model_context_window: Some(200_000),
@@ -13148,6 +13162,7 @@ mod tests {
 
         state.apply_update(SessionUpdate::ContextUsage {
             session_id: "sess-1".to_string(),
+            input_tokens_source: None,
             input_tokens: Some(12_000),
             max_context_tokens: Some(32_000),
             model_context_window: None,
@@ -13157,6 +13172,54 @@ mod tests {
         assert_eq!(
             state.context_model_window, None,
             "a compatibility-fallback frame must clear the prior route's capacity"
+        );
+    }
+
+    #[test]
+    fn context_usage_provenance_travels_with_the_count_it_describes() {
+        let mut state = state();
+
+        // Estimated frame: provenance stored alongside the count.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(4_200),
+            input_tokens_source: Some("estimate".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_input_tokens, Some(4_200));
+        assert_eq!(
+            state.context_input_tokens_source.as_deref(),
+            Some("estimate")
+        );
+
+        // A later provider-reported frame must replace, never inherit, the
+        // previous estimate label.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(
+            state.context_input_tokens_source.as_deref(),
+            Some("provider")
+        );
+
+        // An absent count must clear the label too: a stale "provider" marker
+        // on no number would misdescribe the next thing rendered.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: None,
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_input_tokens, None);
+        assert_eq!(
+            state.context_input_tokens_source, None,
+            "provenance must be cleared whenever the count it describes is cleared"
         );
     }
 
