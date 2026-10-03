@@ -298,10 +298,28 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
 /// Ownership refusals reuse it, so a job owned by someone else is
 /// indistinguishable from one that does not exist. Keeping the wording in one
 /// place is what makes that property structural rather than coincidental.
+/// It is a [`JobNotFound`], so a caller tells it from a storage failure by
+/// type, never by its words.
 #[must_use]
 pub fn job_not_found(job_id: &str) -> anyhow::Error {
-    anyhow::Error::msg(format!("Cron job '{job_id}' not found"))
+    anyhow::Error::new(JobNotFound {
+        id: job_id.to_owned(),
+    })
 }
+
+/// No job, and for a removal no retained run either, has the id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobNotFound {
+    id: String,
+}
+
+impl std::fmt::Display for JobNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cron job '{}' not found", self.id)
+    }
+}
+
+impl std::error::Error for JobNotFound {}
 
 /// Read a job only when `agent_alias` is its current owner. The ownership
 /// predicate belongs to this SELECT so an operator rename that commits before
@@ -420,7 +438,7 @@ pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Res
     })?;
 
     if changed == 0 {
-        anyhow::bail!("Cron job '{id}' not found");
+        return Err(job_not_found(id));
     }
 
     ::zeroclaw_log::record!(
@@ -461,7 +479,7 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     })?;
 
     if jobs_deleted == 0 && runs_deleted == 0 {
-        anyhow::bail!("Cron job '{id}' not found");
+        return Err(job_not_found(id));
     }
 
     ::zeroclaw_log::record!(
