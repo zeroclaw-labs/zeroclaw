@@ -6,10 +6,12 @@ pub mod daemon;
 pub mod gateway_client;
 pub mod health;
 pub mod macos;
+pub mod ownership;
 pub mod state;
 pub mod tray;
 
 use gateway_client::GatewayClient;
+use ownership::SharedOwnedProcesses;
 use state::shared_state;
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
@@ -31,7 +33,14 @@ struct SplashStatus {
 /// Ensure a gateway/daemon is reachable: reuse one if it already answers,
 /// otherwise launch a fresh `zeroclaw daemon`. The splash window's health
 /// polling takes over once the daemon is up and opens the dashboard.
-async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
+///
+/// Only a daemon launched here is recorded in `owned`; a reused one is
+/// external and keeps running when the app quits.
+async fn ensure_daemon(
+    app: tauri::AppHandle,
+    state: state::SharedState,
+    owned: SharedOwnedProcesses,
+) {
     let url = {
         let s = state.read().await;
         s.gateway_url.clone()
@@ -57,7 +66,7 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                     message: "Starting the ZeroClaw daemon…".to_string(),
                 },
             );
-            if let Err(e) = daemon::spawn_daemon(&bin, GATEWAY_PORT) {
+            if let Err(e) = owned.launch(&bin, GATEWAY_PORT) {
                 let _ = app.emit(
                     "zeroclaw://splash-status",
                     SplashStatus {
@@ -195,6 +204,7 @@ fn set_dock_icon() {
 /// Configure and run the Tauri application.
 pub fn run() {
     let shared = shared_state();
+    let owned = SharedOwnedProcesses::default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -209,6 +219,7 @@ pub fn run() {
             }
         }))
         .manage(shared.clone())
+        .manage(owned.clone())
         .invoke_handler(tauri::generate_handler![
             commands::gateway::get_status,
             commands::gateway::get_health,
@@ -241,7 +252,8 @@ pub fn run() {
             // if none is listening, so the app works without a manual setup step.
             let ensure_handle = app.handle().clone();
             let ensure_state = shared.clone();
-            tauri::async_runtime::spawn(ensure_daemon(ensure_handle, ensure_state));
+            let ensure_owned = owned.clone();
+            tauri::async_runtime::spawn(ensure_daemon(ensure_handle, ensure_state, ensure_owned));
 
             // Start background health polling (drives the tray icon/tooltip).
             health::spawn_health_poller(app.handle().clone(), shared.clone());
@@ -250,11 +262,22 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            // Keep the app running in the background when all windows are closed.
-            // This is the standard pattern for menu bar / tray apps.
-            if let RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+        .run(|app, event| match event {
+            // Keep the app, and the daemon it launched, running in the tray
+            // when all windows are closed; an explicit exit (tray Quit) proceeds.
+            RunEvent::ExitRequested { code, api, .. } => {
+                if ownership::keep_running_on_exit_request(code) {
+                    api.prevent_exit();
+                }
             }
+            // Stop only what this instance launched, newest first. A daemon it
+            // reused, or one left by an earlier run, keeps running.
+            RunEvent::Exit => {
+                let owned = app.state::<SharedOwnedProcesses>();
+                for error in owned.quit(ownership::QUIT_GRACE) {
+                    eprintln!("ZeroClaw Desktop: stopping the daemon it launched failed: {error}");
+                }
+            }
+            _ => {}
         });
 }
