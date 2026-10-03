@@ -164,6 +164,7 @@ pub struct SessionRecord {
 /// Canonical live-session data returned when `session/new` reattaches to an
 /// ID that is already present in the process-local session store.
 pub struct ResumedRpcSession {
+    pub generation: u64,
     pub agent: Arc<Mutex<Agent>>,
     pub agent_alias: String,
     pub workspace_dir: String,
@@ -194,6 +195,10 @@ impl ResumeExistingError {
 }
 
 impl RpcSession {
+    pub(crate) fn retained_environment(&self) -> Option<&crate::tools::ForwardedEnvironment> {
+        self.forwarded_environment.as_ref()
+    }
+
     pub fn new(
         agent: Agent,
         alias: &str,
@@ -286,6 +291,8 @@ type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 pub struct SessionStore {
+    #[cfg(test)]
+    test_effect_pauses: std::sync::Mutex<HashMap<&'static str, RehydrateSeedPause>>,
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
@@ -411,6 +418,8 @@ impl SessionStore {
             test_removal_signal_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_effect_pauses: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -630,7 +639,7 @@ impl SessionStore {
                 owner_tui_id,
                 None,
                 expected_access,
-                |_, _, _| Ok::<(), std::convert::Infallible>(()),
+                |_, _, _, _| Ok::<(), std::convert::Infallible>(()),
             )
             .await?;
         Ok(result.map(|result| match result {
@@ -657,7 +666,7 @@ impl SessionStore {
     /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
     /// Ownership and binding are both required: one says the session is the
     /// caller's, the other that the caller may still run it.
-    pub(crate) async fn resume_existing_authorized<E>(
+    pub(crate) async fn resume_existing_authorized<E, G>(
         &self,
         id: &str,
         agent_alias: &str,
@@ -666,7 +675,12 @@ impl SessionStore {
         owner_tui_id: Option<String>,
         expected_principal: Option<&str>,
         expected_access: Option<(u64, Option<&str>)>,
-        authorize: impl FnOnce(&str, &str, Option<&crate::tools::ForwardedEnvironment>) -> Result<(), E>,
+        authorize: impl FnOnce(
+            &str,
+            &str,
+            Option<&crate::tools::ForwardedEnvironment>,
+            Option<&str>,
+        ) -> Result<G, E>,
     ) -> Result<Option<Result<ResumedRpcSession, E>>, ResumeExistingError> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
@@ -696,13 +710,15 @@ impl SessionStore {
         if interaction_surface.is_some() && session.interaction_surface != interaction_surface {
             return Err(ResumeExistingError::DifferentInteractionSurface);
         }
-        if let Err(refused) = authorize(
+        let _authority = match authorize(
             &session.agent_alias,
             &session.workspace_dir,
             session.forwarded_environment.as_ref(),
+            session.owner_principal_id.as_deref(),
         ) {
-            return Ok(Some(Err(refused)));
-        }
+            Ok(guard) => guard,
+            Err(refused) => return Ok(Some(Err(refused))),
+        };
 
         if owner_tui_id.is_some() {
             session.owner_tui_id = owner_tui_id;
@@ -714,6 +730,7 @@ impl SessionStore {
             .map(|agent| agent.history().len())
             .unwrap_or_default();
         Ok(Some(Ok(ResumedRpcSession {
+            generation: session.generation,
             agent: Arc::clone(&session.agent),
             agent_alias: session.agent_alias.clone(),
             workspace_dir: session.workspace_dir.clone(),
@@ -916,6 +933,93 @@ impl SessionStore {
             .await
             .map_err(|_| WaitForProviderUpdateError::Timeout)
     }
+
+    /// Acquire Agent before map, then refuse a replaced incarnation.
+    /// Never retain the map while waiting for an Agent needed by admission.
+    async fn with_current_agent<R>(
+        &self,
+        id: &str,
+        effect: impl FnOnce(&mut Agent) -> R,
+    ) -> Option<R> {
+        let (generation, agent) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            (session.generation, Arc::clone(&session.agent))
+        };
+        let mut guard = agent.lock().await;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        if session.generation != generation || !Arc::ptr_eq(&session.agent, &agent) {
+            return None;
+        }
+        Some(effect(&mut guard))
+    }
+
+    /// Hold the canonical incarnation for a synchronous effect. Acquire Agent
+    /// first; the callback must not await or recursively acquire the map.
+    pub(crate) async fn with_session_effect<R>(
+        &self,
+        id: &str,
+        effect: impl FnOnce(Option<&mut RpcSession>) -> R,
+    ) -> R {
+        let mut sessions = self.sessions.lock().await;
+        effect(sessions.get_mut(id))
+    }
+
+    pub(crate) async fn remove_generation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<bool, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            return Ok(false);
+        };
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
+        let _authority = authorize(session.owner_principal_id.as_deref())?;
+        if tokens
+            .get(id)
+            .is_some_and(|(_, bound, _)| *bound == Some(generation))
+            && let Some((_, _, token)) = tokens.remove(id)
+        {
+            causes.insert(id.to_string(), CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        let pending = sessions
+            .remove(id)
+            .and_then(|session| session.pending_generation);
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_effect_pause(&self, boundary: &'static str) -> RehydrateSeedPause {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        self.test_effect_pauses
+            .lock()
+            .unwrap()
+            .insert(boundary, pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_effect_pause(&self, boundary: &'static str) {
+        let pause = self.test_effect_pauses.lock().unwrap().remove(boundary);
+        if let Some((arrived, release)) = pause {
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn wait_test_effect_pause(&self, _boundary: &'static str) {}
 
     /// Return the current generation for the session with `id`, or `None` if
     /// the session is absent. Provider-refresh callers capture this value
@@ -1416,22 +1520,15 @@ impl SessionStore {
     /// unknown. Callers persist this alongside the transcript so a later
     /// restore never has to infer provenance from message text.
     pub async fn history_has_trim_breadcrumb(&self, id: &str) -> Option<bool> {
-        if let Some(s) = self.sessions.lock().await.get(id) {
-            Some(s.agent.lock().await.history_has_trim_breadcrumb())
-        } else {
-            None
-        }
+        self.with_current_agent(id, |agent| agent.history_has_trim_breadcrumb())
+            .await
     }
 
     /// Restore the session's own canonical breadcrumb-provenance record onto
     /// its in-memory agent. No-op if the session is unknown.
     pub async fn set_history_has_trim_breadcrumb(&self, id: &str, present: bool) {
-        if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent
-                .lock()
-                .await
-                .set_history_has_trim_breadcrumb(present);
-        }
+        self.with_current_agent(id, |agent| agent.set_history_has_trim_breadcrumb(present))
+            .await;
     }
 
     pub async fn seed_history_with_event(
@@ -1439,11 +1536,9 @@ impl SessionStore {
         id: &str,
         msgs: &[zeroclaw_api::model_provider::ChatMessage],
     ) -> Option<TurnEvent> {
-        if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent.lock().await.seed_history_with_event(msgs)
-        } else {
-            None
-        }
+        self.with_current_agent(id, |agent| agent.seed_history_with_event(msgs))
+            .await
+            .flatten()
     }
 
     /// Replace the session's execution plan wholesale (TodoWrite
@@ -1473,14 +1568,9 @@ impl SessionStore {
         id: &str,
         msgs: Vec<zeroclaw_api::model_provider::ConversationMessage>,
     ) -> Option<TurnEvent> {
-        if let Some(s) = self.sessions.lock().await.get(id) {
-            s.agent
-                .lock()
-                .await
-                .seed_conversation_history_with_event(msgs)
-        } else {
-            None
-        }
+        self.with_current_agent(id, |agent| agent.seed_conversation_history_with_event(msgs))
+            .await
+            .flatten()
     }
 
     pub async fn chat_mode(&self, id: &str) -> Option<crate::rpc::types::ChatMode> {
@@ -1492,9 +1582,8 @@ impl SessionStore {
     }
 
     pub async fn history_len(&self, id: &str) -> Option<usize> {
-        let sessions = self.sessions.lock().await;
-        let s = sessions.get(id)?;
-        Some(s.agent.lock().await.history().len())
+        self.with_current_agent(id, |agent| agent.history().len())
+            .await
     }
 
     pub async fn history_slice_from(
@@ -1502,12 +1591,12 @@ impl SessionStore {
         id: &str,
         from: usize,
     ) -> Option<Vec<zeroclaw_api::model_provider::ConversationMessage>> {
-        let sessions = self.sessions.lock().await;
-        let s = sessions.get(id)?;
-        let h = s.agent.lock().await;
-        // Saturate: `trim_history` can shift indices past `from` between polls.
-        let history = h.history();
-        Some(history[from.min(history.len())..].to_vec())
+        self.with_current_agent(id, |agent| {
+            // Saturate: trimming may shift indices past `from` between polls.
+            let history = agent.history();
+            history[from.min(history.len())..].to_vec()
+        })
+        .await
     }
 
     pub async fn remove(&self, id: &str) -> bool {
@@ -2100,6 +2189,55 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn history_wait_releases_map_and_refuses_replaced_incarnation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(
+                    make_agent(),
+                    "test",
+                    "/tmp",
+                    super::super::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        let mut read = Box::pin(store.history_len("s"));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            store.sessions.try_lock().is_ok(),
+            "a blocked history reader must not hold the map required by Agent owners"
+        );
+        store.remove("s").await;
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(
+                    make_agent(),
+                    "test",
+                    "/tmp",
+                    super::super::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            read.await,
+            None,
+            "a queued reader must not disclose its detached predecessor or read the successor"
+        );
+        assert_eq!(store.history_len("s").await, Some(0));
+    }
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))

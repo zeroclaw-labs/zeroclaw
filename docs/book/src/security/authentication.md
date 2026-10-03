@@ -381,8 +381,43 @@ If either the principal's tool selector or agent selector is constrained,
 `delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
 are unavailable, including skill aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+turn remains usable. Admin principals keep their agent's configured nested
+capabilities. Principals with both selectors set to `"*"` keep `delegate`
+itself, but lose its skill aliases, `spawn_subagent`, and `execute_pipeline`
+with the session-data tools below.
+
+The session-data tools `sessions_list`, `sessions_history`, and
+`sessions_send` list, read, and append to other sessions without checking
+who owns them, so no principal without `admin` holds them in its sessions,
+whatever its selectors name, `"*"` included. Skill aliases of those tools go
+with them, and so do `spawn_subagent` and `execute_pipeline` (with their
+skill aliases), whose nested runs would hold them again. A retained
+`delegate` withholds the same tools from every bounded, independent,
+background, and parallel child it builds. `sessions_current`, which reports
+only the caller's own session, stays. The withholding is applied at session
+creation, at rehydration, and before every prompt, so an administrator
+demoted mid-session loses the tools at the next prompt. Like selector
+narrowing, it never gives them back to a live session. Admin principals and
+the shared operator keep them.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+The withholding does not reach runs that execute later under the agent's
+own identity with the agent's configured tools: agent jobs created with
+`cron_add`, or given a new prompt with `cron_update` and started with
+`cron_run` (the same holds for RPC cron grants), SOP runs, and the turns
+`send_message_to_peer` starts in another agent. Those runs can still call
+the session-data tools, and a job's output comes back through `cron_runs`.
+Until the tools check ownership, an operator who lets non-admin principals
+reach these routes can list `sessions_list`, `sessions_history`, and
+`sessions_send`, plus any skill tool that targets them, in `excluded_tools`
+of the risk profile of each agent those runs use. That removes them from
+every run of those agents, administrators' sessions included.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -650,6 +685,11 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
 unlike cron history. Gateway HTTP routes keep their existing pairing

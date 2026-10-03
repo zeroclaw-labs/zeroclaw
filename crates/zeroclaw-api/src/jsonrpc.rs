@@ -329,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Reserve capacity before resolving current disclosure authority.
+    /// The returned permit enqueues synchronously without another wait.
+    pub async fn reserve_frame(&self) -> Option<mpsc::OwnedPermit<String>> {
+        self.writer_tx.clone().reserve_owned().await.ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.
