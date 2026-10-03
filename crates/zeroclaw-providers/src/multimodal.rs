@@ -9175,11 +9175,18 @@ mod tests {
                 probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 false
             });
-        // Both local markers name files that do not exist anywhere: a
-        // rejected path must count 0 without the file ever needing to exist.
+        // Both local markers name files that are never created: a rejected
+        // path must count 0 without the file ever needing to exist. They sit
+        // under a temp dir so they are absolute on every platform; a rooted
+        // path such as `/definitely/...` has no drive on Windows and would be
+        // refused as relative before the predicate ran.
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left.png");
+        let right = temp.path().join("right.png");
         let messages = vec![ChatMessage::user(format!(
             "compare [IMAGE: {}] with [IMAGE: {}]",
-            "/definitely/not/a/real/left.png", "/definitely/not/a/real/right.png"
+            left.display(),
+            right.display()
         ))];
         assert_eq!(
             count_latest_user_resolvable_image_markers(&messages, false, path_allowed.clone())
@@ -9196,7 +9203,8 @@ mod tests {
         let data_uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
         let with_data_uri = vec![ChatMessage::user(format!(
             "compare [IMAGE: {}] with [IMAGE: {}]",
-            data_uri, "/definitely/not/a/real/right.png"
+            data_uri,
+            right.display()
         ))];
         assert_eq!(
             count_latest_user_resolvable_image_markers(&with_data_uri, false, path_allowed).await,
