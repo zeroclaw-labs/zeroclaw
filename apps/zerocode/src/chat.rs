@@ -6709,6 +6709,41 @@ fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> St
     serde_json::Value::Object(metadata).to_string()
 }
 
+fn foreground_subagent_input(name: &str, input_json: &str) -> Option<serde_json::Value> {
+    if !matches!(name, "spawn_subagent" | "delegate") || input_json.len() > TOOL_EXPANDED_MAX_BYTES
+    {
+        return None;
+    }
+    let input: serde_json::Value = serde_json::from_str(input_json).ok()?;
+    if input.get("prompt")?.as_str()?.trim().is_empty() {
+        return None;
+    }
+    if name == "delegate" {
+        if input
+            .get("action")
+            .is_some_and(|action| action.as_str() != Some("delegate"))
+            || input
+                .get("background")
+                .is_some_and(|background| background.as_bool() != Some(false))
+        {
+            return None;
+        }
+        match input.get("parallel") {
+            Some(serde_json::Value::Array(agents))
+                if !agents.is_empty()
+                    && agents
+                        .iter()
+                        .all(|agent| agent.as_str().is_some_and(|s| !s.trim().is_empty())) => {}
+            None if input
+                .get("agent")
+                .and_then(|agent| agent.as_str())
+                .is_some_and(|s| !s.trim().is_empty()) => {}
+            _ => return None,
+        }
+    }
+    Some(input)
+}
+
 fn bounded_tool_output(raw_output: String) -> String {
     const MAX_OUTPUT: usize = 16 * 1024;
     const TRUNCATION_MARKER: &str = "…[truncated]";
@@ -6738,8 +6773,18 @@ fn render_tool_entry(
         Modifier::empty()
     };
     let marker = if disclosure.is_open() { "▼" } else { "▶" };
+    let subagent_input = foreground_subagent_input(name, input_json);
+    let label = if subagent_input.is_some() {
+        crate::i18n::t(if name == "spawn_subagent" {
+            "zc-chat-tool-subagent"
+        } else {
+            "zc-chat-tool-delegation"
+        })
+    } else {
+        format!("tool: {name}")
+    };
     lines.push(Line::from(vec![Span::styled(
-        format!("{marker} [tool: {name}] "),
+        format!("{marker} [{label}] "),
         theme::tool_label_style().add_modifier(sel_mod),
     )]));
 
@@ -6768,20 +6813,58 @@ fn render_tool_entry(
     let body_start = lines.len();
     let mut footer = None;
     let mut display_limited = false;
-    let render_generic_input = |lines: &mut Vec<Line<'static>>| {
-        let (input, limited) = if matches!(disclosure, ToolDisclosure::Full) {
-            terminal_safe_tool_text_limited(
-                input_json,
-                TOOL_EXPANDED_MAX_BYTES,
-                TOOL_EXPANDED_MAX_LINES,
-            )
+    let render_field = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, preview_bytes| {
+        let (text, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(text, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
-            (preview(input_json, 120), false)
+            (preview(text, preview_bytes), false)
         };
-        push_text(lines, "input", &input);
+        push_text(lines, label, &text);
         limited
     };
+    let render_generic_input =
+        |lines: &mut Vec<Line<'static>>| render_field(lines, "input", input_json, 120);
     match name {
+        _ if subagent_input.is_some() => {
+            if let Some(input) = subagent_input {
+                if let Some(prompt) = input.get("prompt").and_then(|value| value.as_str()) {
+                    display_limited |=
+                        render_field(lines, &crate::i18n::t("zc-chat-tool-task"), prompt, 120);
+                }
+                if name == "delegate" {
+                    let target = match input.get("parallel").and_then(|value| value.as_array()) {
+                        Some(agents) => agents
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        None => input
+                            .get("agent")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    };
+                    display_limited |=
+                        render_field(lines, &crate::i18n::t("zc-chat-tool-target"), &target, 120);
+                }
+                // Receipt is transcript evidence, not a child lifecycle or success badge.
+                let status = crate::i18n::t(if result.is_some() {
+                    "zc-chat-tool-result-received"
+                } else {
+                    "zc-chat-tool-result-not-recorded"
+                });
+                push_text(lines, &crate::i18n::t("zc-chat-tool-status"), &status);
+                let projected_fields: &[&str] = match name {
+                    "delegate" if input.get("parallel").is_some() => &["prompt", "parallel"],
+                    "delegate" => &["prompt", "agent"],
+                    _ => &["prompt"],
+                };
+                let metadata = semantic_tool_metadata(&input, projected_fields);
+                if metadata != "{}" {
+                    display_limited |= render_field(lines, "input", &metadata, 120);
+                }
+            }
+        }
         "file_edit" => {
             if disclosure.is_open() {
                 let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
@@ -6897,13 +6980,7 @@ fn render_tool_entry(
     }
 
     if let Some(res) = result {
-        let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
-            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
-        } else {
-            (preview(res, 200), false)
-        };
-        push_text(lines, "result", &result);
-        display_limited |= limited;
+        display_limited |= render_field(lines, "result", res, 200);
     }
 
     if display_limited {
@@ -24460,6 +24537,209 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
+        let mut s = state();
+        for id in ["child-a", "child-b"] {
+            s.apply_update(SessionUpdate::ToolCall {
+                session_id: "sess-1".into(),
+                tool_call_id: id.into(),
+                name: "spawn_subagent".into(),
+                raw_input: serde_json::json!({
+                    "prompt": "Inspect the parser", "agent": "extra-target", "parallel": [42],
+                }),
+            });
+        }
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".into(),
+            tool_call_id: "child-b".into(),
+            raw_output: "Error: this is quoted task content, not an outcome badge".into(),
+        });
+        let rendered = s
+            .entries()
+            .iter()
+            .map(|entry| {
+                let mut lines = Vec::new();
+                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                rendered_text(&lines)
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[0].contains("[Subagent]"));
+        assert!(rendered[0].contains("Task: Inspect the parser"));
+        assert!(rendered[0].contains(r#""agent":"extra-target""#));
+        assert!(rendered[0].contains(r#""parallel":[42]"#));
+        assert!(rendered[0].contains("Status: Result not recorded"));
+        assert!(!rendered[0].contains("quoted task content"));
+        assert!(rendered[1].contains("Status: Result received"));
+        assert!(rendered[1].contains("result: Error: this is quoted task content"));
+        assert!(!rendered[1].contains("Failed"));
+        assert!(!rendered[1].contains("Completed"));
+    }
+
+    #[test]
+    fn subagent_card_restored_missing_result_does_not_claim_live_work() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+        let mut s = state();
+        s.load_history(
+            vec![MessageEntry {
+                role: "assistant".into(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("restored-child".into()),
+                tool_name: Some("delegate".into()),
+                tool_input: Some(serde_json::json!({
+                    "agent": "reviewer",
+                    "prompt": "Inspect the parser",
+                    "context": "Read only",
+                })),
+                ..Default::default()
+            }],
+            false,
+        );
+        let mut lines = Vec::new();
+        render_entry_into(
+            &s.entries()[0],
+            false,
+            false,
+            ToolDisclosure::Full,
+            80,
+            &mut lines,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.contains("[Delegation]"));
+        assert!(text.contains("Target: reviewer"));
+        assert!(text.contains("Task: Inspect the parser"));
+        assert!(text.contains("Read only"));
+        assert!(text.contains("Status: Result not recorded"));
+        assert!(!text.contains("Running"));
+        assert!(!text.contains("Awaiting"));
+    }
+
+    #[test]
+    fn subagent_card_parallel_keeps_one_invocation_and_result_blocks() {
+        let input = serde_json::json!({
+            "action": "delegate",
+            "parallel": ["reader", "reviewer"],
+            "agent": "unused-target",
+            "prompt": "Inspect the parser",
+        })
+        .to_string();
+        let output = "--- reader (success=true) ---\nLooks good\n\n--- reviewer (success=false) ---\nError: timeout";
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "delegate",
+            &input,
+            Some(output),
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert_eq!(text.matches("[Delegation]").count(), 1);
+        assert!(text.contains("Target: reader, reviewer"));
+        assert!(text.contains(r#""agent":"unused-target""#));
+        assert!(text.contains("Status: Result received"));
+        assert!(text.contains("--- reader (success=true) ---"));
+        assert!(text.contains("--- reviewer (success=false) ---"));
+    }
+
+    #[test]
+    fn subagent_card_background_and_management_keep_generic_evidence() {
+        for input in [
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "background": true}),
+            serde_json::json!({"action": "check_result", "task_id": "example-task"}),
+            serde_json::json!({"action": "await_sessions", "task_ids": ["example-task"]}),
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "background": "false"}),
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "parallel": [42]}),
+        ] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "delegate",
+                &input.to_string(),
+                Some("Task started"),
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.starts_with("▼ [tool: delegate]"));
+            assert!(text.contains("result: Task started"));
+            assert!(!text.contains("Status:"));
+            assert!(!text.contains("Completed"));
+        }
+    }
+
+    #[test]
+    fn subagent_card_bounds_display_escapes_controls_and_preserves_copy() {
+        let input = serde_json::json!({
+            "agent": "reviewer\u{1b}]52;c;payload\u{7}",
+            "prompt": format!("{}task-tail", "task line\n".repeat(150)),
+        })
+        .to_string();
+        let result = format!("{}result-tail", "result line\n".repeat(150));
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "delegate",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed = rendered_text(&collapsed);
+        assert!(collapsed.contains("[Delegation]"));
+        assert!(!collapsed.contains("task-tail"));
+        assert!(!collapsed.contains("result-tail"));
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "delegate",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 4);
+        assert!(text.contains("Display limited"));
+        assert!(!text.contains("task-tail"));
+        assert!(!text.contains("result-tail"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{7}'));
+        assert!(text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("bounded-child"),
+            name: Arc::from("delegate"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains("task-tail"));
+        assert!(copied.contains("result-tail"));
+    }
+
+    #[test]
+    fn subagent_card_malformed_and_oversized_input_falls_back() {
+        for input in [
+            "not JSON".to_string(),
+            serde_json::json!({"prompt": 42}).to_string(),
+            serde_json::json!({"prompt": "x".repeat(TOOL_EXPANDED_MAX_BYTES)}).to_string(),
+        ] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "spawn_subagent",
+                &input,
+                None,
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.starts_with("▼ [tool: spawn_subagent]"));
+            assert!(!text.contains("Status:"));
+            assert!(text.len() <= TOOL_EXPANDED_MAX_BYTES + 150);
+        }
     }
 
     #[test]
