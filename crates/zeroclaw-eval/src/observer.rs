@@ -9,7 +9,7 @@ use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric
 /// arguments the agent actually dispatched and the output the tool actually returned.
 /// That is what lets a fixture grade a round trip instead of grading text the replay
 /// provider scripted for itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecordedCall {
     /// Tool name, as dispatched.
     pub name: String,
@@ -29,6 +29,7 @@ pub struct RecordingObserver {
     tool_calls: Mutex<Vec<RecordedCall>>,
     input_tokens: Mutex<u64>,
     output_tokens: Mutex<u64>,
+    llm_calls: Mutex<u32>,
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -68,6 +69,11 @@ impl RecordingObserver {
             *lock_recover(&self.output_tokens),
         )
     }
+
+    /// Number of LLM responses observed during the run.
+    pub fn llm_calls(&self) -> u32 {
+        *lock_recover(&self.llm_calls)
+    }
 }
 
 impl Observer for RecordingObserver {
@@ -92,11 +98,15 @@ impl Observer for RecordingObserver {
                 output_tokens,
                 ..
             } => {
+                let mut llm_calls = lock_recover(&self.llm_calls);
+                *llm_calls = llm_calls.saturating_add(1);
                 if let Some(i) = input_tokens {
-                    *lock_recover(&self.input_tokens) += i;
+                    let mut total = lock_recover(&self.input_tokens);
+                    *total = total.saturating_add(*i);
                 }
                 if let Some(o) = output_tokens {
-                    *lock_recover(&self.output_tokens) += o;
+                    let mut total = lock_recover(&self.output_tokens);
+                    *total = total.saturating_add(*o);
                 }
             }
             _ => {}
@@ -194,6 +204,27 @@ mod tests {
         obs.record_event(&llm_event(100, 50));
         obs.record_event(&llm_event(200, 80));
         assert_eq!(obs.tokens(), (300, 130));
+    }
+
+    #[test]
+    fn token_totals_saturate_on_provider_overflow() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&llm_event(u64::MAX, u64::MAX));
+        obs.record_event(&llm_event(1, 1));
+        assert_eq!(obs.tokens(), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn llm_calls_counted_per_response_event() {
+        let obs = RecordingObserver::new();
+        assert_eq!(obs.llm_calls(), 0);
+        obs.record_event(&llm_event(1, 1));
+        obs.record_event(&llm_event(1, 1));
+        obs.record_event(&llm_event(1, 1));
+        assert_eq!(obs.llm_calls(), 3);
+        // Non-LLM events do not affect the count.
+        obs.record_event(&tool_call_event("echo", true));
+        assert_eq!(obs.llm_calls(), 3);
     }
 
     #[test]
