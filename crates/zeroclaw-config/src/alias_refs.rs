@@ -548,6 +548,26 @@ pub enum CreateError {
     Invalid(String),
 }
 
+impl CreateError {
+    /// The structured config error creating `path`.`key` answers this with
+    /// on every surface: a reserved alias is `validation_failed` on the new
+    /// key; no such section, or an invalid key, is `path_not_found` on the
+    /// section.
+    pub fn api_error(&self, path: &str, key: &str) -> crate::api_error::ConfigApiError {
+        use crate::api_error::{ConfigApiCode, ConfigApiError};
+        match self {
+            Self::Reserved(a) => ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("alias `{a}` is reserved and cannot be created"),
+            )
+            .with_path(format!("{path}.{key}")),
+            Self::Invalid(msg) => {
+                ConfigApiError::new(ConfigApiCode::PathNotFound, msg.clone()).with_path(path)
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -613,6 +633,32 @@ impl std::fmt::Display for RenameError {
 }
 
 impl std::error::Error for RenameError {}
+
+impl RenameError {
+    /// The structured config error a rename of `path`.`from` answers this
+    /// with on every surface: a missing alias is `path_not_found`, an
+    /// unusable or reserved name `validation_failed`, and a failed
+    /// post-condition the server's own `internal_error`.
+    pub fn api_error(&self, path: &str, from: &str) -> crate::api_error::ConfigApiError {
+        use crate::api_error::{ConfigApiCode, ConfigApiError};
+        let (code, msg) = match self {
+            Self::NotFound(p) => (
+                ConfigApiCode::PathNotFound,
+                format!("{p} is not configured"),
+            ),
+            Self::InvalidName(m) => (ConfigApiCode::ValidationFailed, m.clone()),
+            Self::Reserved(a) => (
+                ConfigApiCode::ValidationFailed,
+                format!("alias `{a}` is reserved and cannot be renamed"),
+            ),
+            Self::PostCondition(m) => (
+                ConfigApiCode::InternalError,
+                format!("rename cascade post-condition failed: {m}"),
+            ),
+        };
+        ConfigApiError::new(code, msg).with_path(format!("{path}.{from}"))
+    }
+}
 
 pub fn rename_with_cascade(
     cfg: &mut Config,
