@@ -2752,11 +2752,7 @@ impl RpcDispatcher {
             return;
         };
         for (name, channel) in factory(Arc::clone(&self.ctx.config), agent_alias.to_string()) {
-            agent
-                .channel_handles()
-                .reaction
-                .write()
-                .insert(name, channel);
+            agent.channel_handles().register_channel(name, channel);
         }
     }
 
@@ -12961,6 +12957,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn create_room(
+            &self,
+            _options: &zeroclaw_api::channel::RoomCreationOptions,
+        ) -> anyhow::Result<String> {
+            Ok("test-session-room".to_string())
+        }
     }
 
     fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
@@ -12973,6 +12976,25 @@ mod tests {
             );
             channels
         })
+    }
+
+    fn assert_local_session_channels(agent: &crate::agent::agent::Agent) {
+        let handles = agent.channel_handles();
+        for (tool, handle) in [
+            ("reaction/git_forge", Some(&handles.reaction)),
+            ("ask_user/send_via", handles.ask_user.as_ref()),
+            ("channel_room", handles.channel_room.as_ref()),
+            ("poll", handles.poll.as_ref()),
+            ("escalate", handles.escalate.as_ref()),
+        ] {
+            let channels = handle.expect("configured tool handle should exist").read();
+            assert_eq!(channels.len(), 2, "{tool} should resolve both channels");
+            assert!(
+                channels.contains_key("git.main"),
+                "{tool} lost live channel"
+            );
+            assert!(channels.contains_key("rpc"), "{tool} lost RPC back-channel");
+        }
     }
 
     #[tokio::test]
@@ -12998,10 +13020,24 @@ mod tests {
             .expect("session should be live");
         {
             let agent = before.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert_eq!(reaction.len(), 2);
-            assert!(reaction.contains_key("git.main"));
-            assert!(reaction.contains_key("rpc"));
+            assert_local_session_channels(&agent);
+            let result = agent
+                .execute_tool_for_test(
+                    "channel_room",
+                    serde_json::json!({
+                        "action": "create_room",
+                        "channel": "git.main",
+                        "name": "test-room",
+                    }),
+                )
+                .await
+                .expect("fixture exposes channel_room")
+                .expect("channel_room should execute");
+            assert!(
+                result.success,
+                "channel_room must reach live channel: {result:?}"
+            );
+            assert!(result.output.contains("test-session-room"));
         }
 
         dispatcher
@@ -13016,16 +13052,8 @@ mod tests {
             std::sync::Arc::ptr_eq(&before, &after),
             "same-mode resume must rebind the existing session rather than rebuilding it"
         );
-        assert!(
-            after
-                .lock()
-                .await
-                .channel_handles()
-                .reaction
-                .read()
-                .contains_key("git.main"),
-            "same-mode resume must preserve local channel handles"
-        );
+        let agent = after.lock().await;
+        assert_local_session_channels(&agent);
     }
 
     #[tokio::test]
@@ -13298,10 +13326,7 @@ mod tests {
             .expect("rehydration should not fail")
             .expect("restorable ACP session must rehydrate");
         let agent = recovered.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert_eq!(reaction.len(), 2);
-        assert!(reaction.contains_key("git.main"));
-        assert!(reaction.contains_key("rpc"));
+        assert_local_session_channels(&agent);
     }
 
     /// The personality filename allowlist constrains the name, not its target.
