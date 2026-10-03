@@ -555,6 +555,16 @@ mod argument_preservation_tests {
         native: bool,
         use_native_tools: bool,
     ) -> InterpretedResponse {
+        interpret_with_exposure(spec, arguments, native, use_native_tools, false).await
+    }
+
+    async fn interpret_with_exposure(
+        spec: ToolSpec,
+        arguments: Value,
+        native: bool,
+        use_native_tools: bool,
+        hide_schema: bool,
+    ) -> InterpretedResponse {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let ctx = TurnCtx {
             parent_agent_alias: None,
@@ -584,6 +594,7 @@ mod argument_preservation_tests {
         let specs = IterationToolSpecs {
             known_tool_names: HashSet::from([name.clone()]),
             tool_specs: vec![spec],
+            exposed_tool_specs: hide_schema.then(Vec::new),
             use_native_tools,
         };
         let resp = if native {
@@ -621,6 +632,36 @@ mod argument_preservation_tests {
             false,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn deferred_builtin_text_calls_recover_structured_arguments_before_selection() {
+        let interpreted = interpret_with_exposure(
+            ToolSpec::new(
+                "calendar",
+                "calendar events",
+                json!({"type": "object", "properties": {
+                    "params": {"type": "object"},
+                    "items": {"type": "array", "items": {"type": "string"}}
+                }}),
+            ),
+            json!({"params": "{\"limit\":3}", "items": "[\"event\"]"}),
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert!(!interpreted.parse_issue_detected);
+        assert_eq!(interpreted.tool_calls.len(), 1);
+        assert_eq!(interpreted.tool_calls[0].name, "calendar");
+        assert_eq!(
+            interpreted.tool_calls[0].arguments["params"],
+            json!({"limit": 3})
+        );
+        assert_eq!(
+            interpreted.tool_calls[0].arguments["items"],
+            json!(["event"])
+        );
     }
 
     #[tokio::test]
@@ -830,6 +871,7 @@ mod cost_usd_regression_tests {
 
         let specs = IterationToolSpecs {
             tool_specs: vec![],
+            exposed_tool_specs: None,
             known_tool_names: HashSet::new(),
             use_native_tools: false,
         };
@@ -973,6 +1015,7 @@ mod cost_usd_regression_tests {
             serving_model: None,
         };
         let specs = IterationToolSpecs {
+            exposed_tool_specs: None,
             tool_specs: vec![crate::tools::ToolSpec::new(
                 "shell",
                 "run a command",

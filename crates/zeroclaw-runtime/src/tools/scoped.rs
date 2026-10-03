@@ -33,7 +33,10 @@ use crate::tools::{
 /// registry is a compile error, not a review-checklist item. Read sites are
 /// unchanged: the registry [`std::ops::Deref`]s to the same `[Box<dyn Tool>]`
 /// slice the raw `Vec` used to expose.
-pub struct ScopedToolRegistry(Vec<Box<dyn Tool>>);
+pub struct ScopedToolRegistry(
+    Vec<Box<dyn Tool>>,
+    Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+);
 
 impl std::ops::Deref for ScopedToolRegistry {
     type Target = [Box<dyn Tool>];
@@ -58,6 +61,30 @@ impl ScopedToolRegistry {
     /// [`Self::assemble`] (or the test-only constructor).
     pub(crate) fn retain(&mut self, f: impl FnMut(&Box<dyn Tool>) -> bool) {
         self.0.retain(f);
+        self.refresh_builtin_schemas();
+    }
+
+    /// Schema exposure is derived from the current scoped registry and the
+    /// selected-name state. It does not change which tools can execute.
+    pub fn hidden_builtin_names(&self) -> HashSet<String> {
+        self.1.as_ref().map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        })
+    }
+
+    fn refresh_builtin_schemas(&self) {
+        let Some(state) = &self.1 else { return };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.iter().any(|tool| tool.name() == "tool_search") {
+            state.refresh_deferred_builtin_specs(self.0.iter().map(|tool| tool.spec()).collect());
+        } else {
+            // A later caller ceiling can remove discovery itself. Keep the
+            // surviving executable tools usable through their eager schemas.
+            state.set_deferred_builtin_specs(Vec::new());
+        }
     }
 
     /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
@@ -103,6 +130,7 @@ impl ScopedToolRegistry {
                 *tool = replacement;
             }
         }
+        self.refresh_builtin_schemas();
     }
 
     /// Test-only constructor that mints a registry directly from raw tools,
@@ -114,7 +142,7 @@ impl ScopedToolRegistry {
     /// in shipped builds and the seal holds where it matters.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools)
+        Self(tools, None)
     }
 }
 
@@ -285,6 +313,11 @@ impl ScopedToolRegistry {
                 delegate_tool: _,
         } = built;
 
+        let mut builtin_names: HashSet<String> = tools_registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
         //    real devices), so this is gated: execution surfaces pass
         //    `connect_peripherals: true`; listing-only surfaces pass `false` and
@@ -323,6 +356,7 @@ impl ScopedToolRegistry {
             )) as Arc<dyn Tool>
         });
         if let Some(tool) = pipeline_tool.as_ref() {
+            builtin_names.insert(tool.name().to_string());
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
         }
 
@@ -689,8 +723,69 @@ impl ScopedToolRegistry {
             deferred_section.clear();
         }
 
+        // This is prompt visibility, not ownership or admission. The basic
+        // workspace/memory actions stay directly usable; other built-ins keep
+        // their executable instances in this same scoped registry.
+        const EAGER_BUILTINS: &[&str] = &[
+            "shell",
+            "file_read",
+            "file_write",
+            "file_edit",
+            "memory_recall",
+            "memory_store",
+        ];
+        let builtin_deferral = !list_deferred_mcp_specs
+            && config
+                .runtime_profile_for_agent(agent_alias)
+                .is_some_and(|profile| profile.deferred_builtin_tools);
+        let mut search_policy = zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+            security.allowed_tools.as_deref(),
+            security.excluded_tools.as_deref(),
+            caller_allowed,
+        );
+        let search_admitted = search_policy
+            .as_ref()
+            .is_none_or(|policy| policy.is_tool_allowed("tool_search"));
+        let mut builtin_schema_handle = None;
+        if builtin_deferral && search_admitted {
+            let specs: Vec<_> = tools_registry
+                .iter()
+                .filter(|tool| {
+                    builtin_names.contains(tool.name())
+                        && !EAGER_BUILTINS.contains(&tool.name())
+                        && tool.name() != "tool_search"
+                })
+                .map(|tool| tool.spec())
+                .collect();
+            if !specs.is_empty() {
+                let activated = activated_handle.get_or_insert_with(|| {
+                    Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()))
+                });
+                activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_deferred_builtin_specs(specs);
+                builtin_schema_handle = Some(Arc::clone(activated));
+                if tool_search_handle.is_none() {
+                    let mut search =
+                        tools::ToolSearchTool::for_builtin_schemas(Arc::clone(activated));
+                    if let Some(mut policy) = search_policy.take() {
+                        // The registry already applied this ceiling. Later
+                        // narrowing removes catalog entries at the same seam.
+                        policy.caller_allowed = None;
+                        search = search.with_access_policy(policy);
+                    }
+                    let search = Arc::new(search);
+                    tools_registry.push(Box::new(tools::ArcToolRef(
+                        Arc::clone(&search) as Arc<dyn Tool>
+                    )));
+                    tool_search_handle = Some(search);
+                }
+            }
+        }
+
         ScopedAssembled {
-            registry: ScopedToolRegistry(tools_registry),
+            registry: ScopedToolRegistry(tools_registry, builtin_schema_handle),
             delegate_handle,
             ask_user_handle,
             reaction_handle,
@@ -1203,6 +1298,365 @@ mod tests {
         out.registry.iter().map(|t| t.name().to_string()).collect()
     }
 
+    fn builtin_deferral_config(enabled: bool) -> Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "catalog".into(),
+            RuntimeProfileConfig {
+                deferred_builtin_tools: enabled,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                runtime_profile: "catalog".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    async fn assemble_builtin_catalog(
+        config: &Config,
+        security: &Arc<SecurityPolicy>,
+        built: AllToolsResult,
+        caller_allowed: Option<&[String]>,
+        listing: bool,
+    ) -> ScopedAssembled {
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config,
+            agent_alias: "default",
+            security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: listing,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+    }
+
+    fn search_schemas(result: &ToolResult) -> Vec<serde_json::Value> {
+        result
+            .output
+            .lines()
+            .filter_map(|line| line.strip_prefix("<function>")?.strip_suffix("</function>"))
+            .map(|schema| serde_json::from_str(schema).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn builtin_deferral_preserves_core_schemas_and_executable_registry() {
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["denied".into()]),
+            ..SecurityPolicy::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with_counting_tools(
+                Arc::clone(&calls),
+                &[
+                    "shell",
+                    "file_read",
+                    "file_write",
+                    "file_edit",
+                    "memory_recall",
+                    "memory_store",
+                    "memory_export",
+                    "calendar",
+                    "denied",
+                ],
+            ),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["memory_export".to_string(), "calendar".to_string()])
+        );
+        assert_eq!(assembled.registry.len(), 9);
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != "denied")
+        );
+        let calendar = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "calendar")
+            .unwrap();
+        assert!(
+            calendar
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        let expected_schema = serde_json::to_value(calendar.spec()).unwrap();
+        let search = assembled.tool_search_handle.as_ref().unwrap();
+        let denied = search
+            .execute(serde_json::json!({"query": "select:denied"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&denied).is_empty());
+        let selected = search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assert_eq!(search_schemas(&selected), vec![expected_schema]);
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["memory_export".to_string()])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let activated = assembled.activated_handle.as_ref().unwrap().lock().unwrap();
+        assert!(activated.get("calendar").is_none());
+        assert!(activated.tool_specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_schemas_stay_eager_without_opt_in_or_discovery() {
+        let cases = [
+            (false, SecurityPolicy::default(), None),
+            (
+                true,
+                SecurityPolicy {
+                    excluded_tools: Some(vec!["tool_search".into()]),
+                    ..SecurityPolicy::default()
+                },
+                None,
+            ),
+            (
+                true,
+                SecurityPolicy {
+                    allowed_tools: Some(vec!["shell".into(), "calendar".into()]),
+                    ..SecurityPolicy::default()
+                },
+                None,
+            ),
+            (
+                true,
+                SecurityPolicy::default(),
+                Some(vec!["shell".to_string(), "calendar".to_string()]),
+            ),
+        ];
+        for (enabled, policy, caller_allowed) in cases {
+            let config = builtin_deferral_config(enabled);
+            let assembled = assemble_builtin_catalog(
+                &config,
+                &Arc::new(policy),
+                built_with(vec![
+                    Box::new(MockTool("shell")),
+                    Box::new(MockTool("calendar")),
+                ]),
+                caller_allowed.as_deref(),
+                false,
+            )
+            .await;
+            assert!(assembled.registry.hidden_builtin_names().is_empty());
+            assert_eq!(assembled.registry.len(), 2);
+            assert!(assembled.tool_search_handle.is_none());
+            assert!(assembled.activated_handle.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_assembly_keeps_builtin_schemas_eager() {
+        let config = builtin_deferral_config(true);
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+            ]),
+            None,
+            true,
+        )
+        .await;
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert_eq!(assembled.registry.len(), 2);
+        assert!(assembled.tool_search_handle.is_none());
+        assert!(assembled.activated_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_deferral_prunes_removed_metadata_and_selection() {
+        let config = builtin_deferral_config(true);
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+                Box::new(MockTool("weather")),
+            ]),
+            None,
+            false,
+        )
+        .await;
+        let search = Arc::clone(assembled.tool_search_handle.as_ref().unwrap());
+        search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assembled.registry.retain(|tool| tool.name() != "calendar");
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["weather".to_string()])
+        );
+        assert!(!search.deferred_prompt_section().contains("calendar"));
+        let removed = search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&removed).is_empty());
+
+        search
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        let principal_allowed = vec!["shell".to_string(), "tool_search".to_string()];
+        search.narrow_to_caller(&principal_allowed);
+        assert!(search.deferred_prompt_section().is_empty());
+        let removed = search
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&removed).is_empty());
+        assembled
+            .registry
+            .retain(|tool| principal_allowed.iter().any(|name| name == tool.name()));
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            !assembled
+                .activated_handle
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .has_deferred_builtin_schemas()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_builtin_search_restores_surviving_eager_schemas() {
+        let config = builtin_deferral_config(true);
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+            ]),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            assembled
+                .registry
+                .hidden_builtin_names()
+                .contains("calendar")
+        );
+        assembled
+            .registry
+            .retain(|tool| tool.name() != "tool_search");
+        assert_eq!(assembled.registry.len(), 2);
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            assembled
+                .tool_search_handle
+                .as_ref()
+                .unwrap()
+                .deferred_prompt_section()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_memory_selection_uses_rebound_backend() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+        use zeroclaw_tools::memory_export::MemoryExportTool;
+
+        let original_dir = tempfile::TempDir::new().unwrap();
+        let current_dir = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("original", original_dir.path()).unwrap());
+        let current: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("current", current_dir.path()).unwrap());
+        original
+            .store("shared", "original-backend", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        current
+            .store("private", "current-backend", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy::default());
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with(vec![Box::new(MemoryExportTool::new(Arc::clone(&original)))]),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            assembled
+                .registry
+                .hidden_builtin_names()
+                .contains("memory_export")
+        );
+        let selected = assembled
+            .tool_search_handle
+            .as_ref()
+            .unwrap()
+            .execute(serde_json::json!({"query": "select:memory_export"}))
+            .await
+            .unwrap();
+        assert_eq!(search_schemas(&selected)[0]["name"], "memory_export");
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assembled
+            .registry
+            .rebind_memory_tools(Arc::clone(&current), Arc::clone(&security));
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            assembled
+                .activated_handle
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get("memory_export")
+                .is_none()
+        );
+        let result = assembled.registry[0]
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let entries: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["content"], "current-backend");
+        assert!(!result.output.contains("original-backend"));
+    }
+
     #[tokio::test]
     async fn scoped_assembly_threads_configured_nat64_prefixes_to_skill_http() {
         let mut config = Config::default();
@@ -1613,7 +2067,7 @@ mod tests {
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
-            registry: ScopedToolRegistry(Vec::new()),
+            registry: ScopedToolRegistry(Vec::new(), None),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

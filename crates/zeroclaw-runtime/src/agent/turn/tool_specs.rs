@@ -8,12 +8,21 @@ use zeroclaw_providers::ModelProvider;
 
 /// Tool specs assembled for one loop iteration.
 pub(crate) struct IterationToolSpecs {
+    // Complete admitted schemas serve parsing and argument recovery, even
+    // when a built-in schema is hidden from the provider request.
     pub(crate) tool_specs: Vec<ToolSpec>,
+    pub(crate) exposed_tool_specs: Option<Vec<ToolSpec>>,
     pub(crate) known_tool_names: HashSet<String>,
     pub(crate) use_native_tools: bool,
 }
 
 impl IterationToolSpecs {
+    pub(crate) fn request_tool_specs(&self) -> &[ToolSpec] {
+        self.exposed_tool_specs
+            .as_deref()
+            .unwrap_or(&self.tool_specs)
+    }
+
     pub(crate) fn refresh_native_tool_mode(
         &mut self,
         model_provider: &dyn ModelProvider,
@@ -22,7 +31,7 @@ impl IterationToolSpecs {
         self.use_native_tools = model_provider
             .capabilities_for_model(model)
             .native_tool_calling
-            && !self.tool_specs.is_empty();
+            && !self.request_tool_specs().is_empty();
     }
 }
 
@@ -39,6 +48,7 @@ pub(crate) fn build_iteration_tool_specs(
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
         .map(|tool| tool.spec())
         .collect();
+    let mut hidden_builtin_names = HashSet::new();
     if let Some(at) = activated_tools {
         let activated_tools = match at.lock() {
             Ok(guard) => guard,
@@ -53,6 +63,7 @@ pub(crate) fn build_iteration_tool_specs(
                 poisoned.into_inner()
             }
         };
+        hidden_builtin_names = activated_tools.hidden_builtin_names();
         for spec in activated_tools.tool_specs() {
             if !excluded_tools.iter().any(|ex| ex == &spec.name) {
                 tool_specs.push(spec);
@@ -71,13 +82,24 @@ pub(crate) fn build_iteration_tool_specs(
         .iter()
         .map(|tool| tool.name.to_ascii_lowercase())
         .collect();
+    let exposed_tool_specs = (!hidden_builtin_names.is_empty()).then(|| {
+        tool_specs
+            .iter()
+            .filter(|spec| !hidden_builtin_names.contains(&spec.name))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     let use_native_tools = model_provider
         .capabilities_for_model(model)
         .native_tool_calling
-        && !tool_specs.is_empty();
+        && !exposed_tool_specs
+            .as_deref()
+            .unwrap_or(&tool_specs)
+            .is_empty();
 
     Ok(IterationToolSpecs {
         tool_specs,
+        exposed_tool_specs,
         known_tool_names,
         use_native_tools,
     })
@@ -212,6 +234,45 @@ mod tests {
         fn alias(&self) -> &str {
             self.name()
         }
+    }
+
+    #[test]
+    fn deferred_builtin_request_projection_preserves_callable_names_and_exclusions() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let calendar = Box::new(CountingTool::new("calendar", Arc::clone(&invocations)));
+        let blocked = Box::new(CountingTool::new("blocked", Arc::clone(&invocations)));
+        let search = Box::new(CountingTool::new("tool_search", invocations));
+        let mut activated = ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(vec![calendar.spec(), blocked.spec()]);
+        let activated = Arc::new(Mutex::new(activated));
+        let registry: Vec<Box<dyn Tool>> = vec![calendar, blocked, search];
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &registry,
+            &["blocked".into()],
+            Some(&activated),
+        )
+        .unwrap();
+
+        assert_eq!(
+            specs
+                .request_tool_specs()
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_search"]
+        );
+        assert_eq!(
+            specs
+                .tool_specs
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["calendar", "tool_search"]
+        );
+        assert!(specs.known_tool_names.contains("calendar"));
+        assert!(!specs.known_tool_names.contains("blocked"));
     }
 
     #[test]
