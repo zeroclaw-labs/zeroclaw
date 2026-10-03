@@ -82,6 +82,7 @@ pub(crate) async fn finish_after_max_iterations(
     security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    provider_image_state: Option<&mut super::ProviderImageState>,
     context_limits_for_route: impl Fn(&str, &str) -> ResolvedContextLimits + Send + Sync,
     crumb_present: &mut bool,
     reported_usage: Option<super::ReportedRequestUsage>,
@@ -185,6 +186,7 @@ pub(crate) async fn finish_after_max_iterations(
             )
             .await?
             .messages;
+            let prepared_message_count = messages.len();
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
             let mut selected_model = model.to_string();
@@ -212,6 +214,25 @@ pub(crate) async fn finish_after_max_iterations(
             } else {
                 Vec::new()
             };
+            let summary_image_route =
+                super::ProviderImageState::route(provider_name, &selected_model);
+            let quarantined_image_ids = provider_image_state
+                .map(|state| state.quarantined(&summary_image_route))
+                .unwrap_or_default();
+            if !quarantined_image_ids.is_empty() {
+                if !suffix_only {
+                    anyhow::bail!(crate::i18n::get_required_cli_string(
+                        "turn-context-hook-mutation-unsafe-error",
+                    ));
+                }
+                let transient_suffix = messages.split_off(prepared_message_count);
+                messages = super::suppress_quarantined_provider_images(
+                    &messages,
+                    &quarantined_image_ids,
+                    false,
+                );
+                messages.extend(transient_suffix);
+            }
             let tokens_before =
                 token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
             let mut dropped_messages = 0;
@@ -244,6 +265,11 @@ pub(crate) async fn finish_after_max_iterations(
                     )
                     .await?
                     .messages;
+                    messages = super::suppress_quarantined_provider_images(
+                        &messages,
+                        &quarantined_image_ids,
+                        false,
+                    );
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
                     continue;
@@ -581,6 +607,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -897,6 +924,7 @@ mod graceful_summary_metering_tests {
                 None,
                 Some(&hooks),
                 None,
+                None,
                 |provider, model| {
                     assert_eq!(provider, "custom");
                     assert_eq!(model, "summary-model");
@@ -940,6 +968,146 @@ mod graceful_summary_metering_tests {
     }
 
     #[tokio::test]
+    async fn graceful_summary_omits_quarantined_paired_tool_image_before_and_after_trim() {
+        struct SummaryRouteHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for SummaryRouteHook {
+            fn name(&self) -> &str {
+                "summary-route-hook"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *model = "summary-model".into();
+                messages.push(ChatMessage::user("hook context ".repeat(20)));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_marker = format!("[IMAGE:data:image/png;base64,{PNG_B64}]");
+        let multimodal_config = MultimodalConfig::default();
+
+        for budget in [4096, 512] {
+            let assistant_content = super::super::parse_response::build_native_assistant_history(
+                "",
+                &[zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_image".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            );
+            let mut history = vec![
+                ChatMessage::user("obsolete context ".repeat(800)),
+                ChatMessage::assistant("obsolete answer"),
+                ChatMessage::user("capture the screenshot"),
+                ChatMessage::assistant(assistant_content),
+                ChatMessage::tool(
+                    serde_json::json!({
+                        "content": image_marker,
+                        "tool_call_id": "toolu_image",
+                    })
+                    .to_string(),
+                ),
+            ];
+            let prepared = super::super::vision_route::prepare_messages_for_iteration(
+                &history,
+                &multimodal_config,
+                false,
+                None,
+            )
+            .await
+            .expect("tool image prepares");
+            let submitted = zeroclaw_providers::multimodal::provider_image_ids(&prepared.messages);
+            assert_eq!(
+                submitted.len(),
+                1,
+                "the paired tool image must be provider-visible"
+            );
+
+            let mut provider_image_state = super::super::ProviderImageState::default();
+            provider_image_state.record_recovery(
+                super::super::ProviderImageState::route("custom", "summary-model"),
+                &[],
+                &submitted,
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                vision: true,
+                expected_request: Some(("summary-model", budget)),
+            };
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryRouteHook(Arc::clone(&hook_calls))));
+            let mut crumb_present = false;
+            let mut memory_preamble = None;
+
+            let out = finish_after_max_iterations(
+                &mut memory_preamble,
+                &provider,
+                &mut history,
+                "custom",
+                "original-model",
+                "original-model",
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::LocalIterations(2),
+                String::new(),
+                "summary-quarantined-tool-image",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                None,
+                &multimodal_config,
+                None,
+                Some(&hooks),
+                None,
+                Some(&mut provider_image_state),
+                |provider, model| {
+                    assert_eq!(provider, "custom");
+                    assert_eq!(model, "summary-model");
+                    ResolvedContextLimits {
+                        model_context_window: budget,
+                        ..ResolvedContextLimits::legacy_fallback(budget)
+                    }
+                },
+                &mut crumb_present,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await
+            .expect("graceful summary succeeds");
+
+            assert!(out.contains("wrap-up summary"));
+            assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+            let captured = seen.lock().unwrap();
+            assert!(captured[0].contains("hook context"));
+            assert!(
+                !captured[0].contains(PNG_B64),
+                "the quarantined paired tool image reached the summary provider: {}",
+                captured[0]
+            );
+            assert_eq!(crumb_present, budget == 512);
+            assert_eq!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains("obsolete")),
+                budget == 4096
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
         for disable_soft_budget in [false, true] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -975,6 +1143,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 None,
                 None,
                 None,
@@ -1073,6 +1242,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1148,6 +1318,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -1236,6 +1407,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
@@ -1329,6 +1501,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1414,6 +1587,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             None,
