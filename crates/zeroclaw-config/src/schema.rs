@@ -18618,7 +18618,12 @@ pub struct FilesystemConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Root paths to watch. At least one is required.
+    /// Absolute root paths to watch. At least one is required. A relative
+    /// path is refused unless `allow_broad_roots` is set, because the watcher
+    /// resolves it against the daemon's working directory, which depends on
+    /// how the daemon was started. On Windows an absolute path starts with a
+    /// drive root such as `C:\` or a share such as `\\server\share`, so
+    /// `\inbox` and `C:inbox` are relative too.
     #[tab(Connection)]
     #[serde(default)]
     pub paths: Vec<String>,
@@ -18668,10 +18673,21 @@ pub struct FilesystemConfig {
     #[serde(default = "default_filesystem_max_content_bytes")]
     pub max_content_bytes: Option<usize>,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
-    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
-    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
-    /// paths in SOP payloads and flood the watcher with events. Off unless
-    /// explicitly enabled.
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. On Linux
+    /// and the other Unix systems except macOS this also covers `/root`, each
+    /// home directory in `/home`, `/var/home` and each home directory in it,
+    /// `/var/roothome`, `/mnt`, `/var/mnt`, `/media`, `/run`, `/run/media`, and
+    /// each user's folder in `/run/media`. On macOS this also covers `/Users` and each folder in it (every home
+    /// directory and `Shared`), `/Volumes` and each mounted volume in it,
+    /// `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`. On
+    /// Windows this also covers every drive, volume, and network share root
+    /// and, beneath a drive root, `Windows`, `Windows\Temp`, `Users`, each
+    /// profile in `Users`, `Program Files`, `Program Files (x86)`, and
+    /// `ProgramData`. The pseudo-filesystems `/proc` and `/sys` would surface
+    /// kernel object paths in SOP payloads and flood the watcher with events.
+    /// It also admits relative paths, which are refused otherwise because
+    /// they resolve against the daemon's working directory, so the check
+    /// cannot tell what they name. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -18701,9 +18717,186 @@ impl Default for FilesystemConfig {
     }
 }
 
+/// Unix broad roots. Every platform, Windows and macOS included, refuses a
+/// path that names one exactly, ignoring trailing `/`. The Linux and macOS
+/// matchers also read them the way those systems resolve a path, so `//etc`
+/// matches there.
 const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
     "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
 ];
+
+/// Broad roots on Linux and the other Unix systems except macOS, refused
+/// along with the Unix roots and compared case-sensitively. `*` matches any
+/// one name, so `/home/*` covers every home directory; `/root` is the
+/// superuser's. `/mnt`, `/media`, and `/run/media` hold mounted filesystems,
+/// `/run/media/*` covers each user's folder of mounts, and `/run` holds
+/// `/run/media`. Ostree-based systems such as Fedora Silverblue keep homes in
+/// `/var/home`, the superuser's in `/var/roothome`, and mounts in `/var/mnt`,
+/// where `/home`, `/root`, and `/mnt` link. Each parent of a broad root is
+/// one too.
+const FILESYSTEM_LINUX_BROAD_ROOTS: [&str; 11] = [
+    "/home/*",
+    "/root",
+    "/mnt",
+    "/media",
+    "/run",
+    "/run/media",
+    "/run/media/*",
+    "/var/home",
+    "/var/home/*",
+    "/var/roothome",
+    "/var/mnt",
+];
+
+/// macOS broad roots, refused along with the Unix roots and compared
+/// case-insensitively. `*` matches any one name, so `/Users/*` covers every
+/// home directory and `/Volumes/*` every mounted volume, including the
+/// startup disk's entry, which links to `/`. `/etc`, `/tmp`, and `/var` link
+/// to the directories in `/private`.
+const FILESYSTEM_MACOS_BROAD_ROOTS: [&str; 8] = [
+    "/Users",
+    "/Users/*",
+    "/Volumes",
+    "/Volumes/*",
+    "/private",
+    "/private/etc",
+    "/private/tmp",
+    "/private/var",
+];
+
+/// Windows broad roots, written relative to a drive or volume root and
+/// compared case-insensitively. The empty entry is the root itself, and `*`
+/// matches any one name, so `Users\*` covers every user profile root.
+const FILESYSTEM_WINDOWS_BROAD_ROOTS: [&str; 8] = [
+    "",
+    "Windows",
+    r"Windows\Temp",
+    "Users",
+    r"Users\*",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+];
+
+/// Whether `path` names a broad root, which the filesystem listener refuses
+/// to watch unless `allow_broad_roots` is set. The Unix roots are checked on
+/// every platform exactly as they always were; Linux and the other Unix
+/// systems, macOS, and Windows refuse their own roots as well.
+fn is_filesystem_broad_root(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    FILESYSTEM_BROAD_ROOTS.contains(&normalized)
+        || (cfg!(all(unix, not(target_os = "macos"))) && is_linux_filesystem_broad_root(path))
+        || (cfg!(target_os = "macos") && is_macos_filesystem_broad_root(path))
+        || (cfg!(windows) && is_windows_filesystem_broad_root(path))
+}
+
+/// Whether `path` names a Unix or Linux broad root, read the way Linux
+/// resolves it: repeated and trailing `/` are ignored, so `//etc` and
+/// `/home//tester` match, and names compare case-sensitively. Only an
+/// absolute path can match. The match is lexical, like the Unix check: `.`
+/// and `..` segments and links are not resolved. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_linux_filesystem_broad_root(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let names: Vec<&str> = unix_path_names(path).collect();
+    FILESYSTEM_BROAD_ROOTS
+        .iter()
+        .chain(&FILESYSTEM_LINUX_BROAD_ROOTS)
+        .any(|root| {
+            broad_root_names_match(unix_path_names(root), &names, |root_name, name| {
+                root_name == name
+            })
+        })
+}
+
+/// Whether `path` names a Unix or macOS broad root, read the way a default
+/// macOS volume resolves it: repeated and trailing `/` are ignored and names
+/// compare case-insensitively, so `/TMP` and `//Users` match. Only an
+/// absolute path can match. The match is lexical, like the Unix check: `.`
+/// and `..` segments and links are not resolved. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_macos_filesystem_broad_root(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let names: Vec<&str> = unix_path_names(path).collect();
+    FILESYSTEM_BROAD_ROOTS
+        .iter()
+        .chain(&FILESYSTEM_MACOS_BROAD_ROOTS)
+        .any(|root| {
+            broad_root_names_match(unix_path_names(root), &names, str::eq_ignore_ascii_case)
+        })
+}
+
+/// The non-empty names of a slash-separated Unix path.
+fn unix_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|name| !name.is_empty())
+}
+
+/// Whether `path` names a Windows broad root, read the way Windows resolves
+/// it: `/` and `\` both separate names, repeated and trailing separators are
+/// ignored, names compare case-insensitively, and a `\\?\` or `\\.\` device
+/// prefix resolves to the drive, volume, or share it names. A bare drive
+/// (`C:`), the current drive's root (`\`), and a network share root
+/// (`\\server\share`) count as roots. The match is lexical, like the Unix
+/// check: `.` and `..` segments, links, and substituted drives are not
+/// resolved. It is plain string logic, so tests on every platform cover it.
+fn is_windows_filesystem_broad_root(path: &str) -> bool {
+    let path = path.replace('/', "\\");
+    if let Some(device_path) = path.strip_prefix(r"\\?\").or(path.strip_prefix(r"\\.\")) {
+        // The first name is the drive, volume, or `UNC` link the prefix opens.
+        let mut names = windows_path_names(device_path);
+        return match names.next() {
+            None => true,
+            Some(link) if link.eq_ignore_ascii_case("UNC") => names.count() <= 2,
+            Some(_) => matches_windows_broad_root(names),
+        };
+    }
+    if let Some(share_path) = path.strip_prefix(r"\\") {
+        // A share's server and share names together form its root.
+        return windows_path_names(share_path).count() <= 2;
+    }
+    let mut chars = path.chars();
+    if let (Some(letter), Some(':')) = (chars.next(), chars.next())
+        && letter.is_ascii_alphabetic()
+    {
+        return matches_windows_broad_root(windows_path_names(chars.as_str()));
+    }
+    // A leading `\` starts at the current drive's root; other paths are relative.
+    path.starts_with('\\') && matches_windows_broad_root(windows_path_names(&path))
+}
+
+/// Whether `names`, read down from a drive or volume root, match an entry of
+/// [`FILESYSTEM_WINDOWS_BROAD_ROOTS`].
+fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    let names: Vec<&str> = names.collect();
+    FILESYSTEM_WINDOWS_BROAD_ROOTS.iter().any(|root| {
+        broad_root_names_match(windows_path_names(root), &names, str::eq_ignore_ascii_case)
+    })
+}
+
+/// The non-empty names of a backslash-separated Windows path.
+fn windows_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('\\').filter(|name| !name.is_empty())
+}
+
+/// Whether `names` match a broad root's `root_names` one for one, where a `*`
+/// root name matches any one name and `same_name` compares the others.
+fn broad_root_names_match<'a>(
+    root_names: impl Iterator<Item = &'a str>,
+    names: &[&str],
+    same_name: impl Fn(&str, &str) -> bool,
+) -> bool {
+    let root_names: Vec<&str> = root_names.collect();
+    root_names.len() == names.len()
+        && root_names
+            .iter()
+            .zip(names)
+            .all(|(root_name, name)| *root_name == "*" || same_name(root_name, name))
+}
 
 impl FilesystemConfig {
     /// Validate the filesystem listener configuration.
@@ -18712,11 +18905,18 @@ impl FilesystemConfig {
             anyhow::bail!("at least one path must be configured");
         }
         for path in &self.paths {
-            let trimmed = path.trim_end_matches('/');
-            let normalized = if trimmed.is_empty() { "/" } else { trimmed };
-            if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
+            if !self.allow_broad_roots && is_filesystem_broad_root(path) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+            // The watcher resolves a relative path against the daemon's
+            // working directory, which differs with how the daemon was
+            // started, so the check above cannot tell what it names.
+            if !self.allow_broad_roots && !Path::new(path).is_absolute() {
+                anyhow::bail!(
+                    "path '{path}' is relative and resolves against the daemon's working \
+                     directory; use an absolute path, or set allow_broad_roots = true to watch it"
                 );
             }
         }
@@ -29797,7 +29997,10 @@ zeroclaw-operators = "operator"
 
     #[test]
     async fn filesystem_validate_rejects_broad_root_by_default() {
-        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+        // The Unix roots are refused on every platform, Windows included.
+        for root in [
+            "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp", "//", "/etc/", "/tmp//",
+        ] {
             let cfg = FilesystemConfig {
                 enabled: true,
                 paths: vec![root.into()],
@@ -29808,6 +30011,531 @@ zeroclaw-operators = "operator"
                 err.to_string().contains("broad system root"),
                 "root {root} must be rejected by default"
             );
+        }
+    }
+
+    /// Paths that are relative on every platform. The watcher resolves each
+    /// one against the daemon's working directory, so each needs
+    /// `allow_broad_roots`. No broad-root matcher refuses them, so `validate`
+    /// reports each one as relative.
+    const RELATIVE_PATHS: &[&str] = &[
+        "inbox",
+        "./inbox",
+        "../inbox",
+        // The working directory itself and its parent: the home directory
+        // and `/home` under the systemd user service, `/` under OpenRC.
+        ".",
+        "./",
+        "..",
+        // Broad roots when the working directory is `/`, as it is under
+        // OpenRC or a launchd agent without a `WorkingDirectory`.
+        "root",
+        "etc",
+        "home/tester",
+        "Users",
+        "Users/tester",
+        // `~` is not expanded, so this names a folder called `~`.
+        "~/Inbox",
+        // On Windows these start at the current drive's root or at drive
+        // `C:`'s current folder; elsewhere they are ordinary names.
+        r"\inbox",
+        "C:inbox",
+    ];
+
+    /// A path below the broad roots that is absolute on the platform
+    /// running the tests.
+    const SCOPED_ABSOLUTE_PATH: &str = if cfg!(windows) {
+        r"C:\srv\inbox"
+    } else {
+        "/srv/inbox"
+    };
+
+    #[test]
+    async fn filesystem_validate_rejects_relative_paths_by_default() {
+        for path in RELATIVE_PATHS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must be allowed with allow_broad_roots"
+            );
+        }
+        // Each path is checked, not only the first.
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec![SCOPED_ABSOLUTE_PATH.into(), "inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("'inbox' is relative"));
+        // The empty path names the working directory too. The broad-root
+        // check reads it as `/` and rejects it first, as before.
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec![String::new()],
+            ..FilesystemConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("broad system root"));
+    }
+
+    /// Spellings of Windows broad roots. Each one needs `allow_broad_roots`
+    /// on Windows.
+    const WINDOWS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Drive roots, a bare drive, and the current drive's root.
+        r"C:\",
+        "C:/",
+        "C:",
+        "d:",
+        r"C:\\",
+        r"\",
+        // System, profile, program, and machine-wide data directories on any
+        // drive or the current one, in any case, with any separators.
+        r"C:\Windows",
+        r"c:\windows\",
+        "C:/WINDOWS/",
+        r"C:\\Windows",
+        r"C:\Windows\Temp",
+        r"C:\Users",
+        r"C:\Users\tester",
+        r"c:\users\TESTER\",
+        r"C:\Users\Public",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"D:\Users\tester",
+        r"\Windows",
+        "/Users/tester",
+        // Device-path and network-share spellings.
+        r"\\?\C:\",
+        r"\\?\C:",
+        r"\\?\C:\Windows\",
+        r"\\.\C:\Users",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\",
+        r"\\server\share",
+        r"\\server\share\",
+        "//server/share",
+        r"\\?\UNC\server\share",
+        r"\\.\unc\server\share\",
+    ];
+
+    /// Windows paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const WINDOWS_SCOPED_PATHS: &[&str] = &[
+        r"C:\Users\tester\Inbox",
+        r"C:\ProgramData\ZeroClaw\inbox",
+        r"C:\Windows\Temp\inbox",
+        r"D:\inbox",
+        r"\\?\C:\Users\tester\Inbox",
+        r"\\server\share\inbox",
+        r"\\?\UNC\server\share\inbox",
+    ];
+
+    #[test]
+    async fn filesystem_windows_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on Windows; checking it
+        // directly keeps the Windows rules covered on every platform.
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_windows_filesystem_broad_root(root),
+                "{root} must be a Windows broad root"
+            );
+        }
+        for path in WINDOWS_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
+            assert!(
+                !is_windows_filesystem_broad_root(path),
+                "{path} must not be a Windows broad root"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    async fn filesystem_validate_off_windows_reads_windows_spellings_as_unix_paths() {
+        // Off Windows a backslash is an ordinary file name character and a
+        // drive letter an ordinary name, so these spellings are not broad
+        // roots. Only a leading `/` makes a path absolute, so they are
+        // relative paths, while `//server/share` is an absolute one.
+        for path in [
+            r"C:\",
+            "C:/",
+            r"C:\Windows",
+            r"\\?\C:\",
+            r"\\server\share",
+            r"\etc",
+        ] {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected as relative off Windows"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must be allowed with allow_broad_roots"
+            );
+        }
+        let cfg = FilesystemConfig {
+            enabled: true,
+            paths: vec!["//server/share".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "//server/share must stay accepted off Windows"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_rejects_windows_broad_roots_by_default() {
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_windows_paths() {
+        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    /// Spellings of macOS broad roots that the exact Unix check accepts. Each
+    /// one needs `allow_broad_roots` on macOS.
+    const MACOS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Every home directory, the shared folder, and their parent.
+        "/Users",
+        "/Users/",
+        "/Users/tester",
+        "/Users/tester/",
+        "/Users/Shared",
+        // Every mounted volume, including the startup disk's entry, which
+        // links to `/`, and their parent.
+        "/Volumes",
+        "/Volumes/Macintosh HD",
+        "/Volumes/Backup/",
+        // The directories `/etc`, `/tmp`, and `/var` link to, and their parent.
+        "/private",
+        "/private/etc",
+        "/private/tmp/",
+        "/private/var",
+        // Other cases and repeated separators, which a default macOS volume
+        // resolves to the same directories, the Unix roots included.
+        "/USERS/tester",
+        "//Users",
+        "/Private//Tmp",
+        "/TMP",
+        "/Etc/",
+        "//Var",
+    ];
+
+    /// macOS paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const MACOS_SCOPED_PATHS: &[&str] = &[
+        "/Users/tester/Inbox",
+        "/Users/Shared/inbox",
+        "/Volumes/Backup/inbox",
+        "/private/tmp/inbox",
+        "/private/var/folders",
+    ];
+
+    #[test]
+    async fn filesystem_macos_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on macOS; checking it
+        // directly keeps the macOS rules covered on every platform.
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_macos_filesystem_broad_root(root),
+                "{root} must be a macOS broad root"
+            );
+        }
+        for path in MACOS_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
+            assert!(
+                !is_macos_filesystem_broad_root(path),
+                "{path} must not be a macOS broad root"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    async fn filesystem_validate_off_macos_and_windows_accepts_macos_spellings() {
+        // Elsewhere the macOS roots are ordinary paths, and Linux and the
+        // other Unix systems compare names exactly, so every macOS spelling,
+        // the Unix roots in other cases included, stays accepted as before.
+        for path in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted off macOS and Windows"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_macos_broad_roots_by_default() {
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_resolved_unix_roots_on_macos() {
+        // macOS links `/etc`, `/tmp`, and `/var` elsewhere, and the watcher
+        // follows a watched path's links, so the directories they resolve to
+        // must be refused like the links themselves.
+        for root in ["/etc", "/tmp", "/var"] {
+            let resolved = std::fs::canonicalize(root).expect("Unix root resolves on macOS");
+            let resolved = resolved.to_str().expect("resolved root is UTF-8");
+            assert_ne!(resolved, root, "{root} must be a link on macOS");
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![resolved.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "{resolved}, where {root} resolves, must be rejected by default"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_macos_paths() {
+        for path in MACOS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    /// Spellings of the Linux broad roots that the exact Unix check accepts.
+    /// Each one needs `allow_broad_roots` on Linux and the other Unix systems
+    /// except macOS.
+    const LINUX_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Every home directory, and the superuser's.
+        "/home/tester",
+        "/home/tester/",
+        "/root",
+        "/root/",
+        // The parents of mounted filesystems, each user's folder of mounts in
+        // `/run/media`, and `/run`, which holds `/run/media`.
+        "/mnt",
+        "/media/",
+        "/run",
+        "/run/media",
+        "/run/media/tester",
+        // Where ostree-based systems keep them: `/home` links to `/var/home`,
+        // `/root` to `/var/roothome`, and `/mnt` to `/var/mnt`.
+        "/var/home",
+        "/var/home/tester",
+        "/var/roothome",
+        "/var/mnt",
+        // Repeated separators, which Linux resolves to the same directories,
+        // the Unix roots included.
+        "/home//tester",
+        "//home/tester",
+        "/run//media",
+        "//etc",
+        "///tmp/",
+    ];
+
+    /// Linux paths the broad-root check accepts. None of them needs
+    /// `allow_broad_roots`.
+    const LINUX_SCOPED_PATHS: &[&str] = &[
+        // Folders below the broad roots.
+        "/home/tester/Inbox",
+        "/root/inbox",
+        "/var/home/tester/Inbox",
+        "/var/roothome/inbox",
+        // Mounted filesystems below the mount parents: a path cannot tell a
+        // whole disk mounted there from a folder mounted for the listener.
+        // `/media/<name>` is each user's folder of mounts on Debian and
+        // Ubuntu, but elsewhere often a single mounted filesystem.
+        "/mnt/inbox",
+        "/var/mnt/inbox",
+        "/media/tester",
+        "/run/media/tester/USB",
+        // Other cases, which Linux treats as other directories.
+        "/HOME/tester",
+        "/Root",
+        "/MNT",
+    ];
+
+    #[test]
+    async fn filesystem_linux_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on Linux and the other Unix
+        // systems except macOS; checking it directly keeps the Linux rules
+        // covered on every platform.
+        for root in LINUX_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_linux_filesystem_broad_root(root),
+                "{root} must be a Linux broad root"
+            );
+        }
+        for path in LINUX_SCOPED_PATHS.iter().chain(RELATIVE_PATHS).copied() {
+            assert!(
+                !is_linux_filesystem_broad_root(path),
+                "{path} must not be a Linux broad root"
+            );
+        }
+    }
+
+    #[test]
+    async fn filesystem_linux_broad_roots_include_their_parents() {
+        // A recursive watch covers everything below its root, so every
+        // parent of a Linux broad root must be refused as well.
+        for root in FILESYSTEM_LINUX_BROAD_ROOTS {
+            let root = root.replace('*', "tester");
+            for parent in std::path::Path::new(&root).ancestors().skip(1) {
+                let parent = parent.to_str().expect("broad root is UTF-8");
+                assert!(
+                    is_linux_filesystem_broad_root(parent),
+                    "{parent}, which holds {root}, must be a Linux broad root"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_off_linux_accepts_linux_roots() {
+        // macOS keeps homes and mounted volumes elsewhere, so the Linux roots
+        // are ordinary paths there, accepted as before.
+        for root in FILESYSTEM_LINUX_BROAD_ROOTS {
+            let path = root.replace('*', "tester");
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.clone()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted on macOS"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_rejects_driveless_paths_on_windows() {
+        // On Windows a path without a drive or share starts at the root of
+        // the daemon's current drive, so the Linux roots and other Unix
+        // spellings are relative paths there rather than broad roots.
+        let linux_roots = FILESYSTEM_LINUX_BROAD_ROOTS
+            .iter()
+            .map(|root| root.replace('*', "tester"));
+        for path in std::iter::once("/srv/inbox".to_string()).chain(linux_roots) {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.clone()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("is relative"),
+                "path {path} must be rejected as relative on Windows"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    async fn filesystem_validate_rejects_linux_broad_roots_by_default() {
+        for root in LINUX_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_linux_paths() {
+        for path in LINUX_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
         }
     }
 
@@ -29826,7 +30554,7 @@ zeroclaw-operators = "operator"
     async fn filesystem_validate_rejects_unknown_event() {
         let cfg = FilesystemConfig {
             enabled: true,
-            paths: vec!["/srv/inbox".into()],
+            paths: vec![SCOPED_ABSOLUTE_PATH.into()],
             events: vec!["created".into(), "exploded".into()],
             ..FilesystemConfig::default()
         };
@@ -29838,7 +30566,7 @@ zeroclaw-operators = "operator"
     async fn filesystem_validate_accepts_scoped_path() {
         let cfg = FilesystemConfig {
             enabled: true,
-            paths: vec!["/srv/inbox".into()],
+            paths: vec![SCOPED_ABSOLUTE_PATH.into()],
             ..FilesystemConfig::default()
         };
         assert!(cfg.validate().is_ok());
