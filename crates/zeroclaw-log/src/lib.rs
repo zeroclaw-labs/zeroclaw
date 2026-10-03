@@ -35,8 +35,8 @@ pub use chain::display_chain;
 pub use config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StoragePolicy, ToolIoPolicy};
 pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
-    Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,
-    severity_text_from_tracing_level,
+    Severity, ZeroclawAttribution, attribution_keys, is_attribution_field,
+    severity_text_from_number, severity_text_from_tracing_level,
 };
 pub use export_bridge::{
     LogRecordExporter, clear_log_exporter, flush_log_exporter, set_log_exporter,

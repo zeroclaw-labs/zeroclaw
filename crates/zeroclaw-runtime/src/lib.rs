@@ -47,6 +47,7 @@ pub mod security;
 pub mod service;
 pub mod skills;
 pub mod sop;
+pub mod status;
 pub mod subagent;
 pub mod tools;
 pub mod trust;

@@ -2,7 +2,6 @@
 
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,15 +65,7 @@ impl CancelCause {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
+pub use zeroclaw_rpc_proto::types::SessionOverrides;
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
 #[derive(Clone, Debug)]
@@ -1646,6 +1637,19 @@ impl SessionStore {
             .filter(|(_, session)| session.owner_tui_id.as_deref() == Some(owner_tui_id))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Hold the session index until `release` is notified, signalling
+    /// `entered` once it is held, so a test can park a request that reads it.
+    #[cfg(test)]
+    pub(crate) async fn hold_index_for_test(
+        &self,
+        entered: &tokio::sync::Notify,
+        release: &tokio::sync::Notify,
+    ) {
+        let _index = self.sessions.lock().await;
+        entered.notify_one();
+        release.notified().await;
     }
 
     pub fn register_cancel_token(

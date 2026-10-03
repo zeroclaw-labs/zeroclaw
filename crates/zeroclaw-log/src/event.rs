@@ -216,6 +216,23 @@ pub fn is_attribution_field(name: &str) -> bool {
     false
 }
 
+/// Every attribution key a log filter accepts: [`ATTRIBUTION_FIELDS`] plus,
+/// for each of [`COMPOSITE_PREFIXES`], the bare prefix and its `_type` /
+/// `_alias` keys. Clients list these instead of enumerating the schema.
+#[must_use]
+pub fn attribution_keys() -> Vec<String> {
+    let mut keys: Vec<String> = ATTRIBUTION_FIELDS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for prefix in COMPOSITE_PREFIXES {
+        keys.push((*prefix).to_string());
+        keys.push(type_field(prefix));
+        keys.push(alias_field(prefix));
+    }
+    keys
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZeroclawAttribution {
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]

@@ -587,19 +587,32 @@ pub struct AuthorityLease<'a> {
 }
 
 impl AuthorityLease<'_> {
-    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
-    /// credential is unexpired and still paired, and the grants resolve under
-    /// the policy that stays in force until the lease is dropped.
-    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+    /// The accepted policy generation the lease holds.
+    pub fn generation(&self) -> u64 {
+        self.state.resolver.generation()
+    }
+
+    /// [`RpcInboundAuth::credential_is_live`] answered from the held
+    /// paired-token set: the credential is unexpired and, for a native
+    /// pairing token, still paired.
+    pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
         credential_unexpired(auth)?;
-        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
         if let Some(hash) = auth.native_token_hash.as_deref()
-            && !is_paired(hash)
+            && !self.pairings.contains_hash(hash)
         {
             return Err(AuthDenied::auth_required(
                 crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
             ));
         }
+        Ok(())
+    }
+
+    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
+    /// credential is unexpired and still paired, and the grants resolve under
+    /// the policy that stays in force until the lease is dropped.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        self.credential_is_live(auth)?;
+        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
         if auth.generation != self.state.resolver.generation() {
             self.state
                 .revalidates_local_evidence(
@@ -734,6 +747,14 @@ impl RpcInboundAuth {
                 TransportKind::Wss => {
                     return Err(AuthDenied::auth_required(
                         crate::i18n::get_required_cli_string("rpc-auth-remote-token-required"),
+                    ));
+                }
+                // An in-process duplex is same-host but vouched for by
+                // nothing: no socket mode, no pipe ACL, no peer uid. It gets
+                // no compatibility path, roster or not.
+                TransportKind::Inproc => {
+                    return Err(AuthDenied::auth_required(
+                        crate::i18n::get_required_cli_string("rpc-auth-required-token"),
                     ));
                 }
             }
@@ -918,6 +939,33 @@ mod tests {
             .expect("legacy local path");
         assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
         assert!(conn.grants.admin, "single-operator behavior is unchanged");
+    }
+
+    #[tokio::test]
+    async fn inproc_with_no_roster_gets_no_compatibility_path() {
+        // Same daemon state as the legacy local path above; the in-process
+        // duplex still has to present a credential.
+        let auth = auth_for(&base_config(), &[]);
+        let denied = auth
+            .authenticate(TransportKind::Inproc, Credential::None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, AUTH_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn inproc_with_a_paired_token_authenticates_as_that_token_does_elsewhere() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Inproc,
+                Credential::None,
+                Some("zc_tok"),
+                None,
+            )
+            .await
+            .expect("paired token is accepted on the duplex");
+        assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
     }
 
     #[tokio::test]
