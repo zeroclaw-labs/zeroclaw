@@ -1013,6 +1013,8 @@ jobs:
             command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
           - name: QQ
             command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+          - name: Microsoft Teams
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-msteams --lib msteams a_teams_configuration_failure_is_reported_once_instead_of_restarted compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
