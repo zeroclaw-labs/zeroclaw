@@ -13,6 +13,14 @@ instruction to open the file in an editor. Hand editing is a fallback for
 headless hosts and scripted provisioning, where the docs call it out
 explicitly.
 
+## Save and cancel drafts
+
+The editor shows your current Save and Cancel shortcuts and whether edits are pending. Save works for text, choices, arrays, personality files, and Skills. Enter also saves text and choices; in multiline editors it inserts a newline. Cancel discards the current edit without saving. In a filtered choice list, Cancel clears the filter first.
+
+Switching to another pane parks your draft. Navigation that would replace a pending draft asks you to stay or discard it. Failed saves keep the draft for retry. Saving an inline personality file keeps its content open for further edits.
+
+Before opening an external personality or Skills editor, Config explains that a successful editor exit imports and saves changed content. You can cancel before launch and continue in the inline editor.
+
 ## Keybinding modifiers
 
 Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.
