@@ -125,6 +125,18 @@ impl ConfigApiError {
         self
     }
 
+    /// The error a property read or write that failed with `err` answers
+    /// for `path`: `path_not_found` when the schema does not define the
+    /// path, otherwise the validation failure, pinned to the path. Every
+    /// surface that reports a failed `get_prop`/`set_prop` uses this one rule.
+    pub fn for_prop(err: anyhow::Error, path: &str) -> Self {
+        if err.to_string().starts_with("Unknown property") {
+            Self::path_not_found(path)
+        } else {
+            Self::from_validation(err).with_path(path)
+        }
+    }
+
     pub fn from_validation(err: anyhow::Error) -> Self {
         if let Some(structured) = err.downcast_ref::<ConfigApiError>() {
             return structured.clone();
@@ -153,6 +165,17 @@ impl ConfigApiError {
         Self::new(
             ConfigApiCode::PathNotFound,
             format!("property path not found in schema: {path}"),
+        )
+        .with_path(path)
+    }
+
+    /// Convenience: a `path_not_found` error for a path that names no
+    /// map-keyed section.
+    pub fn no_map_section(path: impl Into<String>) -> Self {
+        let path = path.into();
+        Self::new(
+            ConfigApiCode::PathNotFound,
+            format!("no map-keyed section at `{path}`"),
         )
         .with_path(path)
     }

@@ -1251,6 +1251,11 @@ cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
 cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
 cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
 
+# ── zeroclaw-gw preview — the standalone gateway binary ──
+# Written to stderr once the preview listens; {$url} is where it serves and
+# {$endpoint} is the daemon's RPC socket it reaches the core through.
+cli-gw-preview-serving = zeroclaw-gw preview serving {$url}; core endpoint {$endpoint}
+
 # ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
 # Emitted by the daemon startup guard in src/main.rs when the configured gateway
 # address is already bound. The daemon supervises its own in-process gateway

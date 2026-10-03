@@ -45,7 +45,8 @@ let requirePairingPromise: Promise<boolean> | null = null;
 function fetchRequirePairing(): Promise<boolean> {
   if (!requirePairingPromise) {
     requirePairingPromise = getPublicHealth()
-      .then((health) => health.require_pairing)
+      // A missing field reads as required, the same fail-open default.
+      .then((health) => health.require_pairing !== false)
       // Fail OPEN: if /health is unreachable, assume pairing is required so
       // the reload affordance stays visible rather than wrongly hidden.
       .catch(() => true);
