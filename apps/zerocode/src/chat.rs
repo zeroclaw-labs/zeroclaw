@@ -41,6 +41,16 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
+mod context_menu;
+#[cfg(test)]
+use context_menu::{
+    CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
+    URL_WITH_COPY_CONTEXT_ACTIONS,
+};
+use context_menu::{
+    ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
+};
+
 mod transcript_layout;
 use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
 
@@ -9253,123 +9263,6 @@ struct CachedCodeBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatContextMenuAction {
-    SendNow,
-    Copy,
-    AddToChat,
-    OpenLink,
-    CopyLink,
-    Edit,
-    Delete,
-}
-
-const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
-const CHARACTER_SELECTION_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::AddToChat,
-    ChatContextMenuAction::Copy,
-];
-const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-];
-const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-    ChatContextMenuAction::Copy,
-];
-const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::SendNow,
-    ChatContextMenuAction::Copy,
-    ChatContextMenuAction::Edit,
-    ChatContextMenuAction::Delete,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuTarget {
-    Transcript(CopyHitRegion),
-    Url(UrlHitRegion),
-    UrlWithCopy {
-        url: UrlHitRegion,
-        copy: CopyHitRegion,
-    },
-    Queue(u64),
-}
-
-impl ChatContextMenuTarget {
-    fn actions(&self) -> &'static [ChatContextMenuAction] {
-        match self {
-            Self::Transcript(target) if target.kind == CopyHitKind::Transcript => {
-                CHARACTER_SELECTION_CONTEXT_ACTIONS
-            }
-            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
-            Self::Url(_) => URL_CONTEXT_ACTIONS,
-            Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
-            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
-        }
-    }
-
-    fn copy_kind(&self) -> Option<CopyHitKind> {
-        match self {
-            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
-            Self::Url(_) | Self::Queue(_) => None,
-        }
-    }
-
-    fn is_url(&self) -> bool {
-        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatContextMenu {
-    rect: Rect,
-    target: ChatContextMenuTarget,
-    selected: usize,
-}
-
-impl ChatContextMenu {
-    fn selected_action(&self) -> Option<ChatContextMenuAction> {
-        self.target.actions().get(self.selected).copied()
-    }
-
-    fn select_step(&mut self, delta: isize) {
-        let count = self.target.actions().len();
-        if count > 0 {
-            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
-        }
-    }
-
-    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
-        if self.rect.width <= 2 || self.rect.height <= 2 {
-            return None;
-        }
-        let inner = Rect::new(
-            self.rect.x + 1,
-            self.rect.y + 1,
-            self.rect.width - 2,
-            self.rect.height - 2,
-        );
-        if !mouse::in_rect(column, row, inner) {
-            return None;
-        }
-        let index = usize::from(row.saturating_sub(inner.y));
-        (index < self.target.actions().len()).then_some(index)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuRequest {
-    AddToChat(CopyHitRegion),
-    CopyTranscript(CopyHitRegion),
-    OpenUrl(String),
-    CopyUrl(String),
-    Queue {
-        id: u64,
-        action: ChatContextMenuAction,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyFeedbackTarget {
     Code(usize),
     Overlay(Rect),
@@ -10221,11 +10114,7 @@ impl ChatState {
         let Some(menu) = self.context_menu.as_mut() else {
             return false;
         };
-        let Some(index) = menu.action_at(column, row) else {
-            return false;
-        };
-        menu.selected = index;
-        true
+        menu.select_at(column, row)
     }
 
     fn handle_context_menu_key(&mut self, key: &KeyEvent) -> Option<ChatContextMenuRequest> {
@@ -10250,35 +10139,8 @@ impl ChatState {
     }
 
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
-        let action = self.context_menu.as_ref()?.selected_action()?;
-        let menu = self.context_menu.take()?;
-        match (menu.target, action) {
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(target))
-            }
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::AddToChat)
-                if target.kind == CopyHitKind::Transcript =>
-            {
-                Some(ChatContextMenuRequest::AddToChat(target))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenLink) => {
-                Some(ChatContextMenuRequest::OpenUrl(url.url))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
-                Some(ChatContextMenuRequest::CopyUrl(url.url))
-            }
-            (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(copy))
-            }
-            (ChatContextMenuTarget::Queue(id), action) => {
-                Some(ChatContextMenuRequest::Queue { id, action })
-            }
-            (ChatContextMenuTarget::Transcript(_), _)
-            | (ChatContextMenuTarget::Url(_), _)
-            | (ChatContextMenuTarget::UrlWithCopy { .. }, _) => None,
-        }
+        self.context_menu.as_ref()?.selected_action()?;
+        self.context_menu.take()?.into_request()
     }
 
     fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
