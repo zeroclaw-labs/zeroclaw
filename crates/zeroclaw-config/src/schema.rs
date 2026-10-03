@@ -15270,6 +15270,63 @@ pub struct ClassificationRule {
 
 // ── Heartbeat ────────────────────────────────────────────────────
 
+/// Daily quiet window for dead-man notifications only. Normal heartbeat work
+/// and internal health logging continue throughout the window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "heartbeat.deadman_quiet_hours"]
+pub struct HeartbeatQuietHoursConfig {
+    /// Inclusive local start time, exactly `HH:MM` in 24-hour notation.
+    pub start: String,
+    /// Exclusive local end time, exactly `HH:MM`. Earlier than start wraps
+    /// across midnight; equal endpoints are invalid (use timeout zero to mute).
+    pub end: String,
+    /// Explicit IANA timezone, for example `America/Los_Angeles` or `UTC`.
+    /// Daylight-saving transitions follow local wall time in this zone.
+    pub timezone: String,
+}
+
+impl HeartbeatQuietHoursConfig {
+    fn parsed_window(&self) -> Result<(chrono::NaiveTime, chrono::NaiveTime, chrono_tz::Tz)> {
+        let parse_time = |value: &str| -> Result<chrono::NaiveTime> {
+            anyhow::ensure!(
+                matches!(
+                    value.as_bytes(),
+                    [b'0'..=b'9', b'0'..=b'9', b':', b'0'..=b'9', b'0'..=b'9']
+                ),
+                "heartbeat.deadman_quiet_hours times must be exactly HH:MM"
+            );
+            chrono::NaiveTime::parse_from_str(value, "%H:%M")
+                .context("heartbeat.deadman_quiet_hours times must be valid HH:MM")
+        };
+        let start = parse_time(&self.start)?;
+        let end = parse_time(&self.end)?;
+        anyhow::ensure!(
+            start != end,
+            "heartbeat.deadman_quiet_hours endpoints must differ; use deadman_timeout_minutes=0 to mute"
+        );
+        let timezone = self.timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            anyhow::Error::msg("heartbeat.deadman_quiet_hours.timezone must be an IANA timezone")
+        })?;
+        Ok((start, end, timezone))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.parsed_window().map(|_| ())
+    }
+
+    /// Resolve the policy at use time; never cache a UTC window across DST.
+    pub fn contains(&self, now: chrono::DateTime<chrono::Utc>) -> Result<bool> {
+        let (start, end, timezone) = self.parsed_window()?;
+        let local_time = now.with_timezone(&timezone).time();
+        Ok(if start < end {
+            local_time >= start && local_time < end
+        } else {
+            local_time >= start || local_time < end
+        })
+    }
+}
+
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -15318,6 +15375,12 @@ pub struct HeartbeatConfig {
     /// within this window, an alert is sent. `0` disables. Default: `0`.
     #[serde(default)]
     pub deadman_timeout_minutes: u32,
+    /// Optional daily quiet window for this notification. Suppressed incidents
+    /// remain unclaimed and may notify once after the window, only if still
+    /// overdue. Omitted by default. Does not suppress tasks or internal logging.
+    #[serde(default)]
+    #[nested]
+    pub deadman_quiet_hours: Option<HeartbeatQuietHoursConfig>,
     /// Channel for dead-man's switch alerts (e.g. `telegram`). Falls back to
     /// the heartbeat delivery channel.
     #[serde(default)]
@@ -15381,6 +15444,7 @@ impl Default for HeartbeatConfig {
             min_interval_minutes: default_heartbeat_min_interval(),
             max_interval_minutes: default_heartbeat_max_interval(),
             deadman_timeout_minutes: 0,
+            deadman_quiet_hours: None,
             deadman_channel: None,
             deadman_to: None,
             max_run_history: default_heartbeat_max_run_history(),
@@ -24117,6 +24181,9 @@ impl Config {
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
+        if let Some(quiet_hours) = &self.heartbeat.deadman_quiet_hours {
+            quiet_hours.validate()?;
+        }
         if self.heartbeat.enabled {
             let hb_agent = self.heartbeat.agent.trim();
             if hb_agent.is_empty() {
@@ -25963,6 +26030,9 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        if let Some(quiet) = &self.heartbeat.deadman_quiet_hours {
+            quiet.validate()?;
+        }
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -26046,6 +26116,11 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        // RPC and gateway publish their live snapshot only after this succeeds.
+        // Reject incomplete/invalid notification policy before disk or live swap.
+        if let Some(quiet) = &self.heartbeat.deadman_quiet_hours {
+            quiet.validate()?;
+        }
         if self.dirty_paths.is_empty() {
             return Ok(());
         }
@@ -32255,6 +32330,127 @@ log_tool_io = "off"
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
+        assert!(h.deadman_quiet_hours.is_none());
+    }
+
+    #[test]
+    async fn heartbeat_quiet_hours_boundaries_and_dst() {
+        let mut quiet = HeartbeatQuietHoursConfig {
+            start: "22:00".into(),
+            end: "07:00".into(),
+            timezone: "America/Los_Angeles".into(),
+        };
+        let contains = |policy: &HeartbeatQuietHoursConfig, at: &str| {
+            policy
+                .contains(chrono::DateTime::parse_from_rfc3339(at).unwrap().to_utc())
+                .unwrap()
+        };
+        assert!(!contains(&quiet, "2026-09-28T04:59:59Z"));
+        assert!(contains(&quiet, "2026-09-28T05:00:00Z"));
+        assert!(contains(&quiet, "2026-09-28T13:59:59Z"));
+        assert!(!contains(&quiet, "2026-09-28T14:00:00Z"));
+        // Both instances of the repeated fall-back hour remain quiet.
+        assert!(contains(&quiet, "2026-11-01T08:30:00Z"));
+        assert!(contains(&quiet, "2026-11-01T09:30:00Z"));
+        // A nonexistent spring-forward hour does not extend the local endpoint.
+        assert!(contains(&quiet, "2026-03-08T09:59:59Z"));
+        assert!(contains(&quiet, "2026-03-08T10:00:00Z"));
+        assert!(!contains(&quiet, "2026-03-08T14:00:00Z"));
+        quiet.start = "09:00".into();
+        quiet.end = "17:00".into();
+        quiet.timezone = "UTC".into();
+        assert!(!contains(&quiet, "2026-09-28T08:59:59Z"));
+        assert!(contains(&quiet, "2026-09-28T09:00:00Z"));
+        assert!(!contains(&quiet, "2026-09-28T17:00:00Z"));
+    }
+
+    #[test]
+    async fn heartbeat_quiet_hours_validation_and_roundtrip() {
+        let valid = HeartbeatQuietHoursConfig {
+            start: "22:00".into(),
+            end: "07:00".into(),
+            timezone: "UTC".into(),
+        };
+        for bad in ["", "7:00", " 7:00", "07: 0", "25:00", "12:60", "07:00:00"] {
+            let invalid = HeartbeatQuietHoursConfig {
+                start: bad.into(),
+                ..valid.clone()
+            };
+            assert!(invalid.validate().is_err(), "accepted {bad:?}");
+        }
+        assert!(
+            HeartbeatQuietHoursConfig {
+                end: "22:00".into(),
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HeartbeatQuietHoursConfig {
+                timezone: "Invalid/Zone".into(),
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        let mut config = Config::default();
+        config.heartbeat.deadman_quiet_hours = Some(valid);
+        let serialized = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            restored.heartbeat.deadman_quiet_hours.unwrap().timezone,
+            "UTC"
+        );
+        config.heartbeat.deadman_quiet_hours.as_mut().unwrap().end = "22:00".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("deadman_quiet_hours")
+        );
+    }
+
+    #[test]
+    async fn heartbeat_quiet_hours_save_rejects_invalid_live_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.start", "22:00")
+            .unwrap();
+        // A partial optional object must not reach disk or a live swap.
+        assert!(config.save().await.is_err());
+        assert!(!config.config_path.exists());
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.end", "07:00")
+            .unwrap();
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.timezone", "UTC")
+            .unwrap();
+        config.mark_dirty("heartbeat.deadman_quiet_hours");
+        config.save_dirty().await.unwrap();
+        let before = tokio::fs::read(&config.config_path).await.unwrap();
+        let restored: Config = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+        assert_eq!(restored.heartbeat.deadman_quiet_hours.unwrap().end, "07:00");
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.timezone", "Invalid/Zone")
+            .unwrap();
+        config.mark_dirty("heartbeat.deadman_quiet_hours.timezone");
+        assert!(config.save_dirty().await.is_err());
+        assert_eq!(tokio::fs::read(&config.config_path).await.unwrap(), before);
+        config.clear_dirty();
+        assert!(
+            config.save_dirty().await.is_err(),
+            "a zero-dirty live swap must validate too"
+        );
+        assert!(config.save().await.is_err());
+        assert_eq!(tokio::fs::read(&config.config_path).await.unwrap(), before);
     }
 
     #[test]
