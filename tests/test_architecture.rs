@@ -32,3 +32,8 @@ mod auth_boundary;
 
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;
+
+// Needs the runtime's method table, which the default feature set includes.
+#[cfg(feature = "agent-runtime")]
+#[path = "architecture/gateway_route_coverage.rs"]
+mod gateway_route_coverage;
