@@ -143,6 +143,10 @@ instead. The extraction is defensive by construction
 Version resolution: when the installer gets a bare name, it picks the **last
 matching entry** in the index; a pinned `name@version` selects exactly that
 version. Order repeated names in your registry intentionally, oldest first.
+`zeroclaw plugin update` selects the same way and compares version strings only
+for equality: an operator on the version the rule selects is up to date and
+downloads nothing. Publish every changed package under a new version, because
+an entry republished under the installed version never reaches an update.
 
 ### Search is not a trust boundary
 
