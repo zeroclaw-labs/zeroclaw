@@ -5957,6 +5957,276 @@ permissions = ["http_client"]
                 .contains("file_download.allowed_private_hosts")
         );
     }
+
+    #[test]
+    fn every_reentrant_agent_tool_is_inventoried() {
+        let missing: Vec<&str> = REENTRANT_AGENT_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "REENTRANT_AGENT_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
+    /// Names in the scoped registry assembled with every built-in tool family a
+    /// unit test can switch on. The data, config, and workspace directories, the
+    /// knowledge database, the security playbook and report directories, the
+    /// project report directory, and the plugin directory all point under `tmp`.
+    /// Nothing reaches the network: tool construction only records endpoints and
+    /// placeholder credentials, and the MCP registry is a test stub whose one
+    /// server is never contacted.
+    async fn maximal_registry_names(tmp: &TempDir) -> std::collections::BTreeSet<String> {
+        use zeroclaw_config::schema::{
+            DiscordConfig, McpBundleConfig, McpServerConfig, McpTransport, Microsoft365Config,
+            OpenAIModelProviderConfig, SkillsPromptInjectionMode,
+        };
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(tmp);
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        // Plugin tools are outside the inventory, so plugins stay off, and the
+        // plugin directory points under `tmp` as well.
+        cfg.plugins.enabled = false;
+        cfg.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        cfg.pipeline.enabled = true;
+        cfg.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        cfg.sop.procedural_memory_enabled = true;
+        cfg.browser_delegate.enabled = true;
+        cfg.text_browser.enabled = true;
+        cfg.web_search.enabled = true;
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "inventory-placeholder".into();
+        cfg.jira.enabled = true;
+        cfg.jira.base_url = "https://jira.example.invalid".into();
+        cfg.jira.api_token = "inventory-placeholder".into();
+        cfg.project_intel.enabled = true;
+        cfg.project_intel.report_output_dir =
+            tmp.path().join("project-reports").display().to_string();
+        cfg.security_ops.enabled = true;
+        cfg.security_ops.playbooks_dir = tmp.path().join("playbooks").display().to_string();
+        cfg.security_ops.report_output_dir =
+            tmp.path().join("security-reports").display().to_string();
+        cfg.backup.enabled = true;
+        cfg.data_retention.enabled = true;
+        cfg.cloud_ops.enabled = true;
+        cfg.google_workspace.enabled = true;
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        cfg.claude_code_runner.enabled = true;
+        cfg.linkedin.enabled = true;
+        cfg.image_gen.enabled = true;
+        cfg.file_upload.url = Some("https://upload.example.invalid/files".into());
+        cfg.file_upload_bundle.url = Some("https://upload.example.invalid/bundles".into());
+        cfg.file_download.url = Some("https://download.example.invalid/files".into());
+        cfg.a2a.client.enabled = true;
+        cfg.microsoft365 = Microsoft365Config {
+            enabled: true,
+            tenant_id: Some("inventory-tenant".into()),
+            client_id: Some("inventory-client".into()),
+            // The device-code flow registers without a client secret.
+            auth_flow: "device_code".into(),
+            token_cache_encrypted: false,
+            ..Microsoft365Config::default()
+        };
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+        cfg.channels.email.insert(
+            "inventory".into(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        cfg.channels.discord.insert(
+            "inventory".into(),
+            DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+        // `llm_task` needs a provider for the calling agent, and the agent's MCP
+        // bundle grants the server that the stub registry below stands in for.
+        cfg.providers
+            .models
+            .openai
+            .insert("inventory".into(), OpenAIModelProviderConfig::default());
+        cfg.mcp.enabled = true;
+        cfg.mcp.deferred_loading = true;
+        cfg.mcp.servers = vec![McpServerConfig {
+            name: "inventory".into(),
+            transport: McpTransport::Stdio,
+            command: "inventory-mcp-server-never-started".into(),
+            ..Default::default()
+        }];
+        cfg.mcp_bundles.insert(
+            "inventory".into(),
+            McpBundleConfig {
+                servers: vec!["inventory".into()],
+                exclude: Vec::new(),
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.inventory".into(),
+                mcp_bundles: vec!["inventory".into()],
+                ..Default::default()
+            },
+        );
+        let delegate_targets = HashMap::from([(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.inventory".into(),
+                ..Default::default()
+            },
+        )]);
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let web_fetch = zeroclaw_config::schema::WebFetchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
+        let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
+
+        let built = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("inventory-placeholder"),
+            None,
+            &browser,
+            &http,
+            &web_fetch,
+            &workspace,
+            &delegate_targets,
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(sop_engine),
+            Some(sop_audit),
+            None,
+        )
+        .expect("tool registry builds");
+
+        // The scoped assembly mints `execute_pipeline` and the MCP capability
+        // tools. `acp_delivery` keeps `deliver_file`, which only ACP turns admit.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &cfg,
+            agent_alias: "test-agent",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(Arc::new(McpRegistry::for_test_with_server_count(1))),
+        })
+        .await;
+        assembled
+            .registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_registered_builtin_is_inventoried() {
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        assert!(
+            registered.contains("shell"),
+            "positive control: the maximal registry must be populated; got {registered:?}"
+        );
+
+        let uninventoried: Vec<&String> = registered
+            .iter()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the registry registers tools missing from BUILTIN_TOOLS in \
+             crates/zeroclaw-tools/src/inventory.rs; add each one there and to the \
+             tier tables in docs/book/src/developing/tool-inventory.md: {uninventoried:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_inventoried_tool_registers_under_a_maximal_config() {
+        // Rows a unit test cannot construct, with the reason.
+        let unconstructible = std::collections::BTreeMap::from([(
+            "tool_search",
+            "assembly mints it only behind two gates: `mcp.deferred_loading`, which \
+             defaults to false and is on here, and an MCP registry that advertises at \
+             least one tool, which only a connected MCP server does",
+        )]);
+        for name in unconstructible.keys() {
+            assert!(
+                zeroclaw_tools::inventory::is_builtin_tool_name(name),
+                "`{name}` is allowlisted as unconstructible but is not inventoried"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        let missing: Vec<&str> = zeroclaw_tools::inventory::BUILTIN_TOOLS
+            .iter()
+            .map(|spec| spec.name)
+            .filter(|name| !unconstructible.contains_key(name) && !registered.contains(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "inventoried tools that did not register under the maximal config; switch each \
+             one's gate on in maximal_registry_names or allowlist it with a reason: {missing:?}"
+        );
+
+        let now_constructible: Vec<&str> = unconstructible
+            .keys()
+            .copied()
+            .filter(|name| registered.contains(*name))
+            .collect();
+        assert!(
+            now_constructible.is_empty(),
+            "allowlisted tools now register under the maximal config; drop them from the \
+             allowlist: {now_constructible:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -19994,6 +19994,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn matrix_safe_policy_names_only_inventoried_tools() {
+        // First-party tools the built-in inventory deliberately leaves out that
+        // the Matrix safe policy still covers.
+        let outside_inventory = BTreeSet::from([
+            // Implemented, but the agent registry does not register them.
+            "sessions_reset",
+            "sessions_delete",
+            // Registered only by the opt-in background skill review.
+            "skills_list",
+            "skill_view",
+            "skill_manage",
+            // Peripheral tools, built by the hardware crate from configured boards.
+            "hardware_board_info",
+            "hardware_memory_map",
+            "hardware_memory_read",
+            // Withheld from the model-visible registry.
+            "vi_verify",
+        ]);
+        let policy_tools: BTreeSet<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .collect();
+
+        let uninventoried: Vec<&str> = policy_tools
+            .iter()
+            .copied()
+            .filter(|tool| {
+                !outside_inventory.contains(tool)
+                    && !zeroclaw_tools::inventory::is_builtin_tool_name(tool)
+            })
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the Matrix safe policy names tools missing from the built-in inventory: {uninventoried:?}"
+        );
+
+        for tool in &outside_inventory {
+            assert!(
+                policy_tools.contains(tool),
+                "`{tool}` is no longer in the Matrix safe policy; drop it from this allowlist"
+            );
+            assert!(
+                !zeroclaw_tools::inventory::is_builtin_tool_name(tool),
+                "`{tool}` is now inventoried; drop it from this allowlist"
+            );
+        }
+    }
+
+    #[test]
     fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
         use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_runtime::agent::loop_::StreamDelta;
