@@ -2705,6 +2705,7 @@ impl Chat {
                         }
                     }
                 }
+                Ok(_) => continue,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
                     continue;
@@ -17168,6 +17169,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_notifications_do_not_delay_session_updates() {
+        for sid in ["sess-a", "sess-b"] {
+            let (tx, _rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = two_session_chat(&rpc);
+            chat.state_for_session_mut(sid).unwrap().turn_in_flight = true;
+
+            for (method, params) in [
+                ("logs/event", serde_json::json!({"message": "before text"})),
+                (
+                    "session/update",
+                    serde_json::json!({
+                        "type": "agent_message_chunk", "session_id": sid, "text": "done",
+                    }),
+                ),
+                (
+                    "logs/event",
+                    serde_json::json!({"message": "before completion"}),
+                ),
+                (
+                    "session/update",
+                    serde_json::json!({
+                        "type": "turn_complete", "session_id": sid,
+                        "outcome": "completed", "content": "",
+                    }),
+                ),
+            ] {
+                chat.rpc.push_notification_for_test(method, params);
+            }
+
+            chat.tick_transport_events();
+
+            let state = chat.state_for_session_mut(sid).unwrap();
+            assert!(
+                state.entries.iter().any(|entry| {
+                    matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "done")
+                }),
+                "{sid}: response must arrive in one tick despite unrelated logs"
+            );
+            assert!(
+                !state.turn_in_flight,
+                "{sid}: completion must arrive in that tick"
+            );
+            assert_eq!(state.turn_status, TurnStatus::Idle);
+        }
+    }
+
+    #[tokio::test]
     async fn notifications_route_to_background_sessions() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -17344,9 +17393,8 @@ mod tests {
 
         // The test client's notification channel holds 64 frames. Put the
         // terminal frame first, then overflow it with unparsable
-        // `session/update` frames so `try_recv` reports Lagged while the
-        // drain still consumes the backlog (a foreign method would stop the
-        // drain loop and strand later frames behind it).
+        // `session/update` frames so `try_recv` reports Lagged and the
+        // drain then consumes the retained backlog.
         chat.rpc.push_notification_for_test(
             "session/update",
             serde_json::json!({
