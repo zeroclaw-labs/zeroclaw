@@ -1892,15 +1892,18 @@ mod tests {
         );
     }
 
+    /// `SecurityPolicy::for_agent` creates `agents/<alias>/workspace` under the
+    /// install root (the parent of `config_path`), so the config is rooted in a
+    /// per-test directory. Keep the returned `TempDir` alive for the whole
+    /// test: dropping it deletes the directory.
     fn config_with_agent_profile(
         alias: &str,
         profile: zeroclaw_config::schema::RiskProfileConfig,
-    ) -> zeroclaw_config::schema::Config {
+    ) -> (tempfile::TempDir, zeroclaw_config::schema::Config) {
+        let tmp = tempfile::TempDir::new().unwrap();
         let mut cfg = zeroclaw_config::schema::Config {
-            data_dir: std::path::PathBuf::from("/tmp/zeroclaw-step-turn-security-test"),
-            config_path: std::path::PathBuf::from(
-                "/tmp/zeroclaw-step-turn-security-test/config.toml",
-            ),
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
         cfg.risk_profiles.insert("reviewer".into(), profile);
@@ -1911,7 +1914,7 @@ mod tests {
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
         );
-        cfg
+        (tmp, cfg)
     }
 
     /// A headless step turn must not be able to start, advance, or approve
@@ -1921,7 +1924,7 @@ mod tests {
     /// duplicated when the profile already lists one of them.
     #[test]
     fn step_turn_security_excludes_the_self_drive_sop_tools() {
-        let cfg = config_with_agent_profile(
+        let (_tmp, cfg) = config_with_agent_profile(
             "reviewer",
             zeroclaw_config::schema::RiskProfileConfig {
                 excluded_tools: vec!["browser".into(), "SOP_ADVANCE".into()],
@@ -1962,7 +1965,7 @@ mod tests {
 
     #[test]
     fn step_turn_security_adds_exclusions_to_a_profile_that_has_none() {
-        let cfg = config_with_agent_profile(
+        let (_tmp, cfg) = config_with_agent_profile(
             "reviewer",
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -1979,7 +1982,7 @@ mod tests {
 
     #[test]
     fn step_turn_security_fails_for_an_unknown_agent() {
-        let cfg = config_with_agent_profile(
+        let (_tmp, cfg) = config_with_agent_profile(
             "reviewer",
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
