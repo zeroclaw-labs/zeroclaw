@@ -78,6 +78,10 @@ Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fai
 
 The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch this full matrix automatically; maintainers can manually dispatch it against a branch when full platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
 
+### Desktop App Check (`desktop-check.yml`)
+
+Runs `cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings` and then `cargo test --locked -p zeroclaw-desktop` on `macos-14`, `ubuntu-22.04`, and `windows-latest`. The workspace lint and nextest jobs exclude `zeroclaw-desktop` because it needs the platform GUI toolchains, so this workflow is the only place the desktop app's tests run, including the Unix supervisor process-tree and readiness tests in `apps/tauri/src/daemon.rs` and the webview capability test. It runs on pull requests that change `apps/tauri/**` or the workflow itself, weekly, and on manual dispatch. It does not feed `CI Required Gate`.
+
 ### Daily Advisory Scan (`daily-audit.yml`)
 
 Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
@@ -353,8 +357,8 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
-| `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
-| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
+| `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `desktop-check.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
+| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `desktop-check.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
 | `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected by the `use-blacksmith: 'true'` input each Blacksmith compile job passes to the composite (a checked-in constant) |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
