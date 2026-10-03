@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::{
     ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, projected_entry_count,
 };
@@ -187,11 +187,56 @@ struct AcpSessionCursor {
 const ACP_SESSION_CURSOR_VERSION: u8 = 1;
 const ACP_SESSION_MAX_PAGE_SIZE: usize = 1_000;
 
+/// Characters that may separate a stored session workspace root from a path
+/// below it: the platform separator, plus `/`, which Windows also accepts.
+/// On Unix both entries are `/`.
+const WORKSPACE_SEPARATORS: [char; 2] = [std::path::MAIN_SEPARATOR, '/'];
+
+/// `acp_sessions` rows whose `workspace_dir` is the root bound to `?1` or a
+/// path below it, with `?2` and `?3` bound to [`WORKSPACE_SEPARATORS`]. The
+/// prefix is compared with `substr` rather than `LIKE`, so `%` and `_` in a
+/// path stay literal, and the character after it must be a separator, so a
+/// sibling that only shares the prefix text (`workspace2` beside `workspace`)
+/// is not below the root.
+const WORKSPACE_ROOT_MATCH: &str = "(workspace_dir = ?1
+     OR (substr(workspace_dir, 1, length(?1)) = ?1
+         AND substr(workspace_dir, length(?1) + 1, 1) IN (?2, ?3)))";
+
+/// `root` without trailing separators, so `/x/ws/` and `/x/ws` name the same
+/// root. A root that names no directory below the filesystem root (empty, or
+/// the filesystem root itself) is refused: every stored workspace lies below
+/// it, so matching on it would take every row.
+fn normalized_workspace_root(root: &str) -> Result<&str> {
+    let trimmed = root.trim_end_matches(WORKSPACE_SEPARATORS);
+    if Path::new(trimmed).parent().is_none() {
+        anyhow::bail!(
+            "Refusing ACP session workspace root {root:?}: it names no directory below the \
+             filesystem root"
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Whether `path` is `root` or lies below it, by the rule
+/// [`WORKSPACE_ROOT_MATCH`] applies to stored rows.
+fn workspace_is_within(path: &str, root: &str) -> bool {
+    path.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(WORKSPACE_SEPARATORS))
+}
+
 impl AcpSessionStore {
+    /// Path of the database [`Self::new`] opens under `data_dir`. Resolving
+    /// it creates nothing, so a caller can check whether a store exists
+    /// without opening, and thereby creating, one.
+    pub fn db_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("sessions").join("acp-sessions.db")
+    }
+
     pub fn new(workspace_dir: &Path) -> Result<Self> {
-        let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
-        let db_path = sessions_dir.join("acp-sessions.db");
+        let db_path = Self::db_path(workspace_dir);
+        if let Some(sessions_dir) = db_path.parent() {
+            std::fs::create_dir_all(sessions_dir).context("Failed to create sessions directory")?;
+        }
 
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open ACP session DB: {}", db_path.display()))?;
@@ -2997,6 +3042,72 @@ impl AcpSessionStore {
                 params![from, to],
             )
             .context("Failed to rename ACP session owner")?;
+        Ok(rows)
+    }
+
+    /// Count every ACP session (live or killed) attributed to `agent_alias`,
+    /// exactly the rows [`Self::rename_sessions_by_agent`] re-points. A plain
+    /// read: it neither rescores projected message counts nor writes.
+    pub fn count_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_sessions WHERE agent_alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )
+            .context("Failed to count ACP sessions for agent")?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Count the ACP sessions (live or killed) whose `workspace_dir` is `root`
+    /// or a path below it, exactly the rows
+    /// [`Self::relocate_session_workspaces`] rewrites from that root.
+    pub fn count_sessions_under_workspace(&self, root: &str) -> Result<usize> {
+        let root = normalized_workspace_root(root)?;
+        let [separator, alt_separator] = WORKSPACE_SEPARATORS.map(String::from);
+        let conn = self.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM acp_sessions WHERE {WORKSPACE_ROOT_MATCH}"),
+                params![root, separator, alt_separator],
+                |row| row.get(0),
+            )
+            .context("Failed to count ACP sessions under workspace root")?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Re-point the recorded `workspace_dir` of every ACP session (live or
+    /// killed) that is `old_root` or a path below it to the same place under
+    /// `new_root`, keeping the rest of the path, and return the number of rows
+    /// rewritten. Only the stored paths change; nothing on disk moves. Once
+    /// rewritten, no row is left under `old_root`, so a repeat call rewrites
+    /// none. Equal roots are a no-op, and roots of which one lies below the
+    /// other are refused, since the rewrite would then match its own output.
+    pub fn relocate_session_workspaces(&self, old_root: &str, new_root: &str) -> Result<usize> {
+        let old_root = normalized_workspace_root(old_root)?;
+        let new_root = normalized_workspace_root(new_root)?;
+        if old_root == new_root {
+            return Ok(0);
+        }
+        if workspace_is_within(new_root, old_root) || workspace_is_within(old_root, new_root) {
+            anyhow::bail!(
+                "Refusing to relocate ACP session workspaces between nested roots \
+                 {old_root:?} and {new_root:?}"
+            );
+        }
+        let [separator, alt_separator] = WORKSPACE_SEPARATORS.map(String::from);
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                &format!(
+                    "UPDATE acp_sessions
+                        SET workspace_dir = ?4 || substr(workspace_dir, length(?1) + 1)
+                      WHERE {WORKSPACE_ROOT_MATCH}"
+                ),
+                params![old_root, separator, alt_separator, new_root],
+            )
+            .context("Failed to relocate ACP session workspaces")?;
         Ok(rows)
     }
 
@@ -6953,6 +7064,210 @@ mod tests {
         assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
         // unknown source → 0
         assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
+    }
+
+    #[test]
+    fn db_path_names_the_database_new_opens_without_creating_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = AcpSessionStore::db_path(tmp.path());
+        assert_eq!(path, tmp.path().join("sessions").join("acp-sessions.db"));
+        assert!(
+            !path.exists(),
+            "resolving the path must not create the database"
+        );
+        assert!(!tmp.path().join("sessions").exists());
+
+        let _store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert!(path.is_file(), "new must open the database db_path names");
+    }
+
+    #[test]
+    fn count_sessions_by_agent_counts_what_rename_repoints_without_writing() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("a-live", "alpha", "/ws/a1", None)
+            .unwrap();
+        store
+            .create_session("a-killed", "alpha", "/ws/a2", None)
+            .unwrap();
+        store.mark_session_killed("a-killed").unwrap();
+        store
+            .create_session("b-live", "beta", "/ws/b1", None)
+            .unwrap();
+        store
+            .append_turn(
+                "a-live",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        // Leave the projected-count cache stale, as another writer can.
+        store
+            .conn
+            .lock()
+            .execute("UPDATE acp_sessions SET projected_count_through = NULL", [])
+            .unwrap();
+
+        // Live and killed rows both count, like the rename moves both.
+        assert_eq!(store.count_sessions_by_agent("alpha").unwrap(), 2);
+        assert_eq!(store.count_sessions_by_agent("beta").unwrap(), 1);
+        assert_eq!(store.count_sessions_by_agent("ghost").unwrap(), 0);
+        let rescored: i64 = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM acp_sessions WHERE projected_count_through IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rescored, 0, "the count must not rescore projected counts");
+
+        assert_eq!(store.rename_sessions_by_agent("alpha", "gamma").unwrap(), 2);
+        assert_eq!(store.count_sessions_by_agent("alpha").unwrap(), 0);
+        assert_eq!(store.count_sessions_by_agent("gamma").unwrap(), 2);
+    }
+
+    fn raw_workspace_dir(store: &AcpSessionStore, session_uuid: &str) -> String {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT workspace_dir FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn workspace_relocation_moves_the_root_and_paths_below_it_only() {
+        let (_tmp, store) = open_store();
+        let old_root = "/x/agents/ä/workspace";
+        let new_root = "/x/agents/b/workspace";
+        for (uuid, dir) in [
+            ("exact", old_root),
+            ("nested", "/x/agents/ä/workspace/proj/sub"),
+            ("killed", "/x/agents/ä/workspace/old"),
+            ("sibling", "/x/agents/ä/workspace2"),
+            ("sibling-nested", "/x/agents/ä/workspace2/proj"),
+            ("parent", "/x/agents/ä"),
+            ("elsewhere", "/y/agents/ä/workspace"),
+        ] {
+            store.create_session(uuid, "alpha", dir, None).unwrap();
+        }
+        store.mark_session_killed("killed").unwrap();
+
+        assert_eq!(store.count_sessions_under_workspace(old_root).unwrap(), 3);
+        assert_eq!(
+            store
+                .count_sessions_under_workspace("/x/agents/ä/workspace/")
+                .unwrap(),
+            3,
+            "a trailing separator names the same root"
+        );
+
+        assert_eq!(
+            store
+                .relocate_session_workspaces("/x/agents/ä/workspace/", "/x/agents/b/workspace/")
+                .unwrap(),
+            3
+        );
+        for (uuid, expected) in [
+            ("exact", new_root),
+            ("nested", "/x/agents/b/workspace/proj/sub"),
+            ("killed", "/x/agents/b/workspace/old"),
+            ("sibling", "/x/agents/ä/workspace2"),
+            ("sibling-nested", "/x/agents/ä/workspace2/proj"),
+            ("parent", "/x/agents/ä"),
+            ("elsewhere", "/y/agents/ä/workspace"),
+        ] {
+            assert_eq!(raw_workspace_dir(&store, uuid), expected, "session {uuid}");
+        }
+
+        // Nothing is left under the old root, so a repeat moves nothing.
+        assert_eq!(store.count_sessions_under_workspace(old_root).unwrap(), 0);
+        assert_eq!(
+            store
+                .relocate_session_workspaces(old_root, new_root)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.count_sessions_under_workspace(new_root).unwrap(), 3);
+    }
+
+    #[test]
+    fn workspace_root_matching_treats_like_wildcards_literally() {
+        let (_tmp, store) = open_store();
+        for (uuid, dir) in [
+            ("underscore", "/x/a_b/ws"),
+            ("underscore-wild", "/x/aXb/ws"),
+            ("percent", "/x/100%/ws"),
+            ("percent-wild", "/x/100abc/ws"),
+        ] {
+            store.create_session(uuid, "alpha", dir, None).unwrap();
+        }
+
+        assert_eq!(store.count_sessions_under_workspace("/x/a_b").unwrap(), 1);
+        assert_eq!(store.count_sessions_under_workspace("/x/100%").unwrap(), 1);
+        assert_eq!(
+            store
+                .relocate_session_workspaces("/x/a_b", "/x/moved_ab")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .relocate_session_workspaces("/x/100%", "/x/moved_pct")
+                .unwrap(),
+            1
+        );
+        assert_eq!(raw_workspace_dir(&store, "underscore"), "/x/moved_ab/ws");
+        assert_eq!(raw_workspace_dir(&store, "underscore-wild"), "/x/aXb/ws");
+        assert_eq!(raw_workspace_dir(&store, "percent"), "/x/moved_pct/ws");
+        assert_eq!(raw_workspace_dir(&store, "percent-wild"), "/x/100abc/ws");
+    }
+
+    #[test]
+    fn workspace_relocation_refuses_degenerate_and_nested_roots() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("s", "alpha", "/x/ws/sub", None)
+            .unwrap();
+
+        // An empty root, or the filesystem root, would match every row.
+        for root in ["", "/", "//"] {
+            assert!(
+                store.count_sessions_under_workspace(root).is_err(),
+                "count must refuse {root:?}"
+            );
+            assert!(
+                store.relocate_session_workspaces(root, "/y/ws").is_err(),
+                "relocate must refuse source {root:?}"
+            );
+            assert!(
+                store.relocate_session_workspaces("/x/ws", root).is_err(),
+                "relocate must refuse target {root:?}"
+            );
+        }
+        // With one root below the other the rewrite would match its own output.
+        assert!(
+            store
+                .relocate_session_workspaces("/x/ws", "/x/ws/inner")
+                .is_err()
+        );
+        assert!(
+            store
+                .relocate_session_workspaces("/x/ws/sub", "/x/ws")
+                .is_err()
+        );
+        // Equal roots move nothing.
+        assert_eq!(
+            store
+                .relocate_session_workspaces("/x/ws", "/x/ws/")
+                .unwrap(),
+            0
+        );
+        assert_eq!(raw_workspace_dir(&store, "s"), "/x/ws/sub");
     }
 
     #[test]

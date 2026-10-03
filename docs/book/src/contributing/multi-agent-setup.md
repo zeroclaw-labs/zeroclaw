@@ -82,15 +82,42 @@ Every configured agent lives under an `agents.<alias>` entry with its risk profi
 
 ## Rename an agent
 
-Use the rename control for the agent under **Config > Agents** in the gateway dashboard, or run:
+Use the rename control for the agent under **Config > Agents** in the gateway dashboard, rename it from zerocode, or run:
 
 ```sh
 zeroclaw agents rename researcher analyst
 ```
 
-Both surfaces rewrite references to the alias, persist the config, move the default per-alias workspace, and re-point owned memory, cron, ACP, and session state. Custom workspace paths do not move because they are not derived from the alias. The reserved `default` alias cannot be renamed from or to.
+Every surface runs the same rename. It validates both aliases, writes a recovery record, rewrites references to the alias and persists the config, then moves the agent's owned state to the new alias:
 
-Read any warnings in the response. The config rename commits before workspace and owned-state migration, so warnings identify a side effect that still needs attention. The same gateway API rename request can be reissued to retry residue left under the old alias.
+- the default workspace, from `<install>/agents/researcher/workspace/` to `<install>/agents/analyst/workspace/`;
+- memory attribution;
+- cron jobs and their run history;
+- ACP sessions, and their saved working directory when it was the old default workspace; and
+- agent attribution on conversation sessions.
+
+Custom workspace paths do not move because they are not derived from the alias; an explicit `workspace.path` that names the default location counts as custom. The reserved `default` alias cannot be renamed from or to. The rename re-checks all of this state before it clears the recovery record. Any warnings it reports point at state that has not moved yet.
+
+### If the rename reports unfinished work
+
+Re-run the exact same rename: `zeroclaw agents rename researcher analyst`, or the same gateway API or daemon RPC request. The CLI resumes a pending rename even when `researcher` is no longer in the config, and exits non-zero until the rename has fully converged. The gateway API and daemon RPC keep returning `renamed: true` with a `warnings` list until then; an empty `warnings` list means the rename is complete.
+
+The pending rename is recorded in `<data_dir>/agent-lifecycle-recovery.json`, with a sidecar `.lock` file. Re-running the rename clears the record once it confirms that nothing is left under `researcher`. Removing leftover state by hand does not clear it, and a store that exists but cannot be read counts as unfinished work, not as empty.
+
+While the record is open, `researcher` cannot be reused. Creating an agent with that name is refused by the CLI (including `zeroclaw config set agents.researcher.<field>` and `zeroclaw config patch`), the gateway and dashboard, the daemon RPC, `zeroclaw quickstart`, and the agent-facing config tool, and so is renaming another agent to `researcher`. An agent added through an environment override or a hand edit of `config.toml` is not refused; config load logs a warning for it instead. Renaming or deleting `analyst` is also refused until the pending rename converges. Creating any other agent still works.
+
+Some conflicts need an operator, and the rename keeps reporting them until they are resolved:
+
+- `<install>/agents/analyst/workspace/` already exists and is not empty.
+- `analyst` already owns memory rows.
+- `<install>/agents/researcher/workspace/` still holds files while `analyst` has a custom `workspace.path`. The rename never finishes while that directory exists, because an agent created as `researcher` later would adopt it; an empty one is removed for you.
+- `analyst`'s `workspace.path` points at `<install>/agents/researcher/workspace/` itself. Point it elsewhere first.
+
+Move or merge that state by hand, then re-run the same rename.
+
+If `[agents.researcher]` is back in the config while the record is open (a hand edit, say), re-running the rename is refused and moves nothing, since that entry would take over the state the rename still owes `analyst`. Remove `[agents.researcher]` by hand and re-run the rename, or abandon it.
+
+If a rename cannot be finished, `zeroclaw agents rename researcher analyst --abandon` drops its recovery record without moving anything. `researcher` can then be created again, and the new agent adopts whatever state is still kept under that name, so check the warnings the command prints first.
 
 ## Delete an agent
 

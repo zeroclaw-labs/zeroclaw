@@ -27,7 +27,7 @@ fn committed_jsonl_import_receipts_exist(conn: &Connection) -> Result<bool> {
 }
 
 pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Result<bool> {
-    let db_path = workspace_dir.join("sessions/sessions.db");
+    let db_path = SqliteSessionBackend::db_path(workspace_dir);
     match std::fs::metadata(&db_path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -55,11 +55,19 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 }
 
 impl SqliteSessionBackend {
+    /// Path of the sessions database [`Self::new`] opens under `data_dir`.
+    /// Resolving it creates nothing, so a caller can check whether the
+    /// database exists without opening, and thereby creating, it.
+    pub fn db_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("sessions").join("sessions.db")
+    }
+
     /// Open or create the sessions database.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
-        let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
-        let db_path = sessions_dir.join("sessions.db");
+        let db_path = Self::db_path(workspace_dir);
+        if let Some(sessions_dir) = db_path.parent() {
+            std::fs::create_dir_all(sessions_dir).context("Failed to create sessions directory")?;
+        }
 
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
@@ -1665,6 +1673,21 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn db_path_names_the_database_new_opens_without_creating_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = SqliteSessionBackend::db_path(tmp.path());
+        assert_eq!(path, tmp.path().join("sessions").join("sessions.db"));
+        assert!(
+            !path.exists(),
+            "resolving the path must not create the database"
+        );
+        assert!(!tmp.path().join("sessions").exists());
+
+        let _backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(path.is_file(), "new must open the database db_path names");
     }
 
     #[test]

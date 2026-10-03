@@ -543,6 +543,14 @@ pub fn is_reserved_agent_alias(alias: &str) -> bool {
 pub enum CreateError {
     /// The key is the reserved alias for its section (the `default` agent).
     Reserved(String),
+    /// An unfinished agent rename retired the alias: `alias` is its `from`
+    /// and `pending_to` its target. Display leaves `pending_to` out, since
+    /// surfaces render this error before they authorize the caller.
+    Retired { alias: String, pending_to: String },
+    /// The agent lifecycle recovery journal could not be read, so whether the
+    /// alias is retired is unknown and the create fails closed. Carries the
+    /// reason.
+    RecoveryUnreadable(String),
     /// The generated [`Config::create_map_key`] rejected the request: there is
     /// no map-keyed section at `path`, or the key is invalid. Carries the reason.
     Invalid(String),
@@ -552,6 +560,14 @@ impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reserved(a) => write!(f, "alias `{a}` is reserved and cannot be created"),
+            Self::Retired { alias, .. } => write!(
+                f,
+                "alias `{alias}` is retired by an unfinished agent rename and cannot be created yet"
+            ),
+            Self::RecoveryUnreadable(detail) => write!(
+                f,
+                "agent lifecycle recovery journal could not be read: {detail}"
+            ),
             Self::Invalid(m) => write!(f, "{m}"),
         }
     }
@@ -564,8 +580,38 @@ pub fn create_map_key_checked(
     path: &str,
     key: &str,
 ) -> Result<bool, CreateError> {
-    if path == "agents" && is_reserved_agent_alias(key) {
-        return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
+    if path == "agents" {
+        if is_reserved_agent_alias(key) {
+            return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
+        }
+        // An unfinished rename still owes state moves out of its old alias, and
+        // an agent created under that alias now would inherit whatever has not
+        // moved yet. A journal that cannot be read may hold such a rename, so
+        // that refuses too.
+        match crate::agent_recovery_journal::retired_alias(cfg, key) {
+            Ok(None) => {}
+            Ok(Some(record)) => {
+                return Err(CreateError::Retired {
+                    alias: key.to_string(),
+                    pending_to: record.to,
+                });
+            }
+            Err(e) => {
+                let detail = e.to_string();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "config.recovery_journal_unreadable",
+                            "alias": key,
+                            "error": detail,
+                        })),
+                    "refused to create an agent: the agent lifecycle recovery journal could not be read"
+                );
+                return Err(CreateError::RecoveryUnreadable(detail));
+            }
+        }
     }
     cfg.create_map_key(path, key).map_err(CreateError::Invalid)
 }
@@ -1306,9 +1352,13 @@ mod tests {
     };
 
     /// Empty config with the alias-keyed containers cleared so Config::default
-    /// can't inject spurious references into assertions.
+    /// can't inject spurious references into assertions. It has no data dir,
+    /// so the agent-create guards never read the host's recovery journal.
     fn empty_config() -> Config {
-        let mut c = Config::default();
+        let mut c = Config {
+            data_dir: std::path::PathBuf::new(),
+            ..Config::default()
+        };
         c.agents.clear();
         c.peer_groups.clear();
         c.model_routes.clear();
@@ -2620,6 +2670,150 @@ mod tests {
             .insert("default".to_string(), AliasedAgentConfig::default());
         assert!(!cfg.ensure_map_key_for_path("agents.default.model"));
         assert!(cfg.agents.contains_key("default"));
+    }
+
+    /// A config whose data dir holds a recovery journal with an unfinished,
+    /// committed rename of `scout` to `scout2` (already configured).
+    fn config_with_retired_scout(data_dir: &std::path::Path) -> Config {
+        use crate::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryOperation, RecoveryPhase, RecoveryRecord,
+        };
+        let journal = AgentRecoveryJournal::for_data_dir(data_dir);
+        let guard = journal.lock(std::time::Duration::ZERO).unwrap();
+        journal
+            .upsert(
+                &guard,
+                RecoveryRecord {
+                    operation: RecoveryOperation::Rename,
+                    from: "scout".to_string(),
+                    to: "scout2".to_string(),
+                    phase: RecoveryPhase::Committed,
+                    source_workspace: None,
+                    armed_at: "2026-01-01T00:00:00+00:00".to_string(),
+                },
+            )
+            .unwrap();
+        let mut cfg = empty_config();
+        cfg.data_dir = data_dir.to_path_buf();
+        cfg.agents
+            .insert("scout2".to_string(), AliasedAgentConfig::default());
+        cfg
+    }
+
+    /// Replace the journal under `data_dir` with a directory, which no read
+    /// can parse.
+    fn make_journal_unreadable(data_dir: &std::path::Path) {
+        let path = data_dir.join(crate::agent_recovery_journal::JOURNAL_FILE_NAME);
+        if path.is_file() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::create_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn create_map_key_checked_refuses_an_agent_alias_retired_by_an_unfinished_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config_with_retired_scout(dir.path());
+
+        let err = create_map_key_checked(&mut cfg, "agents", "scout").unwrap_err();
+        match &err {
+            CreateError::Retired { alias, pending_to } => {
+                assert_eq!(alias, "scout");
+                assert_eq!(pending_to, "scout2");
+            }
+            other => panic!("expected Retired, got {other:?}"),
+        }
+        assert!(!cfg.agents.contains_key("scout"));
+        // Surfaces render the error before authorizing the caller, so it names
+        // the retired alias but not where the rename is taking it.
+        let text = err.to_string();
+        assert!(text.contains("alias `scout` is retired"), "{text}");
+        assert!(!text.contains("scout2"), "{text}");
+
+        // Other agents, and the same key in other sections, are unaffected.
+        assert!(create_map_key_checked(&mut cfg, "agents", "ranger").unwrap());
+        assert!(create_map_key_checked(&mut cfg, "providers.models.anthropic", "scout").unwrap());
+    }
+
+    #[test]
+    fn create_map_key_checked_fails_closed_on_an_unreadable_recovery_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = empty_config();
+        cfg.data_dir = dir.path().to_path_buf();
+        make_journal_unreadable(dir.path());
+
+        let err = create_map_key_checked(&mut cfg, "agents", "scout").unwrap_err();
+        assert!(matches!(err, CreateError::RecoveryUnreadable(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("agent lifecycle recovery journal could not be read: "),
+            "{err}"
+        );
+        // Surfaces render this before authorizing the caller, so it names the
+        // journal file and never the directory holding it.
+        assert!(
+            !err.to_string().contains(&dir.path().display().to_string()),
+            "{err}"
+        );
+        assert!(!cfg.agents.contains_key("scout"));
+        // Only agent creation consults the journal.
+        assert!(create_map_key_checked(&mut cfg, "providers.models.anthropic", "scout").unwrap());
+    }
+
+    #[test]
+    fn ensure_map_key_for_path_checked_refuses_a_retired_agent_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config_with_retired_scout(dir.path());
+
+        assert_eq!(
+            cfg.ensure_map_key_for_path_checked("agents.scout.enabled"),
+            Err(crate::schema::VivifyRefusal::Retired {
+                alias: "scout".to_string(),
+                pending_to: "scout2".to_string(),
+            })
+        );
+        assert!(!cfg.agents.contains_key("scout"));
+        // The bool wrappers report the same refusal, and nothing is created.
+        assert!(cfg.ensure_map_key_for_path("agents.scout.enabled"));
+        assert!(cfg.ensure_map_or_list_key_for_path("agents.scout.enabled"));
+        assert!(!cfg.agents.contains_key("scout"));
+        // The rename target and unrelated aliases still resolve.
+        assert_eq!(
+            cfg.ensure_map_key_for_path_checked("agents.scout2.enabled"),
+            Ok(())
+        );
+        assert_eq!(
+            cfg.ensure_map_key_for_path_checked("agents.ranger.enabled"),
+            Ok(())
+        );
+        assert!(cfg.agents.contains_key("ranger"));
+        assert_eq!(
+            cfg.ensure_map_key_for_path_checked("agents.default.enabled"),
+            Err(crate::schema::VivifyRefusal::Reserved)
+        );
+
+        // A journal that cannot be read refuses rather than guessing, and
+        // says so without naming the directory holding it.
+        make_journal_unreadable(dir.path());
+        let refusal = cfg
+            .ensure_map_key_for_path_checked("agents.scout.enabled")
+            .unwrap_err();
+        assert!(
+            matches!(refusal, crate::schema::VivifyRefusal::RecoveryUnreadable(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            !refusal
+                .to_string()
+                .contains(&dir.path().display().to_string()),
+            "{refusal}"
+        );
+        assert!(!cfg.agents.contains_key("scout"));
+        // An alias that already exists never consults the journal.
+        assert_eq!(
+            cfg.ensure_map_key_for_path_checked("agents.ranger.enabled"),
+            Ok(())
+        );
     }
 
     #[test]

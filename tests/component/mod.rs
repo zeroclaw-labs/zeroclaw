@@ -4,6 +4,8 @@ mod acp_cli;
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
 #[cfg(feature = "agent-runtime")]
+mod agents_rename_recovery_cli;
+#[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;

@@ -80,7 +80,7 @@ pub use traits::{
 };
 
 use anyhow::Context;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
@@ -531,6 +531,33 @@ pub fn create_memory_from_config(
     )
 }
 
+/// The SQLite database [`create_memory_from_config`] opens for `config`: the
+/// SQLite backend's store, which Lucid also opens as its local mirror. `None`
+/// when the configured backend keeps no local SQLite database (none,
+/// markdown, postgres, qdrant, or an unrecognized name, which falls back to
+/// markdown). Resolving the path creates nothing, so a caller can check
+/// whether the store exists without the factory creating it.
+pub fn sqlite_db_path_for_config(config: &Config) -> Option<PathBuf> {
+    let backend_kind = classify_memory_backend(&backend_kind_from_dotted(&config.memory.backend));
+    local_sqlite_db_path(backend_kind, &config.data_dir)
+}
+
+/// The SQLite database a backend of `backend_kind` keeps under
+/// `workspace_dir`. The factory opens its SQLite store only at this path, so
+/// [`sqlite_db_path_for_config`] names exactly the file it opens.
+fn local_sqlite_db_path(backend_kind: MemoryBackendKind, workspace_dir: &Path) -> Option<PathBuf> {
+    match backend_kind {
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid => {
+            Some(SqliteMemory::db_path(workspace_dir))
+        }
+        MemoryBackendKind::Postgres
+        | MemoryBackendKind::Qdrant
+        | MemoryBackendKind::Markdown
+        | MemoryBackendKind::None
+        | MemoryBackendKind::Unknown => None,
+    }
+}
+
 fn build_lucid_memory(
     workspace_dir: &Path,
     local: SqliteMemory,
@@ -674,16 +701,16 @@ fn build_memory_with_storage(
     fn build_sqlite_memory(
         config: &MemoryConfig,
         sqlite_open_timeout_secs: Option<u64>,
-        workspace_dir: &Path,
+        db_path: &Path,
         resolved_embedding: Option<&ResolvedEmbeddingConfig>,
     ) -> anyhow::Result<SqliteMemory> {
         let embedder = create_embedder(resolved_embedding);
         let has_embedder = embedder.dimensions() > 0;
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
+        let mem = SqliteMemory::with_embedder_at(
             "sqlite",
-            workspace_dir,
+            db_path,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
@@ -713,6 +740,24 @@ fn build_memory_with_storage(
     let sqlite_open_timeout_secs = match active_storage {
         ActiveStorage::Sqlite(sq) => sq.open_timeout_secs,
         _ => None,
+    };
+
+    // Every SQLite store opened below, the SQLite backend's own and Lucid's
+    // local mirror, opens at the path `local_sqlite_db_path` resolves, the
+    // helper `sqlite_db_path_for_config` also reports through. A backend it
+    // resolves no path for is refused rather than opened where that accessor
+    // cannot see.
+    let local_sqlite_db = local_sqlite_db_path(backend_kind, workspace_dir);
+    let open_local_sqlite = || {
+        let db_path = local_sqlite_db.as_deref().with_context(|| {
+            format!("memory backend '{backend_name}' keeps no local SQLite store")
+        })?;
+        build_sqlite_memory(
+            config,
+            sqlite_open_timeout_secs,
+            db_path,
+            resolved_embedding,
+        )
     };
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
@@ -771,12 +816,7 @@ fn build_memory_with_storage(
     }
 
     if matches!(backend_kind, MemoryBackendKind::Lucid) {
-        let local = build_sqlite_memory(
-            config,
-            sqlite_open_timeout_secs,
-            workspace_dir,
-            resolved_embedding,
-        )?;
+        let local = open_local_sqlite()?;
         return wrap_scanned_and_audit(
             build_lucid_memory(workspace_dir, local, active_storage),
             &config.policy,
@@ -788,14 +828,7 @@ fn build_memory_with_storage(
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
-        || {
-            build_sqlite_memory(
-                config,
-                sqlite_open_timeout_secs,
-                workspace_dir,
-                resolved_embedding,
-            )
-        },
+        open_local_sqlite,
         "",
         &config.policy,
         config.audit_enabled,
@@ -2326,6 +2359,77 @@ url = "http://localhost:6333"
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
+    }
+
+    /// Every `*.db` file below `dir`, sorted. SQLite's `-wal` and `-shm`
+    /// companions carry a different extension and are left out.
+    fn sqlite_databases_under(dir: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "db") {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(dir, &mut found);
+        found.sort();
+        found
+    }
+
+    fn config_with_memory_backend(backend: &str, data_dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.memory.backend = backend.into();
+        config.data_dir = data_dir.to_path_buf();
+        config
+    }
+
+    #[test]
+    fn sqlite_db_path_for_config_names_the_database_the_factory_opens() {
+        for backend in ["sqlite", "sqlite.default", "lucid"] {
+            let tmp = TempDir::new().unwrap();
+            let config = config_with_memory_backend(backend, &tmp.path().join("data"));
+            let db_path = sqlite_db_path_for_config(&config)
+                .unwrap_or_else(|| panic!("{backend} keeps a local SQLite store"));
+            assert!(
+                !db_path.exists(),
+                "{backend}: resolving the path must not create the store"
+            );
+
+            let _memory = create_memory_from_config(&config, None).unwrap();
+            assert_eq!(
+                sqlite_databases_under(&config.data_dir),
+                vec![db_path],
+                "{backend}: the factory must open exactly the database the accessor names"
+            );
+        }
+
+        for backend in ["none", "markdown", "no-such-backend"] {
+            let tmp = TempDir::new().unwrap();
+            let config = config_with_memory_backend(backend, &tmp.path().join("data"));
+            assert_eq!(sqlite_db_path_for_config(&config), None, "{backend}");
+
+            let _memory = create_memory_from_config(&config, None).unwrap();
+            assert!(
+                sqlite_databases_under(&config.data_dir).is_empty(),
+                "{backend}: the factory must open no SQLite database"
+            );
+        }
+
+        // Remote backends keep no local file. Building them needs a resolved
+        // storage alias and, for postgres, a live server, so only the
+        // accessor is checked here.
+        for backend in ["postgres", "postgres.default", "qdrant", "qdrant.default"] {
+            let tmp = TempDir::new().unwrap();
+            let config = config_with_memory_backend(backend, tmp.path());
+            assert_eq!(sqlite_db_path_for_config(&config), None, "{backend}");
+        }
     }
 
     #[test]

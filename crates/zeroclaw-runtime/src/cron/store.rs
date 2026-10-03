@@ -39,22 +39,14 @@ fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     let mut claims = LIVE_AGENT_CLAIM_TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    claims.insert((
-        cron_db_path(config),
-        job_id.to_string(),
-        lock_token.to_string(),
-    ));
+    claims.insert((db_path(config), job_id.to_string(), lock_token.to_string()));
 }
 
 pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     let mut claims = LIVE_AGENT_CLAIM_TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    claims.remove(&(
-        cron_db_path(config),
-        job_id.to_string(),
-        lock_token.to_string(),
-    ));
+    claims.remove(&(db_path(config), job_id.to_string(), lock_token.to_string()));
 }
 
 #[cfg(test)]
@@ -62,7 +54,7 @@ pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     let mut failures = FORCED_RELEASE_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let db_path = cron_db_path(config);
+    let db_path = db_path(config);
     if enabled {
         failures.insert(db_path);
     } else {
@@ -75,7 +67,7 @@ fn should_force_release_failure(config: &Config) -> bool {
     FORCED_RELEASE_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&cron_db_path(config))
+        .contains(&db_path(config))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,7 +87,7 @@ pub(crate) fn reset_write_connection_count_for_tests(config: &Config) {
     let mut counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    counts.insert(cron_db_path(config), 0);
+    counts.insert(db_path(config), 0);
 }
 
 #[cfg(test)]
@@ -103,7 +95,7 @@ pub(crate) fn write_connection_count_for_tests(config: &Config) -> usize {
     let counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    counts.get(&cron_db_path(config)).copied().unwrap_or(0)
+    counts.get(&db_path(config)).copied().unwrap_or(0)
 }
 
 impl rusqlite::types::FromSql for JobType {
@@ -555,6 +547,26 @@ pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usi
         Ok(changed)
     })?;
     Ok(changed)
+}
+
+/// Cron rows still attributed to `agent_alias`: the jobs it owns plus the run
+/// history rows it is the cleanup owner of, including retained rows whose job
+/// is gone. These are exactly the rows [`rename_jobs_by_agent`] re-points.
+/// `None` when the cron database does not exist, which this read never
+/// creates. A database that cannot be read is an error, not zero residue.
+pub fn agent_residue_count(config: &Config, agent_alias: &str) -> Result<Option<usize>> {
+    with_read_connection(config, |conn| {
+        // One statement, so both counts come from the same snapshot.
+        let residue: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM cron_jobs WHERE agent_alias = ?1)
+                      + (SELECT COUNT(*) FROM cron_runs WHERE owner_agent = ?1)",
+                params![agent_alias],
+                |row| row.get(0),
+            )
+            .context("Failed to count cron rows owned by agent")?;
+        usize::try_from(residue).context("Cron residue count out of range")
+    })
 }
 
 /// The agent a job executes under and is cleaned up by: its stored alias when
@@ -1156,7 +1168,7 @@ fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Res
     let claims = LIVE_AGENT_CLAIM_TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let db_path = cron_db_path(config);
+    let db_path = db_path(config);
     let live_tokens = claims
         .iter()
         .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
@@ -2135,7 +2147,10 @@ fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &
     }
 }
 
-fn cron_db_path(config: &Config) -> std::path::PathBuf {
+/// Path of the cron database under `config.data_dir`. Resolving it creates
+/// nothing, so a caller can check whether the database exists without opening
+/// it.
+pub fn db_path(config: &Config) -> std::path::PathBuf {
     config.data_dir.join("cron").join("jobs.db")
 }
 
@@ -2153,7 +2168,7 @@ fn with_existing_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<Option<T>> {
-    let db_path = cron_db_path(config);
+    let db_path = db_path(config);
     if !db_path.exists() {
         return Ok(None);
     }
@@ -2177,7 +2192,7 @@ pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
-    let db_path = cron_db_path(config);
+    let db_path = db_path(config);
     #[cfg(test)]
     {
         let mut counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
@@ -3077,11 +3092,14 @@ mod tests {
     }
 
     fn cron_dir(config: &Config) -> std::path::PathBuf {
-        config.data_dir.join("cron")
+        cron_db(config)
+            .parent()
+            .expect("the cron database lives in a directory")
+            .to_path_buf()
     }
 
     fn cron_db(config: &Config) -> std::path::PathBuf {
-        cron_dir(config).join("jobs.db")
+        db_path(config)
     }
 
     async fn recv_log_event(
@@ -3148,6 +3166,123 @@ mod tests {
         assert!(cron_db(&config).exists());
         assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
         assert_eq!(list_jobs(&config).unwrap().len(), 1);
+    }
+
+    /// Persist one finished run of `job_id` executed, and so cleanup-owned,
+    /// by `agent`. The job row itself need not exist.
+    fn record_run_by(config: &Config, job_id: &str, agent: &str) {
+        let now = Utc::now();
+        record_run(
+            config,
+            job_id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some(agent),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn db_path_is_jobs_db_in_the_cron_dir_under_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // Existing installs keep their jobs here; moving it would orphan them.
+        assert_eq!(
+            db_path(&config),
+            config.data_dir.join("cron").join("jobs.db")
+        );
+    }
+
+    #[test]
+    fn agent_residue_count_is_none_and_creates_nothing_without_a_database() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        assert_eq!(agent_residue_count(&config, "test-agent").unwrap(), None);
+        assert!(
+            !cron_dir(&config).exists(),
+            "the residue probe must not create the cron directory"
+        );
+        assert!(
+            !cron_db(&config).exists(),
+            "the residue probe must not create jobs.db"
+        );
+    }
+
+    #[test]
+    fn agent_residue_count_counts_owned_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        add_job(&config, "owner-agent", "*/5 * * * *", "echo one").unwrap();
+        add_job(&config, "owner-agent", "*/5 * * * *", "echo two").unwrap();
+        add_job(&config, "other-agent", "*/5 * * * *", "echo other").unwrap();
+
+        assert_eq!(
+            agent_residue_count(&config, "owner-agent").unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            agent_residue_count(&config, "other-agent").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            agent_residue_count(&config, "ghost").unwrap(),
+            Some(0),
+            "an existing database owning nothing is Some(0), not None"
+        );
+    }
+
+    #[test]
+    fn agent_residue_count_counts_retained_history_whose_job_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // A completed one-shot: the job row is gone and only its retained run
+        // row, still cleanup-owned by the agent, is left.
+        record_run_by(&config, "gone-one-shot", "agent-a");
+        assert!(get_job(&config, "gone-one-shot").is_err());
+
+        assert_eq!(agent_residue_count(&config, "agent-a").unwrap(), Some(1));
+        assert_eq!(agent_residue_count(&config, "agent-b").unwrap(), Some(0));
+    }
+
+    #[test]
+    fn agent_residue_count_is_zero_for_the_old_alias_after_a_rename() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        record_run_by(&config, &job.id, "agent-a");
+        record_run_by(&config, "gone-one-shot", "agent-a");
+        assert_eq!(agent_residue_count(&config, "agent-a").unwrap(), Some(3));
+
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+
+        assert_eq!(agent_residue_count(&config, "agent-a").unwrap(), Some(0));
+        assert_eq!(agent_residue_count(&config, "agent-b").unwrap(), Some(3));
+    }
+
+    #[test]
+    fn agent_residue_count_reports_an_unreadable_database_as_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        std::fs::write(cron_db(&config), "not a sqlite database").unwrap();
+
+        assert!(
+            agent_residue_count(&config, "agent-a").is_err(),
+            "an unreadable database must not read as zero residue"
+        );
     }
 
     /// Force a job's `next_run` into the past so it is selected by `due_jobs`

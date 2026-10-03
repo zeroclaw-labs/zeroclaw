@@ -4376,7 +4376,8 @@ impl SecurityPolicy {
             || file_name.starts_with(".config.toml.tmp-")
             || file_name == "estop-state.json"
             || file_name == "otp-secret"
-            || file_name == "webauthn_credentials.json";
+            || file_name == "webauthn_credentials.json"
+            || crate::agent_recovery_journal::is_journal_file_name(file_name);
         if !is_protected_name {
             return false;
         }
@@ -9842,6 +9843,39 @@ mod tests {
         assert!(!legacy_policy.is_runtime_config_path(&PathBuf::from(
             "/tmp/zeroclaw-profile/data/webauthn_credentials.json"
         )));
+    }
+
+    #[test]
+    fn agent_recovery_journal_files_in_data_dir_are_protected() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let data_dir = PathBuf::from("/tmp/zeroclaw-profile/data");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            data_dir: Some(data_dir.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The journal, its lock, and its staged temp files are all protected:
+        // an agent that edits any of them could hide an unfinished rename from
+        // the agent-create guards.
+        assert!(policy.is_runtime_config_path(&data_dir.join("agent-lifecycle-recovery.json")));
+        assert!(
+            policy.is_runtime_config_path(&data_dir.join("agent-lifecycle-recovery.json.lock"))
+        );
+        assert!(
+            policy.is_runtime_config_path(
+                &data_dir.join(".agent-lifecycle-recovery.json.tmp-0f1e2d3c")
+            )
+        );
+
+        // The same names inside the workspace are user files.
+        assert!(!policy.is_runtime_config_path(&workspace.join("agent-lifecycle-recovery.json")));
+
+        // Near-miss names under data_dir are unaffected.
+        assert!(
+            !policy.is_runtime_config_path(&data_dir.join("agent-lifecycle-recovery.json.bak"))
+        );
+        assert!(!policy.is_runtime_config_path(&data_dir.join("agent-lifecycle.json")));
     }
 
     #[test]

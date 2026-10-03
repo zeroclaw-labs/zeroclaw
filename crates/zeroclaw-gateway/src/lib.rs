@@ -57,6 +57,9 @@ pub mod ws;
 pub mod ws_approval;
 pub mod ws_sop_runs;
 
+#[cfg(test)]
+mod agent_rename_recovery_tests;
+
 use anyhow::{Context, Result};
 #[cfg(any(
     feature = "channel-email",

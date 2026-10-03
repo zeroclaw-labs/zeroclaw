@@ -10,7 +10,7 @@ use chrono::Local;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -56,9 +56,21 @@ impl SqliteMemory {
         )
     }
 
+    /// Path of the memory database, `brain.db`, that [`Self::new`] and
+    /// [`Self::with_embedder`] open under `workspace_dir`. Resolving it
+    /// creates nothing.
+    pub fn db_path(workspace_dir: &Path) -> PathBuf {
+        Self::named_db_path(workspace_dir, "brain")
+    }
+
+    /// Path of the `{db_name}.db` memory database under `workspace_dir`.
+    fn named_db_path(workspace_dir: &Path, db_name: &str) -> PathBuf {
+        workspace_dir.join("memory").join(format!("{db_name}.db"))
+    }
+
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
     pub fn new_named(alias: &str, workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
+        let db_path = Self::named_db_path(workspace_dir, db_name);
         let conn = Self::open_and_initialize(&db_path, None)?;
         Ok(Self {
             alias: alias.to_string(),
@@ -81,8 +93,31 @@ impl SqliteMemory {
         open_timeout_secs: Option<u64>,
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("brain.db");
-        let conn = Self::open_and_initialize(&db_path, open_timeout_secs)?;
+        Self::with_embedder_at(
+            alias,
+            &Self::db_path(workspace_dir),
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            search_mode,
+        )
+    }
+
+    /// Like [`Self::with_embedder`], but opens the database at `db_path`
+    /// rather than the default one under a workspace.
+    pub(crate) fn with_embedder_at(
+        alias: &str,
+        db_path: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
+    ) -> anyhow::Result<Self> {
+        let conn = Self::open_and_initialize(db_path, open_timeout_secs)?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -2809,6 +2844,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[test]
+    fn db_path_names_the_database_new_opens_without_creating_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = SqliteMemory::db_path(tmp.path());
+        assert_eq!(path, tmp.path().join("memory").join("brain.db"));
+        assert!(
+            !path.exists(),
+            "resolving the path must not create the database"
+        );
+
+        let _mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert!(path.is_file(), "new must open the database db_path names");
     }
 
     #[tokio::test]

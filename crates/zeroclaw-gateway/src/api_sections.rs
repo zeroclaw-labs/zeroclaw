@@ -1003,6 +1003,18 @@ async fn select_section(
                         .with_path(format!("{section_key}.{key}")),
                     );
                 }
+                Err(e @ zeroclaw_config::alias_refs::CreateError::Retired { .. }) => {
+                    return error_response(
+                        ConfigApiError::new(ConfigApiCode::ValidationFailed, e.to_string())
+                            .with_path(format!("{section_key}.{key}")),
+                    );
+                }
+                Err(e @ zeroclaw_config::alias_refs::CreateError::RecoveryUnreadable(_)) => {
+                    return error_response(
+                        ConfigApiError::new(ConfigApiCode::InternalError, e.to_string())
+                            .with_path(format!("{section_key}.{key}")),
+                    );
+                }
                 Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
                     return error_response(
                         ConfigApiError::new(
