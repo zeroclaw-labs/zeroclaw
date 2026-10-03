@@ -20,7 +20,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::authority::{is_authoritative, is_authoritative_owner};
-use super::task_registry::{TaskRegistry, TaskStatus, TerminalSettlementIntent};
+use super::task_registry::{TaskKind, TaskRegistry, TaskStatus, TerminalSettlementIntent};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -123,36 +123,84 @@ async fn recover_terminal_settlements(store: &dyn TaskRegistry) -> anyhow::Resul
             continue;
         }
 
-        let (resolved_status, output, error) =
-            if let Some(artifact_error) = artifact_validation_error(&intent).await {
-                (
-                    TaskStatus::Failed,
-                    None,
-                    Some(format!(
-                        "terminal settlement recovery failed for task {}: {artifact_error}",
-                        intent.task_id
-                    )),
-                )
-            } else {
-                (
-                    intent.desired_status,
-                    if intent.desired_status == TaskStatus::Completed {
-                        intent.artifact_ref.clone()
-                    } else {
-                        None
-                    },
-                    intent.terminal_error.clone(),
-                )
-            };
-
-        if store
-            .promote_terminal_settlement(&intent, resolved_status, output, error)
-            .await?
-        {
+        if promote_validated_settlement(store, &intent).await? {
             recovered += 1;
         }
     }
     Ok(recovered)
+}
+
+async fn promote_validated_settlement(
+    store: &dyn TaskRegistry,
+    intent: &TerminalSettlementIntent,
+) -> anyhow::Result<bool> {
+    let (status, output, error) =
+        if let Some(artifact_error) = artifact_validation_error(intent).await {
+            (
+                TaskStatus::Failed,
+                None,
+                Some(format!(
+                    "terminal settlement recovery failed for task {}: {artifact_error}",
+                    intent.task_id
+                )),
+            )
+        } else {
+            (
+                intent.desired_status,
+                if intent.desired_status == TaskStatus::Completed {
+                    intent.artifact_ref.clone()
+                } else {
+                    None
+                },
+                intent.terminal_error.clone(),
+            )
+        };
+    store
+        .promote_terminal_settlement(intent, status, output, error)
+        .await
+}
+
+/// Called only after awaiting the exact delegate worker's JoinHandle proves exit.
+/// The parent process may still be live; task ownership and terminal winners
+/// remain guarded by the store's compare-and-set transactions.
+pub(crate) async fn recover_exited_delegate_worker(
+    store: &dyn TaskRegistry,
+    task_id: &str,
+    owner_pid: u32,
+    owner_boot_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(task) = store.get(task_id).await? else {
+        return Ok(false);
+    };
+    if task.kind != TaskKind::Delegate
+        || task.status.is_terminal()
+        || task.owner_pid != owner_pid
+        || task.owner_boot_id != owner_boot_id
+    {
+        return Ok(false);
+    }
+    if let Some(intent) = store
+        .list_terminal_settlement_intents()
+        .await?
+        .into_iter()
+        .find(|intent| {
+            intent.task_id == task_id
+                && intent.owner_pid == owner_pid
+                && intent.owner_boot_id == owner_boot_id
+        })
+    {
+        return promote_validated_settlement(store, &intent).await;
+    }
+    store
+        .transition_terminal_if_owner(
+            task_id,
+            owner_pid,
+            owner_boot_id,
+            TaskStatus::Failed,
+            None,
+            Some("background delegate worker exited before terminal settlement".into()),
+        )
+        .await
 }
 
 /// Age in seconds of an RFC3339 instant, or `None` if it cannot be parsed. We NEVER
