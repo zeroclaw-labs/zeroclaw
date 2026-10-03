@@ -387,6 +387,32 @@ pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
+/// Remove invalidated assistant reasoning at and after a rewritten prefix.
+/// The caller owns model policy and supplies the first changed message index.
+/// Text, tool calls/results and other envelope fields remain intact.
+pub fn strip_reasoning_after_prefix_rewrite(
+    history: &mut [ChatMessage],
+    first_changed: usize,
+) -> usize {
+    let mut stripped = 0;
+    for msg in history.iter_mut().skip(first_changed) {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&msg.content) else {
+            continue;
+        };
+        let Some(object) = envelope.as_object_mut() else {
+            continue;
+        };
+        if object.remove("reasoning_content").is_some() {
+            msg.content = envelope.to_string();
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
 /// Insert the trim breadcrumb after the leading system messages unless the
 /// owner's `crumb_present` record says one is already sitting there. Returns
 /// whether a breadcrumb is present after the call, so the caller can store it

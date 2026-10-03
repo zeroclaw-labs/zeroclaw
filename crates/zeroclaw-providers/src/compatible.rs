@@ -1445,7 +1445,7 @@ impl OpenAiCompatibleModelProvider {
     /// runtime supplied native thinking params.
     ///
     /// Style resolution is shared with the native Anthropic provider via
-    /// `crate::anthropic::anthropic_thinking_style` (same crate, free
+    /// `crate::claude_models::compatible_claude_thinking_shape` (same crate, free
     /// function): budget models get the fixed-budget `enabled` shape,
     /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
     /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
@@ -1557,13 +1557,16 @@ impl OpenAiCompatibleModelProvider {
             return None;
         }
         let params = thinking?;
-        let mut object = match crate::anthropic::anthropic_thinking_style(model) {
-            crate::anthropic::AnthropicThinkingStyle::Adaptive => {
+        // Native effort/display-only params are not the gateway's existing
+        // budget opt-in. Do not synthesize a budget or enable adaptive thinking.
+        let budget_tokens = params.budget_tokens?;
+        let mut object = match crate::claude_models::compatible_claude_thinking_shape(model) {
+            crate::claude_models::ClaudeThinkingShape::Adaptive => {
                 serde_json::json!({"type": "adaptive"})
             }
-            crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
+            crate::claude_models::ClaudeThinkingShape::FixedBudget => serde_json::json!({
                 "type": "enabled",
-                "budget_tokens": params.budget_tokens
+                "budget_tokens": budget_tokens
             }),
         };
         if let Some(display) = params.display {
@@ -6462,6 +6465,115 @@ mod tests {
     // "When using `tool_choice`, `tools` must be set."). The request builders
     // must omit `tool_choice` whenever the converted tool list is empty.
     #[test]
+    fn thinking_passthrough_preserves_gateway_model_eligibility() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        for (model, adaptive) in [
+            ("claude-opus-4-7", true),
+            ("claude-fable-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-group/claude-fable-5", true),
+            ("claude-opus-4-6", false),
+            ("claude-sonnet-4-6", false),
+            ("claude-opus-4-8", false),
+            ("claude-next", false),
+            ("other", false),
+            ("Claude-Fable-5", false),
+        ] {
+            let params = zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: Some(8192),
+                effort: None,
+                display: None,
+            };
+            let wire = serde_json::to_value(p.build_native_tool_chat_request(
+                &messages,
+                None,
+                model,
+                Some(0.3),
+                false,
+                false,
+                Some(params),
+            ))
+            .unwrap();
+            let expected = if adaptive {
+                serde_json::json!({"type":"adaptive"})
+            } else {
+                serde_json::json!({"type":"enabled","budget_tokens":8192})
+            };
+            assert_eq!(wire["thinking"], expected, "{model}");
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_no_budget_preserves_request_shape() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let messages = vec![ChatMessage::user("hello")];
+        for enabled in [false, true] {
+            for extra in [
+                None,
+                Some(serde_json::json!({"thinking":{"type":"disabled"},"top_k":5})),
+            ] {
+                let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                    .display_name("gateway")
+                    .base_url("http://localhost:8000/v1")
+                    .credential(None)
+                    .auth_style(AuthStyle::Bearer);
+                if enabled {
+                    builder = builder.with_thinking_passthrough();
+                }
+                if let Some(extra) = extra.clone() {
+                    builder = builder.extra_body(extra);
+                }
+                let p = builder.build();
+                for model in ["claude-opus-4-7", "claude-sonnet-4-6"] {
+                    let baseline = serde_json::to_value(p.build_native_tool_chat_request(
+                        &messages,
+                        None,
+                        model,
+                        Some(0.3),
+                        false,
+                        false,
+                        None,
+                    ))
+                    .unwrap();
+                    for params in [
+                        NativeThinkingParams {
+                            budget_tokens: None,
+                            effort: Some(ThinkingEffort::High),
+                            display: None,
+                        },
+                        NativeThinkingParams {
+                            budget_tokens: None,
+                            effort: None,
+                            display: Some(ThinkingDisplay::Summarized),
+                        },
+                        NativeThinkingParams::default(),
+                    ] {
+                        let wire = serde_json::to_value(p.build_native_tool_chat_request(
+                            &messages,
+                            None,
+                            model,
+                            Some(0.3),
+                            false,
+                            false,
+                            Some(params),
+                        ))
+                        .unwrap();
+                        assert_eq!(wire, baseline, "{model} enabled={enabled}");
+                        assert_eq!(p.request_extra_body(model, Some(params)), extra);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn thinking_passthrough_flag_off_never_injects_thinking() {
         // Flag off = today's behavior exactly, regardless of runtime params.
         // Byte-identical guarantee, asserted two ways: the request payload
@@ -6469,7 +6581,8 @@ mod tests {
         // absent), and the extra_body seam returns the configured extra_body
         // value unchanged.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -6522,7 +6635,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_injects_enabled_budget_shape() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6584,7 +6698,8 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
         };
 
@@ -6624,7 +6739,8 @@ mod tests {
         // Adaptive-only models reject the fixed-budget shape with HTTP 400;
         // the injected object must switch to the bare adaptive shape.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6654,7 +6770,8 @@ mod tests {
         // A budget model keeps the enabled shape exactly, with no display
         // key when params.display is None.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6686,7 +6803,8 @@ mod tests {
             .build();
 
         let updates = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
         };
         let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
@@ -6710,7 +6828,8 @@ mod tests {
         );
 
         let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
         };
         let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
@@ -6728,7 +6847,8 @@ mod tests {
         // resolve to the adaptive shape (live gateways emit IDs like
         // "claude-group/claude-fable-5").
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6757,7 +6877,8 @@ mod tests {
         // End to end through the non-streaming builder: an adaptive-only
         // gateway model gets the adaptive thinking object at the top level.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6821,7 +6942,8 @@ mod tests {
         // Explicit operator `extra_body` always wins: an extra_body `thinking`
         // key must fully shadow the injected object.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6880,7 +7002,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -6954,7 +7077,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -6999,7 +7123,8 @@ mod tests {
         // caller's values, an `enabled` override raises the limit above
         // its own budget and still forces temperature 1.0.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7144,7 +7269,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -7247,7 +7373,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 4_096,
+            budget_tokens: Some(4_096),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7275,7 +7402,8 @@ mod tests {
         // serde(flatten) boundary — unchanged pre-existing behavior — so
         // this pins the seam, not the wire.)
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7302,7 +7430,8 @@ mod tests {
         // provider's rule). Flag off and params-None keep the caller's
         // value, leaving those bodies byte-identical.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7377,7 +7506,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_forces_temperature_in_raw_tool_builder() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7448,7 +7578,8 @@ mod tests {
         // provider: an adaptive-only gateway model with thinking params also
         // gets temperature 1.0.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7491,7 +7622,8 @@ mod tests {
         // caller's value is kept, nothing is forced. Flag off is the same
         // byte-identical legacy body.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7579,7 +7711,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -7641,7 +7774,8 @@ mod tests {
         // params-None keep the configured limit, leaving those bodies
         // byte-identical.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7723,7 +7857,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_raises_max_tokens_in_raw_tool_builder() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7801,7 +7936,8 @@ mod tests {
         // already above the budget is sent unchanged, and an unset limit
         // resolves to the minimum the budget requires.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7861,7 +7997,8 @@ mod tests {
         // adaptive-style thinking carries no budget, so the configured
         // limit is unconstrained.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7905,7 +8042,8 @@ mod tests {
         // value is kept, nothing is raised. Flag off is the same
         // byte-identical legacy body.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -8000,7 +8138,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8672,7 +8811,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8830,7 +8970,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8932,7 +9073,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("What is the weather in SF?")];
@@ -13571,7 +13713,8 @@ mod tests {
                     messages: &messages,
                     tools: None,
                     thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                        budget_tokens: 2048,
+                        budget_tokens: Some(2048),
+                        effort: None,
                         display: None,
                     }),
                 },

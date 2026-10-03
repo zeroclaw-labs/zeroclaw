@@ -60,6 +60,7 @@ pub(crate) fn record_llm_failure(
 pub(crate) async fn try_recover_context_overflow(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
+    model: &str,
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
@@ -118,6 +119,21 @@ pub(crate) async fn try_recover_context_overflow(
             // uses, owner-aware so a pre-existing crumb does not stack and a
             // genuine user turn equal to the breadcrumb is never mistaken.
             *crumb_present = insert_breadcrumb_deduped(&mut recovered_history, *crumb_present);
+            // Trimming and the breadcrumb rewrite the prefix of every retained
+            // assistant turn. Only known prefix-binding models permit dropping
+            // those now-invalid blocks; adaptive 4.6 reasoning must remain.
+            if zeroclaw_providers::claude_models::claude_invalidates_reasoning_on_prefix_rewrite(
+                model,
+            ) {
+                let first_changed = recovered_history
+                    .iter()
+                    .take_while(|m| m.role == "system")
+                    .count();
+                crate::agent::history_trim::strip_reasoning_after_prefix_rewrite(
+                    &mut recovered_history,
+                    first_changed,
+                );
+            }
             // Recompute from the final recovered history (breadcrumb included)
             // so the reported count matches what the retried call sends.
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
@@ -226,6 +242,198 @@ pub(crate) async fn try_recover_context_overflow(
 
 #[cfg(test)]
 mod tests {
+
+    /// Build an overflowing history whose in-flight round carries reasoning.
+    fn history_with_in_flight_reasoning() -> Vec<ChatMessage> {
+        let big = "x".repeat(4_000);
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": r#"{"thinking":"current","signature":"sig_new"}"#,
+        })
+        .to_string();
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("older ask {big}").as_str()),
+            ChatMessage::assistant(format!("older answer {big}").as_str()),
+            ChatMessage::user(format!("newer ask {big}").as_str()),
+            ChatMessage::assistant(&envelope),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"tool result"}"#),
+        ]
+    }
+
+    fn in_flight_carries_reasoning(history: &[ChatMessage]) -> bool {
+        history.iter().any(|msg| msg.content.contains("sig_new"))
+    }
+
+    #[tokio::test]
+    async fn recovery_drops_in_flight_reasoning_when_the_model_binds_it() {
+        let mut history = history_with_in_flight_reasoning();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut None,
+            &mut history,
+            "claude-fable-5-1",
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            limits(100),
+            None,
+            "test",
+            &mut false,
+        )
+        .await;
+
+        assert!(recovered, "an oversized history must trim");
+        assert!(
+            !in_flight_carries_reasoning(&history),
+            "the trim rewrote the prefix the reasoning was signed over"
+        );
+        assert!(
+            history.iter().any(|msg| msg.content.contains("call_1")),
+            "the tool call itself must survive the strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_required_reasoning_and_tool_exchange() {
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "us.anthropic.claude-sonnet-4-6-v1",
+            "claude-mythos-5-1",
+            "claude-next",
+            "claude-fable-6",
+        ] {
+            let mut history = history_with_in_flight_reasoning();
+            let retained = history[3..]
+                .iter()
+                .map(|m| (&m.role, &m.content))
+                .map(|(r, c)| (r.clone(), c.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                try_recover_context_overflow(
+                    &mut None,
+                    &mut history,
+                    model,
+                    &anyhow::Error::msg("maximum context length exceeded"),
+                    1,
+                    None,
+                    None,
+                    &NoopObserver,
+                    limits(100),
+                    None,
+                    "test",
+                    &mut false
+                )
+                .await
+            );
+            let actual = history
+                .iter()
+                .skip(history.len() - retained.len())
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, retained,
+                "required signed exchange changed for {model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_rewrite_invalidates_every_retained_signed_turn() {
+        let envelope = |signature| {
+            serde_json::json!({
+            "content":"answer", "tool_calls":[], "extra":{"keep":true},
+            "reasoning_content":serde_json::json!({"thinking":"", "signature":signature}).to_string(),
+        }).to_string()
+        };
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(20000)),
+            ChatMessage::assistant("old"),
+            ChatMessage::user("retained prior"),
+            ChatMessage::assistant(envelope("prior-signature")),
+            ChatMessage::user("in flight"),
+            ChatMessage::assistant(envelope("current-signature")),
+        ];
+        assert!(
+            try_recover_context_overflow(
+                &mut None,
+                &mut history,
+                "claude-fable-5-1",
+                &anyhow::Error::msg("maximum context length exceeded"),
+                1,
+                None,
+                None,
+                &NoopObserver,
+                limits(100),
+                None,
+                "test",
+                &mut false
+            )
+            .await
+        );
+        let retained = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained.len(),
+            2,
+            "both signed turns must remain after trim"
+        );
+        for message in retained {
+            let value: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+            assert!(value.get("reasoning_content").is_none());
+            assert_eq!(value["content"], "answer");
+            assert_eq!(value["tool_calls"], serde_json::json!([]));
+            assert_eq!(value["extra"], serde_json::json!({"keep":true}));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_prefix_rewrite_preserves_signed_reasoning() {
+        for error in ["maximum context length exceeded", "ordinary provider error"] {
+            let mut history = history_with_in_flight_reasoning();
+            history.drain(1..3);
+            let before = history
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                !try_recover_context_overflow(
+                    &mut None,
+                    &mut history,
+                    "claude-fable-5-1",
+                    &anyhow::Error::msg(error.to_string()),
+                    1,
+                    None,
+                    None,
+                    &NoopObserver,
+                    limits(32000),
+                    None,
+                    "test",
+                    &mut false
+                )
+                .await
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect::<Vec<_>>(),
+                before
+            );
+        }
+    }
+
     use super::*;
     use crate::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
@@ -262,6 +470,7 @@ mod tests {
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
+                "claude-sonnet-4-5",
                 &error,
                 0,
                 Some(&tx),
@@ -316,6 +525,7 @@ mod tests {
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
+                "claude-sonnet-4-5",
                 &error,
                 1,
                 Some(&tx),
@@ -339,36 +549,6 @@ mod tests {
         assert!(injected.is_none());
         assert!(second.retained_messages.iter().any(|message| matches!(message,
             zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content == genuine)));
-    }
-
-    // Keep the existing recovery tests focused on sizing; the test below
-    // calls the production seam with an explicit turn identity.
-    #[allow(clippy::too_many_arguments)]
-    async fn try_recover_context_overflow(
-        injected_memory_preamble: &mut Option<super::super::MemoryPreamble>,
-        history: &mut Vec<ChatMessage>,
-        error: &anyhow::Error,
-        iteration: usize,
-        event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
-        on_delta: Option<&tokio::sync::mpsc::Sender<super::super::events::DraftEvent>>,
-        observer: &dyn Observer,
-        context_limits: zeroclaw_config::schema::ResolvedContextLimits,
-        crumb_present: &mut bool,
-    ) -> bool {
-        super::try_recover_context_overflow(
-            injected_memory_preamble,
-            history,
-            error,
-            iteration,
-            event_tx,
-            on_delta,
-            observer,
-            context_limits,
-            None,
-            "test",
-            crumb_present,
-        )
-        .await
     }
 
     #[derive(Default)]
@@ -409,6 +589,7 @@ mod tests {
         let recovered = super::try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &anyhow::Error::msg("maximum context length exceeded"),
             1,
             None,
@@ -453,12 +634,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
             Some(&delta_tx),
             &observer,
             limits(32_000),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -487,12 +671,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
             Some(&delta_tx),
             &observer,
             limits(32_000),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -524,12 +711,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
             Some(&delta_tx),
             &observer,
             limits(32_000),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -559,12 +749,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             Some(&tx),
             None,
             &observer,
             limits(32_000),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -646,12 +839,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             Some(&tx),
             None,
             &observer,
             limits(configured_budget),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -694,12 +890,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             Some(&tx),
             None,
             &observer,
             limits(0),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -736,12 +935,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             Some(&tx),
             None,
             &observer,
             limits(100),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -773,12 +975,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             Some(&tx),
             None,
             &observer,
             limits(32_000),
+            None,
+            "test",
             &mut false,
         )
         .await;
@@ -815,12 +1020,15 @@ mod tests {
         let recovered = try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
             None,
             &observer,
             limits(budget),
+            None,
+            "test",
             &mut false,
         )
         .await;
