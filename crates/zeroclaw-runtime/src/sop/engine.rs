@@ -1983,6 +1983,20 @@ impl SopEngine {
         self.activate_reserved_run(reservation, event, initiator)
     }
 
+    /// Scope a synchronous RPC effect to a view of the canonical store that
+    /// cannot wait behind a connection/writer lock while authority is held.
+    /// Restore the ordinary store on success and on every returned error.
+    pub(crate) fn with_nonblocking_store<T>(
+        &mut self,
+        effect: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let view = self.store.nonblocking()?;
+        let ordinary = std::mem::replace(&mut self.store, view);
+        let result = effect(self);
+        self.store = ordinary;
+        result
+    }
+
     /// Start a headless-triggered run with a dispatch-decided execution mode.
     /// Dispatch has no initiating agent turn, so the initiator is `None`, as it
     /// is for every headless trigger in [`Self::start_run`].

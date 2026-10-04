@@ -305,6 +305,16 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
 
+    /// The principal scope every operation through this handle is routed to,
+    /// when it is a principal-plane view (the memory of a session pinned to
+    /// its owner). `None` for a shared-plane handle.
+    ///
+    /// Code that builds new tools or a new run over a handle it was given
+    /// reads this to keep that work on the same owner's plane.
+    fn principal_scope(&self) -> Option<PrincipalScope> {
+        None
+    }
+
     /// Store a memory entry, optionally scoped to a session
     async fn store(
         &self,

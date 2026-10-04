@@ -33,10 +33,10 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires every agent it runs as, with the
-     same tool-selector rule as a session, and creating, saving, or deleting
-     one requires the agents it runs as. A step that names no agent, on the
-     step or on the procedure, counts as the first configured agent alias in
+   - running or approving an SOP requires unrestricted tool and agent
+     selectors plus `tools:execute`, or administrator grants. Creating,
+     saving, or deleting one requires the agents it runs as. A step that names
+     no agent, on the step or on the procedure, counts as the first configured agent alias in
      sort order, which is the agent the headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
@@ -378,11 +378,21 @@ implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
 remain callable without the helper.
 
 If either the principal's tool selector or agent selector is constrained,
-`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
-are unavailable, including skill aliases wrapping those tools. These nested
+`delegate` (bounded and independent), `spawn_subagent`, `execute_pipeline`,
+`sop_execute`, `sop_approve`, and `sop_advance` are unavailable, including skill
+aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
 turn remains usable. Admin principals and principals with both selectors set
 to `"*"` keep their agent's configured nested capabilities.
+
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -395,6 +405,16 @@ holding cron grants can create a shell job for its agent, or give an
 existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat
 cron and SOP authoring grants as grants of the agent's tools.
+
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
+`list_results`, `cancel_task`, and `await_sessions` actions are refused,
+including calls through skill aliases and nested delegates. Those task rows
+and result files currently use agent-alias visibility, which cannot protect
+one principal's private output from another principal using the same agent.
+This refusal includes administrator-owned sessions; their private memory is
+still private. Shared operator delegation remains available. Existing shared
+result artifacts are not migrated or removed by this restriction.
 
 ## Breaking change: remote WSS requires authentication
 
