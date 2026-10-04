@@ -11,6 +11,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 pub struct SopStatusTool {
     engine: Arc<Mutex<SopEngine>>,
     collector: Option<Arc<SopMetricsCollector>>,
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SopStatusTool {
@@ -18,7 +19,16 @@ impl SopStatusTool {
         Self {
             engine,
             collector: None,
+            session_memory: None,
         }
+    }
+
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
     }
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
@@ -82,6 +92,12 @@ impl Tool for SopStatusTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|routed| routed.memory.principal_scope());
+
         let engine = self.engine.lock().map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -96,7 +112,10 @@ impl Tool for SopStatusTool {
 
         // Query specific run
         if let Some(run_id) = run_id {
-            return match engine.get_run(run_id) {
+            return match engine
+                .get_run(run_id)
+                .filter(|run| run.is_accessible_from(owner.as_ref()))
+            {
                 Some(run) => {
                     let mut output = format!(
                         "Run: {}\nSOP: {}\nStatus: {}\nStep: {} of {}\nStarted: {}\n",
@@ -149,6 +168,7 @@ impl Tool for SopStatusTool {
         let active: Vec<_> = engine
             .active_runs()
             .values()
+            .filter(|run| run.is_accessible_from(owner.as_ref()))
             .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
             .collect();
 
@@ -167,7 +187,11 @@ impl Tool for SopStatusTool {
         }
 
         // Finished runs
-        let finished = engine.finished_runs(sop_name);
+        let finished: Vec<_> = engine
+            .finished_runs(sop_name)
+            .into_iter()
+            .filter(|run| run.is_accessible_from(owner.as_ref()))
+            .collect();
         if !finished.is_empty() {
             let _ = writeln!(output, "\nFinished runs ({}):", finished.len());
             for run in finished.iter().rev().take(10) {
@@ -183,7 +207,8 @@ impl Tool for SopStatusTool {
         }
 
         // Metrics summary (when requested and collector is available)
-        if include_metrics {
+        // The collector aggregates every owner; it cannot answer a private query.
+        if include_metrics && owner.is_none() {
             if let Some(ref collector) = self.collector {
                 let prefix = sop_name.map_or("sop".to_string(), |n| format!("sop.{n}"));
                 let _ = writeln!(output, "\nMetrics ({prefix}):");
@@ -415,6 +440,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "s1".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
@@ -460,6 +486,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "s1".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,

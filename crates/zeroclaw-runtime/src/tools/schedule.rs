@@ -53,6 +53,11 @@ impl ScheduleTool {
 
 #[async_trait]
 impl Tool for ScheduleTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "schedule"
     }

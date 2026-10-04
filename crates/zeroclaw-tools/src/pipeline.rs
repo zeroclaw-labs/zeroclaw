@@ -6,6 +6,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
+use crate::session_memory::SessionMemoryRoute;
 use crate::tool_search::ToolAccessPolicy;
 
 /// Errors specific to pipeline execution.
@@ -71,6 +72,10 @@ pub struct PipelineTool {
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
     access_policy: Option<ToolAccessPolicy>,
+    /// The session memory of the registry this pipeline was assembled into.
+    /// Once that session is pinned, memory steps run over its routed handle
+    /// instead of the ones captured in `tools`.
+    session_memory: Option<Arc<SessionMemoryRoute>>,
 }
 
 impl PipelineTool {
@@ -91,7 +96,16 @@ impl PipelineTool {
             tools,
             allowed_set,
             access_policy,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this pipeline is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(mut self, route: Arc<SessionMemoryRoute>) -> Self {
+        self.session_memory = Some(route);
+        self
     }
 
     /// Find a tool by name in the registry.
@@ -100,6 +114,20 @@ impl PipelineTool {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// The tool a step named `name` runs. A memory tool of a pinned session
+    /// runs over the session's routed memory; the one captured when the
+    /// pipeline was built still points at the plane it was built over.
+    fn step_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        let captured = self.tools.iter().find(|t| t.name() == name)?;
+        if let Some(routed) = self.session_memory.as_ref().and_then(|r| r.routed())
+            && let Some(tool) =
+                crate::session_memory::memory_tool_over(name, &routed.memory, &routed.security)
+        {
+            return Some(tool);
+        }
+        Some(Arc::clone(captured))
     }
 
     fn policy_allows_exact_name(&self, name: &str) -> bool {
@@ -149,7 +177,7 @@ impl PipelineTool {
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
-                .find_tool(&step.tool)
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
             // Interpolate previous step results into args.
@@ -195,23 +223,18 @@ impl PipelineTool {
         let mut join_set = JoinSet::new();
 
         for (i, step) in steps.iter().enumerate() {
-            let tool = self
-                .find_tool(&step.tool)
+            let tool_arc = self
+                .step_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
             let args = step.args.clone();
 
-            // We need a reference that lives long enough — use Arc.
-            let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
-
-            if let Some(tool_arc) = tool_arc {
-                join_set.spawn(async move {
-                    let result = tool_arc.execute(args).await;
-                    (i, tool_name, result)
-                });
-            }
+            join_set.spawn(async move {
+                let result = tool_arc.execute(args).await;
+                (i, tool_name, result)
+            });
         }
 
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
@@ -864,6 +887,89 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    /// A pipeline allowed to run `memory_store`, captured over `shared` the
+    /// way assembly builds it, sharing `route` with its registry.
+    fn memory_pipeline(
+        shared: &Arc<dyn zeroclaw_memory::Memory>,
+        route: Arc<SessionMemoryRoute>,
+    ) -> PipelineTool {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["memory_store".to_string()],
+        };
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::memory_store::MemoryStoreTool::new(
+            Arc::clone(shared),
+            security,
+        ))];
+        PipelineTool::new(config, tools).with_session_memory(route)
+    }
+
+    fn store_step(key: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({"tool": "memory_store", "args": {"key": key, "content": content}})
+    }
+
+    /// Once the session is pinned, a memory step run by
+    /// the pipeline lands on the owner's private plane, sequentially and in
+    /// parallel, never on the shared plane its captured tool was built over.
+    #[tokio::test]
+    async fn memory_steps_of_a_pinned_session_land_on_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let route = Arc::new(SessionMemoryRoute::default());
+        let alice = PrincipalScope::new("user:alice");
+        let routed: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+            zeroclaw_memory::PrincipalPlaneMemory::new(Arc::clone(&shared), alice.clone()),
+        );
+        route
+            .pin(
+                routed,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .unwrap();
+        let pipeline = memory_pipeline(&shared, route);
+
+        for (parallel, key) in [(false, "seq"), (true, "par")] {
+            let result = pipeline
+                .execute(serde_json::json!({"steps": [store_step(key, "P-MARKER")], "parallel": parallel}))
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert!(
+                shared.get(key).await.unwrap().is_none(),
+                "a pinned session's pipeline step must not write the shared plane ({key})"
+            );
+            let owned = shared
+                .get_for_principal(&alice, key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("the owner's plane holds the {key} step's row"));
+            assert_eq!(owned.content, "P-MARKER");
+        }
+    }
+
+    /// An unowned session never pins the route, and its pipeline keeps the
+    /// shared memory it was built over.
+    #[tokio::test]
+    async fn memory_steps_of_an_unpinned_session_keep_the_shared_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let pipeline = memory_pipeline(&shared, Arc::new(SessionMemoryRoute::default()));
+        let result = pipeline
+            .execute(serde_json::json!({"steps": [store_step("k", "shared-row")]}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            shared.get("k").await.unwrap().unwrap().content,
+            "shared-row"
+        );
     }
 
     fn echo_pipeline() -> PipelineTool {
