@@ -1294,9 +1294,41 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// How much of the model's reasoning comes back inside thinking blocks.
+/// Applies to the Claude generations that think adaptively; older ones ignore
+/// it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingDisplay {
+    /// Blocks arrive signed but with their text withheld, which is the API's
+    /// own default.
+    #[default]
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer models only.
+    Updates,
+}
+
+impl AnthropicThinkingDisplay {
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Summarized => Some("summarized"),
+            Self::Updates => Some("updates"),
+        }
+    }
+}
+
+/// Anthropic model model_provider config. Carries the Anthropic-only reasoning
+/// visibility knob; the typed slot stays the landing place for future
+/// Anthropic-only extras (cache_control, beta headers).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1304,6 +1336,15 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// How much of the model's reasoning is returned: `summarized` for a
+    /// readable summary, `updates` for the short progress notes written
+    /// between tool calls, `omitted` for the API default, which withholds
+    /// the text. When set, this entry-level value overrides the profile-level
+    /// `agent.thinking.display` for requests through this entry; leave it
+    /// unset to inherit that setting. Signed reasoning follows the selected
+    /// model's history policy; this only controls what a person can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
     /// Models Anthropic may fall back to **server-side, inside one API call**
     /// when the requested model's safety classifiers decline a request
     /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
@@ -48634,6 +48675,50 @@ group_policy = "all"
     }
 
     #[test]
+    async fn anthropic_thinking_display_round_trips_through_toml() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+thinking_display = "summarized"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config
+            .providers
+            .models
+            .anthropic
+            .get("fable")
+            .expect("alias should exist");
+        assert_eq!(
+            entry.thinking_display,
+            Some(AnthropicThinkingDisplay::Summarized)
+        );
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(rendered.contains("thinking_display = \"summarized\""));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_is_absent_when_unset() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config.providers.models.anthropic.get("fable").unwrap();
+        assert_eq!(entry.thinking_display, None);
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(!rendered.contains("thinking_display"));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_rejects_an_unknown_value() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+thinking_display = "verbose"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
     async fn config_validate_accepts_empty_classifier_provider_as_inheritance_signal() {
         // No classifier_provider field at all → must validate, must remain
         // the empty default. This pins backward compatibility.
@@ -48878,6 +48963,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-fable-5".to_string()],
+                ..Default::default()
             },
         );
 
@@ -48898,6 +48984,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-opus-4-8".to_string()],
+                ..Default::default()
             },
         );
 

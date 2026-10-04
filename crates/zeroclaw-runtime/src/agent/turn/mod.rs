@@ -2084,6 +2084,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let recovered = try_recover_context_overflow(
                     injected_memory_preamble,
                     turn_state.history,
+                    provider_request_model,
                     &e,
                     iteration,
                     event_tx.as_ref(),
