@@ -350,6 +350,11 @@ impl HeldPairedTokens<'_> {
     pub fn contains_hash(&self, token_hash: &str) -> bool {
         self.0.contains(token_hash)
     }
+
+    /// Whether the bearer `token` itself is paired, as of this hold.
+    pub fn contains_token(&self, token: &str) -> bool {
+        self.contains_hash(&hash_token(token))
+    }
 }
 
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes

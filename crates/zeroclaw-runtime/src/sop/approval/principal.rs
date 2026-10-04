@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The transport a gate resolution arrived on. The agent tool, the loopback CLI,
-/// the gateway WebSocket frame, the gateway HTTP route, or the daemon timeout tick.
+/// the gateway WebSocket frame, the gateway HTTP route, the daemon timeout tick,
+/// a chat channel, or an authenticated principal on the daemon RPC surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalSource {
@@ -21,6 +22,11 @@ pub enum ApprovalSource {
     /// `<choice> <reference>` text reply), attributed to the channel user who
     /// answered. Constructed only by the orchestrator's channel-gate intercept.
     Channel,
+    /// A principal the daemon RPC surface authenticated (a roster user, an
+    /// OIDC subject, or another provider's canonical principal), identified by
+    /// its canonical principal id. Constructed only from the connection's
+    /// bound authentication, never from a request body.
+    Principal,
 }
 
 /// WHO resolved a gate and from WHERE. Recorded into the append-only ledger.
@@ -79,6 +85,45 @@ impl ApprovalPrincipal {
             source: ApprovalSource::Channel,
             identity: user,
             channel: Some(channel_key),
+        }
+    }
+
+    /// A decision made on the daemon RPC surface by a connection that
+    /// authenticated with a native pairing bearer. `subject` is the SHA-256 of
+    /// that bearer, the same subject the gateway HTTP and WebSocket surfaces
+    /// derive from the same token, so it matches the same `http:<subject>`
+    /// memberships and counts as the same quorum voter whichever surface
+    /// carries it. The back-channel records that the decision came over RPC.
+    pub fn rpc_paired(subject: String) -> Self {
+        Self {
+            source: ApprovalSource::Http,
+            identity: Some(subject),
+            channel: Some("rpc".to_string()),
+        }
+    }
+
+    /// A decision made on the daemon RPC surface by an authenticated principal
+    /// that did not present a pairing bearer. The identity is its canonical
+    /// principal id (e.g. `user:alice`), so memberships name it as
+    /// `principal:<id>` or bare.
+    pub fn rpc_principal(principal_id: String) -> Self {
+        Self {
+            source: ApprovalSource::Principal,
+            identity: Some(principal_id),
+            channel: Some("rpc".to_string()),
+        }
+    }
+
+    /// A decision made on the daemon RPC surface by the unauthenticated shared
+    /// operator (local compatibility mode). Anonymous like the loopback CLI:
+    /// it satisfies no group membership, so a policy with a required group
+    /// fails closed. Any client-claimed connection label is deliberately not
+    /// used as an identity.
+    pub fn rpc_local_operator() -> Self {
+        Self {
+            source: ApprovalSource::Cli,
+            identity: None,
+            channel: Some("rpc".to_string()),
         }
     }
 
@@ -155,6 +200,7 @@ impl ApprovalPrincipal {
             ApprovalSource::Http => "http",
             ApprovalSource::System => "system",
             ApprovalSource::Channel => "channel",
+            ApprovalSource::Principal => "principal",
         }
     }
 }
@@ -230,6 +276,31 @@ mod tests {
             ApprovalPrincipal::channel("slack.ops".into(), Some("123".into())).voter_key(),
             "same-looking sender ids on different channels must be distinct voters"
         );
+    }
+
+    #[test]
+    fn rpc_paired_subject_is_the_same_voter_as_the_gateway() {
+        let rpc = ApprovalPrincipal::rpc_paired("sub".into());
+        assert_eq!(
+            rpc.voter_key(),
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            "one paired credential is one voter over HTTP, WS and RPC"
+        );
+        assert_eq!(rpc.channel.as_deref(), Some("rpc"));
+    }
+
+    #[test]
+    fn rpc_principals_are_keyed_by_their_canonical_id() {
+        let alice = ApprovalPrincipal::rpc_principal("user:alice".into());
+        assert_eq!(alice.source, ApprovalSource::Principal);
+        assert_eq!(alice.voter_key(), "principal:user:alice");
+        assert_ne!(
+            alice.voter_key(),
+            ApprovalPrincipal::rpc_principal("user:bob".into()).voter_key()
+        );
+        let operator = ApprovalPrincipal::rpc_local_operator();
+        assert_eq!(operator.identity, None);
+        assert_eq!(operator.voter_key(), "cli");
     }
 
     #[test]

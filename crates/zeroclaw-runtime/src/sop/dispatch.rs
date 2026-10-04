@@ -652,7 +652,78 @@ pub async fn dispatch_sop_event_to_deduplicated(
     .await
 }
 
+/// Something an [`SopRunAdmission`] holds until the run it admitted is
+/// committed, such as a lease that keeps the caller's authority from changing
+/// meanwhile.
+pub trait HeldPermit {}
+
+impl<T: ?Sized> HeldPermit for T {}
+
+/// A caller's right to start, or coalesce onto, a run of a procedure, checked
+/// where the run is committed.
+///
+/// Dispatch calls [`Self::admit`] under the engine lock that publishes the
+/// run, after every wait (the decision model's among them), with the
+/// procedure the engine holds at that moment. So a caller whose authority
+/// lapsed while it waited, or a procedure reloaded meanwhile into one the
+/// caller may not run, is refused there rather than started.
+///
+/// No run is started or coalesced onto without an admission: a procedure
+/// deleted during the waits is not admitted and answers
+/// [`DispatchResult::NoMatch`], even when an earlier run of it is still
+/// active under the same dedup key. Each procedure name is admitted once per
+/// dispatch.
+pub trait SopRunAdmission: Sync {
+    /// `Some(permit)` admits the run; the permit stays held until the run is
+    /// committed. `None` refuses it: dispatch starts nothing and returns no
+    /// results, and the caller keeps its own record of why.
+    fn admit<'a>(&'a self, sop: &super::Sop) -> Option<Box<dyn HeldPermit + 'a>>;
+}
+
+/// [`dispatch_sop_event_to`] or, with `dedup_key`,
+/// [`dispatch_sop_event_to_deduplicated`], with `admission` checked at the
+/// run's commit. A refused admission returns no results.
+pub async fn dispatch_sop_event_to_admitted(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+    dedup_key: Option<&str>,
+    admission: &dyn SopRunAdmission,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_guarded(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        None,
+        dedup_key,
+        Some(admission),
+    )
+    .await
+}
+
 async fn dispatch_sop_event_filtered(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: Option<&str>,
+    delivery_dedup: Option<(&str, bool)>,
+    active_dedup: Option<&str>,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_guarded(
+        engine,
+        audit,
+        event,
+        target_sop,
+        delivery_dedup,
+        active_dedup,
+        None,
+    )
+    .await
+}
+
+async fn dispatch_sop_event_guarded(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
     event: SopEvent,
@@ -668,6 +739,8 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
+    // The caller's admission, checked where the run is committed.
+    admission: Option<&dyn SopRunAdmission>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -771,7 +844,7 @@ async fn dispatch_sop_event_filtered(
     // lock held; a declined SOP is reported as Skipped and never reserves a slot.
     let mut results = Vec::new();
     let mut decided: HashMap<String, RunDecision> = HashMap::new();
-    let matched_names =
+    let mut matched_names =
         apply_decisions(engine, &event, matched_names, &mut decided, &mut results).await;
     if matched_names.is_empty() {
         return results;
@@ -795,6 +868,44 @@ async fn dispatch_sop_event_filtered(
                 return vec![];
             }
         };
+
+        // The caller's admission, checked here rather than before the waits
+        // above: against the procedure this lock holds now, for a run about
+        // to start or be coalesced onto. A refusal starts nothing. The
+        // permits stay held to the end of this block, after the runs below
+        // are committed, so what they guard cannot change in between.
+        //
+        // Every name that goes on to start or coalesce passes through here
+        // first. A procedure deleted during the waits has no definition to
+        // admit against; its retained dedup entry must not stand in for one,
+        // so it is dropped before the coalescing pre-pass below and answers
+        // `NoMatch`. A name is admitted once: the engine resolves a run by
+        // name, so a second manifest with the same name adds no run, and a
+        // second admission on this thread could take another authority lease
+        // while the first is held, which a queued policy writer would turn
+        // into a deadlock.
+        let mut permits = Vec::new();
+        if let Some(admission) = admission {
+            let mut admitted: Vec<String> = Vec::with_capacity(matched_names.len());
+            for sop_name in matched_names {
+                if admitted.contains(&sop_name) {
+                    continue;
+                }
+                let Some(sop) = eng.get_sop(&sop_name) else {
+                    continue;
+                };
+                match admission.admit(sop) {
+                    Some(permit) => permits.push(permit),
+                    None => return Vec::new(),
+                }
+                admitted.push(sop_name);
+            }
+            if admitted.is_empty() {
+                results.push(DispatchResult::NoMatch);
+                return results;
+            }
+            matched_names = admitted;
+        }
 
         // Keep producer/delivery idempotency orthogonal to admission. This pre-pass
         // removes SOPs already active for a shared producer key, or already known to

@@ -5,6 +5,12 @@
 //! projection, wire edits, trigger registry). All routes require gateway
 //! auth. Draft endpoints (`wire-draft`, `graph-draft`) are pure: they
 //! transform the submitted SOP and never touch disk.
+//!
+//! A request bound to a credential is served by the core: each route's
+//! `*_through_core` function is that path, shared with the separate
+//! gateway. The route's own body serves only the requests that stay
+//! in-process (pairing off, or no core attached). `decision-models`,
+//! `graph-legend` and `cancel` have no core method yet and stay in-process.
 
 use std::net::SocketAddr;
 
@@ -14,9 +20,18 @@ use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use serde_json::json;
+use zeroclaw_rpc_client::Method;
+
 use super::AppState;
 use super::api::require_auth;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 use zeroclaw_runtime::sop::SopGraphExt;
+
+/// A core answer, or the refusal it carries, as this route's response.
+fn answered(result: Result<Response, CoreError>) -> Response {
+    result.unwrap_or_else(IntoResponse::into_response)
+}
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RunsQuery {
@@ -41,7 +56,14 @@ fn sop_tool_specs(state: &AppState) -> zeroclaw_runtime::sop::ToolSpecs {
     zeroclaw_runtime::sop::tool_specs_from_config(&config, &agent)
 }
 
-pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn handle_sops_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    access: CoreAccess,
+) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sops_list_through_core(&core).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -50,10 +72,21 @@ pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap)
     Json(serde_json::json!({ "sops": sops })).into_response()
 }
 
+/// `GET /api/sops` through the core, which lists the procedures as a bare
+/// array; this route has always wrapped them.
+pub(crate) async fn sops_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let sops = core.request(Method::SopsList, json!({})).await?;
+    Ok(Json(json!({ "sops": sops })).into_response())
+}
+
 pub async fn handle_sop_trigger_sources(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_trigger_sources_through_core(&core).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -62,6 +95,14 @@ pub async fn handle_sop_trigger_sources(
         zeroclaw_runtime::sop::registry_from_config(&config)
     };
     Json(registry).into_response()
+}
+
+/// `GET /api/sops/trigger-sources` through the core.
+pub(crate) async fn sop_trigger_sources_through_core(
+    core: &CoreCall,
+) -> Result<Response, CoreError> {
+    let registry = core.request(Method::SopsTriggerSources, json!({})).await?;
+    Ok(Json(registry).into_response())
 }
 
 /// `GET /api/sops/decision-models`: the `[decision_models]` aliases an SOP's
@@ -109,8 +150,12 @@ pub struct ParamOptionsBody {
 pub async fn handle_tools_param_options(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(body): Json<ParamOptionsBody>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(tools_param_options_through_core(&core, body).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -151,11 +196,29 @@ pub async fn handle_tools_param_options(
     Json(serde_json::json!({ "options": entries })).into_response()
 }
 
+/// `POST /api/tools/param-options` through the core.
+pub(crate) async fn tools_param_options_through_core(
+    core: &CoreCall,
+    body: ParamOptionsBody,
+) -> Result<Response, CoreError> {
+    let options = core
+        .request(
+            Method::ToolsParamOptions,
+            json!({ "domain": body.domain, "agent": body.agent, "args": body.args }),
+        )
+        .await?;
+    Ok(Json(options).into_response())
+}
+
 pub async fn handle_sop_graph(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_graph_through_core(&core, name).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -172,6 +235,17 @@ pub async fn handle_sop_graph(
         )
             .into_response(),
     }
+}
+
+/// `GET /api/sops/{name}/graph` through the core.
+pub(crate) async fn sop_graph_through_core(
+    core: &CoreCall,
+    name: String,
+) -> Result<Response, CoreError> {
+    let graph = core
+        .request(Method::SopsGraph, json!({ "name": name }))
+        .await?;
+    Ok(Json(graph).into_response())
 }
 
 /// Body for `POST /api/sops/{name}/run`: fire a Manual trigger. `payload` is
@@ -198,8 +272,12 @@ pub async fn handle_sop_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    access: CoreAccess,
     Json(body): Json<SopRunBody>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_run_through_core(&core, name, body).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -287,14 +365,23 @@ pub async fn handle_sop_run(
         timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
     };
 
-    let results = if let Some(dedup_key) = dedup_key {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_deduplicated(
-            engine, audit, event, &name, dedup_key,
-        )
-        .await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await
+    // The checks above refuse early. The run itself is admitted where it is
+    // committed, after the decision model's wait, against the caller's
+    // bearer and the procedure as they are then.
+    let admission = InProcessRunAdmission {
+        state: &state,
+        token: super::api::extract_bearer_token(&headers)
+            .unwrap_or("")
+            .to_string(),
+        refusal: parking_lot::Mutex::new(None),
     };
+    let results = zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_admitted(
+        engine, audit, event, &name, dedup_key, &admission,
+    )
+    .await;
+    if let Some(refusal) = admission.refusal.into_inner() {
+        return refusal;
+    }
     zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
 
     for result in &results {
@@ -387,11 +474,72 @@ pub async fn handle_sop_run(
         .into_response()
 }
 
+/// The in-process run route's admission, checked by the SOP dispatcher where
+/// the run is committed: the bearer is still paired, with the paired-token
+/// set held until the run is committed so an unpairing waits for it, and the
+/// procedure the engine holds now can run headless. A refusal is kept here
+/// for the route to answer.
+struct InProcessRunAdmission<'s> {
+    state: &'s AppState,
+    token: String,
+    refusal: parking_lot::Mutex<Option<Response>>,
+}
+
+impl zeroclaw_runtime::sop::dispatch::SopRunAdmission for InProcessRunAdmission<'_> {
+    fn admit<'a>(
+        &'a self,
+        sop: &zeroclaw_runtime::sop::Sop,
+    ) -> Option<Box<dyn zeroclaw_runtime::sop::dispatch::HeldPermit + 'a>> {
+        let held = if self.state.pairing.require_pairing() {
+            let held = self.state.pairing.hold_paired_tokens();
+            if self.token.is_empty() || !held.contains_token(&self.token) {
+                *self.refusal.lock() = Some(super::api::pairing_required().into_response());
+                return None;
+            }
+            Some(held)
+        } else {
+            None
+        };
+        if let Some(refusal) = zeroclaw_runtime::sop::headless_ownership_refusal(sop) {
+            *self.refusal.lock() = Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": refusal })),
+                )
+                    .into_response(),
+            );
+            return None;
+        }
+        Some(Box::new(held))
+    }
+}
+
+/// `POST /api/sops/{name}/run` through the core, which applies the same
+/// checks before it dispatches, the headless-ownership refusal among them,
+/// and drives the run it starts.
+pub(crate) async fn sop_run_through_core(
+    core: &CoreCall,
+    name: String,
+    body: SopRunBody,
+) -> Result<Response, CoreError> {
+    let started = core
+        .request(
+            Method::SopsRun,
+            json!({ "name": name, "payload": body.payload, "dedup_key": body.dedup_key }),
+        )
+        .await?;
+    Ok(Json(started).into_response())
+}
+
 pub async fn handle_sop_runs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RunsQuery>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_runs_through_core(&core, query).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -412,11 +560,26 @@ pub async fn handle_sop_runs(
     }
 }
 
+/// `GET /api/sops/runs` through the core.
+pub(crate) async fn sop_runs_through_core(
+    core: &CoreCall,
+    query: RunsQuery,
+) -> Result<Response, CoreError> {
+    let runs = core
+        .request(Method::SopsRuns, json!({ "sop": query.sop }))
+        .await?;
+    Ok(Json(runs).into_response())
+}
+
 pub async fn handle_sop_run_overlay(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((name, run_id)): Path<(String, String)>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_run_overlay_through_core(&core, name, run_id).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -452,6 +615,21 @@ pub async fn handle_sop_run_overlay(
     }
 }
 
+/// `GET /api/sops/{name}/runs/{run_id}/overlay` through the core.
+pub(crate) async fn sop_run_overlay_through_core(
+    core: &CoreCall,
+    name: String,
+    run_id: String,
+) -> Result<Response, CoreError> {
+    let overlay = core
+        .request(
+            Method::SopsRunOverlay,
+            json!({ "name": name, "run_id": run_id }),
+        )
+        .await?;
+    Ok(Json(overlay).into_response())
+}
+
 /// Resolve a gated live run. Body carries the raw `ApprovalDecision` wire
 /// value. Waiting approvals and deterministic checkpoints both resolve through
 /// the broker-backed chokepoint with an HTTP principal, so named approval
@@ -461,8 +639,12 @@ pub async fn handle_sop_decide(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((name, run_id)): Path<(String, String)>,
+    access: CoreAccess,
     Json(decision_value): Json<serde_json::Value>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_decide_through_core(&core, name, run_id, decision_value).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -712,6 +894,35 @@ pub async fn handle_sop_decide(
     }
 }
 
+/// `POST /api/sops/{name}/runs/{run_id}/decide` through the core. The core
+/// decides as the principal this caller's credential binds (a paired bearer
+/// is the same `http:` subject the in-process route derives), and marks a
+/// vote that left the gate waiting for its quorum: that answer is `202` with
+/// the overlay, as in-process.
+pub(crate) async fn sop_decide_through_core(
+    core: &CoreCall,
+    name: String,
+    run_id: String,
+    decision: serde_json::Value,
+) -> Result<Response, CoreError> {
+    let mut overlay = core
+        .request(
+            Method::SopsDecide,
+            json!({ "name": name, "run_id": run_id, "decision": decision }),
+        )
+        .await?;
+    let pending_quorum = overlay
+        .as_object_mut()
+        .and_then(|fields| fields.remove(zeroclaw_rpc_proto::types::SOP_DECIDE_PENDING_QUORUM))
+        .is_some_and(|pending| pending == serde_json::Value::Bool(true));
+    let status = if pending_quorum {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(overlay)).into_response())
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct SopCancelBody {
     #[serde(default)]
@@ -902,7 +1113,11 @@ pub async fn handle_sop_full(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_full_through_core(&core, name).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -917,11 +1132,26 @@ pub async fn handle_sop_full(
     }
 }
 
+/// `GET /api/sops/{name}/full` through the core.
+pub(crate) async fn sop_full_through_core(
+    core: &CoreCall,
+    name: String,
+) -> Result<Response, CoreError> {
+    let sop = core
+        .request(Method::SopsGet, json!({ "name": name }))
+        .await?;
+    Ok(Json(sop).into_response())
+}
+
 pub async fn handle_sop_create(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(sop): Json<zeroclaw_runtime::sop::Sop>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_create_through_core(&core, sop).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -938,28 +1168,59 @@ pub async fn handle_sop_create(
     }
 }
 
+/// `POST /api/sops` through the core.
+pub(crate) async fn sop_create_through_core(
+    core: &CoreCall,
+    sop: zeroclaw_runtime::sop::Sop,
+) -> Result<Response, CoreError> {
+    let created = core
+        .request(Method::SopsCreate, json!({ "sop": sop }))
+        .await?;
+    Ok(Json(created).into_response())
+}
+
+/// The SOP a `PUT /api/sops/{name}` body saves: the body names the SOP in its
+/// URL, or no SOP at all and takes the URL's name. Otherwise the `400` it is
+/// refused with.
+fn sop_for_url(
+    name: String,
+    mut sop: zeroclaw_runtime::sop::Sop,
+) -> Result<zeroclaw_runtime::sop::Sop, String> {
+    if !sop.name.is_empty() && sop.name != name {
+        return Err(format!(
+            "body name '{}' does not match URL name '{name}'",
+            sop.name
+        ));
+    }
+    sop.name = name;
+    Ok(sop)
+}
+
+fn name_mismatch(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
 pub async fn handle_sop_save(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Json(mut sop): Json<zeroclaw_runtime::sop::Sop>,
+    access: CoreAccess,
+    Json(sop): Json<zeroclaw_runtime::sop::Sop>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_save_through_core(&core, name, sop).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    if !sop.name.is_empty() && sop.name != name {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!(
-                    "body name '{}' does not match URL name '{name}'",
-                    sop.name
-                )
-            })),
-        )
-            .into_response();
-    }
-    sop.name = name;
+    let sop = match sop_for_url(name, sop) {
+        Ok(sop) => sop,
+        Err(message) => return name_mismatch(message),
+    };
     let (dir, _mode) = sops_dir_and_mode(&state);
     // `PUT` edits the SOP named in its URL. If that SOP has been renamed or
     // deleted since the client loaded it, refuse instead of recreating it
@@ -977,6 +1238,27 @@ pub async fn handle_sop_save(
     }
 }
 
+/// `PUT /api/sops/{name}` through the core. The core saves only over the SOP
+/// it was loaded as, which is the URL's.
+pub(crate) async fn sop_save_through_core(
+    core: &CoreCall,
+    name: String,
+    sop: zeroclaw_runtime::sop::Sop,
+) -> Result<Response, CoreError> {
+    let sop = match sop_for_url(name, sop) {
+        Ok(sop) => sop,
+        Err(message) => return Ok(name_mismatch(message)),
+    };
+    let original_name = sop.name.clone();
+    let saved = core
+        .request(
+            Method::SopsSave,
+            json!({ "sop": sop, "original_name": original_name }),
+        )
+        .await?;
+    Ok(Json(saved).into_response())
+}
+
 /// Body for `POST /api/sops/{name}/rename`: the name to move the SOP to.
 #[derive(serde::Deserialize)]
 pub struct SopRenameBody {
@@ -990,8 +1272,12 @@ pub async fn handle_sop_rename(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    access: CoreAccess,
     Json(body): Json<SopRenameBody>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_rename_through_core(&core, name, body).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1010,11 +1296,27 @@ pub async fn handle_sop_rename(
     }
 }
 
+/// `POST /api/sops/{name}/rename` through the core.
+pub(crate) async fn sop_rename_through_core(
+    core: &CoreCall,
+    name: String,
+    body: SopRenameBody,
+) -> Result<Response, CoreError> {
+    let renamed = core
+        .request(Method::SopsRename, json!({ "from": name, "to": body.to }))
+        .await?;
+    Ok(Json(renamed).into_response())
+}
+
 pub async fn handle_sop_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_delete_through_core(&core, name).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1031,6 +1333,17 @@ pub async fn handle_sop_delete(
     }
 }
 
+/// `DELETE /api/sops/{name}` through the core.
+pub(crate) async fn sop_delete_through_core(
+    core: &CoreCall,
+    name: String,
+) -> Result<Response, CoreError> {
+    let deleted = core
+        .request(Method::SopsDelete, json!({ "name": name }))
+        .await?;
+    Ok(Json(deleted).into_response())
+}
+
 /// Body for `wire-draft`: a full draft SOP plus one edit to apply.
 #[derive(serde::Deserialize)]
 pub struct WireDraftRequest {
@@ -1041,8 +1354,12 @@ pub struct WireDraftRequest {
 pub async fn handle_sop_wire_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(req): Json<WireDraftRequest>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_wire_draft_through_core(&core, req).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1058,6 +1375,20 @@ pub async fn handle_sop_wire_draft(
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 
+/// `POST /api/sops/wire-draft` through the core.
+pub(crate) async fn sop_wire_draft_through_core(
+    core: &CoreCall,
+    req: WireDraftRequest,
+) -> Result<Response, CoreError> {
+    let wired = core
+        .request(
+            Method::SopsWireDraft,
+            json!({ "sop": req.sop, "edit": req.edit }),
+        )
+        .await?;
+    Ok(Json(wired).into_response())
+}
+
 /// Body for `graph-draft`: a full draft SOP to project without saving.
 #[derive(serde::Deserialize)]
 pub struct GraphDraftRequest {
@@ -1067,14 +1398,29 @@ pub struct GraphDraftRequest {
 pub async fn handle_sop_graph_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Json(req): Json<GraphDraftRequest>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return answered(sop_graph_draft_through_core(&core, req).await);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
     let graph =
         zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&req.sop, &sop_tool_specs(&state));
     Json(graph).into_response()
+}
+
+/// `POST /api/sops/graph-draft` through the core.
+pub(crate) async fn sop_graph_draft_through_core(
+    core: &CoreCall,
+    req: GraphDraftRequest,
+) -> Result<Response, CoreError> {
+    let graph = core
+        .request(Method::SopsGraphDraft, json!({ "sop": req.sop }))
+        .await?;
+    Ok(Json(graph).into_response())
 }
 
 pub async fn handle_sop_graph_legend(
@@ -1213,6 +1559,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
+            CoreAccess::InProcess,
             Json(SopRunBody {
                 payload: None,
                 dedup_key: None,
@@ -1246,6 +1593,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
+            CoreAccess::InProcess,
             Json(SopRunBody {
                 payload: None,
                 dedup_key: None,
@@ -1275,6 +1623,7 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
+            CoreAccess::InProcess,
             Json(SopRunBody {
                 payload: None,
                 dedup_key: None,
@@ -1348,6 +1697,7 @@ mod tests {
             State(state.clone()),
             bearer(token),
             Path("deploy-old".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "deploy-new".to_string(),
             }),
@@ -1364,6 +1714,7 @@ mod tests {
             State(state.clone()),
             bearer(token),
             Path("deploy-new".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "deploy-taken".to_string(),
             }),
@@ -1381,6 +1732,7 @@ mod tests {
             State(state.clone()),
             bearer(token),
             Path("deploy-missing".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "deploy-anything".to_string(),
             }),
@@ -1392,6 +1744,7 @@ mod tests {
             State(state),
             bearer(token),
             Path("deploy-new".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "../escaped".to_string(),
             }),
@@ -1417,6 +1770,7 @@ mod tests {
             State(state.clone()),
             bearer(token),
             Path("deploy-before".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "deploy-after".to_string(),
             }),
@@ -1428,6 +1782,7 @@ mod tests {
             State(state),
             bearer(token),
             Path("deploy-before".to_string()),
+            CoreAccess::InProcess,
             Json(authoring_checkpoint_sop("deploy-before")),
         )
         .await;
@@ -1448,6 +1803,7 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Path("deploy-old".to_string()),
+            CoreAccess::InProcess,
             Json(SopRenameBody {
                 to: "deploy-new".to_string(),
             }),
@@ -1537,6 +1893,7 @@ mod tests {
             State(state.clone()),
             bearer(outsider),
             Path(("deploy".to_string(), run_id.clone())),
+            CoreAccess::InProcess,
             Json(serde_json::json!("approve")),
         )
         .await;
@@ -1630,6 +1987,7 @@ mod tests {
             State(state.clone()),
             bearer(first_member),
             Path(("deploy".to_string(), run_id.clone())),
+            CoreAccess::InProcess,
             Json(serde_json::json!("approve")),
         )
         .await;
@@ -1704,6 +2062,7 @@ mod tests {
             State(state.clone()),
             bearer(token),
             Path(("deploy-a".to_string(), run_id.clone())),
+            CoreAccess::InProcess,
             Json(serde_json::json!("approve")),
         )
         .await;
