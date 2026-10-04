@@ -358,6 +358,23 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn builtin_target_name(&self) -> Option<&str> {
+        Some(self.target_tool.name())
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        if target.name() != self.target_tool.name() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            tool_name: self.tool_name.clone(),
+            tool_description: self.tool_description.clone(),
+            target_tool: target,
+            locked_args: self.locked_args.clone(),
+            advertised_schema: Arc::clone(&self.advertised_schema),
+        }))
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.target_tool.requires_unrestricted_principal()
     }

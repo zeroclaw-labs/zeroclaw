@@ -79,6 +79,35 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_prepared(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        (|guard| async { Ok(guard) }, on_event),
+    )
+    .await
+}
+
+pub async fn execute_turn_prepared<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
+    let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -89,7 +118,8 @@ where
         // only schedules that drop; provider and tool cleanup still runs after
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
-        let mut guard = agent.lock().await;
+        let guard = agent.lock_owned().await;
+        let mut guard = prepare(guard).await?;
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;

@@ -12,6 +12,19 @@ use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static PATCH_WRITER_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Only the worker thread's next patch transaction installs this notifier.
+/// Its first SQLite busy callback proves an actual writer wait, not arrival
+/// somewhere before the database acquisition.
+#[cfg(test)]
+pub(crate) fn notify_patch_writer_wait_for_test(sender: std::sync::mpsc::Sender<()>) {
+    PATCH_WRITER_WAIT.set(Some(sender));
+}
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
 static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
@@ -342,25 +355,24 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
 /// re-persist a config-resolved snapshot into a column declarative jobs
 /// don't own; every other caller should use [`get_job`] instead.
 fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| {
-        let mut stmt = conn.prepare(
+    with_read_connection(config, |conn| get_job_raw_on(conn, job_id))?
+        .ok_or_else(|| job_not_found(job_id))
+}
+
+fn get_job_raw_on(conn: &Connection, job_id: &str) -> Result<CronJob> {
+    let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                      allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query(params![job_id])?;
-        if let Some(row) = rows.next()? {
-            map_cron_job_row(row).map_err(Into::into)
-        } else {
-            Err(job_not_found(job_id))
-        }
-    })?
-    else {
-        return Err(job_not_found(job_id));
-    };
-    Ok(job)
+    let mut rows = stmt.query(params![job_id])?;
+    if let Some(row) = rows.next()? {
+        map_cron_job_row(row).map_err(Into::into)
+    } else {
+        Err(job_not_found(job_id))
+    }
 }
 
 pub fn resolve_job_id_or_name(
@@ -764,100 +776,118 @@ fn update_job_inner(
     owner: Option<&str>,
     patch: CronJobPatch,
 ) -> Result<CronJob> {
+    update_job_authorized(config, job_id, owner, patch, |_| Ok(()))
+}
+
+pub(crate) fn update_job_authorized<G>(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+    authorize: impl FnOnce(&CronJob) -> Result<G>,
+) -> Result<CronJob> {
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
     // resolved config value into the column and recreate a second owner.
-    let mut job = get_job_raw(config, job_id)?;
-    let mut schedule_changed = false;
+    with_initialized_connection(config, |connection| {
+        let tx = begin_immediate(connection, "job patch")?;
+        let conn = &tx;
+        let mut job = get_job_raw_on(conn, job_id)?;
+        if owner.is_some_and(|owner| owner != job.agent_alias) {
+            return Err(job_not_found(job_id));
+        }
+        // Resolve current authority only after SQLite grants the writer, and hold
+        // it through the UPDATE, its commit, and the returned row projection.
+        let _authority = authorize(&job)?;
+        let mut schedule_changed = false;
 
-    if let Some(schedule) = patch.schedule {
-        validate_schedule(&schedule, Utc::now())?;
-        job.schedule = schedule;
-        job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
-    }
-    if let Some(command) = patch.command {
-        job.command = command;
-    }
-    if let Some(prompt) = patch.prompt {
-        job.prompt = Some(prompt);
-    }
-    if let Some(name) = patch.name {
-        job.name = Some(name);
-    }
-    if let Some(enabled) = patch.enabled {
-        job.enabled = enabled;
-    }
-    if let Some(delivery) = patch.delivery {
-        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
-        // config.toml. Writing it here would appear to succeed and then be
-        // silently reverted by `sync_declarative_jobs` on the next daemon
-        // start, which rewrites every declarative column from the config.
-        // Reject at this boundary rather than persist a value the next sync
-        // discards, matching how `shell_output_format` is handled below.
-        //
-        // Ownership is checked before shape: a declarative job rejects any
-        // delivery patch, so reporting a missing recipient first would imply
-        // that correcting it would let the write through.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+        if let Some(schedule) = patch.schedule {
+            validate_schedule(&schedule, Utc::now())?;
+            job.schedule = schedule;
+            job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
+            schedule_changed = true;
+        }
+        if let Some(command) = patch.command {
+            job.command = command;
+        }
+        if let Some(prompt) = patch.prompt {
+            job.prompt = Some(prompt);
+        }
+        if let Some(name) = patch.name {
+            job.name = Some(name);
+        }
+        if let Some(enabled) = patch.enabled {
+            job.enabled = enabled;
+        }
+        if let Some(delivery) = patch.delivery {
+            // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+            // config.toml. Writing it here would appear to succeed and then be
+            // silently reverted by `sync_declarative_jobs` on the next daemon
+            // start, which rewrites every declarative column from the config.
+            // Reject at this boundary rather than persist a value the next sync
+            // discards, matching how `shell_output_format` is handled below.
+            //
+            // Ownership is checked before shape: a declarative job rejects any
+            // delivery patch, so reporting a missing recipient first would imply
+            // that correcting it would let the write through.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
                  config.toml for a declarative job, not the database. Edit the config \
                  and restart the daemon."
-            );
+                );
+            }
+            // Match add_*_job: announce delivery must include channel + to.
+            validate_delivery_config(Some(&delivery))?;
+            job.delivery = delivery;
         }
-        // Match add_*_job: announce delivery must include channel + to.
-        validate_delivery_config(Some(&delivery))?;
-        job.delivery = delivery;
-    }
-    if let Some(model) = patch.model {
-        job.model = Some(model);
-    }
-    if let Some(target) = patch.session_target {
-        job.session_target = target;
-    }
-    if let Some(delete_after_run) = patch.delete_after_run {
-        job.delete_after_run = delete_after_run;
-    }
-    if let Some(allowed_tools) = patch.allowed_tools {
-        // Empty list means "clear the allowlist" (all tools available),
-        // not "allow zero tools".
-        if allowed_tools.is_empty() {
-            job.allowed_tools = None;
-        } else {
-            job.allowed_tools = Some(allowed_tools);
+        if let Some(model) = patch.model {
+            job.model = Some(model);
         }
-    }
-    if let Some(uses_memory) = patch.uses_memory {
-        job.uses_memory = uses_memory;
-    }
-    if let Some(shell_output_format) = patch.shell_output_format {
-        // Config-owned (declarative) and non-shell (agent) jobs never store
-        // this field: the gateway API already rejects both cases, but this
-        // is the core boundary every caller of `update_job` goes through,
-        // so it must reject them too rather than silently ignoring or
-        // persisting a value execution never consumes.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
+        if let Some(target) = patch.session_target {
+            job.session_target = target;
+        }
+        if let Some(delete_after_run) = patch.delete_after_run {
+            job.delete_after_run = delete_after_run;
+        }
+        if let Some(allowed_tools) = patch.allowed_tools {
+            // Empty list means "clear the allowlist" (all tools available),
+            // not "allow zero tools".
+            if allowed_tools.is_empty() {
+                job.allowed_tools = None;
+            } else {
+                job.allowed_tools = Some(allowed_tools);
+            }
+        }
+        if let Some(uses_memory) = patch.uses_memory {
+            job.uses_memory = uses_memory;
+        }
+        if let Some(shell_output_format) = patch.shell_output_format {
+            // Config-owned (declarative) and non-shell (agent) jobs never store
+            // this field: the gateway API already rejects both cases, but this
+            // is the core boundary every caller of `update_job` goes through,
+            // so it must reject them too rather than silently ignoring or
+            // persisting a value execution never consumes.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
                  declarative job, not the database"
-            );
+                );
+            }
+            if job.job_type != JobType::Shell {
+                let job_type: &str = job.job_type.into();
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
+                );
+            }
+            job.shell_output_format = shell_output_format;
         }
-        if job.job_type != JobType::Shell {
-            let job_type: &str = job.job_type.into();
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
-            );
+
+        if schedule_changed {
+            job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
         }
-        job.shell_output_format = shell_output_format;
-    }
 
-    if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
-    }
-
-    with_initialized_connection(config, |conn| {
         // Declarative jobs don't own `shell_output_format` — the config is the
         // canonical source, and `resolve_declarative_shell_output_format()` overlays
         // it on every read. Writing the synthesized (Wrapped) value back into the
@@ -876,7 +906,7 @@ fn update_job_inner(
                     job.expression,
                     job.command,
                     serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
                     job.prompt,
                     job.name,
                     job.session_target.as_str(),
@@ -902,7 +932,7 @@ fn update_job_inner(
                     job.expression,
                     job.command,
                     serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
                     job.prompt,
                     job.name,
                     job.session_target.as_str(),
@@ -929,10 +959,10 @@ fn update_job_inner(
         if changed == 0 {
             anyhow::bail!("Cron job '{job_id}' not found");
         }
-        Ok(())
-    })?;
-
-    get_job(config, job_id)
+        tx.commit()?;
+        resolve_declarative_shell_output_format(config, &mut job);
+        Ok(job)
+    })
 }
 
 pub fn record_last_run(
@@ -2463,6 +2493,18 @@ const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
 /// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
 /// fails immediately without consulting the busy handler.
 fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
+    #[cfg(test)]
+    if phase == "job patch" && PATCH_WRITER_WAIT.with(|sender| sender.borrow().is_some()) {
+        conn.busy_handler(Some(|attempt| {
+            PATCH_WRITER_WAIT.with(|sender| {
+                if let Some(sender) = sender.borrow_mut().take() {
+                    let _ = sender.send(());
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            attempt < 500
+        }))?;
+    }
     Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .with_context(|| format!("Failed to begin cron {phase} transaction"))
 }
