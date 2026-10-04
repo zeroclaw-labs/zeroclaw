@@ -256,7 +256,7 @@ fn oauth_basic_authorization(client_id: &str, secret: &str) -> String {
 /// and every other byte becomes `%XX`. This matches the `x-www-form-urlencoded`
 /// serialization RFC 6749 §2.3.1 (via appendix B) requires for the Basic
 /// credentials.
-fn form_urlencode_component(input: &str) -> String {
+pub(super) fn form_urlencode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for &byte in input.as_bytes() {
         match byte {

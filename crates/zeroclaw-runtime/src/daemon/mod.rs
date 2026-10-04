@@ -781,7 +781,7 @@ pub async fn run_with_authority(
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
-        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
+        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::from_config(&config));
 
     // Canonical live pairing authority for this daemon generation. The
     // gateway serves /pair, rotation, and revocation from THIS instance

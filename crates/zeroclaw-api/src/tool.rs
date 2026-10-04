@@ -385,6 +385,23 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// JSON schema for parameters
     fn parameters_schema(&self) -> serde_json::Value;
 
+    /// Concrete builtin captured by an alias wrapper, if any. Memory routing
+    /// uses this identity rather than the alias's advertised name.
+    fn builtin_target_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Rebuild an alias over the same builtin with a new execution handle.
+    /// Implementations must preserve the alias's name, schema, locked arguments,
+    /// and restrictions. The original wrapper remains unchanged, so a child
+    /// registry cannot change its parent's captured handle.
+    fn with_builtin_target(
+        &self,
+        _target: std::sync::Arc<dyn Tool>,
+    ) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
+
     /// JSON schema describing the structured output this tool attaches to
     /// `ToolOutput::data`, when it declares one. `None` means the tool
     /// emits display text only; authoring surfaces fall back to
