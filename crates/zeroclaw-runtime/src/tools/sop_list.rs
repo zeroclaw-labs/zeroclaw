@@ -10,11 +10,23 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Lists all loaded SOPs with their triggers, priority, step count, and active runs.
 pub struct SopListTool {
     engine: std::sync::Arc<Mutex<SopEngine>>,
+    session_memory: Option<std::sync::Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SopListTool {
+    pub fn with_session_memory(
+        mut self,
+        route: std::sync::Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
     pub fn new(engine: std::sync::Arc<Mutex<SopEngine>>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            session_memory: None,
+        }
     }
 }
 
@@ -84,6 +96,11 @@ impl Tool for SopListTool {
             });
         }
 
+        let owner = self
+            .session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .and_then(|route| route.memory.principal_scope());
         let active_runs = engine.active_runs();
         let mut output = format!(
             "Loaded SOPs ({} total, {} shown):\n\n",
@@ -94,7 +111,7 @@ impl Tool for SopListTool {
         for sop in &filtered {
             let active_count = active_runs
                 .values()
-                .filter(|r| r.sop_name == sop.name)
+                .filter(|r| r.sop_name == sop.name && r.is_accessible_from(owner.as_ref()))
                 .count();
             let triggers: Vec<String> = sop.triggers.iter().map(|t| t.to_string()).collect();
 
