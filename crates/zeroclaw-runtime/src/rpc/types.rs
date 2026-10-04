@@ -65,6 +65,17 @@ rpc_type! {
             skip_serializing_if = "Option::is_none"
         )]
         pub client_capabilities: Option<serde_json::Value>,
+        /// Explicit credential for authentication (a native pairing token
+        /// or an OIDC access token). Wins over the transport-intrinsic
+        /// peer credential when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Which configured provider verifies `auth_token` (e.g. `native`,
+        /// `oidc.corp`). Defaults to `native`. Selection is explicit and
+        /// final: the selected provider's denial never falls through to
+        /// another provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_provider: Option<String>,
     }
 }
 
@@ -97,6 +108,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Configured auth provider selection keys (e.g. `native`,
+        /// `peercred`, `oidc.corp`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
+        /// Canonical principal id this connection is bound to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub principal_id: Option<String>,
         /// Shared command catalogue entries available on the TUI surface.
         ///
         /// Always serialized so a new daemon's authoritative empty catalogue
@@ -192,6 +210,10 @@ rpc_type! {
         pub cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_id: Option<String>,
+        /// Accepted for wire compatibility and ignored. The session's shell
+        /// environment is resolved from the calling connection's own TUI
+        /// registration, so naming another connection's id here has no
+        /// effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -349,6 +371,10 @@ rpc_type! {
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
     }
 }
 
@@ -359,6 +385,10 @@ rpc_type! {
         pub limit: Option<usize>,
         #[serde(default)]
         pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
     }
 }
 
@@ -423,6 +453,11 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane: `"private"` (the caller's own; the default for every
+        /// authenticated principal) or `"shared"` (honoured only for callers
+        /// with the admin bypass, audited).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -447,6 +482,9 @@ rpc_type! {
         pub until: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -465,6 +503,11 @@ rpc_type! {
     /// `memory/get` params — fetch one entry's full content by key.
     pub struct MemoryGetParams {
         pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -488,6 +531,9 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -504,6 +550,9 @@ rpc_type! {
         pub key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -638,12 +687,33 @@ rpc_type! {
     pub struct ConfigSetParams {
         pub prop: String,
         pub value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
     }
 }
 
 rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry and at most the
+    /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
         pub set: bool,
     }
 }
@@ -758,6 +828,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default)]
+        pub rewritten: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub warnings: Vec<String>,
     }
@@ -826,6 +898,33 @@ rpc_type! {
 rpc_type! {
     pub struct AgentsStatusResult {
         pub agents: Vec<AgentStatusEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteParams {
+        pub alias: String,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeletePreviewResult {
+        pub alias: String,
+        pub allowed: bool,
+        pub blockers: Vec<String>,
+        pub scrubs: Vec<String>,
+        pub owned_state: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteResult {
+        pub alias: String,
+        pub deleted: bool,
+        pub scrubbed: usize,
+        pub warnings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
     }
 }
 
@@ -1278,6 +1377,57 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Parameters for `file/upload/begin`: announce one upload for a session.
+    pub struct FileUploadBeginParams {
+        pub session_id: String,
+        /// Display name, at most 255 bytes; storage is content-addressed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+        /// Exact decoded size of the whole payload.
+        pub size_bytes: u64,
+        /// Optional hex SHA-256 of the whole payload, verified at commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadBeginResult {
+        /// Identifies the upload on this connection only.
+        pub upload_id: String,
+        /// Largest decoded chunk `file/upload/chunk` accepts.
+        pub chunk_bytes: u64,
+        /// Largest payload an upload may declare.
+        pub max_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/chunk`. Chunks arrive in order: `offset`
+    /// must equal the bytes received so far. Resending an already-accepted
+    /// chunk with identical bytes is acknowledged without change.
+    pub struct FileUploadChunkParams {
+        pub upload_id: String,
+        pub offset: u64,
+        pub data_b64: String,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadChunkResult {
+        pub received_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/commit`. The result is the same
+    /// `FileEntryResult` that `file/attach` returns for one file.
+    pub struct FileUploadCommitParams {
+        pub upload_id: String,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Session approval ─────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
@@ -1305,8 +1455,70 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    /// Parameters shared by every `X/subscribe` method.
+    #[derive(Default)]
+    pub struct SubscribeParams {
+        /// Resume after this sequence number: frames from `since_seq + 1`
+        /// that are still buffered are replayed before live delivery. Omit
+        /// for live frames only.
+        #[serde(default)]
+        pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Every notification of the subscription carries `subscription_id` and
+    /// its `seq`. `seq` here is the newest sequence number at subscribe time.
     pub struct LogsSubscribeResult {
         pub subscribed: bool,
+        pub subscription_id: String,
+        pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelParams {
+        pub subscription_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelResult {
+        /// `false` when no subscription with that id is open on this
+        /// connection (already ended, or never existed).
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `subscription/lagged`: frames `from_seq` up to (not including)
+    /// `resume_seq` are gone; delivery continues at `resume_seq`.
+    pub struct SubscriptionLagged {
+        pub subscription_id: String,
+        pub from_seq: u64,
+        pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
+    }
+}
+
+rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
     }
 }
 
@@ -1323,6 +1535,11 @@ rpc_type! {
         /// pagination regardless of id ordering.
         #[serde(default)]
         pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1335,6 +1552,10 @@ rpc_type! {
         pub outcome: Option<String>,
         #[serde(default)]
         pub trace_id: Option<String>,
+        /// Exact SOP run correlation. Uses the canonical persisted-log
+        /// attribution filter, including its compatibility bridge for older rows.
+        #[serde(default)]
+        pub sop_run_id: Option<String>,
         #[serde(default)]
         pub hide_internal: bool,
         #[serde(default)]
@@ -1360,8 +1581,22 @@ rpc_type! {
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to
         /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
         pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 
@@ -1419,15 +1654,20 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
-    /// absent when the provider doesn't report usage.
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_context_window: Option<u64>,
     },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
@@ -1456,13 +1696,37 @@ pub enum SessionUpdateEvent {
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
     /// was cut here" marker so trimming is never silent. `dropped_messages` is
-    /// the count of conversation messages removed; `kept_turns` is how many
-    /// whole turns remained after the cut.
+    /// the count of conversation messages removed; `dropped_turns` and
+    /// `kept_turns` describe the user-facing whole-turn accounting.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
     },
 }
 
@@ -1708,6 +1972,18 @@ mod tests {
     }
 
     #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
+    }
+
+    #[test]
     fn session_prompt_turn_generation_is_optional_and_wire_stable() {
         let legacy: SessionPromptParams = serde_json::from_value(json!({
             "session_id": "s",
@@ -1860,6 +2136,17 @@ mod tests {
     }
 
     #[test]
+    fn logs_query_params_accepts_sop_run_filter() {
+        let params: LogsQueryParams = serde_json::from_value(json!({
+            "sop_run_id": "run-123-0001",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(params.sop_run_id.as_deref(), Some("run-123-0001"));
+        assert_eq!(params.limit, Some(25));
+    }
+
+    #[test]
     fn config_section_group_key_is_additive_on_the_wire() {
         let legacy: ConfigSectionEntry = serde_json::from_value(json!({
             "key": "cron",
@@ -2008,7 +2295,9 @@ mod tests {
             log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
         };
 
         let value = serde_json::to_value(result).expect("logs/query result");

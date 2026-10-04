@@ -594,6 +594,43 @@ fn parse_readiness_line(line: &str) -> Result<(), String> {
     }
 }
 
+/// Mint a pairing code for this app through the kernel CLI.
+///
+/// The gateway's pairing-code admin routes accept only callers presenting its
+/// owner-only admin token, because a loopback connection alone can be a
+/// same-host proxy relaying a remote caller. The CLI runs as this user with
+/// the same config, so it can read the token; the app asks it rather than
+/// calling the route directly. Blocking: run it off the async runtime.
+pub fn mint_pairing_code(binary: &Path, port: u16) -> Result<String, String> {
+    let output = paircode_command(binary, port)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run {}: {e}", binary.display()))?;
+    if !output.status.success() {
+        return Err(format!("get-paircode exited with {}", output.status));
+    }
+    parse_paircode_output(&output.stdout)
+}
+
+fn paircode_command(binary: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.args(["gateway", "get-paircode", "--new", "--json", "--port"])
+        .arg(port.to_string());
+    cmd
+}
+
+/// Read the code from `get-paircode --json` output: the last line that is a
+/// JSON object carrying a string `pairing_code`.
+fn parse_paircode_output(stdout: &[u8]) -> Result<String, String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find_map(|value| value["pairing_code"].as_str().map(String::from))
+        .ok_or_else(|| "get-paircode returned no pairing code".to_string())
+}
+
 fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
     let mut cmd = Command::new(binary);
     cmd.arg("service")
@@ -608,6 +645,40 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::fs;
+
+    #[test]
+    fn paircode_command_mints_through_the_cli_as_json() {
+        let command = paircode_command(Path::new("/tmp/zeroclaw"), 42617);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "gateway",
+                "get-paircode",
+                "--new",
+                "--json",
+                "--port",
+                "42617"
+            ]
+        );
+    }
+
+    #[test]
+    fn paircode_output_yields_the_code_and_rejects_its_absence() {
+        assert_eq!(
+            parse_paircode_output(b"{\"pairing_code\":\"ABC123\",\"message\":null}\n"),
+            Ok("ABC123".to_string())
+        );
+        assert_eq!(
+            parse_paircode_output(b"noise\n{\"pairing_code\":\"XYZ\"}\n"),
+            Ok("XYZ".to_string())
+        );
+        assert!(parse_paircode_output(b"{\"pairing_code\":null,\"message\":\"off\"}\n").is_err());
+        assert!(parse_paircode_output(b"").is_err());
+    }
 
     #[test]
     fn desktop_command_targets_hidden_supervisor_and_port() {

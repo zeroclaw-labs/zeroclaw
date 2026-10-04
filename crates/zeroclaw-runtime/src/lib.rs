@@ -10,10 +10,12 @@ pub mod cli_input;
 /// `cargo generate installers runtime-locales`. Generated, not hand-edited.
 mod generated_locales;
 pub mod identity;
+pub mod live_config_authority;
 pub mod migration;
 pub mod util;
 
 pub mod agent;
+pub mod agent_lifecycle;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
@@ -32,6 +34,8 @@ pub mod observability;
 pub mod peers;
 pub mod platform;
 pub mod plugin_runtime;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
@@ -48,3 +52,5 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};

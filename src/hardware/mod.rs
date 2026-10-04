@@ -7,7 +7,6 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use zeroclaw_runtime::i18n::get_required_cli_string;
 
-#[allow(dead_code)]
 pub fn handle_command(cmd: crate::HardwareCommands, _config: &Config) -> Result<()> {
     #[cfg(not(feature = "hardware"))]
     {

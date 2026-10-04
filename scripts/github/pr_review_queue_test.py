@@ -17,6 +17,8 @@ except ModuleNotFoundError:
 
 NOW = datetime(2026, 8, 29, tzinfo=timezone.utc)
 CORE = {"core-one", "core-two"}
+HEAD_SHA = "a" * 40
+OLDER_SHA = "b" * 40
 
 
 def pr(number: int = 1, **extra: object) -> dict[str, object]:
@@ -26,13 +28,13 @@ def pr(number: int = 1, **extra: object) -> dict[str, object]:
         "author": {"login": "author"},
         "labels": [],
         "url": f"https://github.com/zeroclaw-labs/zeroclaw/pull/{number}",
-        "headRefOid": "head",
+        "headRefOid": HEAD_SHA,
     }
     value.update(extra)
     return value
 
 
-def review(reviewer: str, state: str = "APPROVED", commit: str | None = "head", review_id: int = 1) -> dict[str, object]:
+def review(reviewer: str, state: str = "APPROVED", commit: str | None = HEAD_SHA, review_id: int = 1) -> dict[str, object]:
     return {
         "id": review_id,
         "user": {"login": reviewer},
@@ -94,13 +96,57 @@ class ReviewQueueTest(unittest.TestCase):
         self.assertIsNone(queue.second_core_row(payload, [], CORE))
         self.assertIsNone(queue.second_core_row(payload, [review("core-one"), review("core-two", review_id=2)], CORE))
 
+    def test_second_core_surfaces_older_independent_approval_for_assessment(self) -> None:
+        payload = pr()
+        row = queue.second_core_row(
+            payload,
+            [review("core-one"), review("core-two", commit=OLDER_SHA, review_id=2)],
+            CORE,
+        )
+        self.assertEqual(row["status"], "candidate")
+        self.assertIn(f"@core-one ({HEAD_SHA[:12]})", row["detail"])
+        self.assertIn("carry-forward assessment", row["detail"])
+        self.assertIn(f"@core-two ({OLDER_SHA[:12]})", row["detail"])
+
+    def test_second_core_does_not_treat_author_approval_as_independent(self) -> None:
+        payload = pr(author={"login": "core-two"})
+        row = queue.second_core_row(
+            payload,
+            [review("core-one"), review("core-two", commit=OLDER_SHA, review_id=2)],
+            CORE,
+        )
+        self.assertEqual(row["status"], "candidate")
+        self.assertNotIn("carry-forward assessment", row["detail"])
+
+    def test_second_core_uses_latest_active_decision_for_older_approval(self) -> None:
+        payload = pr()
+        reviews = [
+            review("core-one"),
+            review("core-two", commit=OLDER_SHA, review_id=2),
+            review("core-two", state="DISMISSED", commit=OLDER_SHA, review_id=3),
+        ]
+        row = queue.second_core_row(payload, reviews, CORE)
+        self.assertEqual(row["status"], "candidate")
+        self.assertNotIn("carry-forward assessment", row["detail"])
+
     def test_second_core_ignores_old_or_non_core_approvals(self) -> None:
-        self.assertIsNone(queue.second_core_row(pr(), [review("core-one", commit="old")], CORE))
+        self.assertIsNone(queue.second_core_row(pr(), [review("core-one", commit=OLDER_SHA)], CORE))
         self.assertIsNone(queue.second_core_row(pr(), [review("contributor")], CORE))
 
     def test_second_core_reports_missing_sha_as_unknown(self) -> None:
         self.assertEqual(queue.second_core_row(pr(headRefOid=None), [review("core-one")], CORE)["status"], "unknown")
         self.assertEqual(queue.second_core_row(pr(), [review("core-one", commit=None)], CORE)["status"], "unknown")
+
+    def test_second_core_reports_malformed_sha_as_unknown(self) -> None:
+        self.assertEqual(queue.second_core_row(pr(headRefOid="not-a-commit"), [review("core-one")], CORE)["status"], "unknown")
+        reviews = [review("core-one"), review("core-two", commit="not-a-commit", review_id=2)]
+        self.assertEqual(queue.second_core_row(pr(), reviews, CORE)["status"], "unknown")
+
+    def test_second_core_normalizes_valid_uppercase_sha(self) -> None:
+        reviews = [review("core-one", commit=HEAD_SHA.upper()), review("core-two", commit=OLDER_SHA.upper(), review_id=2)]
+        row = queue.second_core_row(pr(headRefOid=HEAD_SHA.upper()), reviews, CORE)
+        self.assertEqual(row["status"], "candidate")
+        self.assertIn(f"@core-two ({OLDER_SHA[:12]})", row["detail"])
 
     def test_author_action_reports_old_unanswered_request(self) -> None:
         timeline = [event("labeled", "2026-08-20T00:00:00Z", label="needs-author-action")]

@@ -14,7 +14,7 @@ The coarse-grained knob. Three settings:
 
 - **ReadOnly**: the agent can observe (read files, query memory, fetch URLs it's allowed to fetch) but cannot write or execute commands.
 - **Supervised** (default): low-risk ops run; medium-risk ask the operator; high-risk block.
-- **Full**: no approval gates; `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
+- **Full**: uncovered tools skip approval gates; `always_ask` still prompts or fails closed. `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
 
 Docs: [Autonomy levels](./autonomy.md).
 
@@ -112,8 +112,8 @@ Out of the box:
 - Autonomy: `Supervised`
 - Workspace-only: `true`
 - Sandbox: auto-detect (uses whatever the OS provides)
-- Audit logging: `false` (enable explicitly)
+- Audit logging: `true`, covering certificate issuance and renewal only (command execution is not audited)
 - OTP: `false`
 - E-stop: `false`
 
-This is a reasonable middle ground, safe enough for a laptop, permissive enough to not frustrate. Crank it up for production (OTP, audit, restricted tools) or down to [YOLO](../getting-started/yolo.md) for a dev box.
+This is a reasonable middle ground, safe enough for a laptop, permissive enough to not frustrate. For production, enable OTP and restricted tools, and leave `[security.audit]` on so certificate issuance and renewal stay recorded. Command execution is not audited: until it has a production writer, use an external supervisor or logging wrapper that observes the ZeroClaw process, or enable OS-level process accounting. For a development box, you can instead opt down to [YOLO](../getting-started/yolo.md).

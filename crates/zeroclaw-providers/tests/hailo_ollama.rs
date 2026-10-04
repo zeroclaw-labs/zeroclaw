@@ -1257,7 +1257,7 @@ async fn native_hailo_preserves_literal_backslashes_through_prompt_parser() {
 }
 
 #[tokio::test]
-async fn native_hailo_truncates_without_splitting_prompt_escape_units() {
+async fn native_hailo_preserves_prompt_escape_units_without_truncation() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1276,15 +1276,14 @@ async fn native_hailo_truncates_without_splitting_prompt_escape_units() {
     hailo_provider(&format!("http://{addr}"))
         .simple_chat(&prompt, "qwen3:1.7b", Some(0.2))
         .await
-        .expect("native prompt truncation must preserve complete escape units");
+        .expect("native prompt parser accepts complete escape units");
 
     let decoded = capture
         .lock()
         .expect("prompt capture lock")
         .clone()
         .expect("structured prompt captured");
-    let expected = format!("{}...{}", "\\".repeat(499), "\\".repeat(499));
-    assert_eq!(decoded[0]["content"], expected);
+    assert_eq!(decoded[0]["content"], prompt);
     server.abort();
 }
 
@@ -1434,7 +1433,7 @@ async fn native_hailo_rejects_native_tool_payloads_before_http() {
 }
 
 #[tokio::test]
-async fn native_hailo_preserves_fitting_tool_protocol_before_bounding_user_text() {
+async fn native_hailo_preserves_fitting_tool_protocol_and_user_text() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1453,7 +1452,7 @@ async fn native_hailo_preserves_fitting_tool_protocol_before_bounding_user_text(
         "## Tool Use Protocol\n{}\nTOOL_PROTOCOL_END",
         "Use tool_call exactly. ".repeat(45)
     );
-    assert!(system.chars().count() < 2_000);
+    assert!(system.chars().count() > 1_000);
     let user = format!("USER_HEAD{}USER_TAIL", "u".repeat(1_800));
     let messages = [ChatMessage::system(system), ChatMessage::user(user)];
 
@@ -1485,7 +1484,7 @@ async fn native_hailo_preserves_fitting_tool_protocol_before_bounding_user_text(
 }
 
 #[tokio::test]
-async fn native_hailo_rejects_truncated_prompt_guided_tool_protocol() {
+async fn native_hailo_preserves_large_prompt_guided_tool_protocol() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1499,17 +1498,28 @@ async fn native_hailo_rejects_truncated_prompt_guided_tool_protocol() {
             .await
             .expect("serve fake Hailo server");
     });
-    let provider = hailo_provider(&format!("http://{addr}"));
+    let provider = HailoOllamaModelProvider::new(
+        "edge",
+        Some(&format!("http://{addr}")),
+        5,
+        5,
+        OllamaTuning {
+            num_ctx: 0,
+            num_predict: 64,
+            ..Default::default()
+        },
+    )
+    .expect("provider config");
     let system = format!(
         "Identity: {}\n\n## Tool Use Protocol\nUse <tool_call>.\n### Available Tools\n- file_read(path)",
-        "identity context ".repeat(180)
+        "identity context ".repeat(600)
     );
     let messages = [
         ChatMessage::system(system),
         ChatMessage::user("Read /tmp/example"),
     ];
 
-    let error = provider
+    provider
         .chat(
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &messages,
@@ -1520,21 +1530,20 @@ async fn native_hailo_rejects_truncated_prompt_guided_tool_protocol() {
             Some(0.2),
         )
         .await
-        .expect_err("oversized prompt-guided tools must fail closed");
+        .expect("large prompt-guided tool instructions must not be rejected by a character cap");
 
-    assert!(
-        error
-            .to_string()
-            .contains("prompt-guided tool instructions exceed"),
-        "unexpected tool prompt error: {error}"
-    );
-    assert!(
-        error
-            .chain()
-            .any(|source| source.is::<NonRetryableProviderError>()),
-        "a deterministic local prompt rejection must suppress generic retries: {error:#}"
-    );
-    assert!(capture.lock().expect("capture lock").is_none());
+    let body = capture
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    let content = body["messages"][0]["content"]
+        .as_str()
+        .expect("folded first message");
+    assert!(content.len() > 2_000);
+    assert!(content.contains("## Tool Use Protocol"));
+    assert!(content.contains("- file_read(path)"));
+    assert!(content.contains("Read /tmp/example"));
     server.abort();
 }
 
@@ -1555,19 +1564,34 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
     });
 
     let mut history = vec![
-        ChatMessage::system(format!("{}\nSYSTEM_TAIL", "s".repeat(3_000))),
+        ChatMessage::system(format!("{}\nSYSTEM_TAIL", "s".repeat(900))),
         ChatMessage::assistant("orphan assistant"),
     ];
     for index in 0..8 {
-        history.push(ChatMessage::user(format!("u{index}")));
-        history.push(ChatMessage::assistant(format!("a{index}")));
+        history.push(ChatMessage::user(format!("u{index}{}", "u".repeat(400))));
+        history.push(ChatMessage::assistant(format!(
+            "a{index}{}",
+            "a".repeat(400)
+        )));
     }
     history.push(ChatMessage::user(format!(
         "LATEST_HEAD{}LATEST_TAIL",
-        "x".repeat(3_000)
+        "x".repeat(1_500)
     )));
 
-    hailo_provider(&format!("http://{addr}"))
+    let provider = HailoOllamaModelProvider::new(
+        "edge",
+        Some(&format!("http://{addr}")),
+        5,
+        5,
+        OllamaTuning {
+            num_ctx: 800,
+            num_predict: 64,
+            ..Default::default()
+        },
+    )
+    .expect("provider config");
+    provider
         .chat_with_history(&history, "qwen3:1.7b", Some(0.2))
         .await
         .expect("bounded native Hailo history succeeds");
@@ -1578,7 +1602,7 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
         .clone()
         .expect("request captured");
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 11);
+    assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], "user");
     assert!(
         messages[0]["content"]
@@ -1587,10 +1611,10 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
             .starts_with("Instructions: ")
     );
     assert!(
-        messages[0]["content"]
+        !messages[0]["content"]
             .as_str()
             .expect("first content")
-            .contains("Request: u3")
+            .contains("Request: u0")
     );
     assert_eq!(messages.last().expect("latest message")["role"], "user");
     assert!(
@@ -1601,7 +1625,6 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
     );
     for message in messages {
         let content = message["content"].as_str().expect("message content");
-        assert!(content.chars().count() <= 2_000);
         assert!(
             !content
                 .chars()
@@ -1609,6 +1632,14 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
             "only non-structural control characters should be removed"
         );
     }
+    assert!(
+        messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.chars().count() > 2_000)
+        }),
+        "the provider must preserve message content beyond the old character cap"
+    );
 
     let first_content = messages[0]["content"].as_str().expect("first content");
     assert!(
@@ -1622,7 +1653,7 @@ async fn native_hailo_bounds_history_and_preserves_latest_user_tail() {
 }
 
 #[tokio::test]
-async fn native_hailo_fold_reallocates_unused_system_budget_to_user() {
+async fn native_hailo_fold_preserves_complete_system_and_user_content() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1656,7 +1687,7 @@ async fn native_hailo_fold_reallocates_unused_system_budget_to_user() {
         !content.contains("..."),
         "user content was truncated despite spare system budget"
     );
-    assert!(content.chars().count() <= 2_000);
+    assert!(content.contains("FULL_HEAD"));
 
     server.abort();
 }
@@ -1824,7 +1855,7 @@ async fn native_hailo_fails_closed_when_folded_system_exceeds_context_budget() {
 }
 
 #[tokio::test]
-async fn native_hailo_fails_closed_when_message_cap_splits_latest_tool_turn() {
+async fn native_hailo_preserves_latest_tool_turn_without_message_cap() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1855,30 +1886,27 @@ async fn native_hailo_fails_closed_when_message_cap_splits_latest_tool_turn() {
         history.push(ChatMessage::tool(format!("LATEST_TOOL_RESULT_{index}")));
     }
 
-    let error = hailo_provider(&format!("http://{addr}"))
+    hailo_provider(&format!("http://{addr}"))
         .chat_with_history(&history, "qwen3:1.7b", Some(0.2))
         .await
-        .expect_err("a latest turn split by the message cap must fail before HTTP");
+        .expect("a multi-tool turn must not be rejected by a message-count cap");
 
-    assert!(
-        error.to_string().contains("local history message budget"),
-        "unexpected message-budget error: {error:#}"
-    );
-    assert!(
-        error
-            .chain()
-            .any(|source| source.is::<NonRetryableProviderError>()),
-        "an impossible local message budget must suppress generic retries: {error:#}"
-    );
-    assert!(
-        capture.lock().expect("capture lock").is_none(),
-        "the provider must not replace a split tool turn with a synthetic request"
-    );
+    let body = capture
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    let messages = body["messages"].as_array().expect("messages array");
+    assert!(messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("LATEST_TOOL_RESULT_5"))
+    }));
     server.abort();
 }
 
 #[tokio::test]
-async fn native_hailo_history_boundary_drops_orphaned_tool_exchange() {
+async fn native_hailo_preserves_complete_tool_history_without_message_cap() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1917,15 +1945,22 @@ async fn native_hailo_history_boundary_drops_orphaned_tool_exchange() {
         .clone()
         .expect("request captured");
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 10);
-    let first = messages[0]["content"].as_str().expect("first content");
-    assert!(first.contains("Request: fresh user 0"));
-    assert!(!first.contains("orphaned old result"));
-    assert!(messages.iter().all(|message| {
-        !message["content"]
+    assert_eq!(messages.len(), 12);
+    assert_eq!(messages[0]["role"], "user");
+    assert!(messages.iter().any(|message| {
+        message["content"]
             .as_str()
-            .unwrap_or_default()
-            .contains("file_read")
+            .is_some_and(|content| content.contains("orphaned old result"))
+    }));
+    assert!(messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("fresh user"))
+    }));
+    assert!(messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("file_read"))
     }));
 
     server.abort();
@@ -2077,7 +2112,7 @@ async fn native_hailo_accounts_for_merge_separators_in_context_budget() {
 }
 
 #[tokio::test]
-async fn native_hailo_rejects_prompt_tool_rounds_over_message_cap() {
+async fn native_hailo_preserves_prompt_tool_rounds_without_message_cap() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2104,16 +2139,17 @@ async fn native_hailo_rejects_prompt_tool_rounds_over_message_cap() {
             "[Tool results]\n<tool_result>result {round}</tool_result>"
         )));
     }
-    let error = provider
+    provider
         .chat_with_history(&messages, "qwen3:1.7b", Some(0.2))
         .await
-        .expect_err("the active prompt-tool turn must not be split at the message cap");
-    assert!(
-        error
-            .chain()
-            .any(|source| source.is::<NonRetryableProviderError>())
-    );
-    assert!(capture.lock().expect("capture lock").is_none());
+        .expect("prompt-tool rounds must not be rejected by a message-count cap");
+    let body = capture
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    let body_text = body.to_string();
+    assert!(body_text.contains("result 5"));
     server.abort();
 }
 

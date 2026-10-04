@@ -1479,6 +1479,15 @@ fn is_git_write_verb(verb: &str) -> bool {
             | "checkout"
             | "switch"
             | "tag"
+            // Index and working-tree mutations. These are conservatively gated
+            // to medium risk; read-only subcommands such as `git stash list` are
+            // over-approved in the safe direction rather than parsed further.
+            | "add"
+            | "rm"
+            | "mv"
+            | "restore"
+            | "apply"
+            | "stash"
     )
 }
 
@@ -1506,9 +1515,19 @@ fn git_command_is_write(args: &[String]) -> bool {
                 return true;
             }
         }
-        "diff" | "log" | "show" => {
+        "diff" | "diff-tree" | "diff-files" | "diff-index" | "log" | "show" | "whatchanged" => {
             if git_args_before_pathspec(args, subcommand_idx + 1)
                 .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "fsck" => {
+            // `git fsck --lost-found` writes recovered objects into
+            // `.git/lost-found/`, so it mutates the repository despite `fsck`
+            // being a read by default.
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--lost-found"))
             {
                 return true;
             }
@@ -1529,8 +1548,17 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
 
         match arg {
             "--" => return args.get(idx + 1).map(|_| idx + 1),
+            // Global options whose value is a separate following token. Git
+            // consumes that token as the option value, so the real subcommand is
+            // the token after it. Missing any of these lets a value that
+            // resembles a read verb hide the actual (possibly mutating)
+            // subcommand from the approval classifier: `git --attr-source log
+            // commit` runs `commit`, not `log`. `-c`/`--config-env` also take a
+            // separate value and are included so this resolver is correct on its
+            // own, independent of the allowlist gate that separately rejects
+            // them.
             "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
-            | "--super-prefix" => {
+            | "--super-prefix" | "--attr-source" | "-c" | "--config-env" => {
                 idx += 2;
             }
             "--bare"
@@ -1556,7 +1584,9 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
                 || arg.starts_with("--work-tree=")
                 || arg.starts_with("--namespace=")
                 || arg.starts_with("--exec-path=")
-                || arg.starts_with("--super-prefix=") =>
+                || arg.starts_with("--super-prefix=")
+                || arg.starts_with("--attr-source=")
+                || arg.starts_with("--config-env=") =>
             {
                 idx += 1;
             }
@@ -1879,7 +1909,27 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
-    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
+    if git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager") {
+        return true;
+    }
+    // `git grep -O[<pager>]` opens matches in a pager (external command), even
+    // when clustered behind other short flags (e.g. `-nO`). The scan is
+    // case-sensitive: `-o` is `--only-matching`, a read. Stop at the first
+    // value-consuming short option so its argument is not misread as flags.
+    let Some(short_run) = arg.strip_prefix('-').filter(|run| !run.starts_with('-')) else {
+        return false;
+    };
+    for ch in short_run.chars() {
+        match ch {
+            'O' => return true,
+            // Options whose value consumes the remainder of the run (or the
+            // next argument): `-A`/`-B`/`-C` (context), `-e`/`-f` (patterns),
+            // `-m` (max-count), and any glued `=value`.
+            'A' | 'B' | 'C' | 'e' | 'f' | 'm' | '=' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -2729,6 +2779,16 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
 fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
     let segments = split_powershell_pipeline_syntax(command)?;
     powershell_variables_are_simple(command).then_some(segments)
+}
+
+/// Return whether `command` fits the one canonical bounded PowerShell grammar.
+///
+/// Native PowerShell execution uses this to decide whether a setup statement
+/// can be prepended without rewriting a full script. Inputs outside this
+/// grammar must remain byte-for-byte unchanged so declarations, named blocks,
+/// and other PowerShell syntax keep their native `-Command` behavior.
+pub(crate) fn powershell_command_supports_statement_prelude(command: &str) -> bool {
+    split_simple_powershell_pipeline(command).is_some()
 }
 
 /// Accept only `$Name` and `$Name.Property` reads outside single-quoted
@@ -4036,6 +4096,12 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if cfg!(windows) && is_null_device(resolved) {
+            return true;
+        }
         // Keep the target in the same filesystem namespace as every policy
         // prefix, even when a caller supplies an absolute but not yet fully
         // resolved spelling. Failure to resolve (for example, a symlink cycle)
@@ -4114,37 +4180,105 @@ impl SecurityPolicy {
         false
     }
 
-    /// Return the canonical allowlisted root directory that authorizes reading
-    /// `resolved`: the workspace first, then read-write roots, then read-only
-    /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
-    /// no-follow) to this boundary instead of re-walking a pathname that could be
-    /// swapped between the readability check and the open. Returns `None` when no
-    /// bounded allowlist root contains the path (e.g. a fully permissive,
-    /// non-`workspace_only` policy, or a device path) — there is then no
-    /// confinement boundary to bind to. Assumes `resolved` is already canonical
-    /// and has passed [`Self::is_resolved_path_readable`].
-    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
-            return Some(workspace_root);
-        }
-        for root in self
-            .allowed_roots
-            .iter()
-            .chain(self.allowed_roots_read_only.iter())
-        {
+    fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        let mut approved_roots = Vec::new();
+        for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return Some(canonical);
+            if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                approved_roots.push(canonical);
             }
         }
-        None
+        if include_read_only {
+            for root in &self.allowed_roots_read_only {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                    approved_roots.push(canonical);
+                }
+            }
+        }
+        approved_roots
+    }
+
+    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        // A non-workspace-only policy authorizes paths outside every configured
+        // root (subject to the ordinary forbidden-path checks). It therefore
+        // has no bounded discovery root; callers may continue searching for a
+        // parent-owned resource. The compatibility accessor below retains the
+        // configured-root result for handle-bound file delivery.
+        if !self.workspace_only {
+            return Vec::new();
+        }
+        self.configured_approved_roots(resolved, include_read_only)
+    }
+
+    /// Return every canonical bounded root that authorizes reading `resolved`.
+    ///
+    /// A path can be covered by overlapping grants, such as a workspace nested
+    /// in a broader explicit allowed root. Callers that discover a parent-owned
+    /// resource must consider every applicable boundary; choosing the first one
+    /// would make valid access depend on grant order. Returns an empty vector
+    /// when no bounded allowlist root contains the path (for example, a fully
+    /// permissive non-`workspace_only` policy or a device path). Assumes
+    /// `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_readable`].
+    pub fn approved_read_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, true)
+    }
+
+    /// Return the first canonical configured root that authorizes reading
+    /// `resolved`.
+    ///
+    /// This compatibility accessor intentionally ignores `workspace_only` to
+    /// preserve the existing configured-root contract for handle-bound callers.
+    /// It is not the first value from [`Self::approved_read_roots`];
+    /// parent-resource discovery must use that plural accessor instead.
+    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        self.configured_approved_roots(resolved, true)
+            .into_iter()
+            .next()
+    }
+
+    /// Canonicalize a caller-supplied path into the same filesystem namespace
+    /// the policy prefixes live in, exactly as the internal readability and
+    /// allowlist checks do before they compare.
+    ///
+    /// Every accessor that takes a `resolved` path — `is_resolved_path_readable`,
+    /// `is_resolved_path_allowed`, `approved_read_root`, `approved_read_roots`,
+    /// `approved_write_roots` — assumes its input is already canonical. Callers
+    /// that authorize a request and then bind the granted operation to a root
+    /// MUST resolve the request once through this accessor and carry the
+    /// returned target into both the check and the operation. Feeding the raw
+    /// request spelling to `approved_read_root` while checking readability on a
+    /// separately resolved target lets an alias that resolves inside an
+    /// entitled root pass readability yet fall out of every configured root
+    /// (returning `None`/`Unconfined`), after which the operation would touch
+    /// the still-swappable raw path outside the boundary. Returns `None` when
+    /// the path cannot be resolved (a symlink cycle, or a target whose parents
+    /// do not exist); the caller MUST fail closed.
+    pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
+        if cfg!(windows) && is_null_device(path) {
+            return Some(path.to_path_buf());
+        }
+        resolve_symlinked_path(path)
+    }
+
+    /// Return every canonical bounded root that authorizes writing `resolved`.
+    ///
+    /// This intentionally excludes `allowed_roots_read_only`; callers use it
+    /// when a parent-owned resource may be discovered before a mutation.
+    /// Assumes `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_allowed`].
+    pub fn approved_write_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, false)
     }
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if cfg!(windows) && is_null_device(resolved) {
+            return true;
+        }
         // See `is_resolved_path_readable`: authorization compares the target,
         // allow roots, and forbidden entries only after the same resolution
         // step, and fails closed when no trustworthy target can be produced.
@@ -5399,6 +5533,59 @@ mod tests {
     }
 
     #[test]
+    fn git_value_taking_global_options_do_not_hide_a_mutating_subcommand() {
+        // Regression for the approval-classification bypass where a value-taking
+        // git global option hid the real subcommand from the risk classifier.
+        //
+        // `--attr-source`, `-c`, and `--config-env` each take a *separate*
+        // following token as their value. Git consumes that token, so the real
+        // subcommand is the one after it. When the resolver skipped only the
+        // flag (not its value), a value that looks like a read verb hid the
+        // actual mutating subcommand and the write was classified Low instead of
+        // Medium, dropping the approval requirement.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            // The value (`log`/`HEAD`) resembles a read verb; the real
+            // subcommand `commit` mutates and must stay Medium.
+            "git --attr-source log commit",
+            "git --attr-source HEAD commit",
+            "git --attr-source=HEAD commit",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "value-taking global option must not hide the write subcommand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_attr_source_read_stays_low() {
+        // The fix must not over-approximate: an ordinary read behind
+        // `--attr-source` stays Low so it is not needlessly gated.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD log",
+            "git --attr-source HEAD diff",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "ordinary read behind --attr-source should stay low: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn command_risk_high_for_dangerous_commands() {
         let p = SecurityPolicy {
             allowed_commands: vec!["rm".into()],
@@ -6164,6 +6351,118 @@ mod tests {
             .validate_command_execution("git -C . commit -m test", true)
             .expect("runtime-approved Git write verb behind global options should remain allowed");
         assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn git_read_verb_mutating_args_are_gated_at_the_enforcement_boundary() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Read-by-default verbs that mutate via an argument must require
+        // approval instead of staying Low.
+        for command in [
+            "git fsck --lost-found",
+            "git fsck --lost",
+            "git fsck --l",
+            "git diff --output=/tmp/out",
+            "git diff --output /tmp/out",
+            "git -C . log --output=/tmp/out",
+            "git show --output=/tmp/out",
+            "git whatchanged --output=/tmp/out",
+            "git diff-tree --output=/tmp/out HEAD",
+            "git diff-index --output=/tmp/out HEAD",
+            "git diff-files --output=/tmp/out",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git read verbs that mutate via arguments must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutating Git read verb should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
+
+        // Plain reads and look-alike options stay Low.
+        for command in [
+            "git fsck",
+            "git diff --output-indicator-new=+ HEAD",
+            "git diff -O/tmp/order HEAD",
+            "git whatchanged --stat",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("plain Git reads should remain allowed without approval");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        // `git grep -O` / `--open-files-in-pager` runs a pager (external
+        // command), even clustered behind other short flags; it must be
+        // rejected outright, not merely gated.
+        for command in [
+            "git grep -O foo",
+            "git grep -Ovim foo",
+            "git grep -nO foo",
+            "git grep --open-files-in-pager=sh foo",
+        ] {
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("Git grep pager execution must be rejected even with approval");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        // `-o` is `--only-matching` (a read) and stays allowed and Low; the
+        // pager scan is case-sensitive and stops at value-consuming flags.
+        for command in ["git grep -o needle", "git grep -no needle"] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("git grep --only-matching should remain a read");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
+    fn git_index_and_worktree_mutations_require_approval() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Verbs that mutate the index or working tree. These stay command-
+        // allowed but must require approval rather than classifying Low.
+        for command in [
+            "git add .",
+            "git add -A",
+            "git rm --cached secret",
+            "git mv a b",
+            "git restore src/main.rs",
+            "git restore --staged src/main.rs",
+            "git apply patch.diff",
+            "git stash",
+            "git stash push -m wip",
+            "git -C . add .",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("index/working-tree mutations must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+            let approved = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved mutation should remain allowed");
+            assert_eq!(approved, CommandRiskLevel::Medium, "{command}");
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -7740,15 +8039,21 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -7779,68 +8084,113 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
-        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("ls missing 2>/dev/null"), None);
+        assert_eq!(posix("ls missing 2> /dev/null"), None);
+        assert_eq!(posix("echo hi >/dev/stdout"), None);
+        assert_eq!(posix("echo hi > /dev/stdout"), None);
+        assert_eq!(posix("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix("cat </dev/zero"), None);
+        assert_eq!(posix("cat < /dev/zero"), None);
+        // Bare-argument device classification is host-gated BENEATH the
+        // dialect: the harmless-device carve-out for a bare `/dev/null`
+        // argument exists only on Unix hosts, so pinning Posix does not
+        // unify this case. Assert both arms so the split stays visible.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+        assert_eq!(posix("cat /dev/null"), None);
+        #[cfg(target_os = "windows")]
+        assert_eq!(posix("cat /dev/null"), Some("/dev/null".into()));
+        assert_eq!(posix("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix("cat> /dev/null"), None);
+        assert_eq!(posix("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("echo hi >/etc/passwd"), Some("/etc/passwd".into()));
+        assert_eq!(posix("echo hi > /etc/passwd"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi > /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            posix("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            posix("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            posix("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            posix("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            posix("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            posix("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            posix("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
         );
+        assert_eq!(posix("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>&2"),
+            posix("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// The dialect divergence that broke the host-defaulting tests on Windows,
+    /// pinned as intended behavior: under `cmd.exe` the safe null device is
+    /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
+    /// bare leading-slash redirect target is rooted on the current drive
+    /// rather than being workspace-relative.
+    #[test]
+    fn forbidden_path_argument_windows_cmd_classifies_devices_by_dialect() {
+        let p = unix_forbidden_path_policy();
+        let windows_cmd =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::WindowsCmd);
+
+        // Host-independent dialect facts: the cmd.exe null device is safe,
+        // and a drive-relative form fails closed on every host because it
+        // resolves against a per-drive current directory.
+        assert_eq!(windows_cmd("dir missing 2>nul"), None);
+        assert_eq!(windows_cmd("dir missing 2> nul"), None);
         assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
-            Some("/etc/passwd".into())
+            windows_cmd("type C:relative.txt"),
+            Some("C:relative.txt".into())
         );
+
+        // The `/dev/null` classification under the Windows dialect is
+        // host-gated, not dialect-gated: on a Windows host a bare leading
+        // slash is rooted on the current drive and fails closed, while on
+        // POSIX hosts the Unix device path remains acceptable. Assert both
+        // arms so the split stays visible instead of surprising the next
+        // host-defaulting caller.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            windows_cmd("dir missing 2>/dev/null"),
+            Some("/dev/null".into())
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(windows_cmd("dir missing 2>/dev/null"), None);
     }
 
     // ── Edge cases: path traversal ──────────────────────────
@@ -8146,6 +8496,44 @@ mod tests {
                 "POSIX device file {device} must be readable"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_write_check_preserves_symlinks_to_the_null_device() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let null_alias = tmp.path().join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(policy.is_resolved_path_readable(Path::new("/dev/null")));
+        assert!(policy.is_resolved_path_allowed(Path::new("/dev/null")));
+        // Both reads and writes retain the longstanding resolved-target
+        // exception for POSIX devices.
+        assert!(policy.is_resolved_path_readable(&null_alias));
+        assert!(
+            policy.is_resolved_path_allowed(&null_alias),
+            "a symlink to the null device must retain write authorization"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolved_path_checks_allow_the_windows_null_device() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from(r"C:\\workspace"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(policy.is_resolved_path_readable(Path::new("nul")));
+        assert!(policy.is_resolved_path_allowed(Path::new("nul")));
     }
 
     #[test]
@@ -9704,37 +10092,90 @@ mod tests {
     }
 
     #[test]
-    fn approved_read_root_returns_workspace_for_contained_paths() {
+    fn approved_read_roots_returns_every_applicable_boundary() {
         let ws = tempfile::tempdir().unwrap();
         let ws_canon = ws.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
             workspace_dir: ws.path().to_path_buf(),
             ..SecurityPolicy::default()
         };
-        // A path inside the workspace binds to the canonical workspace root.
+        // A path inside the workspace is bounded by its canonical workspace root.
+        assert_eq!(
+            policy.approved_read_roots(&ws_canon.join("sub").join("a.txt")),
+            vec![ws_canon.clone()]
+        );
         assert_eq!(
             policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
             Some(ws_canon.clone())
         );
-        // A path outside every allowlist has no bounded root.
+        // A path outside every allowlist has no bounded roots.
         let outside = tempfile::tempdir().unwrap();
         let outside_canon = outside.path().canonicalize().unwrap();
-        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+        assert!(
+            policy
+                .approved_read_roots(&outside_canon.join("x"))
+                .is_empty()
+        );
     }
 
     #[test]
-    fn approved_read_root_honors_read_only_allowlist() {
-        let ws = tempfile::tempdir().unwrap();
-        let ro = tempfile::tempdir().unwrap();
-        let ro_canon = ro.path().canonicalize().unwrap();
+    fn unrestricted_policy_has_no_discovery_boundary_but_preserves_handle_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = workspace.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
-            workspace_dir: ws.path().to_path_buf(),
-            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let path = workspace_canon.join("nested").join("file.txt");
+
+        assert!(policy.approved_read_roots(&path).is_empty());
+        assert!(policy.approved_write_roots(&path).is_empty());
+        assert_eq!(policy.approved_read_root(&path), Some(workspace_canon));
+    }
+
+    #[test]
+    fn approved_read_roots_include_overlapping_readable_grants() {
+        let parent = tempfile::tempdir().unwrap();
+        let nested_workspace = parent.path().join("workspace");
+        std::fs::create_dir(&nested_workspace).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let workspace_canon = nested_workspace.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: nested_workspace,
+            allowed_roots: vec![parent.path().to_path_buf()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
             ..SecurityPolicy::default()
         };
         assert_eq!(
-            policy.approved_read_root(&ro_canon.join("doc.pdf")),
-            Some(ro_canon.clone())
+            policy.approved_read_roots(&workspace_canon.join("doc.pdf")),
+            vec![workspace_canon, parent_canon]
+        );
+    }
+
+    #[test]
+    fn approved_write_roots_exclude_read_only_parent_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let child = parent.path().join("writable-child");
+        std::fs::create_dir(&child).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let child_canon = child.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![child.clone()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.approved_read_roots(&child_canon.join("file")),
+            vec![child_canon.clone(), parent_canon]
+        );
+        assert_eq!(
+            policy.approved_write_roots(&child_canon.join("file")),
+            vec![child_canon]
         );
     }
 

@@ -13,7 +13,7 @@ pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
 pub(crate) use boot::ControlPlaneRecoveryOwner;
 pub use global::control_plane;
-pub(crate) use global::{init_control_plane, spawn_control_plane_reaper};
+pub(crate) use global::{init_control_plane, non_daemon_control_plane, spawn_control_plane_reaper};
 pub use goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,

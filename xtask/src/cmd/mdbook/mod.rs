@@ -4,6 +4,7 @@ pub mod feature_matrix;
 pub mod hardware;
 pub mod keymap;
 pub mod linkcheck;
+pub mod llms;
 pub mod peer_groups;
 pub mod placeholders;
 pub mod plugins;

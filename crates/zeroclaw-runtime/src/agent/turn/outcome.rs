@@ -6,6 +6,21 @@ use std::sync::{Arc, Mutex};
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
+/// The provider/model and resolved limits that actually served the most recent
+/// LLM call in a tool loop. Written every dispatching iteration so the last
+/// value is the FINAL serving route — including a per-call vision switch that
+/// differs from the turn's selected text route.
+#[derive(Clone, Debug)]
+pub struct ServedRoute {
+    pub provider_name: String,
+    pub model: String,
+    pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+}
+
+/// Shared sink a caller hands the loop to observe the final serving route.
+/// `None` on paths that do not return serving-route metadata (tests, sub-turns).
+pub type ServedRouteSink = Arc<Mutex<Option<ServedRoute>>>;
+
 tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.
@@ -40,6 +55,28 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+/// The complete provider-facing request cannot fit the active model's capacity.
+#[derive(Debug)]
+pub struct ContextWindowExceeded {
+    pub estimated_tokens: usize,
+    pub model_context_window: usize,
+}
+
+impl std::fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-context-window-exceeded-error",
+        ))
+    }
+}
+
+impl std::error::Error for ContextWindowExceeded {}
+
+pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&ContextWindowExceeded> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ContextWindowExceeded>())
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
@@ -67,6 +104,9 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    /// The typed stream error that produced this outcome. `Terminal` is
+    /// load-bearing: the provider-call step reads it to skip the
+    /// non-streaming fallback the error's producer already performed.
     pub(crate) source: zeroclaw_api::model_provider::StreamError,
 }
 
@@ -233,6 +273,9 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
+    if context_window_exceeded_from_error(err).is_some() {
+        return Some(render("turn-context-window-exceeded-error", &[]));
+    }
     // A refusal that is still the final cause sits beneath Reliable's
     // envelopes; it needs safety-specific guidance rather than the generic
     // provider-failure projection. A later non-refusal failure replaces it as
@@ -258,7 +301,7 @@ fn terminal_completion_error_message_with_renderer(
 }
 
 #[cfg(test)]
-fn terminal_completion_error_message_in_english(
+pub(crate) fn terminal_completion_error_message_in_english(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
@@ -391,6 +434,32 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_error_preserves_its_typed_cause_and_localized_projection() {
+        let error = anyhow::Error::new(ContextWindowExceeded {
+            estimated_tokens: 40_000,
+            model_context_window: 32_768,
+        })
+        .context("private prompt and provider diagnostics");
+        let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
+        assert_eq!(exceeded.estimated_tokens, 40_000);
+        assert_eq!(exceeded.model_context_window, 32_768);
+        assert_eq!(
+            exceeded.to_string(),
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error"),
+        );
+        let delivered = terminal_completion_error_message(&error, Some("delegate-a"))
+            .expect("typed capacity failure must have a safe terminal projection");
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+        );
+        assert!(!delivered.contains("private prompt"));
+        let untyped = anyhow::Error::msg("context window exceeded");
+        assert!(context_window_exceeded_from_error(&untyped).is_none());
+        assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
 
     #[test]
     fn tool_loop_cancelled_display() {

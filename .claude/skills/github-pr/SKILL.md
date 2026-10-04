@@ -90,7 +90,7 @@ Using the parsed template structure and gathered context, draft a complete PR bo
 
 - For each `## ` section from the template, fill in the bullet points and fields based on context from the commits, diff, and changed files.
 - Use the field descriptions and placeholder text in the template as guidance for what each field expects.
-- For Yes/No fields, infer from the diff (e.g., if no files in `src/security/` changed, security impact is likely all No).
+- For Yes/No fields, infer from the diff (e.g., if files in `src/security/` changed, security impact is likely).
 - For required sections, always provide a substantive answer. For optional sections, fill if there's enough context, otherwise leave the template prompts in place.
 - Draft a conventional commit-style PR title based on the changes (e.g., `feat(provider): add retry budget override`, `fix(channel): handle disconnect gracefully`, `chore(ci): update workflow targets`).
 - Apply the shared authorship-hygiene check before showing or submitting the PR

@@ -46,6 +46,7 @@ fn fill_defaults<A: RebindableActions>(map: &mut HashMap<String, Vec<Chord>>) {
 
 /// Every rebindable action key — used by the completeness test and to
 /// size preset maps.
+#[cfg(test)]
 fn all_action_keys() -> Vec<String> {
     all_defaults().into_keys().collect()
 }
@@ -398,8 +399,8 @@ mod tests {
 
     /// A config file is the third writer of chord ownership, after the resolver
     /// and the binding editor, and it has to answer the question the same way.
-    /// `strip_redundant_shift` drops `SHIFT` from every character chord on every
-    /// platform, so these two spellings are one key at dispatch while `Eq` reads
+    /// `strip_redundant_shift` drops `SHIFT` from '?' on every platform,
+    /// so these two spellings are one key at dispatch while `Eq` reads
     /// them as two. Accepting both left `resolved_bindings` holding two explicit
     /// owners, which nothing arbitrates: dispatch takes the earlier declaration
     /// and Help advertises the chord for both actions.

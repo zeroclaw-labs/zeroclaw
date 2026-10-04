@@ -257,11 +257,23 @@ ZeroClaw automatically persists ACP sessions to SQLite. No configuration is requ
 What is persisted:
 
 - Session metadata: `sessionId`, `workspaceDir`, `created_at`, `last_activity`
-- Full conversation history: every `ConversationMessage` written after each completed `session/prompt` turn, in one atomic transaction per turn
+- Finalized conversation history: the agent's post-turn `ConversationMessage` history, including partial output retained after cancellation or failure, written atomically after the turn reaches a terminal outcome
+
+Standalone `zeroclaw acp` and gateway WebSocket ACP persist terminal turn state. They do not write the in-progress checkpoints described below, so a process exit during a turn can retain only history that was finalized before the exit.
 
 Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
 
-Sessions are not automatically deleted. Use `session/close` to deactivate a session without deleting it, then `session/load` or `session/resume` to bring it back.
+Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed.
+
+### ZeroCode / daemon RPC checkpoints
+
+ZeroCode uses the separate [daemon RPC interface](../architecture/rpc-socket.md). For an ACP-mode RPC session, the daemon saves the accepted prompt, assistant text, tool calls, and tool results before sending their corresponding updates to the client. If the process stops during a turn, the next supported RPC resume recovers that checkpoint once and appends an interruption marker to the client-visible transcript.
+
+Provider replay uses a separate safe projection: it keeps partial assistant text, omits the synthetic interruption marker and unmatched or ambiguous native tool exchanges, and limits each persisted tool-result payload to 16 KiB at a UTF-8 boundary plus a truncation marker. Thinking events and approval prompts are not checkpointed. Automatic trimming also stores the owner-selected retained provider context and its checkpoint frontier without deleting or renumbering the original visible transcript.
+
+A completed turn finalizes the visible transcript and retained provider context atomically. If a cancelled or failed turn has no terminal message delta to finalize, the daemon keeps its checkpoint for recovery and removes the live owner rather than discarding the accepted prompt or earlier saved progress. A later supported resume can then recover that checkpoint normally.
+
+Daemon RPC also provides `session/kill`, which records a durable tombstone so the session cannot be resumed, and `session/delete`, which removes the selected ACP history and checkpoint. Both methods first cancel an active turn and wait for its finalization before changing durable state. If the durable operation fails, the RPC returns an error, but cancellation is not undone. An idle live session remains available; hard cancellation can remove an active live owner, leaving its saved history and checkpoint available for recovery once storage is working. These two methods are not served by standalone or gateway WebSocket ACP.
 
 ### `session/load` _(ZeroClaw extension)_
 
@@ -388,7 +400,7 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 
 ## Security
 
-ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
+ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, uncovered tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); tools listed in `always_ask` still prompt through `session/request_permission` (or fail closed if the client cannot answer). `forbidden_paths` still apply.
 
 The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. The agent's system prompt reflects that same effective session workspace: the prompt's "Working directory" is rendered from `SecurityPolicy.workspace_dir` (the session `cwd`, or the agent workspace when `cwd` is omitted), while the agent's identity and personality (`IDENTITY.md`, `SOUL.md`) are loaded from the separate agent workspace. The model therefore sees the directory its file and shell tools are actually rooted at.
 

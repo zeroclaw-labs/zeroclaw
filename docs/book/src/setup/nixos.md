@@ -7,28 +7,44 @@ for an internet-facing process, modelled on `services.restic.backups`.
 
 ## The package
 
-The module invokes `${pkgs.zeroclaw}/bin/zeroclaw daemon`. `pkgs.zeroclaw` is
-not yet in nixpkgs; it is tracked in
-[#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987). Until it lands,
-build the binary yourself and point the module at it with the `package` option:
+The upstream flake builds ZeroClaw from source. With Nix's `nix-command` and
+`flakes` experimental features enabled, check the CLI without installing a
+system service:
+
+```sh
+nix run github:zeroclaw-labs/zeroclaw -- --version
+nix run github:zeroclaw-labs/zeroclaw -- --help
+```
+
+The default package is the ZeroClaw CLI; the development toolchain is exposed
+separately through `nix develop`. Building the package can take time on a cold
+cache. To inspect a local checkout:
+
+```sh
+nix build .#zeroclaw
+./result/bin/zeroclaw --version
+nix flake check
+```
+
+Running the CLI through `nix run` does not add it to your login shell's `PATH`.
+For a persistent NixOS installation, Nixpkgs provides `pkgs.zeroclaw`:
 
 <div class="os-tabs-src">
 
 #### nix
 
 ```nix
-services.zeroclaw.instances.me.package =
-  pkgs.callPackage ./zeroclaw.nix { };
+environment.systemPackages = [ pkgs.zeroclaw ];
 ```
 
 </div>
 
-For the same reason, `nix run github:zeroclaw-labs/zeroclaw` does not launch the
-agent. `nix run` resolves `apps.<system>.default` then `packages.<system>.default`;
-this flake defines no `apps`, and its `packages.default` is the Rust toolchain
-(for the dev shell), so the command would run the toolchain derivation, not
-ZeroClaw. On any other platform, [`install.sh`](./linux.md) is the supported
-path.
+The Nixpkgs package version follows your Nixpkgs pin; the upstream flake follows
+the selected ZeroClaw revision. These can differ. The module below defaults to
+`pkgs.zeroclaw` and starts its `zeroclaw daemon` command. Set
+`services.zeroclaw.instances.<name>.package` to use another package, for example
+`inputs.zeroclaw.packages.${pkgs.stdenv.hostPlatform.system}.zeroclaw` when your
+system flake has a `zeroclaw` input pointing at this repository.
 
 ## Single instance
 

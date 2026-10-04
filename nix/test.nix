@@ -34,6 +34,14 @@
 #   8. A second instance may share another instance's user/group when it sets
 #      `createUser = false`, matching the documented "bring your own user"
 #      contract.
+#   9. The dashboard bundle is wired through `gateway.web_dist_dir`: the
+#      `test` instance (with `webUiPackage` set) renders a `web_dist_dir`
+#      ending in `/share/zeroclaw-web` whose directory contains
+#      `index.html`, while the `other` instance (no bundle) renders no
+#      `gateway` section at all (API-only mode).
+#   10. A raw `[gateway]` table in the `test` instance's `extraConfig` merges
+#      with the bundle default into a single valid table (`gateway.port`
+#      renders alongside `gateway.web_dist_dir`).
 #
 # A no-op stub binary stands in for the real `zeroclaw daemon` so the test
 # does not depend on a working ZeroClaw build. The stub validates everything
@@ -66,6 +74,14 @@ let
         cp ${zeroclawStub}/bin/zeroclaw $out/bin/zeroclaw
       '';
 
+  # Minimal stand-in for `packages.zeroclaw-web`: the module only needs the
+  # bundle layout (`share/zeroclaw-web/`) referenced via
+  # `gateway.web_dist_dir`.
+  stubWebPackage = pkgs.runCommand "zeroclaw-web-stub" { } ''
+    mkdir -p $out/share/zeroclaw-web
+    echo '<html></html>' > $out/share/zeroclaw-web/index.html
+  '';
+
   moduleUnderTest = ./module.nix;
 
 in
@@ -79,6 +95,7 @@ in
 
       services.zeroclaw.instances.test = {
         package = stubPackage;
+        webUiPackage = stubWebPackage;
         settings = {
           default_provider = "anthropic";
           default_model = "claude-sonnet-4-6";
@@ -89,6 +106,12 @@ in
             allowed_users = [ "12345" ];
           };
         };
+        # Raw `[gateway]` table merges with the bundle's injected
+        # `gateway.web_dist_dir` into a single valid table (no duplicate).
+        extraConfig = ''
+          [gateway]
+          port = 42618
+        '';
       };
 
       services.zeroclaw.instances.other = {
@@ -241,5 +264,33 @@ in
             f"unexpected owner {owner_shared}"
         )
         machine.succeed("test -f /var/lib/zeroclaw-shared-user/config.toml")
+
+    with subtest("web UI bundle wired via gateway.web_dist_dir"):
+        dist = machine.succeed(
+            "yq -p toml -o json '.gateway.web_dist_dir' "
+            "/var/lib/zeroclaw-test/config.toml"
+        ).strip().strip('"')
+        assert dist.endswith("/share/zeroclaw-web"), (
+            f"unexpected web_dist_dir {dist!r}"
+        )
+        machine.succeed(f"test -f {dist}/index.html")
+
+    with subtest("API-only instance omits gateway.web_dist_dir"):
+        gateway = machine.succeed(
+            "yq -p toml -o json '.gateway' "
+            "/var/lib/zeroclaw-other/config.toml"
+        ).strip()
+        assert gateway == "null", (
+            f"expected no gateway section, got {gateway!r}"
+        )
+
+    with subtest("extraConfig gateway table merges with the bundle default"):
+        port = machine.succeed(
+            "yq -p toml -o json '.gateway.port' "
+            "/var/lib/zeroclaw-test/config.toml"
+        ).strip().strip('"')
+        assert port == "42618", (
+            f"extraConfig did not merge into [gateway], got {port!r}"
+        )
   '';
 }

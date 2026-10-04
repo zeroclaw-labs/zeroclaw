@@ -398,6 +398,15 @@ coexist, each generating its own bindings. And waki emits `wasi:http@0.2.4`
 imports while the current toolchain baseline is `@0.2.6`; the host links
 both without issue. Neither requires action.
 
+One version fact that **is** breakage: the world you vendor must match the host's
+exported world exactly. `wit/v0` is experimental and can gain a variant under the
+same `@0.1.0` (for example, `memory-audit` is a case of the
+`zeroclaw:plugin/logging` `plugin-action` enum). A component built against an
+older copy may compile cleanly but fail during instantiation. The host preserves
+the Wasmtime error chain and adds a conditional WIT-drift hint; inspect that
+chain, then diff your vendored `wit/v0` against the WIT from the host revision
+you run.
+
 Remember the trust framing from the [overview](./index.md): `http_client` is
 all-or-nothing. The sandbox does not bound where a granted plugin sends
 data, so operators running `strict` signature policy are trusting your code,
@@ -451,10 +460,21 @@ call site.
 Two operational constraints worth repeating from the
 [plugins overview](./index.md):
 
-- **Tool names must not collide with built-ins.** Built-in tools register
-  first and dispatch resolves first-match (`find_tool` in the runtime), so a
-  plugin tool named like a built-in is never selected. There is no error;
-  there is just silence. Pick a unique name.
+- **Package and tool names must not conflict with a registered tool.**
+  Registration refuses a conflict instead of letting one tool shadow another.
+  If your package name (the manifest `name`) matches an already registered
+  tool, the plugin is refused before its component is instantiated, and the
+  host logs a `WARN` event with `error_key` `plugin_package_name_conflict` in
+  its `attributes`. If the name your `name` export returns matches one, the
+  tool is not registered, and the `error_key` is `plugin_tool_name_conflict`.
+  The names checked are the tools that registry build has already registered,
+  including plugin tools accepted before yours, plus `execute_pipeline` when
+  `[pipeline] enabled = true`. That is not a fixed list of every built-in
+  name: a built-in the operator's config leaves unregistered is not reserved
+  in that build, so a name that loads on one host can be refused on another.
+  Pick names that are unique outright. See
+  [Tool name conflicts](../developing/how-plugins-work.md#tool-name-conflicts)
+  for the operator view.
 - **One tool per component.** The `tool-plugin` world exports a single `tool`
   interface. A toolbox is several plugin directories, one component each.
 
@@ -462,10 +482,11 @@ Two operational constraints worth repeating from the
 
 | Symptom | Likely cause |
 |---|---|
+| `zeroclaw plugin install` fails with `does not load against this host` | The component was built against a WIT that differs from this host's `wit/v0` (a stale `configure` signature, a capability flag the host does not share), or for the wrong target (a core module or `wasm32-wasip1`). The install-time load check is the same instantiation the daemon runs at startup, so nothing was installed. Rebuild against the shipped WIT and reinstall; `--no-verify` installs it anyway, and the daemon will then skip it at startup with the same diagnostic. |
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
 | Present in `zeroclaw plugin list` but the tool never loads | `plugins.auto_discover` is `false` (the default). Auto-discovered tool and skill capabilities load only when `plugins.auto_discover = true`; `plugins.enabled = true` alone activates only explicitly-declared channels. Run `zeroclaw config set plugins.auto_discover true`. |
-| Tool rejected during registration | Config validation or the metadata probe failed. Check the log for the specific error; a probe failure usually means the component was built against mismatched WIT. |
-| Tool never selected by the model | Name collides with a built-in, or the description/schema do not tell the model when the tool applies. |
+| Tool rejected during registration | Config validation or the metadata probe failed, or the package or tool name conflicts with an already registered tool. Check the log for the specific error: a name conflict carries `error_key` `plugin_package_name_conflict` or `plugin_tool_name_conflict`, and a probe failure usually means the component was built against mismatched WIT. |
+| Tool never selected by the model | The description/schema do not tell the model when the tool applies. A tool that is missing from the model's catalog entirely is a loading problem instead; start with the rows above. |
 | `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, the validated object is empty, or every validated property is marked secret. A `config_schema`/permission mismatch rejects the plugin instead. |
 | `secrets.get` returns `not-found` | The property is missing or is not a direct top-level string marked `x-secret = true` in the admitted schema. |
 | `secrets.get` returns `unavailable` | The call ran outside `execute`, config resolution failed, or the execution exhausted its fixed host-call budget. |

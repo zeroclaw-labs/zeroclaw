@@ -17,6 +17,15 @@ struct Cli {
 enum Cmd {
     /// Render the gateway's OpenAPI spec and regenerate the TS client.
     GenApi,
+    /// Dump the OpenAPI spec plus the Rust-rendered TS helpers
+    /// (`openapi.json`, `api-descriptions.ts`, `api-enums.ts`) into `--out`
+    /// without touching npm. Hermetic step for Nix builds; `api-generated.ts`
+    /// is produced from `openapi.json` by `openapi-typescript` downstream.
+    SpecDump {
+        /// Directory receiving the dumped files.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run `npm install` in web/.
     Install,
     /// Regenerate the TS client and run `npm run build`.
@@ -35,6 +44,7 @@ fn main() -> Result<()> {
     let spec_path = root.join("target/openapi.json");
     match cli.cmd {
         Cmd::GenApi => gen_api(&web_dir, &spec_path),
+        Cmd::SpecDump { out } => spec_dump(&out),
         Cmd::Install => npm_install(&web_dir),
         Cmd::Build => {
             gen_api(&web_dir, &spec_path)?;
@@ -89,6 +99,35 @@ fn npx(web_dir: &Path, args: &[&str]) -> Result<()> {
     let mut cmd = Command::new(bin("npx"));
     cmd.current_dir(web_dir).arg("--no-install").args(args);
     run_cmd(&mut cmd)
+}
+
+/// Hermetic spec dump for Nix builds: writes `openapi.json` plus the two
+/// Rust-rendered TS helpers. The single source of truth stays
+/// `zeroclaw_gateway::openapi::build_spec()`; `api-generated.ts` is derived
+/// from `openapi.json` via `openapi-typescript` in the npm build step.
+fn spec_dump(out_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("create output directory {}", out_dir.display()))?;
+
+    let spec_value = zeroclaw_gateway::openapi::build_spec();
+    let spec = serde_json::to_string(&spec_value).context("serialize openapi spec to JSON")?;
+    std::fs::write(out_dir.join("openapi.json"), &spec)
+        .with_context(|| format!("write openapi spec to {}", out_dir.display()))?;
+    println!("==> spec-dump → {}", out_dir.join("openapi.json").display());
+
+    let desc_ts = render_descriptions(&spec_value);
+    std::fs::write(out_dir.join("api-descriptions.ts"), &desc_ts)
+        .with_context(|| format!("write field descriptions to {}", out_dir.display()))?;
+    println!(
+        "==> spec-dump → {}",
+        out_dir.join("api-descriptions.ts").display()
+    );
+
+    let enums_ts = render_enum_values(&spec_value);
+    std::fs::write(out_dir.join("api-enums.ts"), &enums_ts)
+        .with_context(|| format!("write enum values to {}", out_dir.display()))?;
+    println!("==> spec-dump → {}", out_dir.join("api-enums.ts").display());
+    Ok(())
 }
 
 fn gen_api(web_dir: &Path, spec_path: &Path) -> Result<()> {

@@ -27,7 +27,8 @@ pub enum TurnStopCode {
     LoopDetector,
     /// Consecutive rounds produced byte-identical tool output.
     IdenticalOutput,
-    /// The tool loop exhausted `max_tool_iterations`.
+    /// The tool loop exhausted an iteration cap: `max_tool_iterations` or the
+    /// execution-tree iteration budget.
     MaxIterations,
     /// The turn's cost budget is spent.
     BudgetExhausted,

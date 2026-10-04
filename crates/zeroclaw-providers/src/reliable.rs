@@ -92,6 +92,17 @@ struct ReliableEntryId {
     entry_index: usize,
 }
 
+/// Explicit outcome of the retry policy for one entry. Returned by the pure
+/// [`ReliableModelProvider::stream_recovery_decision`]; callers must not infer
+/// precedence from branch order — read the `match` arms instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// Attempt the entry with the given retry budget.
+    Admit(u32),
+    /// Skip the entry entirely (avoids replaying a failed stream entry).
+    Skip,
+}
+
 /// Call-scoped outcome retained independently of the provider result.
 ///
 /// In particular, callers must extract it before propagating an error: a
@@ -103,6 +114,14 @@ pub(crate) struct ReliableCallAccounting {
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
+    /// True iff the recorded stream failure carries a transport-reported
+    /// connect failure: some error in the chain downcasts to
+    /// `StreamError::ConnectFailed`, which only a send site emits. This
+    /// grant matches the non-streaming retry loop, which already retries
+    /// connect failures on the same entry; the redirect limit on that
+    /// variant applies equally to both paths. Provider error text never
+    /// sets this.
+    stream_recovery_connect_failed: bool,
 }
 
 impl ReliableCallAccounting {
@@ -215,9 +234,25 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
 
 /// Preserve the classified stream failure while runtime attempts eligible
 /// non-streaming recovery candidates.
+///
+/// The diagnostic is presentation-only. The recovery exception is decided
+/// from the error chain itself: it is granted only when some cause
+/// downcasts to `StreamError::ConnectFailed`, which a streaming adapter
+/// emits at the send site on a transport-reported connect failure. The
+/// exception matches the non-streaming retry loop, which already retries
+/// connect failures on the same entry; the redirect limit on that variant
+/// applies equally to both paths. Provider error text never grants it.
 pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let stream_recovery_connect_failed = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<StreamError>(),
+            Some(StreamError::ConnectFailed(_))
+        )
+    });
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
-        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+        let mut accounting = accounting.lock();
+        accounting.stream_recovery_connect_failed = stream_recovery_connect_failed;
+        accounting.stream_recovery_failure = Some(provider_error_diagnostic(error));
     });
 }
 
@@ -303,6 +338,7 @@ pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Ou
 }
 
 /// Record a model_provider fallback event.
+/// No-ops when called outside a `scope_provider_fallback` scope.
 fn record_provider_fallback(
     requested_provider: &str,
     requested_model: &str,
@@ -557,6 +593,53 @@ fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
         .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
 }
 
+/// The status shape rule shared by `embedded_status_code` and the
+/// error-text marker parser (`http_status_from_error_text`): a status
+/// code is a run of exactly three ASCII digits with no alphanumeric byte
+/// on either side.
+fn is_status_shaped_run(bytes: &[u8], start: usize) -> bool {
+    start + 3 <= bytes.len()
+        && bytes[start..start + 3].iter().all(u8::is_ascii_digit)
+        && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+        && (start + 3 == bytes.len() || !bytes[start + 3].is_ascii_alphanumeric())
+}
+
+/// First status-shaped HTTP status code embedded in an error message and
+/// admitted by `accept`: a run of exactly three ASCII digits, not adjacent
+/// (either side) to an ASCII alphanumeric character
+/// (`is_status_shaped_run`). Numbers glued to units or words ("480s"),
+/// longer digit runs ("0409", "4800"), and values `accept` rejects are
+/// not status codes. This keeps timing and sizing numbers in provider
+/// messages (for example a stream-idle bound of 480 s) from being misread
+/// as an HTTP status.
+fn embedded_status_code(message: &str, accept: impl Fn(u16) -> bool) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if is_status_shaped_run(bytes, start)
+            && let Ok(code) = message[start..start + 3].parse::<u16>()
+            && accept(code)
+        {
+            return Some(code);
+        }
+        start = end;
+    }
+    None
+}
+
+/// First status-shaped HTTP client error (4xx) code embedded in a message.
+fn embedded_client_status(message: &str) -> Option<u16> {
+    embedded_status_code(message, |code| (400..500).contains(&code))
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     // A provider's typed classification is definitive. Check the full chain
@@ -607,13 +690,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    // Only status-shaped numbers count (see `embedded_client_status`), so
+    // elapsed times and other digit noise in a message never look like an
+    // HTTP client error.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>()
-            && (400..500).contains(&code)
-        {
-            return code != 429 && code != 408;
-        }
+    if let Some(code) = embedded_client_status(&msg) {
+        return code != 429 && code != 408;
     }
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
@@ -641,6 +723,20 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
 
     has_model_not_found_hint(&msg_lower)
+}
+
+/// The single terminal-failure predicate the four non-streaming retry arms
+/// consult. Typed provider decisions (`NonRetryableProviderError`), typed
+/// refusals, and business-quota rate limits are definitive and never
+/// retried — overload wording cannot clear them. Overload downgrades only
+/// the heuristic non-retryable classification (status text, auth keyword
+/// hints), where the same wording can describe a transient server shed.
+/// Centralising the precedence here means the four arms cannot drift.
+fn is_terminal_provider_failure(err: &anyhow::Error) -> bool {
+    has_typed_non_retryable_marker(err)
+        || err.downcast_ref::<AnthropicRefusalError>().is_some()
+        || is_non_retryable_rate_limit(err)
+        || (is_non_retryable(err) && !is_overloaded(err))
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -737,6 +833,53 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("429")
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
+}
+
+/// Check if an error is an overload (transient server-side shed): the
+/// upstream accepted the request and dropped it under load. The decision is
+/// layered, each layer decisive when it applies:
+///
+/// 1. A typed reqwest status: overload iff it is 529.
+/// 2. The outermost status the crate's recognised markers yield
+///    (`modelprovider error:`, `api error (`, `http `): 529 is an
+///    overload; any 4xx is definitive and not one; another 5xx falls
+///    through to the wording, so a gateway's 502 or 503 whose body says
+///    "overloaded" still gets the overload floor. A status quoted from
+///    an upstream body never outranks the adapter's own status.
+/// 3. A status-shaped embedded client status (4xx): definitive, not an
+///    overload; a parsed client status outranks wording, so
+///    "429 ...: servers overloaded" is a rate limit, not a shed.
+/// 4. Otherwise the wording: "overloaded" (case-insensitive, covering
+///    `overloaded_error`) or a status-shaped 529.
+///
+/// Residual: a status-shaped `529` (space or punctuation on both sides) in
+/// a message with no recognised status marker and no typed classification
+/// is treated as overload — the price of the text fallback.
+/// `is_terminal_provider_failure` keeps that residual from overriding
+/// typed or quota decisions. Consulted on error values only — successful
+/// response text never reaches it. A plain 503 (even one whose body
+/// mentions "overload") is not an overload signal; it keeps the ordinary
+/// server-error policy without the overload backoff floor.
+fn is_overloaded(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+    {
+        return status.as_u16() == 529;
+    }
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    if let Some(status) = http_status_from_error_text(&lower) {
+        if status == 529 {
+            return true;
+        }
+        if (400..500).contains(&status) {
+            return false;
+        }
+    }
+    if embedded_client_status(&msg).is_some() {
+        return false;
+    }
+    lower.contains("overloaded") || embedded_status_code(&lower, |code| code == 529).is_some()
 }
 
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
@@ -1011,6 +1154,16 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     Some(sanitized_url_endpoint(url))
 }
 
+/// HTTP status code carried by one of the crate's recognised error-text
+/// markers: a `modelprovider error:` prefix at the start of the text, or
+/// an `api error (` / `http ` marker anywhere in it. The outermost marker
+/// wins: adapters format their own response status first and append the
+/// upstream body after it (the Gemini CLI OAuth refresh bail in
+/// `gemini.rs` is the shape in hand), and `anyhow::Error::to_string`
+/// renders the outermost message, so the first marker in the text carries
+/// the wrapper's status; anything later is quoted payload and never
+/// outranks it. The shape rule is the one `embedded_status_code` applies:
+/// exactly three digits, no alphanumeric neighbour.
 fn http_status_from_error_text(text: &str) -> Option<u16> {
     for prefix in [
         "model_provider stream error: modelprovider error:",
@@ -1032,21 +1185,29 @@ fn http_status_from_error_text(text: &str) -> Option<u16> {
         }
     }
 
+    // Earliest accepted marker occurrence wins, across both markers: a
+    // status quoted from an upstream body sits after the adapter's own
+    // status and must not override it.
+    let bytes = text.as_bytes();
+    let mut outermost: Option<(usize, u16)> = None;
     for marker in ["api error (", "http "] {
+        let mut scanned_to = 0;
         let mut remainder = text;
         while let Some(start) = remainder.find(marker) {
-            let after_marker = &remainder[start + marker.len()..];
-            if let Some(code) = after_marker
-                .get(..3)
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|code| (400..600).contains(code))
+            let marker_at = scanned_to + start;
+            let status_at = marker_at + marker.len();
+            if is_status_shaped_run(bytes, status_at)
+                && let Ok(code) = text[status_at..status_at + 3].parse::<u16>()
+                && (400..600).contains(&code)
+                && outermost.is_none_or(|(at, _)| marker_at < at)
             {
-                return Some(code);
+                outermost = Some((marker_at, code));
             }
-            remainder = after_marker;
+            scanned_to = status_at;
+            remainder = &remainder[start + marker.len()..];
         }
     }
-    None
+    outermost.map(|(_, code)| code)
 }
 
 fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
@@ -1166,6 +1327,17 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             kind: "rate_limited",
             phase: "http_response",
             hint: "wait, change key/quota, or switch provider",
+            endpoint,
+        };
+    }
+
+    if is_overloaded(err) {
+        // Overload (529 / `overloaded_error`) is a server-side shed:
+        // classify and present it exactly like any other 5xx.
+        return ProviderErrorDiagnostic {
+            kind: "provider_server",
+            phase: "http_response",
+            hint: "provider returned a server error; retry or switch provider",
             endpoint,
         };
     }
@@ -1870,6 +2042,35 @@ impl ReliableModelProvider {
             rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Build a provider whose entries mirror `push_pinned_entries`: every entry
+    /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
+    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    ///
+    /// Exposed for cross-crate regressions that need the same-alias
+    /// pinned-model failover shape; the production builder reaches
+    /// `new_pinned` directly.
+    #[doc(hidden)]
+    pub fn new_pinned_for_test(
+        alias: &str,
+        entries: Vec<(&str, &str, &str, std::sync::Arc<dyn ModelProvider>)>,
+        max_retries: u32,
+        base_backoff_ms: u64,
+    ) -> Self {
+        let model_providers = entries
+            .into_iter()
+            .map(|(cooldown_key, provider_alias, pinned_model, inner)| {
+                ReliableModelProviderEntry::new_pinned(
+                    cooldown_key,
+                    cooldown_key,
+                    provider_alias,
+                    pinned_model,
+                    Box::new(inner),
+                )
+            })
+            .collect();
+        Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
+    }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
@@ -1905,6 +2106,11 @@ impl ReliableModelProvider {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Use Retry-After but cap at 30s to avoid indefinite waits
             retry_after.min(30_000).max(base)
+        } else if is_overloaded(err) {
+            // Overload sheds arrive without a Retry-After; an immediate
+            // re-send lands back in the same shed window, so hold at least
+            // the floor. Growth across attempts stays the loop's doubling.
+            base.max(Self::OVERLOAD_BACKOFF_FLOOR_MS)
         } else {
             base
         }
@@ -1919,6 +2125,10 @@ impl ReliableModelProvider {
 
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
+
+    /// Minimum wait between attempts after an overload when no Retry-After
+    /// is parsed. Overload sheds typically outlast one round trip.
+    const OVERLOAD_BACKOFF_FLOOR_MS: u64 = 2_000;
 
     /// Returns whether a cooldown is active and prunes expired cooldowns.
     fn provider_cooldown_active(&self, cooldown_key: &str) -> bool {
@@ -1943,9 +2153,25 @@ impl ReliableModelProvider {
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// semantic-empty stream entry, which receives one atomic non-stream
-    /// recovery attempt when the configured budget permits it.
-    fn effective_retry_limit(&self, model_slot: usize, entry_index: usize) -> Option<u32> {
+    /// stream-failed entry, which is skipped to avoid replaying it. Three
+    /// exceptions admit the failed entry anyway: the semantic-empty entry
+    /// (when the budget permits it, granted as a single attempt), a
+    /// connect-failed stream failure (the streaming adapter recorded a
+    /// typed `StreamError::ConnectFailed` from the transport; the exception
+    /// matches the non-streaming retry loop, which already retries connect
+    /// failures on the same entry, and the redirect limit on that variant
+    /// applies equally to both paths; it carries the full configured
+    /// budget), and the single-candidate case (no other candidate exists,
+    /// so a non-stream retry of the same entry is recovery, not replay,
+    /// and it carries the full configured budget). When two
+    /// exceptions apply to the same entry, semantic-empty wins and its grant
+    /// stays a single attempt, never two.
+    fn effective_retry_limit(
+        &self,
+        model_slot: usize,
+        entry_index: usize,
+        has_other_candidate: bool,
+    ) -> Option<u32> {
         let max_retries = self.max_retries;
         RELIABLE_CALL_ACCOUNTING
             .try_with(|accounting| {
@@ -1953,16 +2179,83 @@ impl ReliableModelProvider {
                 let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
                     model_slot == failed.model_slot && entry_index == failed.entry_index
                 });
-                if !exact_failed_entry {
-                    return Some(max_retries);
+                // Connect-failed is a transport fact, not an error-text
+                // reading: the flag is set only when the recorded failure
+                // carries `StreamError::ConnectFailed`, which adapters emit
+                // at the send site on a transport-reported connect failure.
+                // A provider's own error text (an SSE error frame on an
+                // accepted 200 response, an API error body) never grants
+                // this; unknown provenance keeps the skip.
+                let connect_failed = accounting.stream_recovery_connect_failed;
+                let decision = Self::stream_recovery_decision(
+                    max_retries,
+                    exact_failed_entry,
+                    connect_failed,
+                    accounting.stream_recovery_semantic_empty_permission,
+                    has_other_candidate,
+                );
+                match decision {
+                    RetryDecision::Admit(limit) => {
+                        if exact_failed_entry {
+                            // Consume one-shot recovery grants so each fires at
+                            // most once. Clearing the resume marker merges the
+                            // single-candidate and connect-failed grants into
+                            // the semantic-empty attempt when more than one
+                            // applies, and keeps the connect-failed grant
+                            // from firing twice in one call. The next
+                            // candidate keeps its own ordinary budget.
+                            accounting.stream_recovery_semantic_empty_permission = false;
+                            if !has_other_candidate || connect_failed {
+                                accounting.stream_resume_after = None;
+                            }
+                        }
+                        Some(limit)
+                    }
+                    RetryDecision::Skip => None,
                 }
-                if max_retries == 0 || !accounting.stream_recovery_semantic_empty_permission {
-                    return None;
-                }
-                accounting.stream_recovery_semantic_empty_permission = false;
-                Some(0)
             })
             .unwrap_or(Some(max_retries))
+    }
+
+    /// Pure retry policy for a single entry: precedence is encoded in this
+    /// `match` so each recovery mode is an explicit, independently testable
+    /// decision rather than a branch in an if-chain. Stateful one-shot
+    /// consumption lives in [`Self::effective_retry_limit`], not here.
+    fn stream_recovery_decision(
+        max_retries: u32,
+        exact_failed_entry: bool,
+        connect_failed: bool,
+        semantic_empty_permission: bool,
+        has_other_candidate: bool,
+    ) -> RetryDecision {
+        if !exact_failed_entry {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Semantic-empty wins when more than one exception applies (a
+        // semantic-empty failure came from a completed response, so it can
+        // never be a connect failure; it stays first so the order reads
+        // right). See `effective_retry_limit` for the merged single-attempt
+        // consumption.
+        if max_retries > 0 && semantic_empty_permission {
+            return RetryDecision::Admit(0);
+        }
+        // Connect failure on the stream send: the exception matches the
+        // non-streaming retry loop, which already retries connect failures
+        // on the same entry; the redirect limit on the variant applies
+        // equally to both paths. The grant carries the configured budget
+        // even when another candidate exists (a zero budget still means
+        // exactly one attempt).
+        if connect_failed {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Single-candidate stream failure: no alternative entry exists, so a
+        // non-stream retry of the same entry is recovery, not replay, and it
+        // carries the configured budget (a zero budget still means exactly
+        // one attempt). Semantic-empty keeps its single-attempt grant.
+        if !has_other_candidate {
+            return RetryDecision::Admit(max_retries);
+        }
+        RetryDecision::Skip
     }
 
     fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
@@ -2296,7 +2589,11 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -2604,7 +2901,11 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -2833,9 +3134,13 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
@@ -3015,7 +3320,11 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -3157,6 +3466,8 @@ impl ModelProvider for ReliableModelProvider {
             .as_ref()
             .and_then(|refusal| refusal.attempted_candidate.clone());
 
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
@@ -3179,7 +3490,9 @@ impl ModelProvider for ReliableModelProvider {
                     streamed_refusal = None;
                     continue;
                 }
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
@@ -3363,7 +3676,11 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -3483,6 +3800,15 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
+        // Aggregation stays any(): a streaming-capable fallback may serve a
+        // turn whose selected primary disclaims streaming, surfacing the
+        // standard fallback notice (runtime contract, verified by
+        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
+        // audit's stream-into-disclaiming-route hazard is closed at the
+        // dispatch layer instead: RouterModelProvider never streams a
+        // resolved route that disclaims streaming, and the passthrough
+        // leaf's streaming builders never attach thinking params to the
+        // streamed wire (unverified SSE frames, no signed capture there).
         self.model_providers
             .iter()
             .any(|entry| entry.provider().supports_streaming())
@@ -7057,6 +7383,57 @@ mod tests {
         assert!(is_non_retryable(&error));
     }
 
+    #[test]
+    fn terminal_provider_failure_outranks_overload_wording() {
+        // A typed provider decision is definitive even when its message
+        // says "overloaded".
+        let typed = anyhow::Error::new(crate::traits::NonRetryableProviderError::new(
+            "backend overloaded, refusing further work",
+        ));
+        assert!(is_terminal_provider_failure(&typed));
+        // A business-quota 429 that mentions overload keeps the rate-limit
+        // policy, not the overload floor.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "429 Too Many Requests: insufficient_quota, servers overloaded"
+        )));
+        // An auth failure with incidental 529 digits is not overloaded (a
+        // parsed client status outranks wording), so the heuristic
+        // non-retryable classification stands.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
+        )));
+        // An outer auth status stays terminal when the upstream body
+        // quotes an overload status: the marker layer reads the
+        // outermost status, and only status-shaped tokens count, so a
+        // nested "529" (or a queue-depth "52931") never clears it.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
+        // A typed refusal is terminal (constructed offline, no live
+        // response needed).
+        let refusal = anyhow::Error::new(AnthropicRefusalError {
+            requested_model: "test-model".to_string(),
+            category: None,
+            usage: None,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        });
+        assert!(is_terminal_provider_failure(&refusal));
+        // Overload wording alone is a transient shed: never terminal.
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "Anthropic API error (529 <unknown status code>): overloaded"
+        )));
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded"
+        )));
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "503 Service Unavailable: OVERLOADED"
+        )));
+    }
+
     #[tokio::test]
     async fn reliable_provider_does_not_retry_a_typed_marker_with_retryable_text() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -7078,6 +7455,203 @@ mod tests {
             .await
             .expect_err("typed provider failure should be terminal");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Overload wording inside a typed provider decision must not buy
+    /// retries: the marker is definitive, so `chat` fires exactly once and
+    /// the failure events record `non_retryable`.
+    #[tokio::test(start_paused = true)]
+    async fn chat_does_not_retry_typed_marker_with_overload_wording() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MarkerErrorProvider {
+                    calls: Arc::clone(&calls),
+                    error: "backend overloaded, refusing further work",
+                }),
+            )],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect_err("typed provider failure is terminal despite overload wording");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// An auth failure whose message carries incidental 529 digits must not
+    /// be reclassified as overload: one attempt, `non_retryable` reason.
+    #[tokio::test]
+    async fn chat_with_system_does_not_retry_auth_failure_with_incidental_529_digits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "401 Unauthorized: request req_a529b",
+                }),
+            )],
+            2,
+            1,
+        );
+        let err = provider
+            .chat_with_system(None, "hello", "test", None)
+            .await
+            .expect_err("auth failure with incidental 529 digits must stay terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// An outer auth status with an overload status quoted from the
+    /// upstream body is terminal: the marker layer reads the outermost
+    /// status, so the `chat_with_tools` arm fails fast instead of
+    /// retrying the authentication failure against the same candidate.
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_tools_does_not_retry_outer_auth_status_with_nested_529() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
+                }),
+            )],
+            2,
+            1,
+        );
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "noop", "parameters": {}}
+        })];
+        let err = provider
+            .chat_with_tools(&[], &tools, "test", None)
+            .await
+            .expect_err("outer auth status with nested 529 must stay terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// A mixed quota/overload message is a business quota: one attempt on
+    /// the first candidate, then failover. The rate-limit policy, not the
+    /// overload floor, governs the message.
+    #[tokio::test]
+    async fn chat_mixed_quota_overload_message_advances_after_one_attempt() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "first".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&first_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "",
+                        error: "429 Too Many Requests: insufficient_quota, servers overloaded",
+                    }),
+                ),
+                (
+                    "second".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&second_calls),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "",
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let resp = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect("second candidate recovers after the quota failure");
+        assert_eq!(resp.text.as_deref(), Some("recovered"));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Single-candidate pin for the mixed quota/overload message: with no
+    /// second candidate the rate-limit cooldown failover branch is
+    /// unreachable, so a classification that let overload wording clear
+    /// the business-quota decision would retry here (three calls under
+    /// `max_retries = 2`) instead of failing fast with the rate-limit
+    /// terminal reason.
+    #[tokio::test(start_paused = true)]
+    async fn chat_mixed_quota_overload_message_is_terminal_on_single_candidate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "only".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "429 Too Many Requests: insufficient_quota, servers overloaded",
+                }),
+            )],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect_err("mixed quota/overload message is terminal on a single candidate");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("rate_limited_non_retryable"),
+            "failure events must record rate_limited_non_retryable: {err}"
+        );
     }
 
     #[tokio::test]
@@ -7233,6 +7807,15 @@ mod tests {
             ),
             (
                 "401 Unauthorized: invalid api key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                // The outer adapter status classifies the diagnostic; a
+                // 529 quoted from the upstream body is payload, not the
+                // response status.
+                "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
                 "auth",
                 "http_response",
                 "credentials",
@@ -7948,6 +8531,221 @@ mod tests {
         assert_eq!(model_provider.compute_backoff(500, &err), 500);
     }
 
+    #[test]
+    fn is_overloaded_matches_status_and_message_signals() {
+        // Typed reqwest error carrying a 529 status (built offline).
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(529)
+                .body("overloaded")
+                .expect("static test response"),
+        );
+        let typed = anyhow::Error::new(response.error_for_status().expect_err("529 is an error"));
+        assert!(is_overloaded(&typed), "reqwest 529 must match");
+
+        // Anthropic SSE error type carried in the message.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded"
+        )));
+        // Recognised `ModelProvider error:` prefix yields the status
+        // (gateway style).
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: 529 <unknown status code>: Overloaded"
+        )));
+        // Marker layer: the crate's `api error (` marker yields the status
+        // even when the payload wording alone would carry it.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (529 <unknown status code>): {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
+        )));
+        // Case-insensitive: a 503 body that says "OVERLOADED" is an overload
+        // signal too (same provider_server classification, plus the floor).
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "503 Service Unavailable: OVERLOADED"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (503 Service Unavailable): overloaded_error"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: 502 Bad Gateway: upstream overloaded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (400 Bad Request): prompt has 529 tokens"
+        )));
+        // The marker layer reads the outermost status and only
+        // status-shaped tokens: an adapter's own HTTP status wins over a
+        // status quoted from the upstream body, and "52931 queued
+        // requests" is a queue depth, not a 529.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (52931 queued requests)"
+        )));
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 529 overloaded): {\"error\":\"upstream API error (401 Unauthorized)\"}"
+        )));
+
+        // The predicate classifies the shared provider_server kind, matching
+        // any other 5xx.
+        let diagnostic = provider_error_diagnostic(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded",
+        ));
+        assert_eq!(diagnostic.kind, "provider_server");
+
+        // Negatives: other failure classes never match, and the singular
+        // word "overload" is prose, not the provider's overload signal — a
+        // plain 503 keeps the ordinary server-error policy (base backoff, no
+        // floor). The status half matches status-shaped runs only, so "529"
+        // inside a larger number (token counts below) is not an overload
+        // signal: this predicate overrides non-retryable classification in
+        // the retry loop, and a 400 whose body merely mentions a token count
+        // must not be retried. The predicate only ever sees error values, so
+        // response text containing "Overloaded" cannot reach it.
+        assert!(!is_overloaded(&anyhow::Error::msg("429 Too Many Requests")));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: bad key"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "503 Service Unavailable: overload"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "maximum context length exceeded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt is 15290 tokens, limit 8192"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: input has 52931 tokens"
+        )));
+        // Shape rule, shared with `embedded_client_status`: a status is a
+        // run of exactly three digits with non-alphanumeric neighbours, so
+        // digits glued to letters ("req_a529b", "model529b",
+        // "chatcmpl-529abc") or to more digits ("0529") are never a status,
+        // and a leading-zero run is four digits, not a three-digit status.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "unknown model model529b for this key"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "no such completion chatcmpl-529abc"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "gateway reported 0529 queued requests"
+        )));
+        // A parsed client status outranks overload wording: a bad request
+        // and a rate limit are client decisions, not a server shed.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt has 529 tokens"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "429 Too Many Requests: insufficient_quota, servers overloaded"
+        )));
+    }
+
+    #[test]
+    fn embedded_status_code_admits_by_acceptor() {
+        // A non-client acceptor: the overload probe looking for a bare 529.
+        // A status-shaped 529 between spaces is found.
+        assert_eq!(
+            embedded_status_code("shed 529 retry later", |code| code == 529),
+            Some(529)
+        );
+        // Digits glued to letters on either side are not a status.
+        assert_eq!(
+            embedded_status_code("request req_a529b failed", |code| code == 529),
+            None
+        );
+        // A leading-zero run is four digits, not a three-digit status.
+        assert_eq!(
+            embedded_status_code("queue depth 0529", |code| code == 529),
+            None
+        );
+        // The first accepted code wins when two are present.
+        assert_eq!(
+            embedded_status_code("saw 530 then 529", |code| matches!(code, 529 | 530)),
+            Some(530)
+        );
+    }
+
+    #[test]
+    fn http_status_from_error_text_prefers_outer_status_and_status_shaped_tokens() {
+        // Inputs are lowercase: both callers pass a lowercased message.
+        // The outer adapter status wins over a status quoted from the
+        // upstream body (the Gemini CLI OAuth refresh adapter wraps its
+        // own response status around the body it received).
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (529 <unknown status code>)\"}"
+            ),
+            Some(401)
+        );
+        // A marker-adjacent run of more than three digits is not a
+        // status: "52931 queued requests" is a queue depth, not a 529.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (52931 queued requests)\"}"
+            ),
+            Some(401)
+        );
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (52931 queued requests)"),
+            None
+        );
+        assert_eq!(http_status_from_error_text("http 52931"), None);
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 529 overloaded): {\"error\":\"upstream api error (401 unauthorized)\"}"
+            ),
+            Some(529)
+        );
+        // Unchanged positives: a lone marker status, and the
+        // `modelprovider error:` prefix path.
+        assert_eq!(
+            http_status_from_error_text(
+                "anthropic api error (529 <unknown status code>): overloaded"
+            ),
+            Some(529)
+        );
+        assert_eq!(
+            http_status_from_error_text(
+                "modelprovider error: 529 <unknown status code>: overloaded"
+            ),
+            Some(529)
+        );
+        // A marker whose token is not status-shaped is skipped; the next
+        // valid marker counts.
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (unknown): http 401"),
+            Some(401)
+        );
+    }
+
+    #[test]
+    fn compute_backoff_overload_floors_at_2s_without_retry_after() {
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("ModelProvider error: overloaded_error: Overloaded");
+        // Base below the floor: the floor binds.
+        assert_eq!(model_provider.compute_backoff(500, &err), 2_000);
+        // Base above the floor: the base wins.
+        assert_eq!(model_provider.compute_backoff(4_000, &err), 4_000);
+    }
+
+    #[test]
+    fn compute_backoff_overload_honors_retry_after() {
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("overloaded_error: Overloaded (Retry-After: 1)");
+        assert_eq!(model_provider.compute_backoff(500, &err), 1_000);
+    }
+
     // ── §2.1 API auth error (401/403) tests ──────────────────
 
     #[test]
@@ -8011,6 +8809,51 @@ mod tests {
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
         );
+    }
+
+    #[test]
+    fn non_retryable_ignores_stream_idle_timeout_messages() {
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "a stream idle timeout must stay retryable so the user's turn is preserved"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 3600s (stream idle timeout; raise timeout_secs above 3600s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "an hour-long idle bound is still not a client error"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "the fixed-bound idle rendering must also stay retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_status_shaped_numbers_only() {
+        assert!(is_non_retryable(&anyhow::Error::msg("HTTP 401")));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "upstream rejected the call: \"code\":404, model missing"
+        )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "status=403 forbidden"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "waited 480s for first byte"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "code 0409 from gateway"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "spent 4800 ms connecting"
+        )));
     }
 
     // ── §2.2 Rate limit Retry-After edge cases ───────────────
@@ -9106,7 +9949,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_context_treats_prompt_tool_results_as_part_of_turn() {
+    fn truncate_for_context_treats_tool_result_carriers_as_part_of_turn() {
         let mut messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("old request"),
@@ -9696,6 +10539,60 @@ mod tests {
         chat_calls: Arc<AtomicUsize>,
     }
 
+    /// The stream errors the connect-failed recovery tests drive, each
+    /// matching the exact shape its adapter emits.
+    #[derive(Clone, Copy)]
+    enum ConfiguredStreamError {
+        /// A transport connect failure at the send site, tagged by the
+        /// adapter as `StreamError::ConnectFailed` (the observed
+        /// connect-timeout chain).
+        ConnectFailed,
+        /// B1's counterexample: an accepted HTTP 200 stream whose SSE error
+        /// frame says `failed to resolve backend`, forwarded as a plain
+        /// provider-side error.
+        AcceptedResolveBackend,
+        /// The observed connect-timeout text carried without the transport's
+        /// typed verdict.
+        UntaggedConnectTimeoutText,
+    }
+
+    impl ConfiguredStreamError {
+        fn emit(self) -> crate::traits::StreamError {
+            match self {
+                Self::ConnectFailed => crate::traits::StreamError::ConnectFailed(
+                    "error sending request for url (https://gateway.example.test/v1/messages): \
+                     client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+                Self::AcceptedResolveBackend => crate::traits::StreamError::ModelProvider(
+                    "api_error: failed to resolve backend".to_string(),
+                ),
+                Self::UntaggedConnectTimeoutText => crate::traits::StreamError::Http(
+                    "error sending request for url (https://gateway.example.test/v1/messages): \
+                     client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Wrap a stream error the way the runtime's stream consumer hands it to
+    /// `record_stream_recovery_failure`: an outer message with the stream
+    /// error reachable as a chain cause.
+    fn runtime_stream_error_wrap(stream_error: crate::traits::StreamError) -> anyhow::Error {
+        anyhow::Error::new(stream_error).context("model_provider stream error")
+    }
+
+    /// Stream emits the configured error as its first item; non-streaming
+    /// chat counts calls, failing with an overload for the first
+    /// `chat_overload_failures` calls and then succeeding.
+    struct ConfiguredStreamErrorChatMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        stream_error_kind: ConfiguredStreamError,
+        chat_overload_failures: usize,
+    }
+
     struct StreamRefusalNoChatReplayMock {
         stream_calls: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
@@ -9989,6 +10886,146 @@ mod tests {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
                 text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(StreamingRecordMock::stream_error())]).boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ConfiguredStreamErrorChatMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ConfiguredStreamErrorChatMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ConfiguredStreamErrorChatMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(self.stream_error_kind.emit())]).boxed()
+        }
+    }
+
+    /// Stream fails pre-output; non-streaming calls fail with an overload
+    /// error for the first `chat_overload_failures` calls, then succeed.
+    struct StreamErrorThenOverloadedChatMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        chat_overload_failures: usize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamErrorThenOverloadedChatMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StreamErrorThenOverloadedChatMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamErrorThenOverloadedChatMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok(ChatResponse {
+                text: Some("recovered after overload".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
@@ -10521,6 +11558,287 @@ mod tests {
         assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A stream failure carrying the transport's own connect-failed verdict
+    /// must hand the exact failed entry its non-streaming recovery attempt
+    /// before any other candidate is tried. The recorded error is the
+    /// stream error the mock actually emitted, wrapped the way the runtime
+    /// wraps it.
+    #[tokio::test]
+    async fn connect_failed_stream_recovery_retries_the_failed_entry_before_other_candidates() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The transport reported the connect failure, so the primary gets
+        // the non-streaming attempt and the backup is never called.
+        assert_eq!(response.unwrap().text.as_deref(), Some("must not replay"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The connect-failed grant carries the configured retry budget: the
+    /// failed entry sees exactly `max_retries + 1` non-streaming attempts
+    /// before the backup is reached, and the backup keeps its own ordinary
+    /// budget.
+    #[tokio::test(start_paused = true)]
+    async fn connect_failed_stream_recovery_exhausts_the_failed_entry_budget_before_the_backup() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: usize::MAX,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2_000,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An accepted stream cannot buy the connect-failed grant: an SSE error
+    /// on a 200 response (B1's counterexample, `api_error: failed to
+    /// resolve backend`) is a provider-side error type, so the failed entry
+    /// keeps the multi-candidate skip and the backup serves instead.
+    #[tokio::test]
+    async fn stream_recovery_skips_accepted_stream_error_frame_text() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::AcceptedResolveBackend,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The frame's `resolve` wording still classifies as a DNS
+        // diagnostic for presentation, but the recorded type is a
+        // provider-side stream error, so the primary is never retried.
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Connect-timeout text alone no longer grants the exception: the
+    /// observed connect-timeout message, recorded without the transport's
+    /// typed connect-failed verdict, keeps the multi-candidate skip.
+    #[tokio::test]
+    async fn stream_recovery_skips_connect_timeout_text_without_typed_verdict() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::UntaggedConnectTimeoutText,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn failed_non_stream_recovery_is_a_second_canonical_leaf() {
         let provider = ReliableModelProvider::new(
@@ -10592,7 +11910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_candidate_reliable_recovery_skip_creates_no_second_leaf() {
+    async fn single_entry_stream_recovery_retries_same_candidate() {
         let chat_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableModelProvider::new(
             "test",
@@ -10621,27 +11939,345 @@ mod tests {
                     StreamOptions::new(true),
                 );
                 assert!(stream.next().await.expect("stream error event").is_err());
-                assert!(
-                    ProviderDispatch::from_ref(&provider)
-                        .chat(
-                            ChatRequest {
-                                messages: &messages,
-                                tools: None,
-                                thinking: None,
-                            },
-                            "served-model",
-                            None,
-                        )
-                        .await
-                        .is_err()
-                );
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("chat should succeed after stream recovery");
+                assert_eq!(resp.text.as_deref(), Some("must not replay"));
             })
             .await;
 
         let report = scope.take();
-        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.attempts().len(), 2);
         assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
+    }
+
+    #[test]
+    fn single_candidate_recovery_decision_boundaries() {
+        // Non-failed entries always admit the configured budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, false, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // Semantic-empty wins with budget; without budget it stays skipped
+        // when another candidate exists.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, true),
+            RetryDecision::Skip
+        );
+        // Single-candidate stream failure: recovery is not replay, so the
+        // entry is admitted with the configured budget (exactly one attempt
+        // when that budget is zero). Merges with semantic-empty into the
+        // same single attempt when both grants apply at a zero budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, false),
+            RetryDecision::Admit(0)
+        );
+        // Multi-candidate without permission: skip the failed entry.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true),
+            RetryDecision::Skip
+        );
+    }
+
+    #[test]
+    fn connect_failed_stream_recovery_decision_boundaries() {
+        // A connect failure admits the configured budget even when another
+        // candidate exists, exactly as the single-candidate case does (a
+        // zero budget still means exactly one attempt).
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true),
+            RetryDecision::Admit(2)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false),
+            RetryDecision::Admit(2)
+        );
+        // A failure that reached the upstream keeps the multi-candidate
+        // skip when no other exception applies.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, true),
+            RetryDecision::Skip
+        );
+        // Semantic-empty still wins over the connect-failed grant and
+        // keeps its single attempt (a semantic-empty failure came from a
+        // completed response, so it can never be a connect failure).
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true, true),
+            RetryDecision::Admit(0)
+        );
+    }
+
+    /// A pre-output stream failure on a single candidate must hand the
+    /// recovery attempt the configured retry budget with overload backoff:
+    /// two overloaded non-streaming responses, then success on the third.
+    #[tokio::test(start_paused = true)]
+    async fn single_candidate_stream_recovery_uses_configured_budget_on_overload() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamErrorThenOverloadedChatMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    chat_calls: Arc::clone(&chat_calls),
+                    chat_overload_failures: 2,
+                }) as Box<dyn ModelProvider>,
+            )],
+            2,
+            2_000,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let started = tokio::time::Instant::now();
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("chat succeeds after overloaded recovery attempts");
+                assert_eq!(resp.text.as_deref(), Some("recovered after overload"));
+            })
+            .await;
+
+        // Budget 2 → up to 3 non-streaming attempts; the first two overload.
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 3);
+        // Paused-clock waits: at base 2000 the floor is inert — the
+        // 2000 + 4000 schedule is the loop's doubling alone, so deleting
+        // the floor would not fail this test. The below-floor case is
+        // pinned by `compute_backoff_overload_floors_at_2s_without_retry_after`.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(6_000),
+            "overload backoff waits missing: {elapsed:?}"
+        );
+    }
+
+    /// A zero budget stays exactly one attempt even when that attempt hits
+    /// an overload (the single-candidate grant is recovery, not extra budget).
+    #[tokio::test]
+    async fn single_candidate_stream_recovery_zero_budget_stays_one_attempt_on_overload() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamErrorThenOverloadedChatMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    chat_calls: Arc::clone(&chat_calls),
+                    chat_overload_failures: usize::MAX,
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("zero-budget overload recovery must terminate");
+                assert!(
+                    format!("{err:?}").contains("overloaded_error"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// With another candidate available, the stream-failed entry is skipped
+    /// unless the adapter recorded a transport connect failure; the
+    /// recovery request goes to the next entry instead.
+    #[tokio::test]
+    async fn multi_candidate_stream_failure_skips_failed_entry() {
+        let first_chat_calls = Arc::new(AtomicUsize::new(0));
+        let second_chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "first".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&first_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "second".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&second_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("second candidate recovers");
+                assert_eq!(resp.text.as_deref(), Some("must not replay"));
+            })
+            .await;
+
+        assert_eq!(
+            first_chat_calls.load(Ordering::SeqCst),
+            0,
+            "failed entry must not be replayed when another candidate exists"
+        );
+        assert_eq!(second_chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn single_entry_stream_recovery_failure_errors_after_one_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamThenChatErrorMock) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("failed recovery must surface, not loop");
+                assert!(
+                    format!("{err:?}").contains("expected recovery failure"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        // Stream + exactly one recovery attempt are both ledger-visible.
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
     }
 
     #[tokio::test]
@@ -10984,15 +12620,35 @@ mod tests {
             activate_stream_recovery_after_first_poll(3, 4);
             mark_stream_recovery_semantic_empty();
 
-            assert_eq!(provider.effective_retry_limit(3, 3), Some(2));
-            assert_eq!(provider.effective_retry_limit(2, 4), Some(2));
-            assert_eq!(provider.effective_retry_limit(3, 4), Some(0));
-            assert_eq!(provider.effective_retry_limit(3, 4), None);
+            assert_eq!(provider.effective_retry_limit(3, 3, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(2, 4, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), Some(0));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), None);
 
             activate_stream_recovery_after_first_poll(5, 6);
             mark_stream_recovery_semantic_empty();
-            assert_eq!(zero_budget.effective_retry_limit(5, 6), None);
+            assert_eq!(zero_budget.effective_retry_limit(5, 6, true), None);
             assert!(stream_recovery_was_semantic_empty());
+
+            // Single-candidate stream failure grants one non-stream recovery
+            // attempt even with zero budget; the marker is consumed one-shot.
+            // Uses a budgeted provider so consumption is observable: granted
+            // once as Some(0), then normal budget Some(2) afterwards.
+            activate_stream_recovery_after_first_poll(7, 8);
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(2));
+
+            // Single-candidate + semantic-empty on the same entry merges into
+            // one single attempt (semantic-empty wins): granted once, then
+            // normal budget — never two recovery attempts.
+            activate_stream_recovery_after_first_poll(9, 10);
+            mark_stream_recovery_semantic_empty();
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(2));
+            // Both grants are consumed: re-arming the same marker without a
+            // fresh permission must skip when another candidate exists.
+            activate_stream_recovery_after_first_poll(9, 10);
+            assert_eq!(provider.effective_retry_limit(9, 10, true), None);
         })
         .await;
     }

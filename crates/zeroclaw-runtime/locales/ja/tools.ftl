@@ -1,4 +1,4 @@
-tool-backup = ワークスペースバックアップの作成、一覧表示、検証、復元
+tool-backup = 共有データディレクトリのバックアップを作成、一覧表示、検証、復元
 tool-browser = プラグイン可能なバックエンド（agent-browser、rust-native、computer_use）を使用したWeb/ブラウザオートメーション。DOMアクションに加えて、オプションのOSレベルアクション（mouse_move、mouse_click、mouse_drag、key_type、key_press、screen_capture）をコンピュータユースサイドカー経由でサポート。'snapshot'を使用して対話的要素をref（@e1、@e2）にマップします。openアクション向けにbrowser.allowed_domainsを強制します。
 tool-browser-delegate = ブラウザ対応CLIへのブラウザベースのタスクの委譲。Teams、Outlook、Jira、Confluenceなどのウェブアプリケーションと相互作用するため
 tool-browser-open = 承認されたHTTPS URLをシステムブラウザで開く。セキュリティ制約：許可リストのみのドメイン、ローカル/プライベートホストなし、スクレイピングなし。
@@ -34,7 +34,7 @@ tool-cron-remove = IDでcronジョブを削除
 tool-cron-run = cronジョブを即座に強制実行し、実行履歴を記録
 tool-cron-runs = cronジョブの最近の実行履歴を一覧表示
 tool-cron-update = 既存のcronジョブにパッチを適用（スケジュール、コマンド、プロンプト、有効、配信、モデル等）
-tool-data-management = ワークスペースデータ保持、削除、ストレージ統計
+tool-data-management = 共有データディレクトリの保持プレビューとストレージ統計
 tool-delegate = 特殊なエージェントへの小タスクの委譲。用途：異なるモデルから利益を得られるタスク（例：高速要約、深い推論、コード生成）。サブエージェントはデフォルトで単一のプロンプトを実行します。agentic=trueでは、フィルタ済みツール呼び出しループで反復できます。
 tool-file-edit = 完全一致する文字列を新しいコンテンツに置き換えてファイルを編集
 tool-file-download = 設定済みのリモートエンドポイントからファイルをダウンロードし、エージェントのワークスペースに書き込みます。取得するドキュメントの識別子とワークスペース相対の宛先パスを指定します。エンドポイントURLはホスト設定で固定されており、モデルが制御することはありません。バイトは直接ディスクにストリーミングされ、モデルのコンテキストには読み込まれません。HTTPステータス、書き込まれたバイト数、宛先パスを返します。
@@ -62,8 +62,11 @@ tool-file-download-error-move = ダウンロードしたファイルの移動に
 tool-file-download-success = { $written } バイトを { $dest_path } にダウンロードしました ({ $status })
 tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。バイナリファイルと画像ファイルは拒否されます（画像の場合は image_info ツールを使用）。encoding="base64" を設定すると、生のバイトをbase64エンコードして返します（.pdf/.xlsx/.docx などのバイナリファイル用）。そのモードでは offset/limit は無視されます。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み
-tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
+tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash、worktree）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
 tool-git-operations-error-not-in-repo = '{ $path }' はGitリポジトリ内にありません。Gitワークツリー内のパスを選択し、リポジトリのサブディレクトリに 'path' を渡すか、git_operationsを実行する前にリポジトリを初期化してください。
+tool-git-operations-error-repository-outside-authorized-roots = '{ $path }' の許可済みルート内に到達可能なGitリポジトリはありません。適用可能な許可済みルートで覆われたリポジトリ内のパスを選択するか、git_operationsを実行する前にリポジトリを初期化してください。
+tool-git-operations-error-repository-not-authorized = '{ $path }' のGitリポジトリメタデータはこの操作に対して許可されていません。適用可能な許可済みルートで覆われたリポジトリを選択してください。
+tool-git-operations-error-path-not-authorized = Gitパス '{ $path }' はこの操作に対して許可されていません。適用可能な許可済みルートに含まれるパスを選択してください。
 tool-git-forge-error-requires-field = { $resource }.{ $action } には '{ $field }' が必要です。
 tool-git-forge-error-requires-number = { $resource }.{ $action } には 'number' が必要です。
 tool-git-forge-error-issue-close-reason = issue.close の 'reason' は 'completed' または 'not_planned' である必要があります。
@@ -96,7 +99,7 @@ tool-project-intel = プロジェクト配信インテリジェンス：ステ�
 tool-proxy-config = ZeroClawプロキシ設定を管理（スコープ：environment | zeroclaw | services）。ランタイムおよびプロセス環境アプリケーション含む
 tool-pushover = Pushover通知をデバイスに送信します。.envファイルにPUSHOVER_TOKENおよびPUSHOVER_USER_KEYが必要。
 tool-schedule = スケジュール済みシェルのみのタスクを管理します。アクション：create/add/once/list/get/cancel/remove/pause/resume。警告：このツールは、出力がログに記録されるのみで、チャネルに配信されないシェルジョブを作成します。Discord/Telegram/Slack/Matrixにスケジュール済みメッセージを送信するには、job_type='agent'とdelivery配信設定（例：{"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}）付きのcron_addツールを使用してください。
-tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。ファイルパスと基数64エンコード済みPNGデータを返します。
+tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。保存先のファイルパスを返します。
 tool-browser-screenshot-error-path-not-allowed = スクリーンショットのパス「{ $path }」はワークスペースの許可リストに含まれていません
 tool-browser-screenshot-error-parent-not-exist = スクリーンショットのパス「{ $path }」の親ディレクトリ「{ $parent }」が存在しません
 tool-browser-screenshot-error-path-outside-workspace = スクリーンショットのパス「{ $path }」は「{ $canonical }」に解決されますが、ワークスペース外です

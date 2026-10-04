@@ -79,3 +79,13 @@ sender_example = "octocat"
 key = "nostr"
 sender_desc = "the sender's hex public key"
 sender_example = "npub1exampleexampleexampleexample"
+
+[[channel]]
+key = "bluesky"
+sender_desc = "the sender's handle or DID (a DID survives a handle rename)"
+sender_example = "example.bsky.social"
+
+[[channel]]
+key = "reddit"
+sender_desc = "the Reddit username without the `u/` prefix (case-insensitive)"
+sender_example = "example_user"

@@ -451,6 +451,58 @@ fn materializable_base64(item: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// The joined text of a `tools/call` result that can be losslessly compacted.
+///
+/// A `CallToolResult` carries the same payload twice: once as `content[].text`
+/// and again as `structuredContent`. Pretty-printing the whole envelope stores
+/// both copies, plus the envelope keys and the indentation, in the conversation
+/// — measured at roughly three characters per character of text the model reads,
+/// over 162,438 characters of tool results in one real session. The conversation
+/// is re-read on every agent-loop iteration, so a long tool-calling turn pays for
+/// all of it.
+///
+/// Returns `None` unless every content item is exactly a plain text block and
+/// every top-level field is part of the known envelope. If `structuredContent`
+/// is present, the joined text must parse as semantically equal JSON. Anything
+/// else takes the preserving full-result path.
+fn all_text_content(result: &serde_json::Value) -> Option<String> {
+    let envelope = result.as_object()?;
+    if envelope
+        .keys()
+        .any(|key| !matches!(key.as_str(), "content" | "structuredContent" | "isError"))
+        || envelope
+            .get("isError")
+            .is_some_and(|value| value != &serde_json::Value::Bool(false))
+    {
+        return None;
+    }
+    let items = envelope.get("content")?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for item in items {
+        let block = item.as_object()?;
+        if block.len() != 2 || block.get("type").and_then(|value| value.as_str()) != Some("text") {
+            return None;
+        }
+        let block = block.get("text").and_then(|value| value.as_str())?;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(block);
+    }
+
+    if let Some(structured) = envelope.get("structuredContent") {
+        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+        if &parsed != structured {
+            return None;
+        }
+    }
+
+    (!text.is_empty()).then_some(text)
+}
+
 /// Format an MCP `tools/call` result for the model.
 ///
 /// When `content` contains any `resource` blob or `type: "image"`/`"audio"`
@@ -464,8 +516,11 @@ fn materializable_base64(item: &serde_json::Value) -> Option<&str> {
 /// survives — a malformed image/audio payload (empty or non-string `data`) is
 /// stripped just like a valid one. Every non-binary field (text, `resource_link`,
 /// unknown content types, per-item `annotations`, and top-level
-/// `structuredContent`/`_meta`/`isError`) is preserved. Results without any
-/// binary item keep the existing pretty-printed JSON shape.
+/// `structuredContent`/`_meta`/`isError`) is preserved.
+///
+/// A result whose envelope can be losslessly represented by plain text renders
+/// as that text alone — see [`all_text_content`]. Results without binary content
+/// that cannot be compacted keep the existing pretty-printed JSON shape.
 ///
 /// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
 /// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
@@ -474,6 +529,12 @@ pub(crate) fn format_mcp_tool_result_for_model(
     mut result: serde_json::Value,
     workspace_dir: &Path,
 ) -> Result<String, EmbeddedResourceError> {
+    // An all-text result needs none of the machinery below: no content item can
+    // hold binary data, and the envelope around the text is proven redundant.
+    if let Some(text) = all_text_content(&result) {
+        return Ok(text);
+    }
+
     // Preflight over an immutable borrow: count every binary item that WILL be
     // decoded, hashed, and written — resource blobs AND valid image `data` — and
     // estimate their aggregate decoded size WITHOUT decoding. Two independent
@@ -1178,15 +1239,151 @@ mod tests {
     }
 
     #[test]
-    fn mcp_intake_without_blob_keeps_pretty_json() {
+    fn mcp_intake_all_text_sends_the_text_alone() {
+        // The model reads the tool's own payload, not the envelope and its
+        // duplicate. FastMCP-based servers emit both by default.
+        let dir = tempdir().unwrap();
+        let payload = r#"{"id": 15, "name": "Upper Strength"}"#;
+        let result = json!({
+            "content": [{ "type": "text", "text": payload }],
+            "structuredContent": { "id": 15, "name": "Upper Strength" },
+            "isError": false,
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(out, payload);
+        assert!(!out.contains("structuredContent"), "envelope kept: {out}");
+        assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_distinct_structured_content_keeps_the_envelope() {
         let dir = tempdir().unwrap();
         let result = json!({
+            "content": [{ "type": "text", "text": "Found one record" }],
+            "structuredContent": { "records": [{ "id": 7, "value": 42 }] },
+        });
+
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+
+        assert!(out.contains("Found one record"));
+        assert!(
+            out.contains("structuredContent"),
+            "structured output dropped: {out}"
+        );
+        assert!(out.contains("\"value\": 42"), "record dropped: {out}");
+    }
+
+    #[test]
+    fn mcp_intake_annotated_text_keeps_the_envelope() {
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{
+                "type": "text",
+                "text": "For the assistant only",
+                "annotations": { "audience": ["assistant"], "priority": 0.8 },
+            }],
+        });
+
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+
+        assert!(out.contains("For the assistant only"));
+        assert!(out.contains("annotations"), "annotations dropped: {out}");
+        assert!(out.contains("audience"), "audience metadata dropped: {out}");
+    }
+
+    #[test]
+    fn mcp_intake_error_and_unknown_fields_keep_the_envelope() {
+        let dir = tempdir().unwrap();
+        for result in [
+            json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "tool failed" }],
+            }),
+            json!({
+                "content": [{ "type": "text", "text": "plain" }],
+                "traceId": "request-7",
+            }),
+        ] {
+            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            assert!(out.starts_with('{'), "envelope dropped: {out}");
+        }
+    }
+
+    #[test]
+    fn mcp_intake_joins_multiple_text_blocks() {
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "a" },
+                { "type": "text", "text": "b" },
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(out, "a\nb");
+    }
+
+    #[test]
+    fn mcp_intake_mixed_content_keeps_every_block() {
+        // No-silent-loss rule: a text block beside an image, audio, resource_link
+        // or unknown content type must NOT reduce the result to its text. The
+        // binary payload is still redacted, but the block itself survives.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG");
+        for (sibling, marker) in [
+            (
+                json!({ "type": "image", "data": b64, "mimeType": "image/png" }),
+                "[IMAGE:",
+            ),
+            (
+                json!({ "type": "audio", "data": b64, "mimeType": "audio/wav" }),
+                "[audio attachment:",
+            ),
+            (
+                json!({ "type": "resource_link", "uri": "file:///kb/report.pdf" }),
+                "resource_link",
+            ),
+            (
+                json!({ "type": "video", "uri": "file:///clip.mp4" }),
+                "video",
+            ),
+        ] {
+            let result = json!({
+                "content": [
+                    { "type": "text", "text": "Screenshot captured" },
+                    sibling,
+                ]
+            });
+            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            assert!(out.contains("Screenshot captured"), "text lost: {out}");
+            assert!(out.contains(marker), "{marker} block dropped: {out}");
+        }
+    }
+
+    #[test]
+    fn mcp_intake_all_text_with_meta_keeps_pretty_json() {
+        // `_meta` is not a copy of the text, so the text-only path declines it.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "_meta": { "trace": "abc123" },
             "content": [{ "type": "text", "text": "plain" }]
         });
         let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("\"type\": \"text\"") || out.contains("\"type\":\"text\""));
+        assert!(out.contains("abc123"), "_meta dropped: {out}");
         assert!(out.contains("plain"));
-        assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_empty_or_absent_text_keeps_pretty_json() {
+        // Nothing to send instead of the envelope: keep the full result.
+        let dir = tempdir().unwrap();
+        for result in [
+            json!({ "content": [], "structuredContent": { "rows": 3 } }),
+            json!({ "content": [{ "type": "text", "text": "" }] }),
+            json!({ "structuredContent": { "rows": 3 } }),
+        ] {
+            let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+            assert!(out.contains("{"), "not JSON: {out}");
+        }
     }
 
     #[test]

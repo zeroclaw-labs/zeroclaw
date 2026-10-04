@@ -6,6 +6,7 @@ pub mod context_analyzer;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
+pub mod execution_tree_budget;
 pub mod history;
 pub mod history_pruner;
 pub mod history_trim;
@@ -26,7 +27,8 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
-    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
+    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
+    is_semantic_empty_terminal_completion,
     media_degrade::{
         degrade_media_in_message, degrade_media_in_messages, is_turn_opening_user_message,
     },
@@ -68,10 +70,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{process_message, process_message_with_live_config, run};
+
+#[cfg(test)]
+mod tests;

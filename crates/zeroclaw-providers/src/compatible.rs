@@ -19,10 +19,8 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
-use zeroclaw_config::schema::ToolResultImagePolicy;
+use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
-/// Maximum silence between body reads for OpenAI-compatible SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
@@ -62,10 +60,31 @@ pub struct OpenAiCompatibleModelProvider {
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
+    /// When true, forward the configured reasoning effort to any model,
+    /// bypassing the OpenAI-reasoning-family name filter. The filter exists
+    /// because some backends reject unknown request params; operators enable
+    /// this only for backends they have verified accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do).
+    reasoning_effort_passthrough: bool,
     /// Whether stored assistant reasoning should be replayed on outbound
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
     replay_assistant_reasoning: bool,
+    /// Whether Anthropic prompt-cache breakpoints should be injected into
+    /// outbound request bodies (system prompt; rolling last message).
+    /// Drives `capabilities().prompt_caching` and the request-build path.
+    cache_passthrough: bool,
+    /// Cache entry lifetime carried by every breakpoint injected behind
+    /// `cache_passthrough`. One TTL per request by design. Inert without
+    /// passthrough: no markers are placed, so nothing carries a TTL.
+    cache_ttl: Option<CacheTtl>,
+    /// When true, forward runtime-supplied native thinking params as an
+    /// Anthropic-shaped `thinking` object in request bodies and normalize
+    /// gateway thinking responses for replay. Requires a gateway that
+    /// translates between OpenAI Chat Completions and the Anthropic API;
+    /// a non-translating upstream rejects the injected object with HTTP 400.
+    thinking_passthrough: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -217,36 +236,76 @@ fn base64url_no_pad(data: &[u8]) -> String {
 /// Apply auth to a request builder (usable from spawned tasks without `&self`).
 /// When `credential` is `None` (e.g. local LLM servers that require no API key),
 /// the request is returned unchanged -- no auth header is added.
-fn apply_auth_to_request(
+///
+/// Within the OpenAI-compatible family builder this is where a stored
+/// credential becomes an outbound header, and the requests built here --
+/// chat, model listing, and context-window discovery
+/// ([`crate::fetch_context_window`]) -- share it. That is what keeps a family
+/// whose credential must be transformed before it is usable
+/// (`AuthStyle::ZhipuJwt` mints a short-lived JWT from the stored `id.secret`)
+/// from having one of those paths transform it while another sends it raw.
+///
+/// Scoped deliberately: providers implemented outside this module (Anthropic,
+/// Gemini, Bedrock, …) authenticate their own way and make no claim here.
+///
+/// Fails closed. `AuthStyle::ZhipuJwt` mints a short-lived JWT from a stored
+/// `id.secret`; when that minting fails the request is *not* built. The
+/// alternative — attaching no `Authorization` header and sending anyway —
+/// produces a request that can only ever be rejected upstream, and reports
+/// the refusal as whatever status the provider happens to return rather than
+/// as the local credential problem it is.
+///
+/// `provider` names the caller for the refusal record. Both the request path
+/// and context-window discovery pass it explicitly rather than relying on an
+/// ambient span, because discovery builds its probe outside any per-provider
+/// span.
+pub(crate) fn apply_auth_to_request(
     req: reqwest::RequestBuilder,
     style: &AuthStyle,
     credential: Option<&str>,
-) -> reqwest::RequestBuilder {
+    provider: &str,
+) -> anyhow::Result<reqwest::RequestBuilder> {
     let credential = match credential {
         Some(c) => c,
-        None => return req,
+        None => return Ok(req),
     };
-    match style {
+    Ok(match style {
         AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
         AuthStyle::XApiKey => req.header("x-api-key", credential),
         AuthStyle::Custom(header) => req.header(header, credential),
-        AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
-            Ok(val) => req.header("Authorization", val),
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "zhipu_jwt_generation_failed",
-                            "reason": error,
-                        })),
-                    "Zhipu JWT generation failed; omitting authorization header"
-                );
-                req
-            }
-        },
-    }
+        AuthStyle::ZhipuJwt => req.header(
+            "Authorization",
+            zhipu_jwt_bearer_or_refuse(credential, provider)?,
+        ),
+    })
+}
+
+/// Mint the `Authorization` value for [`AuthStyle::ZhipuJwt`], or refuse.
+///
+/// Split out so the refusal is one place: the reason is logged against the
+/// provider that owns the credential and turned into an operator-readable
+/// error whose text is built only from the static failure reason, never from
+/// the credential itself.
+fn zhipu_jwt_bearer_or_refuse(credential: &str, provider: &str) -> anyhow::Result<String> {
+    zhipu_jwt_bearer(credential).map_err(|reason| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": provider,
+                    "auth_style": "zhipu_jwt",
+                    "reason": &reason,
+                    "error_key": "provider_credential_unusable",
+                })),
+            "compatible: stored credential could not be converted into a request token; \
+             refusing to send the request"
+        );
+        anyhow::Error::msg(format!(
+            "{provider}: stored credential cannot be converted into a request token \
+             ({reason}); no request was sent"
+        ))
+    })
 }
 
 fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
@@ -296,14 +355,14 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
 /// router from making the client buffer an unbounded body — a boundary that
 /// matters most on the public, credential-free listing path a `PUBLIC_MODEL_LISTING`
 /// family (ZeroRouter, Kilo, AtlasCloud) exposes.
-const MAX_MODELS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_MODELS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read a response body into memory, refusing anything past `max_bytes`: a
 /// declared `Content-Length` over the cap fails fast, and a stream that grows
 /// past it fails as the bytes arrive (so a lying or absent `Content-Length`
 /// cannot get around the bound). Mirrors the bounded reader in `zeroclaw-channels`
 /// so both behave identically, without taking a cross-crate dependency for it.
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     mut response: reqwest::Response,
     max_bytes: u64,
 ) -> anyhow::Result<Vec<u8>> {
@@ -328,7 +387,7 @@ async fn read_body_capped(
 }
 
 #[derive(Deserialize)]
-struct ModelsResponse {
+pub(crate) struct ModelsResponse {
     data: Vec<ModelEntry>,
 }
 
@@ -352,6 +411,11 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+pub(crate) fn parse_model_ids_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let body: ModelsResponse = serde_json::from_slice(bytes)?;
+    Ok(normalize_model_ids(body))
 }
 
 /// Extract model IDs with pricing from a ModelsResponse.
@@ -427,10 +491,24 @@ pub struct OpenAiCompatibleBuilder {
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
+    /// Set to `true` by
+    /// [`OpenAiCompatibleBuilder::with_reasoning_effort_passthrough`].
+    /// Default `false` keeps the OpenAI-reasoning-family name filter in
+    /// charge of which models receive `reasoning_effort`.
+    reasoning_effort_passthrough: bool,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
     replay_assistant_reasoning_override: Option<bool>,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_passthrough`]. Default
+    /// `false`: requests and capability reporting are unchanged.
+    cache_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_ttl`]. Default `None`:
+    /// breakpoints keep the 5-minute API default.
+    cache_ttl: Option<CacheTtl>,
+    /// Set to `true` by [`OpenAiCompatibleBuilder::with_thinking_passthrough`].
+    /// Default `false` leaves requests and response handling unchanged.
+    thinking_passthrough: bool,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -445,6 +523,17 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// The configured `[multimodal]` policy this provider normalizes under.
+    ///
+    /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
+    /// overwrites it with the operator's configured policy so the provider
+    /// boundary does not re-trim history under different rules than the
+    /// runtime already applied.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
+        self
+    }
+
     /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
     /// in logs, `Attributable` output, and the onboarding UI. Required.
     pub fn display_name(mut self, name: &str) -> Self {
@@ -493,14 +582,6 @@ impl OpenAiCompatibleBuilder {
     /// Set the policy for image markers in native role=`tool` results.
     pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
         self.tool_result_image_policy = policy;
-        self
-    }
-
-    /// Set the root `[multimodal]` policy used when expanding `[IMAGE:...]`
-    /// markers into inline data URIs. Without this the provider falls back to
-    /// library defaults and operator limits never reach the outbound request.
-    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
-        self.multimodal = config;
         self
     }
 
@@ -563,10 +644,52 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Forward the configured reasoning effort to every model on this
+    /// provider, bypassing the OpenAI-reasoning-family name filter. The
+    /// filter exists because some backends reject unknown request params;
+    /// enable this only on backends verified to accept `reasoning_effort`.
+    pub fn with_reasoning_effort_passthrough(mut self) -> Self {
+        self.reasoning_effort_passthrough = true;
+        self
+    }
+
     /// Disable replay of stored assistant reasoning on outbound assistant
     /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
         self.replay_assistant_reasoning_override = Some(false);
+        self
+    }
+
+    /// Opt this provider into Anthropic prompt-cache passthrough: request
+    /// bodies gain `cache_control` breakpoints (system prompt; rolling last
+    /// message once the conversation has more than one non-system message),
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage is captured. The flag also reports
+    /// `prompt_caching` in the provider capabilities.
+    pub fn with_cache_passthrough(mut self) -> Self {
+        self.cache_passthrough = true;
+        self
+    }
+
+    /// Request the given cache entry lifetime on every breakpoint injected
+    /// behind `cache_passthrough`. Effective only together with
+    /// [`Self::with_cache_passthrough`]: without passthrough no breakpoints
+    /// are placed, so the setting is inert (no parse-time warning — an
+    /// operator may stage the value before switching passthrough on).
+    /// Defaults to the 5-minute API default when unset.
+    pub fn with_cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
+        self
+    }
+
+    /// Forward Anthropic extended thinking through this provider: inject the
+    /// runtime thinking params as an Anthropic-shaped `thinking` request
+    /// object and normalize gateway thinking responses for replay. Only
+    /// meaningful for gateways that translate between OpenAI Chat
+    /// Completions and the Anthropic API (e.g. LiteLLM); a non-translating
+    /// upstream rejects the injected object with HTTP 400. Off by default.
+    pub fn with_thinking_passthrough(mut self) -> Self {
+        self.thinking_passthrough = true;
         self
     }
 
@@ -704,7 +827,11 @@ impl OpenAiCompatibleBuilder {
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
+            reasoning_effort_passthrough: self.reasoning_effort_passthrough,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
+            cache_passthrough: self.cache_passthrough,
+            cache_ttl: self.cache_ttl,
+            thinking_passthrough: self.thinking_passthrough,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -744,7 +871,11 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
+            reasoning_effort_passthrough: false,
             replay_assistant_reasoning_override: None,
+            cache_passthrough: false,
+            cache_ttl: None,
+            thinking_passthrough: false,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -779,7 +910,13 @@ impl OpenAiCompatibleModelProvider {
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
-    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+    /// Flatten system messages per `merge`. Returns the flattened list plus
+    /// whether the system content was merged INTO a user message (or a
+    /// synthetic user inserted for it): that first user message is the
+    /// system-equivalent carrier and the only place a system-role
+    /// breakpoint can ride when merging is on. `false` means a system-role
+    /// message still exists on the wire (or there never was one).
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> (Vec<ChatMessage>, bool) {
         let mut saw_system = false;
         let mut system_content = String::new();
         let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
@@ -799,28 +936,26 @@ impl OpenAiCompatibleModelProvider {
         }
 
         if !saw_system {
-            return messages.to_vec();
+            return (messages.to_vec(), false);
         }
 
         if system_content.is_empty() {
-            return result;
+            return (result, false);
         }
 
         if !merge {
             result.insert(0, ChatMessage::system(system_content));
-            return result;
+            return (result, false);
         }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
-            if !system_content.is_empty() {
-                first_user.content = format!("{system_content}\n\n{}", first_user.content);
-            }
+            first_user.content = format!("{system_content}\n\n{}", first_user.content);
         } else {
             // No user message found: insert a synthetic user message with system content
             result.insert(0, ChatMessage::user(&system_content));
         }
 
-        result
+        (result, true)
     }
 
     fn http_client(&self) -> Client {
@@ -828,8 +963,12 @@ impl OpenAiCompatibleModelProvider {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
+        // An OpenCode client needs its own redirect policy, which the shared
+        // cached client below does not carry.
+        let endpoint = self.chat_completions_url();
+        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
 
-        if has_user_agent || has_extra_headers || has_tls_cert {
+        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -863,6 +1002,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -892,9 +1032,13 @@ impl OpenAiCompatibleModelProvider {
 
     /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
     /// total timeout kills long-running streams mid-response), but a `read_timeout`
-    /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
-    /// of hanging forever. Streaming paths must use this client instead of http_client().
+    /// idle bound so a silent connection fails fast instead of hanging forever.
+    /// The bound is derived as `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: the 300 s
+    /// floor applies when `timeout_secs` is unset or lower, and a higher
+    /// `timeout_secs` raises the bound to match. Streaming paths must use this
+    /// client instead of http_client().
     fn streaming_http_client(&self) -> Client {
+        let endpoint = self.chat_completions_url();
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
@@ -931,8 +1075,9 @@ impl OpenAiCompatibleModelProvider {
 
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
+                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -954,7 +1099,8 @@ impl OpenAiCompatibleModelProvider {
 
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -971,6 +1117,85 @@ impl OpenAiCompatibleModelProvider {
 
     fn models_url(&self) -> String {
         format!("{}/models", self.base_url)
+    }
+
+    /// Inject Anthropic prompt-cache breakpoints behind `cache_passthrough`.
+    ///
+    /// The native Anthropic provider is the reference for the breakpoint
+    /// gate: `AnthropicModelProvider::should_cache_conversation` and
+    /// `apply_cache_to_last_message` in `anthropic.rs`. (a) The system prompt
+    /// always carries a breakpoint when one exists on the wire. With
+    /// `merge_system_into_user`, the system role disappears from the wire,
+    /// so the carrier index of the merged system content (the first user
+    /// message, or the synthetic user carrying it) takes over that role and
+    /// is marked unconditionally. (b) Once the conversation has more than
+    /// one non-system message, a rolling breakpoint lands on the last
+    /// non-system message with a non-empty text part: the last message when
+    /// it carries text, otherwise the nearest earlier non-system message
+    /// that does, so an image-only turn rolls the breakpoint back instead
+    /// of silently dropping it. System messages are never marked twice, and
+    /// when nothing qualifies there is no rolling breakpoint. At most two
+    /// breakpoints per request; only breakpoint-carrying messages convert
+    /// from string content to block form, every other message serializes
+    /// exactly as before.
+    fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
+        &self,
+        messages: &mut [T],
+        merged_system_carrier: Option<usize>,
+    ) {
+        if !self.cache_passthrough {
+            return;
+        }
+        // One TTL per request: every breakpoint this pass places carries
+        // the same configured lifetime. `None` resolves to the 5-minute
+        // API default, whose markers serialize without a `ttl` field.
+        let cache_ttl = self.cache_ttl.unwrap_or_default();
+        let carrier = merged_system_carrier.and_then(|idx| {
+            (idx < messages.len() && messages[idx].cache_role() != "system").then_some(idx)
+        });
+        match carrier {
+            Some(idx) => {
+                if let Some(content) = messages[idx].cache_content() {
+                    content.apply_cache_control(cache_ttl);
+                }
+            }
+            None => {
+                if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
+                    && let Some(content) = system.cache_content()
+                {
+                    content.apply_cache_control(cache_ttl);
+                }
+            }
+        }
+        let non_system_count = messages
+            .iter()
+            .filter(|m| m.cache_role() != "system")
+            .count();
+        if non_system_count > 1 {
+            for message in messages.iter_mut().rev() {
+                if message.cache_role() == "system" {
+                    continue;
+                }
+                if let Some(content) = message.cache_content()
+                    && content.apply_cache_control(cache_ttl)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Index of the merged system-content carrier (the first user message)
+    /// when `flatten_system_messages` reported a merge, else `None`.
+    fn merged_system_carrier_index<T: CacheBreakpointMessage>(
+        messages: &[T],
+        system_merged: bool,
+    ) -> Option<usize> {
+        if system_merged {
+            messages.iter().position(|m| m.cache_role() == "user")
+        } else {
+            None
+        }
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -1039,6 +1264,15 @@ impl OpenAiCompatibleModelProvider {
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
+        // The name filter below exists because some OpenAI-compatible
+        // backends reject unknown request params (HTTP 400 for
+        // `reasoning_effort` on models they do not treat as reasoners).
+        // Operators who have verified their backend honors the param —
+        // GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+        // gateways commonly do — can bypass the filter per provider.
+        if self.reasoning_effort_passthrough {
+            return Some(effort.clone());
+        }
         let id = model
             .rsplit('/')
             .next()
@@ -1090,13 +1324,45 @@ impl OpenAiCompatibleModelProvider {
             .or_else(|| value.get("reasoning").and_then(serde_json::Value::as_str))
     }
 
-    fn assistant_reasoning_pair_for_replay(
-        &self,
-        value: &serde_json::Value,
-    ) -> (Option<String>, Option<String>) {
+    /// Replay payload for an outbound assistant history message.
+    ///
+    /// Flag off: today's behavior — the stored reasoning strings replay
+    /// verbatim. Flag on: history reasoning is expected as newline-delimited
+    /// signed-JSON envelope lines (the capture format); signed lines
+    /// reconstruct a `thinking_blocks` array and suppress the string fields.
+    /// Unsigned or malformed history sends nothing — blocks are never
+    /// fabricated, and a bare reasoning string is exactly what translating
+    /// gateways reject. `replay_assistant_reasoning = false` still wins:
+    /// nothing at all.
+    fn assistant_thinking_replay(&self, value: &serde_json::Value) -> AssistantThinkingReplay {
         if !self.replay_assistant_reasoning {
-            return (None, None);
+            return AssistantThinkingReplay::none();
         }
+        if !self.thinking_passthrough {
+            let (reasoning_content, reasoning) = Self::assistant_reasoning_pair(value);
+            return AssistantThinkingReplay {
+                reasoning_content,
+                reasoning,
+                thinking_blocks: None,
+            };
+        }
+        let Some(reasoning) = Self::assistant_reasoning_value(value) else {
+            return AssistantThinkingReplay::none();
+        };
+        match Self::reasoning_lines_to_thinking_blocks(reasoning) {
+            Some(blocks) => AssistantThinkingReplay {
+                reasoning_content: None,
+                reasoning: None,
+                thinking_blocks: Some(blocks),
+            },
+            // Unsigned/malformed: documented no-op.
+            None => AssistantThinkingReplay::none(),
+        }
+    }
+
+    /// Field-level reasoning pair, ignoring the replay gate. Shared by the
+    /// flag-off branch of [`Self::assistant_thinking_replay`].
+    fn assistant_reasoning_pair(value: &serde_json::Value) -> (Option<String>, Option<String>) {
         let reasoning_content = value
             .get("reasoning_content")
             .and_then(serde_json::Value::as_str)
@@ -1107,6 +1373,347 @@ impl OpenAiCompatibleModelProvider {
             .map(ToString::to_string);
         (reasoning_content, reasoning)
     }
+
+    /// Signed-block replay for the history fallback builder. Mirrors the
+    /// native request converter's assistant handling: when the stored
+    /// content is the runtime's reasoning envelope (a JSON object carrying
+    /// `reasoning_content`), run the same validated reconstruction and
+    /// attach the resulting `thinking_blocks`. Gated by the same provider
+    /// flags as the converter, so flag-off history produces no field.
+    fn fallback_thinking_replay(&self, message: &ChatMessage) -> Option<Vec<serde_json::Value>> {
+        if !self.thinking_passthrough || !self.replay_assistant_reasoning {
+            return None;
+        }
+        if message.role != "assistant" {
+            return None;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+        self.assistant_thinking_replay(&value).thinking_blocks
+    }
+
+    /// Reconstruct `thinking_blocks` from newline-delimited signed-JSON
+    /// envelope lines. Replay whitelist mirrors capture: signed `thinking`
+    /// envelopes and well-formed `redacted_thinking` lines (opaque `data`
+    /// replayed verbatim, signature-less by design) are forwarded; well-formed
+    /// lines of any other type are skipped, not forwarded. Lines that fail to
+    /// parse and thinking lines without a signature void the whole replay:
+    /// Anthropic rejects unsigned thinking blocks on input, and the caller
+    /// sends nothing rather than fabricating or forwarding a partial
+    /// sequence. Mirrors the native Anthropic provider's replay parsing
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`) — duplicate-with-comment
+    /// per the passthrough spec boundary.
+    fn reasoning_lines_to_thinking_blocks(reasoning: &str) -> Option<Vec<serde_json::Value>> {
+        let mut blocks = Vec::new();
+        for line in reasoning.split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+            let block_type = parsed
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = parsed
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    blocks.push(parsed);
+                }
+                continue;
+            }
+            if block_type != "thinking" {
+                continue;
+            }
+            let thinking = parsed.get("thinking").and_then(serde_json::Value::as_str)?;
+            let signature = parsed
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .filter(|signature| !signature.is_empty())?;
+            blocks.push(serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            }));
+        }
+        (!blocks.is_empty()).then_some(blocks)
+    }
+
+    /// Anthropic-shaped `thinking` request object for the given model and
+    /// runtime params, when [`Self::thinking_passthrough`] is on and the
+    /// runtime supplied native thinking params.
+    ///
+    /// Style resolution is shared with the native Anthropic provider via
+    /// `crate::anthropic::anthropic_thinking_style` (same crate, free
+    /// function): budget models get the fixed-budget `enabled` shape,
+    /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
+    /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
+    /// `NativeThinkingConfig` serialization. `params.display` rides on both
+    /// shapes as the snake_case `display` key when present, exactly as the
+    /// native provider emits it. Gateway model IDs may carry routing
+    /// prefixes; the resolver's substring matching handles them.
+    /// History-path chat with optional thinking rethreading. Fallback paths
+    /// that rebuild a tool request as prompt-guided text pass the original
+    /// `request.thinking` so the rebuilt body keeps the same injection the
+    /// primary path would have sent. Returns the parsed gateway message
+    /// plus its usage; projecting that into legacy text is the caller's
+    /// choice (`legacy_history_text` for the `String`-returning path).
+    async fn chat_with_history_inner(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> anyhow::Result<(
+        ResponseMessage,
+        Option<zeroclaw_api::model_provider::TokenUsage>,
+    )> {
+        let credential = self.resolve_credential().await?;
+
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
+        let merge = self.effective_merge_system(model);
+        let (effective_messages, _system_merged) =
+            Self::flatten_system_messages(&normalized, merge);
+        // Strip native tool constructs for non-native-tool model_providers.
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+                thinking_blocks: self.fallback_thinking_replay(m),
+            })
+            .collect();
+
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature: shape.temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
+        };
+        // No cache breakpoints here, deliberately: the `String`-returning
+        // `chat_with_history` wrapper drops response usage, so a premium
+        // cache write it triggered could never be accounted for. The
+        // structured schema-fallback re-entry in `chat` does surface usage,
+        // but the rule still holds: this shared request builder exists for
+        // the text-only contract, whose wrapper cannot account a cache
+        // write. The cache flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
+
+        let url = self.chat_completions_url();
+        let response = match self
+            .apply_opencode_session_header(self.apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            )?)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => return Err(chat_error.into()),
+        };
+
+        if !response.status().is_success() {
+            return Err(super::api_error(&self.name, response).await);
+        }
+
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| (choice.message, usage))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })
+    }
+
+    fn thinking_request_object(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        if !self.thinking_passthrough {
+            return None;
+        }
+        let params = thinking?;
+        let mut object = match crate::anthropic::anthropic_thinking_style(model) {
+            crate::anthropic::AnthropicThinkingStyle::Adaptive => {
+                serde_json::json!({"type": "adaptive"})
+            }
+            crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": params.budget_tokens
+            }),
+        };
+        if let Some(display) = params.display {
+            object["display"] = serde_json::json!(display.as_str());
+        }
+        Some(serde_json::json!({ "thinking": object }))
+    }
+
+    /// Effective `extra_body` for a request body: the injected `thinking`
+    /// object (when any) merged under the configured `extra_body`, whose
+    /// explicit keys always win. With the flag off or no params supplied,
+    /// this is exactly the configured `extra_body` (byte-identical default).
+    fn request_extra_body(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        let Some(mut merged) = self.thinking_request_object(model, thinking) else {
+            return self.extra_body.clone();
+        };
+        match self.extra_body.as_ref() {
+            None => Some(merged),
+            Some(extra) if extra.is_object() => {
+                if let (Some(base), Some(over)) = (merged.as_object_mut(), extra.as_object()) {
+                    base.extend(over.clone());
+                }
+                Some(merged)
+            }
+            // Non-object `extra_body` cannot be key-merged; the explicit
+            // config value wins outright (preserving its existing behavior).
+            Some(extra) => Some(extra.clone()),
+        }
+    }
+
+    /// Effective request shape for a body that may carry thinking
+    /// passthrough: the merged `extra_body` plus the normalized temperature
+    /// and output limit, resolved together so the three fields can never
+    /// disagree about which `thinking` object is being sent. Normalization
+    /// follows the `thinking` object that will actually be serialized —
+    /// the injected one, or the operator's explicit
+    /// `provider_extra.thinking` override when that key wins the merge —
+    /// so an `enabled` or `adaptive` effective object forces temperature
+    /// 1.0 (Anthropic rejects extended thinking combined with a modified
+    /// temperature) and an `enabled` object with an integer
+    /// `budget_tokens` raises `max_tokens` above that effective budget
+    /// (the API requires the limit to strictly exceed the budget), while
+    /// any other effective shape keeps the caller's values. With the flag
+    /// off or no params supplied nothing is injected and nothing is
+    /// normalized, keeping flag-off requests byte-identical; an operator's
+    /// configured `extra_body` carrying its own `thinking` key with the
+    /// flag off is that explicit request and is left alone.
+    fn resolve_request_shape(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> EffectiveRequestShape {
+        let extra_body = self.request_extra_body(model, thinking);
+        if self.thinking_request_object(model, thinking).is_none() {
+            return EffectiveRequestShape {
+                extra_body,
+                temperature,
+                max_tokens,
+            };
+        }
+        // The `thinking` object that will actually be serialized: the
+        // injected one, or the operator's explicit override when the
+        // configured `extra_body` key wins the merge.
+        let effective_thinking = extra_body.as_ref().and_then(|body| body.get("thinking"));
+        let thinking_type = effective_thinking
+            .and_then(|object| object.get("type"))
+            .and_then(serde_json::Value::as_str);
+        if !matches!(thinking_type, Some("enabled") | Some("adaptive")) {
+            // `off` or any other explicit shape (including a non-object
+            // `extra_body` that replaced the merge): the operator pinned a
+            // non-thinking request, so their temperature and limit stand.
+            return EffectiveRequestShape {
+                extra_body,
+                temperature,
+                max_tokens,
+            };
+        }
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"model": model})),
+            "Passthrough extended thinking enabled; forcing temperature=1.0"
+        );
+        if thinking_type == Some("adaptive") {
+            // Adaptive thinking carries no budget; the configured limit
+            // stands.
+            return EffectiveRequestShape {
+                extra_body,
+                temperature: Some(1.0),
+                max_tokens,
+            };
+        }
+        // The API requires max_tokens > budget_tokens (strictly greater),
+        // measured against the budget actually being sent.
+        let min_required = effective_thinking
+            .and_then(|object| object.get("budget_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|budget| u32::try_from(budget).ok())
+            .and_then(|budget| budget.checked_add(1));
+        let max_tokens = match min_required {
+            Some(min_required) => {
+                let raised = max_tokens.max(Some(min_required));
+                if raised != max_tokens {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"model": model})),
+                        "Passthrough thinking budget meets or exceeds configured max_tokens; raising output limit"
+                    );
+                }
+                raised
+            }
+            None => {
+                // The effective object carries no integer budget (an
+                // override asked for a shape whose limit relation cannot
+                // be validated here); leave the configured limit alone and
+                // let the gateway report an invalid shape.
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Passthrough thinking object carries no integer budget_tokens; leaving max_tokens unchanged"
+                );
+                max_tokens
+            }
+        };
+        EffectiveRequestShape {
+            extra_body,
+            temperature: Some(1.0),
+            max_tokens,
+        }
+    }
+}
+
+/// Resolved request-shape fields for a body that may carry thinking
+/// passthrough: the merged `extra_body` plus the normalized temperature
+/// and output limit, produced together by
+/// [`OpenAiCompatibleModelProvider::resolve_request_shape`] so the three
+/// fields cannot disagree about which `thinking` object is being sent.
+#[derive(Debug)]
+struct EffectiveRequestShape {
+    extra_body: Option<serde_json::Value>,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1150,6 +1757,16 @@ struct StreamOptionsBody {
 struct Message {
     role: String,
     content: MessageContent,
+    /// Anthropic `thinking_blocks` replay on assistant turns, populated only
+    /// when the passthrough flag is on and the stored content is a runtime
+    /// reasoning envelope with validated signed blocks: the same
+    /// reconstruction the native request converter performs. Absent
+    /// otherwise, keeping flag-off fallback requests byte-identical. This is
+    /// what keeps the second schema-fallback turn's signed trajectory
+    /// intact: the two-field fallback builder must replay what the primary
+    /// converter would have replayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1159,11 +1776,91 @@ enum MessageContent {
     Parts(Vec<MessagePart>),
 }
 
+impl MessageContent {
+    /// Mark this content as an Anthropic prompt-cache breakpoint and return
+    /// whether a markable text part was found: plain string content
+    /// converts to the single-text-block wire form (block conversion
+    /// touches only breakpoint-carrying messages); block-form content gains
+    /// the marker on its last non-empty text part. A message ending in an
+    /// image part therefore carries the breakpoint on its text, and the
+    /// image part stays unmarked: the image is covered by the following
+    /// turn's rolling breakpoint. Empty text is never marked, because the
+    /// wire format rejects empty text blocks that carry `cache_control`.
+    fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
+        match self {
+            MessageContent::Text(text) => {
+                if text.is_empty() {
+                    return false;
+                }
+                *self = MessageContent::Parts(vec![MessagePart::Text {
+                    text: std::mem::take(text),
+                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                        cache_ttl,
+                    )),
+                }]);
+                true
+            }
+            MessageContent::Parts(parts) => {
+                for part in parts.iter_mut().rev() {
+                    if let MessagePart::Text {
+                        text,
+                        cache_control,
+                    } = part
+                        && !text.is_empty()
+                    {
+                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                            cache_ttl,
+                        ));
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Uniform (role, content) access over the two wire message shapes so one
+/// breakpoint-injection routine serves both the no-tools and the native-tools
+/// request types.
+trait CacheBreakpointMessage {
+    fn cache_role(&self) -> &str;
+    fn cache_content(&mut self) -> Option<&mut MessageContent>;
+}
+
+impl CacheBreakpointMessage for Message {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        Some(&mut self.content)
+    }
+}
+
+impl CacheBreakpointMessage for NativeMessage {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        self.content.as_mut()
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        /// Anthropic prompt-cache breakpoint, injected only behind
+        /// `cache_passthrough` and only on breakpoint-carrying messages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<crate::anthropic::CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1209,6 +1906,18 @@ struct UsageInfo {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     prompt_cache_hit_tokens: Option<u64>,
+    /// Anthropic-shaped cache counters, forwarded by translating gateways
+    /// on Anthropic-backed routes. `cache_read_input_tokens` is the
+    /// authoritative cached-read count (it comes from the upstream API
+    /// itself), so it takes precedence over the gateway-accounted OpenAI
+    /// and DeepSeek shapes.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_read_input_tokens: Option<u64>,
+    /// Anthropic-shaped cache-write counter. Not part of `TokenUsage`
+    /// (cached reads are the billing-relevant figure there); logged so
+    /// write-premium spend is visible in logs.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1222,12 +1931,18 @@ struct PromptTokensDetails {
 }
 
 impl UsageInfo {
+    /// Cached-read tokens across the three coexisting provider shapes.
+    /// Precedence: Anthropic `cache_read_input_tokens` (upstream-reported
+    /// on translated routes) over DeepSeek `prompt_cache_hit_tokens` over
+    /// OpenAI `prompt_tokens_details.cached_tokens` (gateway-accounted).
     fn cached_input_tokens(&self) -> Option<u64> {
-        self.prompt_cache_hit_tokens.or_else(|| {
-            self.prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens)
-        })
+        self.cache_read_input_tokens
+            .or(self.prompt_cache_hit_tokens)
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
     }
 
     fn cache_creation_input_tokens(&self) -> Option<u64> {
@@ -1237,6 +1952,18 @@ impl UsageInfo {
     }
 
     fn into_provider_usage(self) -> zeroclaw_api::model_provider::TokenUsage {
+        if let Some(creation) = self.cache_creation_input_tokens.filter(|count| *count > 0) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "cache_creation_input_tokens": creation,
+                        "cache_read_input_tokens": self.cache_read_input_tokens,
+                    })),
+                "gateway-reported Anthropic cache write (billed at the write premium)"
+            );
+        }
         let cached_input_tokens = self.cached_input_tokens();
         let cache_creation_input_tokens = self.cache_creation_input_tokens();
         zeroclaw_api::model_provider::TokenUsage {
@@ -1351,6 +2078,12 @@ struct ResponseMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw gateway `thinking_blocks` array, preserved so
+    /// [`OpenAiCompatibleModelProvider::parse_native_response`] can
+    /// normalize it behind the `thinking_passthrough` flag. Never
+    /// serialized.
+    #[serde(skip_serializing)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1363,6 +2096,10 @@ struct RawResponseMessage {
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Anthropic thinking blocks forwarded by translating gateways
+    /// (e.g. `thinking_blocks` on LiteLLM / passthrough responses).
+    #[serde(default)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 impl From<RawResponseMessage> for ResponseMessage {
@@ -1374,6 +2111,7 @@ impl From<RawResponseMessage> for ResponseMessage {
             content: openai_assistant_content_plaintext(raw.content),
             reasoning_content,
             tool_calls: raw.tool_calls,
+            thinking_blocks: raw.thinking_blocks,
         }
     }
 }
@@ -1405,6 +2143,22 @@ impl ResponseMessage {
 
     fn effective_content_optional(&self) -> Option<String> {
         self.content.as_ref().cloned().filter(|c| !c.is_empty())
+    }
+}
+
+/// Text-only history contract, carried over from the pre-structured-path
+/// behavior: callers that parse tool calls back out of text depend on the
+/// JSON shape, so a message with non-empty `tool_calls` serializes the
+/// whole gateway message; every other shape reduces to visible content.
+fn legacy_history_text(message: &ResponseMessage) -> String {
+    if message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|t: &Vec<_>| !t.is_empty())
+    {
+        serde_json::to_string(message).unwrap_or_else(|_| message.effective_content())
+    } else {
+        message.effective_content()
     }
 }
 
@@ -1539,6 +2293,24 @@ fn ensure_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Replay fields for an outbound assistant history message — see
+/// [`OpenAiCompatibleModelProvider::assistant_thinking_replay`].
+struct AssistantThinkingReplay {
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    thinking_blocks: Option<Vec<serde_json::Value>>,
+}
+
+impl AssistantThinkingReplay {
+    fn none() -> Self {
+        Self {
+            reasoning_content: None,
+            reasoning: None,
+            thinking_blocks: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -1554,6 +2326,11 @@ struct NativeMessage {
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
     reasoning: Option<String>,
+    /// Reconstructed Anthropic thinking blocks for assistant history replay
+    /// under `thinking_passthrough` (signed envelope lines only). Never
+    /// populated alongside the string reasoning fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
     /// Tool name for `role: "tool"` messages. Groq native tool calling
     /// requires this field on every tool-result message; omitting it causes
     /// HTTP 400 "Tools should have a name!"./
@@ -1877,9 +2654,13 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
 }
 
 /// Convert SSE byte stream to text chunks.
+/// Convert an SSE byte stream into structured chunks. `idle_timeout` is the
+/// streaming client's read-idle bound; it names the bound that fired in
+/// body-read timeout errors, including whether `timeout_secs` can raise it.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -1958,7 +2739,10 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -1980,13 +2764,19 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(response, count_tokens, false)
+    sse_bytes_to_events_for_contract(
+        response,
+        count_tokens,
+        false,
+        super::StreamIdleBound::Fixed(super::STREAM_IDLE_TIMEOUT),
+    )
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2137,7 +2927,10 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -2190,12 +2983,15 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
 }
 
 impl OpenAiCompatibleModelProvider {
+    /// `Err` when the stored credential cannot be turned into a header for
+    /// this provider's [`AuthStyle`]. Callers propagate it rather than send:
+    /// the request would carry no credential at all and be rejected upstream.
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
         credential: Option<&str>,
-    ) -> reqwest::RequestBuilder {
-        apply_auth_to_request(req, &self.auth_header, credential)
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        apply_auth_to_request(req, &self.auth_header, credential, &self.name)
     }
 
     /// OpenCode affinity header value for the calling conversation, or `None`
@@ -2205,15 +3001,12 @@ impl OpenAiCompatibleModelProvider {
     /// request is sent to, rather than `base_url`: an `api_path` is appended to
     /// the base, so the base alone need not name the destination host.
     ///
-    /// Returns `None` when the operator has already pinned the header through
-    /// `extra_headers`: those are baked into the client's default headers, so
-    /// adding a second value here would put the header on the wire twice.
+    /// Returns `None` when the operator has already pinned a valid header value
+    /// through `extra_headers`: those are baked into the client's default
+    /// headers, so adding a second value here would put the header on the wire
+    /// twice. A pinned value the client builder skips as invalid does not count.
     fn opencode_session_value(&self) -> Option<String> {
-        if self
-            .extra_headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
-        {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
             return None;
         }
         crate::opencode_session::session_token(&self.chat_completions_url())
@@ -2301,14 +3094,21 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
 
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
-            temperature,
+            messages,
+            temperature: shape.temperature,
             stream: Some(false),
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
@@ -2317,8 +3117,8 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
         }
     }
 
@@ -2329,20 +3129,46 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
-            temperature,
+            messages,
+            temperature: shape.temperature,
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
+        }
+    }
+
+    /// Thinking params for a STREAMING request body. Passthrough never
+    /// attaches thinking to the streamed wire: gateway SSE thinking frames
+    /// are unverified territory (the live probe was non-streaming), and a
+    /// streamed response cannot feed signed capture. This is defense in
+    /// depth for a wrapper that streams this leaf despite the
+    /// [`ModelProvider::supports_streaming`] disclaimer: such a request
+    /// behaves like thinking-off for that turn instead of producing an
+    /// uncapturable trajectory. Flag off keeps legacy streaming untouched.
+    fn streaming_thinking_params(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<zeroclaw_api::model_provider::NativeThinkingParams> {
+        if self.thinking_passthrough {
+            None
+        } else {
+            thinking
         }
     }
 
@@ -2356,6 +3182,8 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options_enabled: bool,
         merge: bool,
+        system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -2365,10 +3193,31 @@ impl OpenAiCompatibleModelProvider {
         let tool_choice = tools
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
+        let mut messages = self.convert_messages_for_native(effective_messages, !merge);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
+        // Streamed requests are thinking-off under passthrough (see
+        // streaming_thinking_params). History replay blocks require the
+        // request thinking object, so strip them here: a hypothetical
+        // wrapper streaming this leaf gets a thinking-off request, not a
+        // blocks-without-thinking-object 400. Stripping after the cache
+        // breakpoints are placed keeps both features composing on one
+        // converted message list.
+        if self.thinking_passthrough {
+            for message in &mut messages {
+                message.thinking_blocks = None;
+            }
+        }
+        let shape = self.resolve_request_shape(
+            model,
+            self.streaming_thinking_params(thinking),
+            temperature,
+            self.max_tokens,
+        );
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, !merge),
-            temperature,
+            messages,
+            temperature: shape.temperature,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
                 self.tool_stream_for_tools(true)
@@ -2384,16 +3233,24 @@ impl OpenAiCompatibleModelProvider {
             }),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
         }
     }
 
+    /// Normalize image markers into inline data URIs for the upstream request.
+    ///
+    /// Takes the configured policy rather than `MultimodalConfig::default()`:
+    /// this pass decodes pixels and applies `max_images` / `max_image_size_mb`,
+    /// so running it under defaults would re-trim a history the runtime had
+    /// already accepted under the operator's configuration.
     async fn normalize_messages_for_upstream(
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = self.multimodal.clone();
+        // Provider policy may strip image markers from native tool results
+        // before normalization; the normalization itself then runs under the
+        // configured `[multimodal]` policy rather than defaults.
         let sanitized;
         let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             sanitized = messages
@@ -2413,7 +3270,8 @@ impl OpenAiCompatibleModelProvider {
         } else {
             messages
         };
-        let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
         Ok(prepared.messages)
     }
 
@@ -2439,6 +3297,7 @@ impl OpenAiCompatibleModelProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -2583,16 +3442,16 @@ impl OpenAiCompatibleModelProvider {
                                 .then(|| MessageContent::Text(String::new()))
                         });
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -2611,16 +3470,16 @@ impl OpenAiCompatibleModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: None,
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -2691,6 +3550,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
+                        thinking_blocks: None,
                         name: tool_name,
                     };
                 }
@@ -2707,6 +3567,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
+                    thinking_blocks: None,
                     name: None,
                 }
             })
@@ -2830,7 +3691,7 @@ impl OpenAiCompatibleModelProvider {
 
     fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = self.capture_reasoning_content(&message);
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
@@ -2855,6 +3716,87 @@ impl OpenAiCompatibleModelProvider {
             usage: None,
             reasoning_content,
         }
+    }
+
+    /// Flag-gated reasoning capture for a parsed gateway message.
+    ///
+    /// Flag off: today's behavior exactly — the `reasoning_content` string is
+    /// passed through untouched (DeepSeek/GLM/Qwen flows).
+    ///
+    /// Flag on: normalize into the newline-delimited signed-JSON line format
+    /// the native Anthropic provider uses for `reasoning_content` (one
+    /// `{"thinking":..,"signature":..}` line per block). A `thinking_blocks`
+    /// array (signed) wins over a plain reasoning string; a bare string is
+    /// wrapped as a single unsigned line (`signature: ""`), matching how the
+    /// native provider emits signature-less blocks.
+    fn capture_reasoning_content(&self, message: &ResponseMessage) -> Option<String> {
+        if !self.thinking_passthrough {
+            return message.reasoning_content.clone();
+        }
+        if let Some(blocks) = &message.thinking_blocks
+            && let Some(lines) = Self::thinking_blocks_to_reasoning_lines(blocks)
+        {
+            return Some(lines);
+        }
+        message.reasoning_content.as_ref().map(|reasoning| {
+            serde_json::json!({"thinking": reasoning, "signature": ""}).to_string()
+        })
+    }
+
+    /// Convert gateway `thinking_blocks` (Anthropic content-block style) into
+    /// the native signed-JSON line format. Blocks with neither thinking text
+    /// nor a signature are skipped. Returns `None` when no block survives, so
+    /// the caller falls back to the plain reasoning string.
+    ///
+    /// Deliberately mirrors the native Anthropic provider's block emission
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`): same line shape, same
+    /// signature-or-text inclusion rule. Duplicate-with-comment, not a shared
+    /// helper, per the passthrough spec boundary (mirrors the native provider).
+    ///
+    /// Block-type whitelist: only `thinking` and `redacted_thinking` are
+    /// captured. `redacted_thinking` is preserved verbatim (it must replay
+    /// unchanged and carries no signature by design) but only when its
+    /// required opaque `data` field is a non-empty string. Every other type
+    /// is skipped, not stored: accepting gateway-controlled JSON blocks of
+    /// unknown shape into replay history would be an unvalidated
+    /// network-to-request channel. Skipping keeps a novel-but-harmless block
+    /// type from bricking the turn.
+    fn thinking_blocks_to_reasoning_lines(blocks: &[serde_json::Value]) -> Option<String> {
+        let mut lines: Vec<String> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let block_type = block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    lines.push(block.to_string());
+                }
+                continue;
+            }
+            if block_type != "thinking" {
+                continue;
+            }
+            let thinking = block
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let signature = block
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if thinking.is_empty() && signature.is_empty() {
+                continue;
+            }
+            lines.push(
+                serde_json::json!({"thinking": thinking, "signature": signature}).to_string(),
+            );
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -2891,7 +3833,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
-            prompt_caching: false,
+            prompt_caching: self.cache_passthrough,
             extended_thinking: false,
         }
     }
@@ -2900,11 +3842,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
         // servers with a public catalog use the same path without an Authorization header.
+        // A profile that authenticates purely through `extra_headers` (e.g. a
+        // `Cookie` or `X-Auth` bridge, rather than a credential resolved into
+        // `Authorization`) must be probed too — otherwise its configured
+        // endpoint and any real auth failure are never observed, and the
+        // caller silently falls back to an unrelated public catalog.
         let list_credential = self.resolve_credential().await?;
-        if list_credential.is_some() || self.public_model_listing {
+        if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
+        {
             let url = self.models_url();
+            // A configured endpoint URL can carry credentials in its userinfo,
+            // query, or fragment. Log and report only the scrubbed form: the
+            // central catalog caller sanitizes the returned error, but these
+            // structured log attributes and error strings are produced before
+            // it and would otherwise leak into operator logs.
+            let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -2914,20 +3868,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model_provider": &self.name,
-                                "url": &url,
+                                "url": &safe_url,
                                 "phase": "model_list_request",
                                 "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
                     anyhow::Error::msg(format!(
-                        "{} model list request failed: {url}: {e}",
+                        "{} model list request failed: {safe_url}: {e}",
                         self.name
                     ))
                 })?;
             if !response.status().is_success() {
                 let status = response.status();
-                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+                anyhow::bail!(
+                    "{} model list failed at {safe_url}: HTTP {status}",
+                    self.name
+                );
             }
             let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
                 .await
@@ -2982,7 +3939,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
         match &self.openrouter_vendor_prefix {
             Some(prefix) => crate::openrouter_catalog::list_models_for_vendor(prefix).await,
-            None => anyhow::bail!("live model listing is not supported for this model_provider"),
+            None => Err(zeroclaw_api::model_provider::ModelListingUnsupportedError.into()),
         }
     }
 
@@ -2990,12 +3947,21 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         &self,
     ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         // When a credential is present, hit the provider's native /models
-        // endpoint — this returns pricing data that we can capture.
+        // endpoint — this returns pricing data that we can capture. A
+        // header-only authenticated profile (see `list_models` above) is
+        // probed too, for the same reason.
         let list_credential = self.resolve_credential().await?;
-        if list_credential.is_some() || self.public_model_listing {
+        if list_credential.is_some() || self.public_model_listing || !self.extra_headers.is_empty()
+        {
             let url = self.models_url();
+            // A configured endpoint URL can carry credentials in its userinfo,
+            // query, or fragment. Log and report only the scrubbed form: the
+            // central catalog caller sanitizes the returned error, but these
+            // structured log attributes and error strings are produced before
+            // it and would otherwise leak into operator logs.
+            let safe_url = super::sanitize_api_error(&url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
+                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())?
                 .send()
                 .await
                 .map_err(|e| {
@@ -3005,20 +3971,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model_provider": &self.name,
-                                "url": &url,
+                                "url": &safe_url,
                                 "phase": "model_list_request",
                                 "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
                     anyhow::Error::msg(format!(
-                        "{} model list request failed: {url}: {e}",
+                        "{} model list request failed: {safe_url}: {e}",
                         self.name
                     ))
                 })?;
             if !response.status().is_success() {
                 let status = response.status();
-                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+                anyhow::bail!(
+                    "{} model list failed at {safe_url}: HTTP {status}",
+                    self.name
+                );
             }
             let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
                 .await
@@ -3066,8 +4035,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     return Ok(models_dev_to_model_info(models));
                 }
                 Ok(_) => {} // empty → fall through to openrouter
-                Err(_) if self.openrouter_vendor_prefix.is_none() => {
-                    return Ok(Vec::new());
+                Err(error) if self.openrouter_vendor_prefix.is_none() => {
+                    return Err(error);
                 }
                 Err(_) => {} // fall through to openrouter
             }
@@ -3076,7 +4045,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             Some(prefix) => {
                 crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
             }
-            None => Ok(Vec::new()),
+            None => Err(zeroclaw_api::model_provider::ModelListingUnsupportedError.into()),
         }
     }
 
@@ -3114,17 +4083,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &content, !merge),
+                thinking_blocks: None,
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
                     role: "system".to_string(),
                     content: MessageContent::Text(sys.to_string()),
+                    thinking_blocks: None,
                 });
             }
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &normalized_message, true),
+                thinking_blocks: None,
             });
         }
 
@@ -3141,6 +4113,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
+        // No cache breakpoints here, deliberately: this text-only helper
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
 
@@ -3148,7 +4127,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            ))
+            )?)
             .send()
             .await
         {
@@ -3203,82 +4182,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.resolve_credential().await?;
-
-        let normalized = self.normalize_messages_for_upstream(messages).await?;
-        let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
-        // Strip native tool constructs for non-native-tool model_providers.
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
-        };
-
-        let url = self.chat_completions_url();
-        let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            ))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
-        };
-
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
-
-        let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
+        let (message, _usage) = self
+            .chat_with_history_inner(messages, model, temperature, None)
+            .await?;
+        Ok(legacy_history_text(&message))
     }
 
     async fn chat_with_tools(
@@ -3292,7 +4199,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3304,6 +4211,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
+            // Legacy entry point: carries no `ChatRequest`, so no runtime
+            // thinking params are available to forward.
+            None,
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -3317,7 +4228,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                ))
+                )?)
                 .send()
                 .await
             {
@@ -3406,7 +4317,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .normalize_messages_for_upstream(request.messages)
             .await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3420,6 +4331,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
+            request.thinking,
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -3456,7 +4369,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                ))
+                )?)
                 .send()
                 .await
             {
@@ -3499,15 +4412,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                let (message, usage) = self
+                    .chat_with_history_inner(
+                        &fallback_messages,
+                        model,
+                        temperature,
+                        request.thinking,
+                    )
                     .await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
+                let mut response = self.parse_native_response(message);
+                response.usage = usage;
+                return Ok(response);
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
@@ -3542,7 +4457,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        true
+        // Passthrough pins requests to the non-streaming wire: gateway SSE
+        // thinking frames are unverified territory (the live probe was
+        // non-streaming), and streamed reasoning would reach history
+        // unsigned, breaking signed block replay on the next tool-loop
+        // iteration. The flag is opt-in, so trading streaming for a correct
+        // signed trajectory is the honest default until wire-first
+        // streaming support lands.
+        !self.thinking_passthrough
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
@@ -3569,6 +4491,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
             request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
+        // `NativeThinkingParams` is `Copy`; captured for both streaming
+        // request branches (tool and tool-less) below.
+        let thinking_owned = request.thinking;
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
@@ -3590,7 +4515,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
@@ -3609,9 +4535,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     temperature,
                     options_enabled,
                     merge,
+                    system_merged,
+                    thinking_owned,
                 ))
             } else {
-                let messages = effective_messages
+                let mut messages: Vec<Message> = effective_messages
                     .iter()
                     .map(|message| Message {
                         role: message.role.clone(),
@@ -3620,14 +4548,28 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             &message.content,
                             !merge,
                             false,
+                            // Streamed requests are thinking-off under
+                            // passthrough (see streaming_thinking_params):
+                            // history replay blocks require the request
+                            // thinking object, so they never ride the
+                            // streamed wire.
                         ),
+                        thinking_blocks: None,
                     })
                     .collect();
+                let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+                provider.apply_cache_breakpoints(&mut messages, carrier);
 
+                let shape = provider.resolve_request_shape(
+                    &model,
+                    provider.streaming_thinking_params(thinking_owned),
+                    temperature,
+                    provider.max_tokens,
+                );
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
                     messages,
-                    temperature,
+                    temperature: shape.temperature,
                     reasoning_effort: reasoning_effort.clone(),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
@@ -3640,8 +4582,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     }),
                     tools: None,
                     tool_choice: None,
-                    max_tokens: provider.max_tokens,
-                    extra_body: provider.extra_body.clone(),
+                    max_tokens: shape.max_tokens,
+                    extra_body: shape.extra_body,
                 })
             };
 
@@ -3674,6 +4616,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3688,8 +4631,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let response = loop {
                 let mut req_builder = client.post(&url).json(&payload);
-                req_builder =
-                    apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+                req_builder = match apply_auth_to_request(
+                    req_builder,
+                    &auth_header,
+                    credential.as_deref(),
+                    &provider.name,
+                ) {
+                    Ok(req_builder) => req_builder,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(error.to_string())))
+                            .await;
+                        return;
+                    }
+                };
                 req_builder = req_builder.header("Accept", "text/event-stream");
                 if let Some(session) = opencode_session.as_deref() {
                     req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
@@ -3699,7 +4654,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                            .send(Err(if e.is_connect() {
+                                StreamError::ConnectFailed(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            } else {
+                                StreamError::Http(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            }))
                             .await;
                         return;
                     }
@@ -3746,6 +4711,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
+                idle_timeout,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -3815,17 +4781,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &content, !merge),
+                    thinking_blocks: None,
                 });
             } else {
                 if let Some(sys) = system_prompt_owned {
                     messages.push(Message {
                         role: "system".to_string(),
                         content: MessageContent::Text(sys),
+                        thinking_blocks: None,
                     });
                 }
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    thinking_blocks: None,
                 });
             }
 
@@ -3844,9 +4813,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3861,8 +4837,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // Build request with auth
             let mut req_builder = client.post(&url).json(&request);
 
-            // Apply auth header
-            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+            // Apply auth header, or refuse locally if the credential cannot be
+            // turned into one.
+            req_builder = match apply_auth_to_request(
+                req_builder,
+                &auth_header,
+                credential.as_deref(),
+                &provider.name,
+            ) {
+                Ok(req_builder) => req_builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -3875,7 +4865,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -3893,7 +4890,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -3943,13 +4940,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, _system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let api_messages: Vec<Message> = effective_messages
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
                     content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
+                    thinking_blocks: None,
                 })
                 .collect();
 
@@ -3968,9 +4967,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3983,7 +4989,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let mut req_builder = client.post(&url).json(&request);
-            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+            req_builder = match apply_auth_to_request(
+                req_builder,
+                &auth_header,
+                credential.as_deref(),
+                &provider.name,
+            ) {
+                Ok(req_builder) => req_builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             req_builder = req_builder.header("Accept", "text/event-stream");
             if let Some(session) = opencode_session.as_deref() {
                 req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
@@ -3993,7 +5012,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -4009,7 +5035,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -4030,7 +5056,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.models_url();
         let credential = self.resolve_credential().await?;
         let mut response = self
-            .apply_auth_header(self.http_client().get(&url), credential.as_deref())
+            .apply_auth_header(self.http_client().get(&url), credential.as_deref())?
             .send()
             .await?;
         // Drain without retaining the catalog so HTTP/1 connections can be reused.
@@ -4214,6 +5240,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn absent_catalog_sources_return_typed_unsupported_for_ids_and_pricing() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("No catalog")
+            .base_url("http://127.0.0.1:9")
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let ids_error = provider
+            .list_models()
+            .await
+            .expect_err("missing live and static ID catalogs must be typed unsupported");
+        assert!(
+            ids_error
+                .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+                .is_some()
+        );
+
+        let pricing_error = provider
+            .list_models_with_pricing()
+            .await
+            .expect_err("missing live and static pricing catalogs must be typed unsupported");
+        assert!(
+            pricing_error
+                .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+                .is_some()
+        );
+    }
+
     fn make_model_provider(
         name: &str,
         url: &str,
@@ -4259,6 +5314,900 @@ mod tests {
         let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
 
         (provider, captured, server)
+    }
+
+    fn make_cache_passthrough_model_provider(
+        name: &str,
+        url: &str,
+    ) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("test")
+            .display_name(name)
+            .base_url(url)
+            .auth_style(AuthStyle::Bearer)
+            .with_cache_passthrough()
+            .build()
+    }
+
+    /// Capability pin: the compat provider reports prompt caching exactly
+    /// when the flag is set, so routing and UI gating can trust capability
+    /// reporting instead of probing the wire.
+    #[test]
+    fn cache_passthrough_capability_reports_flag_state() {
+        let off = make_model_provider("custom", "http://127.0.0.1:1", None);
+        assert!(!off.capabilities().prompt_caching);
+        let on = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        assert!(on.capabilities().prompt_caching);
+    }
+
+    /// Byte-identity pin for the default path: the flag-off request body is
+    /// fully specified, so any future injection work that leaks into the
+    /// default path fails this test instead of silently changing the wire.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_request_body_is_pinned() {
+        let (provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        let result = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        server.abort();
+        let result = result.unwrap_or_else(|error| panic!("flag-off request failed: {error}"));
+        assert_eq!(result, "ok");
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "flag-off request body must stay byte-identical to the pre-feature wire"
+        );
+    }
+
+    /// Capture mock for the TTL path: passthrough on or off, provider
+    /// built with the requested `cache_ttl` when set. Same wire as
+    /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
+    /// against one shape.
+    async fn mock_cache_capture_with_ttl(
+        cache_passthrough: bool,
+        cache_ttl: Option<CacheTtl>,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        if let Some(cache_ttl) = cache_ttl {
+            builder = builder.with_cache_ttl(cache_ttl);
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint
+    /// the compat provider places (system prompt; rolling last message),
+    /// and only breakpoint-carrying messages convert to block form. With
+    /// the default lifetime the body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn cache_ttl_one_hour_marks_every_compat_breakpoint() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("1h request failed: {error}"));
+
+        {
+            let requests = captured.lock().unwrap();
+            let body = &requests[0];
+            let msgs = body["messages"].as_array().expect("messages array");
+
+            let system_block = msgs[0]["content"][0]["cache_control"]
+                .as_object()
+                .expect("system breakpoint in block form");
+            assert_eq!(system_block["type"], "ephemeral");
+            assert_eq!(
+                system_block["ttl"], "1h",
+                "system marker carries the 1h lifetime"
+            );
+
+            let rolling_block = msgs[3]["content"][0]["cache_control"]
+                .as_object()
+                .expect("rolling breakpoint in block form");
+            assert_eq!(rolling_block["type"], "ephemeral");
+            assert_eq!(
+                rolling_block["ttl"], "1h",
+                "rolling marker carries the 1h lifetime"
+            );
+
+            assert_eq!(
+                msgs[2]["content"], "first answer",
+                "non-carrier messages must keep plain string serialization"
+            );
+        }
+
+        // Default-lifetime control run: same placement, no ttl anywhere.
+        let (provider, captured, server) = mock_cache_capture_with_ttl(true, None).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("default request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let body = &requests[0];
+        assert!(
+            !body.to_string().contains("\"ttl\""),
+            "default config must keep the compat wire free of ttl keys: {body}"
+        );
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured
+    /// `chat` path hits the `!cache_passthrough` early return in
+    /// `apply_cache_breakpoints`, so the body is byte-identical to the
+    /// flag-off structured wire and a staged value waiting for a passthrough
+    /// flip changes nothing on the wire. Removing that early return fails
+    /// this test (breakpoints would appear in the body).
+    #[tokio::test]
+    async fn cache_ttl_one_hour_without_passthrough_is_inert() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
+                ],
+                "stream": false,
+            }),
+            "cache_ttl without passthrough must leave the structured body identical to flag-off"
+        );
+    }
+
+    /// Streaming capture mock: records every request body, answers with a
+    /// minimal SSE stream. Returns the provider built with or without the
+    /// cache flag so tests can pin both wire paths.
+    async fn mock_streaming_cache_capture(
+        cache_passthrough: bool,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D3 wire shape: behind the flag, the system prompt converts from
+    /// string content to the single-text-block form carrying
+    /// `cache_control`, while every other message keeps its existing
+    /// serialization untouched.
+    #[tokio::test]
+    async fn cache_passthrough_system_breakpoint_serializes_block_form() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![ChatMessage::system("be brief"), ChatMessage::user("hello")];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "be brief",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "system prompt must serialize as a cache_control text block; other messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange must carry exactly one breakpoint"
+        );
+    }
+
+    /// Rolling breakpoint: once the conversation has more than one
+    /// non-system message (the native provider's gate), the last message
+    /// gains the second breakpoint and converts to block form; messages in
+    /// between serialize exactly as before.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_after_first_exchange() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "system and last message carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "rolling breakpoint must never exceed two per request"
+        );
+    }
+
+    /// Writes a minimal real PNG (a 1x1 transparent pixel) into a fresh
+    /// tempdir and returns the dir plus the file path. The dir must outlive
+    /// the request so the multimodal prepare pass can inline the file, and
+    /// tests build the image marker at runtime from the path so this
+    /// source never carries a literal marker.
+    fn write_minimal_png() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let image_path = temp.path().join("pixel.png");
+        std::fs::write(&image_path, png).unwrap();
+        (temp, image_path)
+    }
+
+    /// Wire form of [`write_minimal_png`]'s file once the multimodal
+    /// prepare pass inlines it: MIME detected from the PNG signature,
+    /// standard padded base64.
+    const MINIMAL_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+
+    /// Rolling breakpoint on an image-ending turn: the last user message
+    /// serializes as [text, image] parts, and the breakpoint must land on
+    /// that text part instead of vanishing because the final part is an
+    /// image. The image part stays unmarked; the following turn's rolling
+    /// breakpoint covers it.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "system and the text part ahead of the trailing image carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "an image-ending turn must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Streaming twin of the image-turn pin: the streaming path must place
+    /// the rolling breakpoint on the same text part when the final user
+    /// message ends with an image.
+    #[tokio::test]
+    async fn cache_passthrough_streaming_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming image-turn request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "streaming path must inject the image-turn breakpoints identically"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "streaming image-ending turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Image-only turn: a message whose content is just the image carries
+    /// no text part at all, so it cannot host the rolling breakpoint. The
+    /// breakpoint rolls back onto the nearest earlier non-system message
+    /// with text, the image part stays unmarked, and the two-breakpoint
+    /// ceiling holds.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_falls_back_when_last_message_is_image_only() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!("[{}:{}]", "IMAGE", image_path.display())),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-only request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; the image part stays unmarked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "image-only fallback must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Unit pin for the fallback walk on hand-built messages, so the
+    /// invariant holds regardless of how a history was constructed: an
+    /// image-only last message rolls the rolling breakpoint back onto the
+    /// nearest earlier non-system message with text, a trailing system
+    /// message never absorbs the slot or gains a second mark, and the
+    /// two-breakpoint ceiling holds.
+    #[test]
+    fn cache_passthrough_breakpoint_walk_handles_hand_built_image_only_messages() {
+        let provider = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("you are brief".to_string()),
+                thinking_blocks: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+                thinking_blocks: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+                thinking_blocks: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![MessagePart::ImageUrl {
+                    image_url: ImageUrlPart {
+                        url: "data:image/png;base64,abcd".to_string(),
+                    },
+                }]),
+                thinking_blocks: None,
+            },
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("extra".to_string()),
+                thinking_blocks: None,
+            },
+        ];
+        provider.apply_cache_breakpoints(&mut messages, None);
+        let value = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+                ]},
+                {"role": "system", "content": "extra"},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; system messages never take the rolling slot"
+        );
+        assert_eq!(
+            value.to_string().matches("cache_control").count(),
+            2,
+            "hand-built fallback must keep the two-breakpoint ceiling"
+        );
+    }
+
+    /// Flag-off twin for the multimodal shape: with the flag off, the
+    /// image-ending history serializes byte-identically to the pre-feature
+    /// wire, with plain string content where the flag-on path would mark,
+    /// the same unmarked image parts, and no cache markers anywhere in the
+    /// body.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_image_turn_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "you are brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "flag-off multimodal body must stay byte-identical: plain strings and unmarked image parts"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off image-ending turn must carry no cache markers"
+        );
+    }
+
+    /// The rolling breakpoint follows the native provider's gate: a
+    /// conversation with only one non-system message gets the system
+    /// breakpoint alone.
+    #[tokio::test]
+    async fn cache_passthrough_single_exchange_skips_rolling_breakpoint() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "one non-system message means no rolling breakpoint"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hi"),
+            "first user message must stay a plain string"
+        );
+    }
+
+    /// Streaming twin of the system-breakpoint pin: the injection must be
+    /// identical on the streaming path (a previous feature shipped the
+    /// non-streaming path and silently missed streaming).
+    #[tokio::test]
+    async fn cache_passthrough_streaming_system_breakpoint_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0],
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "be brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ],
+            }),
+            "streaming path must inject the system breakpoint identically"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hello"),
+            "streaming user message must stay a plain string"
+        );
+    }
+
+    /// Flag-off streaming twin: the default path stays byte-identical on
+    /// the streaming wire too.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_streaming_body_unmarked() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0]["content"],
+            serde_json::json!("be brief"),
+            "flag-off system message must stay a plain string"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off streaming body must carry no cache markers"
+        );
+    }
+
+    /// Native-tools path: the same two-breakpoint placement applies to the
+    /// native-tools request builder, so tool-bearing agent loops get the
+    /// same caching shape as plain conversations.
+    #[tokio::test]
+    async fn cache_passthrough_tools_path_rolls_breakpoint_onto_last_message() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on tools request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "tools path must carry at most the two standard breakpoints"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system breakpoint present on the tools path"
+        );
+        assert_eq!(
+            requests[0]["messages"].as_array().unwrap().last().unwrap()["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling breakpoint lands on the last message of the tools path"
+        );
     }
 
     fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
@@ -4421,6 +6370,8 @@ mod tests {
             Some(0.5),
             true,
             false,
+            false,
+            None,
         ))
         .unwrap();
 
@@ -4452,6 +6403,8 @@ mod tests {
             None,
             true,
             false,
+            false,
+            None,
         ))
         .unwrap();
         assert!(
@@ -4509,6 +6462,1600 @@ mod tests {
     // "When using `tool_choice`, `tools` must be set."). The request builders
     // must omit `tool_choice` whenever the converted tool list is empty.
     #[test]
+    fn thinking_passthrough_flag_off_never_injects_thinking() {
+        // Flag off = today's behavior exactly, regardless of runtime params.
+        // Byte-identical guarantee, asserted two ways: the request payload
+        // carries no `thinking` key (and is identical with params present or
+        // absent), and the extra_body seam returns the configured extra_body
+        // value unchanged.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let with_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        let without_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            with_params.get("thinking").is_none(),
+            "flag-off request must never gain a thinking key; got: {with_params}"
+        );
+        assert_eq!(
+            with_params, without_params,
+            "flag-off requests must be byte-identical whether params are present or not"
+        );
+
+        let extra = serde_json::json!({"top_k": 5});
+        let p_with_extra = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .extra_body(extra.clone())
+            .build();
+        assert_eq!(
+            p_with_extra.request_extra_body("test-model", Some(params)),
+            Some(extra),
+            "flag-off extra_body seam must return the configured extra_body unchanged"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_injects_enabled_budget_shape() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "passthrough must inject the Anthropic enabled-budget thinking shape"
+        );
+
+        // Streaming builder mirrors the non-streaming injection... except it
+        // must NOT: passthrough never attaches thinking to the streamed wire
+        // (unverified SSE frames, no signed capture on streamed responses).
+        // The streamed body behaves like thinking-off for that turn.
+        let streaming = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(
+            streaming.get("thinking").is_none(),
+            "streamed requests under passthrough must never carry the thinking object: {streaming}"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_streaming_builder_drops_thinking_display_variants_too() {
+        // Defense in depth: every display variant is equally withheld from
+        // the streamed wire under passthrough.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+
+        let with_tools = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(with_tools.get("thinking").is_none());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off streaming never injected thinking and must stay that way"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_model_sends_adaptive_shape_without_budget() {
+        // Adaptive-only models reject the fixed-budget shape with HTTP 400;
+        // the injected object must switch to the bare adaptive shape.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p
+            .request_extra_body("claude-opus-4-7", Some(params))
+            .unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "adaptive-only models must receive the adaptive shape"
+        );
+        assert!(
+            resolved["thinking"].get("budget_tokens").is_none(),
+            "adaptive shape must not carry a budget_tokens key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_budget_model_shape_unchanged_by_style_share() {
+        // A budget model keeps the enabled shape exactly, with no display
+        // key when params.display is None.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "budget models must keep the enabled shape; display None must omit the key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_display_includes_snake_case_value_on_both_styles() {
+        // params.display rides on both shapes, serialized snake_case like
+        // the native provider's NativeThinkingConfig.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let updates = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+        };
+        let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
+        assert_eq!(
+            budget["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 8_192,
+                "display": "updates"
+            }),
+            "display Some must emit the snake_case value on the budget shape"
+        );
+
+        let adaptive = p
+            .request_extra_body("claude-opus-4-7", Some(updates))
+            .unwrap();
+        assert_eq!(
+            adaptive["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "display Some must emit the snake_case value on the adaptive shape"
+        );
+
+        let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+        };
+        let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
+        assert_eq!(
+            omitted_body["thinking"]["display"],
+            serde_json::json!("omitted"),
+            "each display variant must serialize to its snake_case name"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
+        // Gateway routing prefixes model IDs; the shared style resolver
+        // matches on substrings, so a prefixed adaptive-only ID must still
+        // resolve to the adaptive shape (live gateways emit IDs like
+        // "claude-group/claude-fable-5").
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        for model in [
+            "claude-group/claude-opus-4-7",
+            "team-alias/claude-fable-5-1",
+        ] {
+            let resolved = p.request_extra_body(model, Some(params)).unwrap();
+            assert_eq!(
+                resolved["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "prefixed adaptive-only ID {model} must resolve to the adaptive shape"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_shape_flows_through_request_builder() {
+        // End to end through the non-streaming builder: an adaptive-only
+        // gateway model gets the adaptive thinking object at the top level.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            None,
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"}),
+            "the request builder must carry the adaptive plus display shape to the wire"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_without_params_sends_no_thinking() {
+        // Flag on but the runtime supplied no native thinking params: nothing
+        // to forward, request must stay free of a thinking key.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("thinking").is_none(),
+            "params-None request must not carry a thinking key; got: {value}"
+        );
+        assert!(p.request_extra_body("test-model", None).is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_extra_body_keys_win_over_injected_thinking() {
+        // Explicit operator `extra_body` always wins: an extra_body `thinking`
+        // key must fully shadow the injected object.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit extra_body thinking key must win over the injected object"
+        );
+        assert!(
+            resolved.get("budget_tokens").is_none(),
+            "injected budget_tokens must not leak to the top level"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_explicit_enabled_override_raises_limit_above_its_budget() {
+        // An explicit `provider_extra` thinking key wins over the injected
+        // object, so normalization must follow the object that is actually
+        // serialized: an `enabled` override with its own budget raises
+        // `max_tokens` above THAT budget (the runtime budget is not the one
+        // on the wire) and still forces temperature 1.0.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.7), Some(params))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "one captured body per request");
+        assert_eq!(
+            bodies[0]["thinking"]["budget_tokens"],
+            serde_json::json!(16_384),
+            "explicit extra_body thinking budget must win over the injected one"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(16_385),
+            "max_tokens must be raised above the effective (override) budget; got max_tokens = {}",
+            bodies[0]["max_tokens"]
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(1.0),
+            "an effective enabled thinking object still forces temperature 1.0"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_explicit_off_override_keeps_temperature_and_limit() {
+        // The `off` override is the object actually serialized, so the
+        // request is not thinking-enabled: the caller's temperature and
+        // limit stand instead of the injected-shape normalization.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .max_tokens(Some(10_000))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.7), Some(params))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "one captured body per request");
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit extra_body thinking key must win over the injected object"
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(0.7),
+            "an effective off thinking object must keep the caller's temperature"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(10_000),
+            "an effective off thinking object must keep the configured limit"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_passthrough_override_shapes_flow_through_native_tool_builder() {
+        // The typed native-tools path resolves from the same effective
+        // object as the shared builder: an `off` override keeps the
+        // caller's values, an `enabled` override raises the limit above
+        // its own budget and still forces temperature 1.0.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .max_tokens(Some(10_000))
+            .build();
+        let off_body = serde_json::to_value(off.build_native_tool_chat_request(
+            &messages,
+            Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "get_weather".to_string(),
+                    description: String::new(),
+                    parameters: std::sync::Arc::new(serde_json::json!({})),
+                },
+            }]),
+            "test-model",
+            Some(0.7),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            off_body["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit off override must win on the typed path; got: {off_body}"
+        );
+        assert_eq!(
+            off_body["temperature"],
+            serde_json::json!(0.7),
+            "effective off object keeps the caller's temperature on the typed path"
+        );
+        assert_eq!(
+            off_body["max_tokens"],
+            serde_json::json!(10_000),
+            "effective off object keeps the configured limit on the typed path"
+        );
+
+        let enabled = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        let enabled_body = serde_json::to_value(enabled.build_native_tool_chat_request(
+            &messages,
+            Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "get_weather".to_string(),
+                    description: String::new(),
+                    parameters: std::sync::Arc::new(serde_json::json!({})),
+                },
+            }]),
+            "test-model",
+            Some(0.7),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            enabled_body["thinking"]["budget_tokens"],
+            serde_json::json!(16_384),
+            "explicit enabled override budget must win on the typed path; got: {enabled_body}"
+        );
+        assert_eq!(
+            enabled_body["max_tokens"],
+            serde_json::json!(16_385),
+            "typed path must raise the limit above the effective override budget; got: {enabled_body}"
+        );
+        assert_eq!(
+            enabled_body["temperature"],
+            serde_json::json!(1.0),
+            "effective enabled object still forces temperature 1.0 on the typed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_prompt_guided_fallback_never_injects_or_normalizes() {
+        // Streaming sites pass streaming_thinking_params, which is None
+        // whenever passthrough is on: the tool-less streaming fallback can
+        // never inject the thinking object, so it never normalizes either.
+        // Without an override the body carries no `thinking` key at all;
+        // an operator's explicit override rides along as their own request
+        // with the caller's temperature and limit untouched.
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    bodies.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let plain = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(10_000))
+            .build();
+        let events = plain
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(params),
+                },
+                "test-model",
+                Some(0.75),
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "fallback stream must succeed: {events:?}"
+        );
+
+        let override_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        let events = override_provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(params),
+                },
+                "test-model",
+                Some(0.7),
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "override fallback stream must succeed: {events:?}"
+        );
+
+        server.abort();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one captured body per stream");
+        assert!(
+            bodies[0].get("thinking").is_none(),
+            "passthrough streaming fallback must not inject a thinking object; got: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(0.75),
+            "no injection means no temperature forcing on the fallback body"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(10_000),
+            "no injection means no limit raising on the fallback body"
+        );
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 16_384}),
+            "an explicit override rides the fallback body as the operator's own request"
+        );
+        assert_eq!(
+            bodies[1]["temperature"],
+            serde_json::json!(0.7),
+            "the fallback never normalizes, even with an enabled override configured"
+        );
+        assert_eq!(
+            bodies[1]["max_tokens"],
+            serde_json::json!(10_000),
+            "the fallback never raises the limit, even with an enabled override configured"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 4_096,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"top_k": 5}))
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 4_096}),
+            "injected thinking object must ride alongside unrelated extra_body keys"
+        );
+        assert_eq!(resolved["top_k"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn thinking_passthrough_non_object_extra_body_wins_outright() {
+        // A non-object extra_body cannot be key-merged; the explicit config
+        // value wins outright. (Serializing it would fail at the existing
+        // serde(flatten) boundary — unchanged pre-existing behavior — so
+        // this pins the seam, not the wire.)
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!("scalar"))
+            .build();
+
+        assert_eq!(
+            p.request_extra_body("test-model", Some(params)),
+            Some(serde_json::json!("scalar")),
+            "non-object extra_body must win outright over the injected thinking object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_native_tool_builder() {
+        // Anthropic rejects extended thinking combined with a modified
+        // temperature: whenever the builder injects the thinking object, the
+        // caller's temperature must be replaced with 1.0 (the native
+        // provider's rule). Flag off and params-None keep the caller's
+        // value, leaving those bodies byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "injected thinking requires temperature 1.0; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the forcing must ride on an actually injected thinking object"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off request must keep the caller's temperature"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None request under passthrough must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "raw tool builder must force temperature 1.0 when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off raw tool request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None raw tool request must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_for_adaptive_style() {
+        // The forcing rule is style-independent, matching the native
+        // provider: an adaptive-only gateway model with thinking params also
+        // gets temperature 1.0.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "adaptive-style thinking must force temperature 1.0 too"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_temperature_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the temperature resolves from the
+        // same params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the temperature as well: the
+        // caller's value is kept, nothing is forced. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["temperature"],
+            serde_json::json!(0.75),
+            "streamed requests under passthrough carry no thinking object, so the caller's temperature is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off streamed request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_forces_temperature_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same temperature forcing as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(1.0),
+            "fallback request with injected thinking must carry temperature 1.0"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["temperature"],
+            serde_json::json!(0.75),
+            "flag-off fallback request must keep the caller's temperature"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["temperature"],
+            serde_json::json!(0.75),
+            "params-None fallback request must keep the caller's temperature"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_native_tool_builder() {
+        // Anthropic rejects a fixed-budget thinking request whose output
+        // limit does not strictly exceed the budget: whenever the builder
+        // injects the thinking object, the configured limit is raised to
+        // budget_tokens + 1 (the native provider's rule). Flag off and
+        // params-None keep the configured limit, leaving those bodies
+        // byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "injected thinking requires max_tokens above the budget; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the raising must ride on an actually injected thinking object"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off request must keep the configured max_tokens"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None request under passthrough must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "raw tool builder must raise max_tokens when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off raw tool request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None raw tool request must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_when_configured_above_budget() {
+        // The native rule raises only when needed: a configured limit
+        // already above the budget is sent unchanged, and an unset limit
+        // resolves to the minimum the budget requires.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(16_384))
+            .build();
+        let value = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(16_384),
+            "configured limit above the budget must be kept"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let unset = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let value = serde_json::to_value(unset.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "unset limit must resolve to the budget minimum"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_for_adaptive_style() {
+        // The raising rule is budget-only, matching the native provider:
+        // adaptive-style thinking carries no budget, so the configured
+        // limit is unconstrained.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(4_096),
+            "adaptive-style thinking must keep the configured max_tokens"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the limit resolves from the same
+        // params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the limit as well: the configured
+        // value is kept, nothing is raised. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["max_tokens"],
+            serde_json::json!(4_096),
+            "streamed requests under passthrough carry no thinking object, so the configured max_tokens is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off streamed request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_raises_max_tokens_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same budget-safe limit as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(8_193),
+            "fallback request with injected thinking must carry a budget-safe limit"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off fallback request must keep the configured max_tokens"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None fallback request must keep the configured max_tokens"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
     fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
@@ -4519,7 +8066,15 @@ mod tests {
         // directly.
 
         // None tools → no tool_choice key.
-        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("tool_choice").is_none(),
@@ -4527,8 +8082,15 @@ mod tests {
         );
 
         // Empty tools vec → still no tool_choice key.
-        let req_empty =
-            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let req_empty = p.build_native_tool_chat_request(
+            &messages,
+            Some(vec![]),
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
         let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
             value_empty.get("tool_choice").is_none(),
@@ -4550,8 +8112,15 @@ mod tests {
                 parameters: std::sync::Arc::new(serde_json::json!({})),
             },
         }];
-        let req =
-            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value.get("tool_choice").and_then(serde_json::Value::as_str),
@@ -4584,7 +8153,15 @@ mod tests {
             },
         }];
 
-        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "gpt-5",
+            None,
+            false,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -4609,7 +8186,8 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false, None);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -4617,6 +8195,114 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("high"),
             "reasoning_effort must be present when no tools are sent; got: {value}"
+        );
+    }
+
+    // Opt-in reasoning-effort passthrough: the name filter is fail-closed
+    // because some backends reject unknown request params, so only an
+    // explicit per-provider flag forwards effort to non-OpenAI model names.
+    #[test]
+    fn reasoning_effort_passthrough_default_keeps_name_filter_for_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "flag unset must preserve the name filter: glm-style models never receive reasoning_effort; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_forwards_effort_to_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "flag on must forward the configured effort to glm-style models; got: {value}"
+        );
+
+        // Models the filter already passes keep the same outcome with the
+        // flag on: passthrough only widens coverage, it never narrows it.
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "openai/o3-mini",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "o3-style models must keep receiving the effort with the flag on; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_without_configured_effort_sends_none() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "passthrough without a configured effort must not invent one; got: {value}"
         );
     }
 
@@ -4765,6 +8451,591 @@ mod tests {
             Some("high")
         );
         assert!(bodies[0].get("tools").is_some());
+        server.abort();
+    }
+
+    /// Spawn a mock endpoint that rejects any request carrying `tools` with a
+    /// schema-unsupported error and accepts the tool-less fallback. Returns
+    /// the bound address, the recorded bodies, and the server handle.
+    fn spawn_schema_rejecting_endpoint() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "unknown parameter: tools",
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": "guided fallback thought",
+                                            "signature": "sig_fb"
+                                        }
+                                    ]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve schema test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    /// Schema-rejecting endpoint whose tool-less fallback responses carry
+    /// signed thinking blocks, so the first fallback turn produces captured
+    /// reasoning for the second turn's history.
+    fn spawn_schema_rejecting_endpoint_with_signed_fallback() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "message": "unknown parameter: tools" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                                        {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                                        {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+                                    ]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve signed fallback test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    /// Schema-rejecting endpoint whose tool-less fallback reply carries a
+    /// native tool call beside visible content, signed thinking, and usage:
+    /// the prompt-guided fallback retry is not limited to text-only replies.
+    fn spawn_schema_rejecting_endpoint_with_tool_call_fallback() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "message": "unknown parameter: tools" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "tool_calls": [{
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_weather",
+                                            "arguments": "{\"city\":\"SF\"}"
+                                        }
+                                    }],
+                                    "thinking_blocks": [
+                                        {"type": "thinking", "thinking": "fallback thought", "signature": "sig_norm"}
+                                    ]
+                                }
+                            }],
+                            "usage": {"prompt_tokens": 12, "completion_tokens": 34}
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve tool-call fallback test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    #[tokio::test]
+    async fn second_schema_fallback_replays_signed_history() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        // Turn 1: schema rejected, prompt-guided fallback succeeds and its
+        // response carries signed thinking blocks, which capture converts
+        // into replay lines.
+        let turn_one = vec![ChatMessage::user("What is the weather in SF?")];
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_one,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let captured = response
+            .reasoning_content
+            .expect("fallback thinking captured");
+        let captured_lines: Vec<&str> = captured.split('\n').collect();
+        assert_eq!(captured_lines.len(), 3, "signed, signature-only, redacted");
+
+        // Turn 2: history carries the runtime-persisted reasoning envelope;
+        // the gateway rejects the schema again, so this request also goes
+        // through the fallback history builder.
+        let envelope = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": captured,
+        });
+        let turn_two = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(envelope.to_string()),
+            ChatMessage::user("And the forecast for tomorrow?"),
+        ];
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_two,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        // Each chat call records its rejected primary request plus its
+        // fallback request: [primary-1, fallback-1, primary-2, fallback-2].
+        assert_eq!(bodies.len(), 4, "two calls, primary plus fallback each");
+        assert!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("thinking_blocks").is_none()),
+            "turn-1 history carries no reasoning yet"
+        );
+
+        let assistant = bodies[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn in second request");
+        assert_eq!(
+            assistant["thinking_blocks"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+            ]),
+            "the second fallback request must replay the exact signed blocks"
+        );
+        assert_eq!(
+            bodies[3]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback request keeps the thinking request object"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_history_replay_is_flag_gated() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        // Same envelope history, flag OFF: the fallback wire must stay
+        // byte-identical to the pre-passthrough behavior, so the assistant
+        // message carries no thinking_blocks field at all.
+        let provider = make_model_provider("test", &format!("http://{addr}"), None);
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let messages = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "ok",
+                    "reasoning_content": "{\"thinking\":\"visible\",\"signature\":\"sig1\"}"
+                })
+                .to_string(),
+            ),
+            ChatMessage::user("And the forecast?"),
+        ];
+
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "primary plus fallback");
+        let assistant = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn");
+        assert!(
+            assistant.get("thinking_blocks").is_none(),
+            "flag-off fallback wire must not grow a thinking_blocks field"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn schema_fallback_rethreads_thinking_params() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        let captured: serde_json::Value = serde_json::from_str(
+            response
+                .reasoning_content
+                .as_deref()
+                .expect("fallback response must capture the returned signed thinking"),
+        )
+        .unwrap();
+        assert_eq!(
+            captured,
+            serde_json::json!({
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            }),
+            "fallback response must capture the returned signed thinking, not drop it"
+        );
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "primary request carries the injected thinking object"
+        );
+        assert!(bodies[0].get("tools").is_some());
+        assert!(
+            bodies[1].get("tools").is_none(),
+            "fallback rebuild drops the tools parameter"
+        );
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback rebuild must rethread the same thinking injection"
+        );
+        drop(bodies);
+        server.abort();
+
+        // Two-turn regression: the captured fallback thinking must replay on
+        // the next tool-loop iteration. Simulate turn 2 by appending the
+        // assistant turn (as the runtime persists it) and converting.
+        let assistant_content = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": response.reasoning_content,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"SF\"}",
+                }
+            ],
+        });
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant(assistant_content.to_string()),
+            ChatMessage::tool(r#"{"tool_call_id": "call_1", "content": "72F"}"#.to_string()),
+        ];
+        let native = provider.convert_messages_for_native(&history, false);
+        assert_eq!(
+            native[1].thinking_blocks,
+            Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            })]),
+            "turn-2 outbound must replay the exact signed blocks captured on the fallback turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_fallback_returns_normalized_text_beside_native_tool_calls() {
+        let (addr, bodies, server) =
+            spawn_schema_rejecting_endpoint_with_tool_call_fallback().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("What is the weather in SF?")];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.text.as_deref(),
+            Some("ok"),
+            "fallback text must stay the normalized content, not the legacy JSON projection"
+        );
+        assert!(
+            !response
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool_calls"),
+            "visible narration must not carry the serialized message JSON"
+        );
+        assert_eq!(
+            response.tool_calls.len(),
+            1,
+            "the native call must surface structurally"
+        );
+        assert_eq!(response.tool_calls[0].name, "get_weather");
+        assert_eq!(response.tool_calls[0].arguments, "{\"city\":\"SF\"}");
+        let captured: serde_json::Value = serde_json::from_str(
+            response
+                .reasoning_content
+                .as_deref()
+                .expect("fallback response must capture the returned signed thinking"),
+        )
+        .unwrap();
+        assert_eq!(
+            captured,
+            serde_json::json!({
+                "thinking": "fallback thought",
+                "signature": "sig_norm"
+            }),
+            "fallback response must capture the returned signed thinking"
+        );
+        let usage = response.usage.expect("fallback response surfaces usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_keeps_legacy_json_text_for_tool_call_responses() {
+        let reply = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_legacy",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"SF\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let (provider, _captured, server) = mock_non_streaming_response(reply.clone()).await;
+        let messages = vec![ChatMessage::user("What is the weather in SF?")];
+
+        let text = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await
+            .expect("chat history should succeed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .expect("tool-call replies keep the serialized-message JSON text contract");
+        assert_eq!(
+            parsed["tool_calls"][0]["function"]["name"],
+            serde_json::json!("get_weather"),
+            "legacy text names the called function"
+        );
+        let message: ResponseMessage =
+            serde_json::from_value(reply["choices"][0]["message"].clone())
+                .expect("reply message parses as the gateway message shape");
+        assert_eq!(
+            text,
+            serde_json::to_string(&message).expect("gateway message serializes"),
+            "legacy text is exactly the serialized gateway message"
+        );
+
         server.abort();
     }
 
@@ -5385,7 +9656,11 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        let mut stream = sse_bytes_to_chunks(response, false);
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+        );
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -5483,6 +9758,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
+                thinking_blocks: None,
                 name: None,
             }],
             temperature: Some(0.7),
@@ -5630,10 +9906,12 @@ mod tests {
                 Message {
                     role: "system".to_string(),
                     content: MessageContent::Text("You are ZeroClaw".to_string()),
+                    thinking_blocks: None,
                 },
                 Message {
                     role: "user".to_string(),
                     content: MessageContent::Text("hello".to_string()),
+                    thinking_blocks: None,
                 },
             ],
             temperature: Some(0.4),
@@ -5997,6 +10275,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_pinned_session_header_falls_back_to_the_derived_token() {
+        // The client builder skips a header value it cannot encode, so treating
+        // it as a pin would leave the request with no affinity header at all.
+        let headers = std::collections::HashMap::from([(
+            "x-opencode-session".to_string(),
+            "bad\nvalue".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            built_session_header(&provider).is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest strips only credential headers on a cross-host redirect, so
+        // every client an OpenCode provider builds must stop there instead.
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+
+        let opencode = opencode_provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_http_client()));
+
+        let other = opencode_provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_http_client()));
+    }
+
+    #[test]
     fn zhipu_jwt_auth_style_applies_correctly() {
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("Z.AI")
@@ -6007,22 +10324,281 @@ mod tests {
         assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
+    /// Every request that reached the test server, as `(method, path)`.
+    type WireLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// A server that records anything that arrives, on any method and path,
+    /// and answers a well-formed chat completion. Recording everything is the
+    /// point: a test asserting the log is empty then fails if a request
+    /// escapes by a route the test did not anticipate, instead of passing
+    /// because the request 404'd.
+    async fn recording_server() -> (String, WireLog, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let log: WireLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_for_route = std::sync::Arc::clone(&log);
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let log = std::sync::Arc::clone(&log_for_route);
+                async move {
+                    log.lock()
+                        .expect("wire log poisoned")
+                        .push((method.to_string(), uri.path().to_string()));
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}],
+                        "data": []
+                    }))
+                }
+            });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), log, server)
+    }
+
+    /// A `ZhipuJwt` credential that is not `id.secret` cannot be minted into a
+    /// per-request token, and this provider fails closed rather than falling
+    /// back to sending the stored value as a plain bearer token.
+    ///
+    /// Driven through every entry point on this provider that carries a
+    /// credential, because the fallback lived in the helper they all share.
+    /// Two properties per entry point: the operator gets a local error naming
+    /// the provider, and — the security property — nothing reaches the server,
+    /// so the stored value cannot have left the client in any form.
+    ///
+    /// The local error is also the behaviour change. These paths previously
+    /// sent `Authorization: Bearer <stored value>` and surfaced whatever
+    /// rejection the provider chose to return, which reads as a credential
+    /// problem at the far end rather than a malformed credential here.
+    #[tokio::test]
+    async fn malformed_zhipu_credential_fails_closed_on_every_credential_bearing_path() {
+        const MALFORMED: &str = "no-dot-separator-here";
+
+        let (base_url, wire, server) = recording_server().await;
+        let provider = OpenAiCompatibleModelProvider::builder("zai")
+            .display_name("Z.AI")
+            .base_url(&base_url)
+            .credential(Some(MALFORMED))
+            .auth_style(AuthStyle::ZhipuJwt)
+            .build();
+
+        let history = [ChatMessage::user("hi")];
+        let stream_options = StreamOptions {
+            enabled: true,
+            count_tokens: false,
+        };
+
+        let mut refusals: Vec<(&str, String)> = Vec::new();
+        let mut push = |entry_point: &'static str, err: String| refusals.push((entry_point, err));
+
+        push(
+            "list_models",
+            provider.list_models().await.unwrap_err().to_string(),
+        );
+        push(
+            "list_models_with_pricing",
+            provider
+                .list_models_with_pricing()
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_system",
+            provider
+                .chat_with_system(None, "hi", "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_history",
+            provider
+                .chat_with_history(&history, "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat_with_tools",
+            provider
+                .chat_with_tools(&history, &[], "m", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push(
+            "chat",
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &history,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "m",
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+        );
+        push("warmup", provider.warmup().await.unwrap_err().to_string());
+
+        // The streaming paths build their request inside a spawned task, so the
+        // refusal arrives as the stream's first item rather than as a return
+        // value. It must still be the first item — not an empty stream that
+        // looks like a successful, contentless response.
+        let mut events = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &history,
+                tools: None,
+                thinking: None,
+            },
+            "m",
+            None,
+            stream_options,
+        );
+        push(
+            "stream_chat",
+            match events.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => panic!("stream_chat must yield a refusal first, got {other:?}"),
+            },
+        );
+        drop(events);
+
+        let mut chunks = provider.stream_chat_with_system(None, "hi", "m", None, stream_options);
+        push(
+            "stream_chat_with_system",
+            match chunks.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => {
+                    panic!("stream_chat_with_system must yield a refusal first, got {other:?}")
+                }
+            },
+        );
+        drop(chunks);
+
+        let mut chunks = provider.stream_chat_with_history(&history, "m", None, stream_options);
+        push(
+            "stream_chat_with_history",
+            match chunks.next().await {
+                Some(Err(err)) => err.to_string(),
+                other => {
+                    panic!("stream_chat_with_history must yield a refusal first, got {other:?}")
+                }
+            },
+        );
+        drop(chunks);
+
+        for (entry_point, err) in &refusals {
+            assert!(
+                err.contains("Z.AI"),
+                "{entry_point}: the error must name the provider: {err}"
+            );
+            assert!(
+                err.contains("no request was sent"),
+                "{entry_point}: the error must say the request was refused locally: {err}"
+            );
+            assert!(
+                !err.contains(MALFORMED),
+                "{entry_point}: the error must not quote the stored credential: {err}"
+            );
+        }
+
+        let seen = wire.lock().expect("wire log poisoned").clone();
+        assert!(
+            seen.is_empty(),
+            "no request may leave the client for a credential that cannot be minted: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// The counterpart: a well-formed `id.secret` still reaches the provider,
+    /// so failing closed did not disable Zhipu-auth families outright.
+    #[tokio::test]
+    async fn a_well_formed_zhipu_credential_still_reaches_the_provider() {
+        let (base_url, wire, server) = recording_server().await;
+        let provider = OpenAiCompatibleModelProvider::builder("zai")
+            .display_name("Z.AI")
+            .base_url(&base_url)
+            .credential(Some("keyid.longlivedsecret"))
+            .auth_style(AuthStyle::ZhipuJwt)
+            .build();
+
+        provider
+            .chat_with_system(None, "hi", "m", None)
+            .await
+            .expect("a well-formed id.secret must still be usable");
+
+        let seen = wire.lock().expect("wire log poisoned").clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the well-formed case must still issue its request: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// A credential that cannot be minted refuses the request rather than
+    /// building one. Sending it unauthenticated would leave the operator
+    /// reading whatever 401 the provider returns instead of the local
+    /// credential fault that actually happened.
     #[test]
-    fn invalid_zhipu_credential_is_not_sent_as_raw_bearer_token() {
-        let request = apply_auth_to_request(
+    fn an_unmintable_zhipu_credential_refuses_the_request_instead_of_building_one() {
+        const STORED: &str = "raw-secret-without-required-separator";
+
+        let error = apply_auth_to_request(
             reqwest::Client::new().get("https://example.com"),
             &AuthStyle::ZhipuJwt,
-            Some("raw-secret-without-required-separator"),
+            Some(STORED),
+            "GLM",
         )
-        .build()
-        .unwrap();
+        .expect_err("an unmintable credential must not produce a request builder");
 
+        let message = error.to_string();
         assert!(
-            request
-                .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .is_none()
+            !message.contains(STORED),
+            "the refusal must not quote the credential: {message}"
         );
+        assert!(
+            message.contains("GLM"),
+            "the refusal must name the provider it belongs to: {message}"
+        );
+    }
+
+    /// The three auth styles that pass a credential through untransformed keep
+    /// doing so — fail-closed is scoped to the style that mints.
+    #[test]
+    fn untransformed_auth_styles_still_build_their_request() {
+        for style in [
+            AuthStyle::Bearer,
+            AuthStyle::XApiKey,
+            AuthStyle::Custom("X-Token".to_string()),
+        ] {
+            let request = apply_auth_to_request(
+                reqwest::Client::new().get("https://example.com"),
+                &style,
+                Some("plain-key"),
+                "test",
+            )
+            .expect("a credential needing no transformation always builds")
+            .build()
+            .expect("request should build");
+
+            assert!(
+                request
+                    .headers()
+                    .iter()
+                    .any(|(_, v)| v.to_str().is_ok_and(|v| v.contains("plain-key"))),
+                "expected the credential on the wire for {style:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6251,6 +10827,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6277,6 +10854,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6365,6 +10943,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6392,6 +10971,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6419,6 +10999,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6460,6 +11041,7 @@ mod tests {
                 },
             ]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6497,12 +11079,14 @@ mod tests {
         // config field alone would still pass if the expansion pass kept
         // using library defaults.
         let temp = tempfile::tempdir().unwrap();
-        // Minimal PNG signature bytes are enough for MIME detection.
-        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        // Use a complete decodable image: content validation now performs
+        // pixel decoding after MIME detection, so a bare signature is
+        // correctly rejected as a corrupt image.
+        let png = boundary_test_png();
         let first = temp.path().join("first.png");
         let second = temp.path().join("second.png");
-        std::fs::write(&first, png).unwrap();
-        std::fs::write(&second, png).unwrap();
+        std::fs::write(&first, &png).unwrap();
+        std::fs::write(&second, &png).unwrap();
 
         // One image per message: `trim_old_images` evicts whole messages, so
         // co-locating both in a single message would exercise that eviction
@@ -7025,6 +11609,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: Some("shell".to_string()),
         };
         let json = serde_json::to_string(&tool_with_name).unwrap();
@@ -7040,6 +11625,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&tool_without_name).unwrap();
@@ -7055,6 +11641,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&assistant_msg).unwrap();
@@ -7150,7 +11737,9 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "merged into the existing user message");
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -7168,7 +11757,9 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "synthetic user inserted as the carrier");
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -7702,8 +12293,12 @@ mod tests {
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
 
+        // Omit-policy tool-result stripping must not touch user-message
+        // normalization: this user image still rewrites to a data URI with
+        // the policy active.
         let mut provider = make_model_provider("test", "https://example.com", None);
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+
         let normalized = provider
             .normalize_messages_for_upstream(std::slice::from_ref(&msg))
             .await
@@ -7721,6 +12316,92 @@ mod tests {
         );
     }
 
+    /// A real 1x1 PNG. Content validation drops undecodable bytes, so a bare
+    /// signature would be skipped before reaching the boundary assertions.
+    fn boundary_test_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_honours_the_configured_multimodal_policy() {
+        // The provider boundary re-normalizes messages, and that pass now
+        // decodes pixels and applies `max_images`. Under
+        // `MultimodalConfig::default()` it would trim to 4 images, silently
+        // discarding one the runtime had already accepted under a configured
+        // `max_images = 8`. The configured policy must reach the provider.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut markers = String::from("compare these");
+        for index in 0..5 {
+            let path = tmp.path().join(format!("shot{index}.png"));
+            std::fs::write(&path, boundary_test_png()).expect("write fixture");
+            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        }
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: markers,
+        };
+
+        let configured = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 8,
+            max_image_size_mb: 10,
+            ..Default::default()
+        };
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .multimodal(configured)
+            .build();
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+
+        let content = &normalized[0].content;
+        let surviving = content.matches("[IMAGE:data:image/png;base64,").count();
+        assert_eq!(
+            surviving, 5,
+            "all five images must survive the configured max_images = 8; \
+             a default-config boundary pass would have trimmed to 4: {content}"
+        );
+
+        // The default policy is what the boundary used before this fix. With
+        // per-image eviction the same five-image message is trimmed to the
+        // default cap of 4 — the oldest image is evicted even though the
+        // operator's configuration had accepted all five. That boundary-side
+        // re-trim is the data loss the configured policy prevents, so pin it
+        // so a regression cannot quietly restore the default-config pass.
+        let default_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let default_normalized = default_provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+        let default_surviving = default_normalized[0]
+            .content
+            .matches("[IMAGE:data:image/png;base64,")
+            .count();
+        assert_eq!(
+            default_surviving, 4,
+            "under the default max_images = 4 the boundary pass evicts the oldest image; \
+             that re-trim is what the configured policy prevents"
+        );
+    }
     #[tokio::test]
     async fn normalize_messages_for_upstream_omit_preserves_tool_envelope() {
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -7772,6 +12453,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -7797,6 +12479,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -7833,6 +12516,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -8015,6 +12699,8 @@ mod tests {
             "deepseek-v4-flash",
             Some(0.7),
             true,
+            false,
+            None,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -8051,7 +12737,9 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -8073,7 +12761,9 @@ mod tests {
             ChatMessage::user("Follow-up"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged);
         assert_eq!(
             flattened
                 .iter()
@@ -8100,7 +12790,9 @@ mod tests {
             ChatMessage::system(""),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged, "empty system content merged nothing");
 
         assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].role, "user");
@@ -8114,7 +12806,9 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
@@ -8632,10 +13326,591 @@ mod tests {
     }
 
     #[test]
+    fn api_response_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(4863));
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// All three cached-token shapes on one response: the Anthropic fields
+    /// are upstream-reported and win over the gateway-accounted DeepSeek
+    /// and OpenAI shapes, which keep their existing relative order.
+    #[test]
+    fn api_response_prefers_anthropic_cache_read_across_all_shapes() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "prompt_cache_hit_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// An upstream-reported zero is authoritative, not missing data: when
+    /// the Anthropic shape says zero reads, the gateway-accounted OpenAI
+    /// figure must NOT be substituted (that would double-count gateway-side
+    /// accounting against the upstream's authoritative answer).
+    #[test]
+    fn api_response_anthropic_zero_read_blocks_openai_fallback() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn stream_chunk_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 99,
+                "completion_tokens": 11,
+                "cache_read_input_tokens": 42,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let chunk: StreamChunkResponse = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(99));
+        assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.cached_input_tokens, Some(42));
+    }
+
+    /// Cache-write tokens are logged for write-premium visibility. The log
+    /// must carry the counts, not the prompt content.
+    #[test]
+    fn cache_creation_tokens_are_logged_with_counts_only() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_creation_input_tokens": 4803
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        // Write-only response: upstream reported no cache read, so the
+        // cached-token figure stays unset.
+        assert_eq!(usage.cached_input_tokens, None);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let found = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("gateway-reported Anthropic cache write (billed at the write premium)");
+                let matches_counts = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("cache_creation_input_tokens"))
+                    == Some(&serde_json::json!(4803));
+                if matches_message && matches_counts && matches_source_file(&event) {
+                    break 'search true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break 'search false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(found, "cache-write log record with counts must be emitted");
+    }
+
+    fn matches_source_file(event: &serde_json::Value) -> bool {
+        event
+            .get("attributes")
+            .and_then(|attributes| attributes.get("_file"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|file| file.ends_with("compatible.rs"))
+    }
+
+    /// End to end on the tools path: a translated-gateway response carrying
+    /// Anthropic-shaped usage populates `TokenUsage.cached_input_tokens`.
+    /// Parsing is flag-independent (the gateway sends these fields on
+    /// Anthropic-backed routes regardless of the client flag).
+    #[tokio::test]
+    async fn chat_with_tools_surfaces_anthropic_cache_read_tokens() {
+        let (provider, _captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 4,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }))
+        .await;
+        let messages = vec![ChatMessage::user("hi")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let response = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        let response = response.unwrap_or_else(|error| panic!("tools request failed: {error}"));
+        let usage = response.usage.expect("usage must be captured");
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+        assert_eq!(usage.input_tokens, Some(4863));
+    }
+
+    /// Flag interaction: the thinking object reaches the wire through
+    /// `extra_body` (the same surface the thinking-passthrough feature
+    /// uses), and it must ride alongside the cache breakpoints in one
+    /// request: neither injection disturbs the other. This proves generic
+    /// flattened-body coexistence on the structured path; the flag-side
+    /// composition proof lives in
+    /// `cache_and_thinking_passthrough_flags_compose_in_one_request` below.
+    #[tokio::test]
+    async fn cache_breakpoints_coexist_with_thinking_object_in_one_request() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        // Builder-level extra_body mirrors what provider_extra supplies for
+        // thinking-capable gateways; the flag-side equivalent is proven by
+        // cache_and_thinking_passthrough_flags_compose_in_one_request below.
+        let provider = OpenAiCompatibleModelProvider {
+            extra_body: Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            })),
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("combined request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "the thinking object must ride at the top level untouched"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system cache breakpoint present alongside the thinking object"
+        );
+        assert_eq!(
+            requests[0]["messages"][3]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling cache breakpoint present alongside the thinking object"
+        );
+    }
+
+    /// Flag composition, the real thing: both operator flags on one
+    /// provider, runtime thinking params supplied by the caller, and the
+    /// cache breakpoints still landing beside the injected thinking object
+    /// in a single request. Where the sibling test above proves flattened
+    /// extra_body coexistence, this one exercises the flags themselves
+    /// (flag-gated injection plus the forced temperature and budget-safe
+    /// output limit that come with it).
+    #[tokio::test]
+    async fn cache_and_thinking_passthrough_flags_compose_in_one_request() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            thinking_passthrough: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                        budget_tokens: 2048,
+                        display: None,
+                    }),
+                },
+                "test-model",
+                Some(0.7),
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("two-flag request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "the flag-injected thinking object rides at the top level"
+        );
+        assert_eq!(
+            requests[0]["temperature"],
+            serde_json::json!(1.0),
+            "thinking injection forces temperature 1.0 on the combined request"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system cache breakpoint present alongside flag-injected thinking"
+        );
+        assert_eq!(
+            requests[0]["messages"][3]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling cache breakpoint present alongside flag-injected thinking"
+        );
+        let max_tokens = requests[0]["max_tokens"]
+            .as_u64()
+            .expect("budget-safe output limit is set");
+        assert!(
+            max_tokens > 2048,
+            "output limit must strictly exceed the thinking budget, got {max_tokens}"
+        );
+    }
+
+    #[test]
     fn api_response_parses_without_usage() {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // merged-system carrier + usage-capture boundary tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Merged-carrier, single-turn: with `merge_system_into_user`, the
+    /// system role never reaches the wire, so the merged first user message
+    /// is the only system-equivalent carrier and must carry the breakpoint
+    /// unconditionally. Before the repair this shape sent zero breakpoints.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_single_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged single-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged user message is the system-equivalent carrier and must be marked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange carries exactly the carrier breakpoint"
+        );
+    }
+
+    /// Merged-carrier, multi-turn: the carrier keeps the system breakpoint
+    /// and the rolling breakpoint still lands on the last message, exactly
+    /// two total, middle messages untouched.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_carrier_plus_rolling_multi_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged multi-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhi",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged carrier and rolling breakpoint with middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "merged multi-turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Merged-carrier, assistant-first history: the merged user is not
+    /// message zero; the carrier index must follow the first user wherever
+    /// it sits.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_after_assistant() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("assistant-first merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "carrier breakpoint lands on the merged user, not on message zero"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "assistant + merged user is a single exchange: no rolling breakpoint"
+        );
+    }
+
+    /// Streaming twin of the merged-carrier pin.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_streaming_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "merged streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "be brief\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "streaming merged carrier carries the breakpoint identically"
+        );
+    }
+
+    /// Flag-off merged: the merge behavior is unchanged and the wire stays
+    /// free of markers.
+    #[tokio::test]
+    async fn cache_passthrough_merged_flag_off_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "core policy\n\nhello"},
+            ]),
+            "flag-off merged body must be byte-identical to the pre-feature wire"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off merged request must carry no cache markers"
+        );
+    }
+
+    /// Capture-boundary regression: the text-only helpers must never emit
+    /// cache breakpoints even with the flag on, because their responses
+    /// drop usage and could never account for the premium.
+    #[tokio::test]
+    async fn cache_passthrough_simple_paths_emit_no_breakpoints_even_when_enabled() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let _ = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let _ = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                !request.to_string().contains("cache_control"),
+                "simple path {index} must not emit cache breakpoints: {request}"
+            );
+        }
+    }
+
+    /// Capture-boundary regression, streaming side: the legacy chunk stream
+    /// drops usage, so it must not trigger premium writes either.
+    #[tokio::test]
+    async fn cache_passthrough_legacy_stream_emits_no_breakpoints_even_when_enabled() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat_with_system(
+                Some("be brief"),
+                "hello",
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        let _ = events;
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "legacy chunk stream must carry no cache markers even with the flag on"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -8660,6 +13935,7 @@ mod tests {
                 parameters: None,
                 extra_content: None,
             }]),
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8675,11 +13951,709 @@ mod tests {
             content: Some("hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn thinking_passthrough_off_keeps_reasoning_content_raw() {
+        // Flag off = today's behavior: `reasoning_content` passes through
+        // untouched and gateway `thinking_blocks` are ignored entirely.
+        let provider = make_model_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("raw chain of thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "signed thought",
+                "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("raw chain of thought"),
+            "flag-off capture must not normalize or wrap the reasoning string"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_normalizes_thinking_blocks_to_signed_lines() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "second", "signature": "sig2"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("blocks must normalize to lines");
+        let lines: Vec<serde_json::Value> = reasoning
+            .split('\n')
+            .map(|line| serde_json::from_str(line).expect("each line must be valid JSON"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                serde_json::json!({"thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"thinking": "second", "signature": "sig2"}),
+            ],
+            "capture must emit one signed-JSON line per thinking block, matching the \
+             native provider's reasoning_content format"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_wraps_bare_reasoning_string_as_unsigned_line() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("plain reasoning".to_string()),
+            tool_calls: None,
+            thinking_blocks: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("string must be captured");
+        let line: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("captured string must be a JSON line");
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "plain reasoning", "signature": ""}),
+            "bare reasoning strings normalize to an unsigned envelope line"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_signed_blocks_win_over_plain_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("unsigned duplicate".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "thinking": "signed", "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("capture must produce lines");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "signed", "signature": "sig"}),
+            "signed thinking_blocks are the authoritative capture source"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_empty_blocks_and_falls_back_to_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("fallback thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "", "signature": ""}),
+                serde_json::json!({"thinking": "", "signature": ""}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("fallback capture");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "fallback thought", "signature": ""}),
+            "blocks with neither text nor signature are skipped; bare string is the fallback"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_reconstructs_signed_blocks() {
+        // Flag on + signed envelope history (2a capture format) -> outbound
+        // thinking_blocks; string fields suppressed.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"thought one\",\"signature\":\"sig1\"}\n{\"thinking\":\"thought two\",\"signature\":\"sig2\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 1);
+        let message = &native[0];
+        assert_eq!(
+            message.reasoning_content, None,
+            "signed replay must suppress the reasoning_content string"
+        );
+        assert_eq!(message.reasoning, None);
+        let blocks = message
+            .thinking_blocks
+            .as_ref()
+            .expect("signed history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![
+                serde_json::json!({"type": "thinking", "thinking": "thought one", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "thought two", "signature": "sig2"}),
+            ],
+            "reconstructed blocks must be Anthropic content-block shaped"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_signature_only_history_round_trips_probe_shape() {
+        // Live-probe fixture (slice 2b): 2a captures a signature-only block;
+        // replay must reconstruct exactly what the gateway sent.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signature_only = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"\",\"signature\":\"CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ==\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signature_only.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let blocks = native[0]
+            .thinking_blocks
+            .as_ref()
+            .expect("signature-only history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })],
+            "signature-only capture must round-trip to the observed gateway block shape"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_unsigned_history_is_noop() {
+        // Unsigned envelope (signature "") and plain unparseable text both
+        // send nothing: blocks are never fabricated, and a bare string is
+        // exactly what translating gateways reject.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content": "a", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"\"}"}"#
+                    .to_string(),
+            ),
+            ChatMessage::assistant(
+                r#"{"content": "b", "reasoning_content": "plain streamed reasoning"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 2);
+        for message in &native {
+            assert_eq!(
+                message.reasoning_content, None,
+                "unsigned history replays nothing"
+            );
+            assert_eq!(message.reasoning, None);
+            assert!(message.thinking_blocks.is_none(), "no fabricated blocks");
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_mixed_lines_noop_entirely() {
+        // All-or-nothing: one unsigned line in signed history voids the
+        // replay rather than sending a partial block sequence.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let mixed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"signed\",\"signature\":\"sig\"}\n{\"thinking\":\"unsigned\",\"signature\":\"\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(mixed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert!(native[0].thinking_blocks.is_none());
+        assert_eq!(native[0].reasoning_content, None);
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_flag_off_replays_strings_verbatim() {
+        // Flag off = today's behavior: strings replay, no blocks field.
+        let provider = make_model_provider("gateway", "https://example.com", None);
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some(r#"{"thinking":"t","signature":"sig"}"#),
+            "flag-off replay must pass the stored string through untouched"
+        );
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_replay_override_wins_over_flag() {
+        // replay_assistant_reasoning = false wins under thinking_passthrough:
+        // providers that reject reasoning input still get nothing.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .without_assistant_reasoning_replay()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native[0].reasoning_content, None);
+        assert_eq!(native[0].reasoning, None);
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_blocks_serialize_top_level() {
+        // The reconstructed blocks serialize as a top-level assistant
+        // message field for the gateway to translate.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let value = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            value["thinking_blocks"],
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "sig"}]),
+            "thinking_blocks must serialize at the assistant message top level"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_disables_streaming_capability() {
+        // Passthrough pins requests to the non-streaming wire: gateway SSE
+        // thinking frames are unverified, and streamed reasoning would reach
+        // history unsigned and break signed replay. Flag off keeps streaming.
+        let with_flag = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let without_flag = make_model_provider("gateway", "https://example.com", None);
+
+        assert!(
+            !with_flag.supports_streaming(),
+            "passthrough must report the provider as non-streaming"
+        );
+        assert!(without_flag.supports_streaming());
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_preserves_redacted_blocks_verbatim() {
+        // redacted_thinking carries an opaque data field and no signature;
+        // the empty-empty skip must never swallow it. Non-thinking blocks
+        // are stored as raw JSON lines.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "ErUBCkEIRAP...opaque"
+        });
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "visible thought",
+                    "signature": "sig1"
+                }),
+                redacted.clone(),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("both blocks must be captured");
+        let lines: Vec<serde_json::Value> = reasoning
+            .split('\n')
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(lines.len(), 2, "thinking and redacted lines both captured");
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"thinking": "visible thought", "signature": "sig1"}),
+        );
+        assert_eq!(
+            lines[1], redacted,
+            "redacted_thinking must be stored verbatim, data field intact"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_redacted_blocks_round_trip_verbatim() {
+        // Full circle: gateway blocks -> capture lines -> replay blocks, with
+        // the redacted block byte-identical and the thinking block canonical.
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "ErUBCkEIRAP...opaque"
+        });
+        let thinking = serde_json::json!({
+            "type": "thinking",
+            "thinking": "visible thought",
+            "signature": "sig1"
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![thinking.clone(), redacted.clone()]),
+        };
+        let reasoning = provider
+            .parse_native_response(message)
+            .reasoning_content
+            .expect("capture must produce replay lines");
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("signed thinking plus redacted lines must reconstruct");
+        assert_eq!(
+            blocks,
+            vec![thinking, redacted],
+            "replay must emit the thinking block canonical and the redacted block verbatim"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_hostile_block_types() {
+        // Whitelist enforcement: only thinking and redacted_thinking are
+        // captured. A gateway-controlled text/tool_use/unknown-typed block
+        // must not become stored replay material.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "text", "text": "hostile text block"}),
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": "call_x",
+                    "name": "get_weather",
+                    "input": {"city": "SF"}
+                }),
+                serde_json::json!({"type": "totally_novel", "payload": "???"}),
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "real thought",
+                    "signature": "sig1"
+                }),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the thinking block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "hostile block types must not reach replay history"
+        );
+        assert!(lines[0].contains("real thought"));
+        assert!(!lines[0].contains("hostile"));
+        assert!(!lines[0].contains("tool_use"));
+        assert!(!lines[0].contains("totally_novel"));
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_rejects_malformed_redacted_blocks() {
+        // redacted_thinking without a non-empty data field fails validation
+        // and is skipped, not stored verbatim.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "redacted_thinking"}),
+                serde_json::json!({"type": "redacted_thinking", "data": ""}),
+                serde_json::json!({"type": "redacted_thinking", "data": "ErUBCkEIRAP"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the well-formed block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(lines.len(), 1, "only the validated redacted block survives");
+        assert!(lines[0].contains("ErUBCkEIRAP"));
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_does_not_forward_hostile_lines() {
+        // History written before the whitelist (or tampered) must not forward
+        // unknown-typed blocks into outbound thinking_blocks. Well-formed
+        // siblings still replay.
+        let reasoning = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"text","text":"hostile"}"#,
+            r#"{"type":"tool_use","id":"call_x","name":"f","input":{}}"#,
+            r#"{"type":"thinking","thinking":"real","signature":"sig1"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(
+            blocks,
+            vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "real",
+                "signature": "sig1"
+            })],
+            "hostile typed lines must be skipped, valid thinking forwarded"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_skips_malformed_redacted_lines() {
+        // A redacted line without data cannot come from fixed capture; it
+        // must not forward. Signed thinking siblings still replay.
+        let reasoning = format!(
+            "{}\n{}",
+            r#"{"type":"redacted_thinking"}"#,
+            r#"{"type":"thinking","thinking":"t","signature":"sig"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], serde_json::json!("thinking"));
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_tool_loop_replays_signed_blocks_on_turn_two() {
+        // Two-turn regression: a tool-call turn whose response carried signed
+        // thinking must produce a turn-2 outbound request replaying those
+        // exact blocks (non-streaming; the flag pins the loop to this path).
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let envelope = r#"{"thinking":"checked the weather","signature":"sig1"}"#;
+        let assistant_content = serde_json::json!({
+            "content": null,
+            "reasoning_content": envelope,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"SF\"}",
+                }
+            ],
+        });
+        let history = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(assistant_content.to_string()),
+            ChatMessage::tool(
+                r#"{"tool_call_id": "call_1", "content": "72F and sunny"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&history, false);
+        assert_eq!(native.len(), 3, "all three turns convert");
+        let assistant = &native[1];
+        assert_eq!(
+            assistant.reasoning_content, None,
+            "signed replay suppresses the string fields"
+        );
+        assert_eq!(
+            assistant.thinking_blocks,
+            Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "checked the weather",
+                "signature": "sig1"
+            })]),
+            "turn-2 outbound must replay the exact signed blocks from turn 1"
+        );
+        assert!(assistant.tool_calls.is_some(), "tool calls stay intact");
+        let tool_result = &native[2];
+        assert_eq!(tool_result.role, "tool");
+        assert!(tool_result.thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_signature_only_block_survives() {
+        // Live-probe fixture (slice 2b, .worktree/probe-truefoundry-2026-09-03.md):
+        // TrueFoundry returns thinking blocks with EMPTY text but a valid
+        // signature. These must survive capture — a text-only gate would drop
+        // them and break replay (the same bug previously fixed for the native
+        // provider's signature-only blocks).
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("signature-only block must be captured");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            }),
+            "signature-only blocks (empty thinking text) must survive capture intact"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_parses_gateway_thinking_blocks_json() {
+        // End-to-end through the response envelope: a gateway response whose
+        // message carries `thinking_blocks` deserializes into the raw field
+        // that capture normalization reads.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "plain text",
+                    "thinking_blocks": [
+                        {"type": "thinking", "thinking": "block thought", "signature": "sig9"}
+                    ]
+                }
+            }]
+        });
+        let response =
+            parse_chat_response_body("gateway", &body.to_string()).expect("payload parses");
+        let parsed = provider.parse_native_response(
+            response
+                .choices
+                .into_iter()
+                .next()
+                .expect("one choice")
+                .message,
+        );
+        let reasoning = parsed.reasoning_content.expect("capture from gateway JSON");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "block thought", "signature": "sig9"}),
+            "gateway thinking_blocks must reach capture and win over the plain string"
+        );
     }
 
     #[test]
@@ -8754,6 +14728,8 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
+            None,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -8789,6 +14765,8 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
+            None,
         );
         let groq_message = &groq_request.messages[0];
         assert_eq!(groq_message.role, "assistant");
@@ -8996,6 +14974,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
@@ -9011,6 +14990,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
@@ -9025,6 +15005,172 @@ mod tests {
     fn default_timeout_is_120s() {
         let p = make_model_provider("test", "https://example.com", None);
         assert_eq!(p.timeout_secs, 120);
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_names_bound_on_read_timeout() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get(format!("http://{addr}/stream")).send(),
+        )
+        .await
+        .expect("stalled headers must hit the read-idle bound")
+        .unwrap_err();
+        server.abort();
+        assert!(
+            err.is_timeout(),
+            "stalled headers must surface as a timeout: {err}"
+        );
+        assert!(!err.is_connect(), "the connection itself succeeded: {err}");
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
+        );
+        assert!(
+            message.contains(&crate::format_error_chain(&err)),
+            "the underlying reqwest error must stay in the chain: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_leaves_connect_errors_unchanged() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/stream")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect(),
+            "a refused local port is a connect error: {err}"
+        );
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert_eq!(
+            message,
+            crate::format_error_chain(&err),
+            "connect errors must keep the plain error chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_chunk_stream_names_idle_bound_when_body_goes_silent() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // A 1 s read-idle bound gives the header exchange and first chunk a
+        // comfortable window on a slow runner; the silent body still trips it
+        // in about a second, keeping the whole test under ~2 s.
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(std::time::Duration::from_secs(300)),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("first chunk must arrive before the stall")
+            .expect("chunk stream must yield a chunk")
+            .expect("first chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stall must hit the read-idle bound")
+            .expect("stalled chunk stream must yield an item");
+        server.abort();
+        let message = match item {
+            Err(StreamError::Http(message)) => message,
+            Err(other) => panic!("expected an HTTP stream error, got {other:?}"),
+            Ok(_) => panic!("expected an error after the stalled body"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            !message.contains("timeout_secs"),
+            "a fixed idle bound has no knob advice: {message}"
+        );
     }
 
     #[test]
@@ -9348,6 +15494,109 @@ mod tests {
         assert_eq!(stripped[1].content, "Here are the results");
     }
 
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt as _;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => {
+                panic!("connect failure must be tagged ConnectFailed, got {other:?}")
+            }
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// An accepted HTTP 200 stream whose SSE body carries an error frame is
+    /// a body-level failure: the send succeeded, so nothing in it may be
+    /// tagged `ConnectFailed`, whatever the frame text says. (The
+    /// chat-completions parser currently swallows such a frame without
+    /// surfacing an error; the pin is that it can never become a
+    /// connect-failed transport verdict either way.)
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_accepted_stream_body_error() {
+        use axum::response::IntoResponse;
+        use axum::{Router, http::header, routing::post};
+        use futures_util::StreamExt as _;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"error\":{\"message\":\"failed to resolve backend\"}}\n\n",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let mut items = Vec::new();
+        while let Some(item) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("accepted stream must not hang")
+        {
+            items.push(item);
+        }
+        server.abort();
+        assert!(
+            !items.is_empty(),
+            "an accepted stream must yield at least its final event"
+        );
+        for item in items {
+            if let Err(err) = item {
+                assert!(
+                    !matches!(err, StreamError::ConnectFailed(_)),
+                    "an accepted stream's body error must not be tagged ConnectFailed: {err:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stream_chat_with_tools_sends_typed_tools_in_streaming_body() {
         use axum::response::IntoResponse;
@@ -9614,6 +15863,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
+                thinking_blocks: None,
             }],
             temperature,
             stream: None,
@@ -10042,5 +16292,161 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
+    }
+
+    /// A profile that authenticates purely through `extra_headers` (a
+    /// `Cookie`- or `X-Auth`-style bridge, rather than a credential
+    /// `resolve_credential()` returns) must still probe the configured
+    /// endpoint's `/models`, and a real failure there must be surfaced —
+    /// not silently swapped for an unrelated models.dev/OpenRouter catalog.
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_cookie_only_auth() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/models",
+            get(
+                move |headers: HeaderMap, State(capture): State<Arc<Mutex<Option<HeaderMap>>>>| {
+                    *capture.lock().unwrap() = Some(headers);
+                    async move { axum::http::StatusCode::UNAUTHORIZED }
+                },
+            )
+            .with_state(captured_for_route),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Cookie".to_string(), "session=abc123".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("cookie-auth")
+            .display_name("cookie-auth")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a Cookie-only profile's real endpoint failure must be surfaced");
+        assert!(
+            error.to_string().contains("HTTP 401"),
+            "expected the configured endpoint's actual failure, got: {error}"
+        );
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "the configured endpoint must actually be probed for a header-only auth profile"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_x_auth_only_auth() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_route = requests.clone();
+        let app = Router::new().route(
+            "/models",
+            get(move || {
+                let requests = requests_for_route.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("x-auth-only")
+            .display_name("x-auth-only")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models_with_pricing()
+            .await
+            .expect_err("an X-Auth-only profile's real endpoint failure must be surfaced");
+        assert!(
+            error.to_string().contains("HTTP 403"),
+            "expected the configured endpoint's actual failure, got: {error}"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the configured endpoint must be probed exactly once for a header-only auth profile"
+        );
+
+        let _unused: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        server_handle.abort();
+    }
+
+    /// A configured endpoint URL may carry credentials in its userinfo,
+    /// query, or fragment. The header-only probe branch reports transport
+    /// failures before the central catalog caller sanitizes the returned
+    /// error, so the URL it embeds must already be scrubbed.
+    #[tokio::test]
+    async fn list_models_scrubs_url_credentials_from_transport_failure() {
+        // Bind and immediately drop the listener so the port is closed: this
+        // forces a connect-level transport failure (the `map_err` branch that
+        // formats the URL), rather than an HTTP status failure.
+        let closed_addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiCompatibleModelProvider::builder("url-credential")
+            .display_name("url-credential")
+            .base_url(&format!(
+                "http://synthetic-user:synthetic-secret@{}:{}",
+                closed_addr.ip(),
+                closed_addr.port()
+            ))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a closed configured endpoint must surface a transport failure");
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("synthetic-secret"),
+            "URL userinfo credentials must not reach the returned error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("synthetic-user"),
+            "URL userinfo must not reach the returned error: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "the scrubbed URL should retain a redaction marker: {rendered}"
+        );
     }
 }

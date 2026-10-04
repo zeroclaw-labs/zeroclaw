@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-echo "==> zerocode gate: no zeroclaw-* crate dependency"
+echo "==> zerocode gate: zeroclaw-api is the only allowed zeroclaw-* dependency"
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -17,57 +17,74 @@ import tomllib
 with open(sys.argv[1], "rb") as handle:
     manifest = tomllib.load(handle)
 
-own_name = manifest.get("package", {}).get("name", "")
+def dependency_tables(candidate):
+    tables = []
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = candidate.get(key)
+        if isinstance(table, dict):
+            tables.append(table)
 
-dep_tables = []
-for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-    table = manifest.get(key)
-    if isinstance(table, dict):
-        dep_tables.append(table)
-
-target = manifest.get("target")
-if isinstance(target, dict):
-    for cfg in target.values():
-        if not isinstance(cfg, dict):
-            continue
-        for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-            table = cfg.get(key)
-            if isinstance(table, dict):
-                dep_tables.append(table)
-
-found = set()
+    target = candidate.get("target")
+    if isinstance(target, dict):
+        for cfg in target.values():
+            if not isinstance(cfg, dict):
+                continue
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = cfg.get(key)
+                if isinstance(table, dict):
+                    tables.append(table)
+    return tables
 
 
-def flag(label):
-    if label.startswith("zeroclaw-") or label.startswith("zeroclaw_"):
-        found.add(label)
+def find_offending(candidate):
+    own_name = candidate.get("package", {}).get("name", "")
+    found = set()
+
+    def flag(label):
+        if (
+            label.startswith("zeroclaw-") or label.startswith("zeroclaw_")
+        ) and label not in allowed:
+            found.add(label)
+
+    for table in dependency_tables(candidate):
+        for name, spec in table.items():
+            if name == own_name:
+                continue
+            flag(name)
+            # Cargo renamed dependencies declare the real crate under `package`
+            # while the table key is an arbitrary local alias. Inspect both so a
+            # rename cannot hide an implementation dependency.
+            if isinstance(spec, dict):
+                package = spec.get("package")
+                if isinstance(package, str):
+                    flag(package)
+    return sorted(found)
 
 
-for table in dep_tables:
-    for name, spec in table.items():
-        if name == own_name:
-            continue
-        flag(name)
-        # Cargo renamed dependencies declare the real crate under `package`
-        # while the table key is an arbitrary local alias. Inspect both so a
-        # rename like `x = { package = "zeroclaw-providers" }` cannot slip past.
-        if isinstance(spec, dict):
-            package = spec.get("package")
-            if isinstance(package, str):
-                flag(package)
+allowed = {"zeroclaw-api", "zeroclaw_api"}
 
-for name in sorted(found):
+# Keep the exception narrow even when a dependency is renamed or target-gated.
+assert find_offending({"dependencies": {"zeroclaw-api": {"workspace": True}}}) == []
+assert find_offending({"dependencies": {"zeroclaw_api": {"workspace": True}}}) == []
+assert find_offending({"dependencies": {"zeroclaw-runtime": {"workspace": True}}}) == [
+    "zeroclaw-runtime"
+]
+assert find_offending(
+    {"target": {"cfg(unix)": {"dependencies": {"backend": {"package": "zeroclaw-config"}}}}}
+) == ["zeroclaw-config"]
+
+for name in find_offending(manifest):
     print(name)
 PY
 )"
 
 if [ -n "$offending" ]; then
-    echo "::error file=${manifest}::zerocode must not depend on any zeroclaw-* crate; found:"
+    echo "::error file=${manifest}::zerocode may depend on zeroclaw-api only; found implementation dependencies:"
     while IFS= read -r dep; do
         echo "  - ${dep}"
     done <<<"$offending"
-    echo "zerocode is an RPC-only surface: everything it knows must come over the wire, not by linking backend crates."
+    echo "zerocode is an RPC-only surface: shared contracts may come from zeroclaw-api, while runtime/config/channel/tool behavior must come over the wire."
     exit 1
 fi
 
-echo "zerocode gate passed: no zeroclaw-* dependencies."
+echo "zerocode gate passed: no zeroclaw-* implementation dependencies."

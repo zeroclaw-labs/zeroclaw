@@ -11,7 +11,13 @@ observer event, and history entry, see
 
 Before adding a built-in tool or replacing one with an external integration,
 use the [Built-In Tool Inventory](../developing/tool-inventory.md)
-to choose the smallest durable home.
+to choose the smallest durable home. Working built-in integrations stay
+available until a replacement is real, documented, and independently reviewed;
+that replacement-first rule is the accepted
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) policy,
+recorded in the inventory's
+[Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
+section.
 
 ## Built-in tools
 
@@ -26,9 +32,9 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, or Serply |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
 | `web_fetch` | Fetch a page and return clean plain text |
-| `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
+| `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
@@ -121,7 +127,7 @@ The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating li
 - **MCP exception**: when `allowed_tools` is non-empty, runtime-discovered MCP tools (any name containing `__`, the `<server>__<tool>` convention) are auto-admitted into the effective allow-list without having to be listed there individually. This keeps the post-#7464 eager-MCP default usable for agents that already pin an explicit allow-list. To block individual MCP tools, list them in `excluded_tools`.
 - The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them.
 
-If you need finer-grained gating, drop the profile's `level` to `read_only` or `supervised` and rely on the per-profile `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
+If you need finer-grained gating under Full autonomy, put sensitive tools in the per-profile `always_ask` list: they still prompt (or fail closed) even when `level = "full"`. Dropping the profile to `read_only` or `supervised` is only required when you want the whole risk-tier matrix, not when you need a handful of exceptions.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 

@@ -91,7 +91,12 @@ fn install_fixture_package() -> TempDir {
 /// passes `Config::validate`, making this a realistic operator config rather
 /// than a fixture shaped only to satisfy the loader.
 fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Config {
-    let mut config = Config::default();
+    // Isolate the durable plugin state and encryption key for parallel fixtures.
+    let mut config = Config {
+        data_dir: plugins.path().join("data"),
+        config_path: plugins.path().join("config.toml"),
+        ..Config::default()
+    };
     config.plugins.enabled = true;
     config.plugins.auto_discover = false;
     config.plugins.max_active_instances = 1;

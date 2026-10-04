@@ -38,16 +38,24 @@ one.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
    containing a `manifest.toml`.
-3. **Validate shape.** Each manifest must declare at least one capability, and a
-   non-skill plugin must name a `wasm_path` that exists. A malformed manifest is
-   skipped with a warning, never loaded.
+3. **Validate shape.** Each manifest must declare at least one capability, and
+   a non-skill plugin must name a confined relative `wasm_path`. Traversal and
+   symlink paths are rejected. A malformed manifest is skipped with a warning,
+   never loaded.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
-5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
-   appended after the built-ins. Tool dispatch resolves names first-match, so a
-   plugin tool that collides with a built-in name is never selected; give plugin
-   tools unique names. Tool and skill plugins are *auto-discovered*, so this
+5. **Admit executable bytes.** The host opens the confined component once,
+   verifies any declared `wasm_sha256`, and retains those exact bytes. In
+   `strict` mode the signed manifest must declare this digest. Adapters compile
+   the admitted buffer rather than reopening its path. This is an execution
+   identity guarantee for the retained bytes, not a claim of race-free
+   filesystem namespace resolution.
+6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
+   appended after the built-ins. A plugin whose package name or tool name
+   conflicts with an already registered tool is refused with a warning instead
+   of being registered; see [Tool name conflicts](#tool-name-conflicts).
+   Tool and skill plugins are *auto-discovered*, so this
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
@@ -71,16 +79,41 @@ signature is enforced through `[plugins.security] signature_mode`:
 
 In `strict` mode the manifest's `publisher_key` must appear in
 `[plugins.security] trusted_publisher_keys`, and the signature must verify
-against the canonical manifest bytes. A plugin that is unsigned, signed by an
-untrusted key, or whose signature does not verify is dropped at discovery and
-never becomes a tool. The default is `disabled` so a fresh local checkout works
-without key management, but a host that loads plugins from anywhere you do not
-control should run `strict`.
+against the canonical manifest bytes. Executable plugins must also declare a
+signed `wasm_sha256` matching the exact admitted bytes. A plugin that fails any
+of these checks is dropped at discovery and never becomes a tool. The default
+is `disabled` so a fresh local checkout works without key management, but a
+host that loads plugins from anywhere you do not control should run `strict`.
 
 This policy is enforced uniformly: the same check that the host applies when you
 list plugins is the check the agent runtime applies when it builds the tool set,
 so a plugin you cannot see in `strict` mode is also a plugin the agent cannot
 call.
+
+## Tool name conflicts
+
+Registration refuses a name conflict instead of letting one tool shadow
+another. Tool plugins register in package-name order, and the host checks each
+one twice:
+
+1. **Package name.** A plugin whose package name (the manifest `name`) matches
+   an already registered tool is refused before its component is instantiated.
+   The host logs a `WARN` event with `error_key`
+   `plugin_package_name_conflict` in its `attributes`.
+2. **Tool name.** The guest declares its own tool name, so the host learns it
+   only by instantiating the component to read its metadata. A plugin whose
+   tool name matches an already registered tool is not registered. The host
+   logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
+   `attributes`.
+
+The names checked are the tools that registry build has already registered,
+including plugin tools accepted earlier in the same pass, plus
+`execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
+of every built-in name: a built-in that a build does not register, for example
+because its config section is disabled, is not reserved in that build. Tools
+that join the registry after plugin registration are outside this check. Give
+plugin packages and tools names that are unique outright rather than relying
+on it.
 
 ## Capabilities and permissions
 
@@ -150,9 +183,9 @@ Even with every permission granted, the sandbox bounds a plugin:
   injection and cross-instance selection, but a plaintext-returning import
   cannot prevent a malicious guest from retaining what it reads. Compliant
   channel plugins must resolve config and credentials at each point of use.
-- It cannot displace a built-in tool: the built-ins register first and tool
-  dispatch resolves names first-match, so a colliding plugin tool is simply
-  never selected.
+- It cannot take the name of an already registered tool. Registration refuses
+  the conflicting plugin instead of registering its tool, within the bounds
+  described in [Tool name conflicts](#tool-name-conflicts).
 
 The sandbox and namespace bounds hold regardless of what plugin code attempts.
 The no-retention rule is instead part of the trusted channel-plugin contract,

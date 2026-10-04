@@ -3,7 +3,6 @@ pub use zeroclaw_runtime::service::*;
 use crate::config::Config;
 use anyhow::Result;
 
-#[allow(dead_code)]
 pub fn handle_command(
     command: &crate::ServiceCommands,
     config: &Config,
@@ -15,6 +14,9 @@ pub fn handle_command(
         }
         crate::ServiceCommands::RunDesktopDaemon { .. } => {
             anyhow::bail!("internal desktop runner must dispatch before config loading")
+        }
+        crate::ServiceCommands::RunWindowsDaemon => {
+            anyhow::bail!("internal Windows task runner must dispatch before config loading")
         }
         crate::ServiceCommands::RunOpenrcLogWriter { .. } => {
             anyhow::bail!("internal OpenRC logger must dispatch before config loading")

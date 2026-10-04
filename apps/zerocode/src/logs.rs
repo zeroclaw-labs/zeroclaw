@@ -551,9 +551,20 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
+    run_filter_active: bool,
+    run_filter_buf: String,
+    sop_run_id: Option<String>,
+    /// Segment-aware cursor from the previous page. Preferred over
+    /// `next_cursor_offset`: it is the only cursor that can advance once
+    /// the oldest event on a page lives in a rotated archive segment.
+    next_cursor_segment: Option<String>,
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
+    /// True when the daemon could not read part of the retained history. The
+    /// status line says so, because `at_end` alone would present a truncated
+    /// buffer as the whole stream.
+    history_incomplete: bool,
     loading: bool,
     active_log_path: Option<String>,
     // Viewport
@@ -589,9 +600,14 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
+            run_filter_active: false,
+            run_filter_buf: String::new(),
+            sop_run_id: None,
+            next_cursor_segment: None,
             next_cursor_offset: None,
             next_cursor_legacy: None,
             at_end: false,
+            history_incomplete: false,
             loading: false,
             active_log_path: None,
             list_height: 0,
@@ -612,36 +628,54 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None, None).await;
+        self.load_page(None, None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
     async fn load_page(
         &mut self,
+        cursor_segment: Option<String>,
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
         self.loading = true;
+        // Set when a cursor-bearing response turns out to contain only events
+        // already in the buffer, which means the cursor bought no older
+        // history and paging cannot advance past it.
+        let mut stale_cursor_no_progress = false;
+        // Cursor precedence: segment cursor first (only one that can cross
+        // into a rotated archive), then plain byte offset, then the legacy
+        // `(ts, id)` pair for daemons predating either field. Send only
+        // the winning cursor to keep the request unambiguous.
+        let has_segment = cursor_segment.is_some();
+        let has_offset = !has_segment && cursor_offset.is_some();
+        let has_legacy = !has_segment && !has_offset && cursor_legacy.is_some();
+        let has_cursor = has_segment || has_offset || has_legacy;
         let params = LogsQueryParams {
-            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
-            until_line_offset: cursor_offset,
+            until_ts: if has_legacy {
+                cursor_legacy.as_ref().map(|(ts, _)| ts.clone())
+            } else {
+                None
+            },
+            until_id: if has_legacy {
+                cursor_legacy.as_ref().map(|(_, id)| id.clone())
+            } else {
+                None
+            },
+            until_line_offset: if has_offset { cursor_offset } else { None },
+            until_segment_cursor: cursor_segment,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
             } else {
                 Some(self.search_query.clone())
             },
+            sop_run_id: self.sop_run_id.clone(),
             hide_internal: true,
-            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
-                INITIAL_LOAD
-            } else {
-                PAGE_SIZE
-            }),
+            limit: Some(if has_cursor { PAGE_SIZE } else { INITIAL_LOAD }),
             ..Default::default()
         };
-        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 self.active_log_path = result.log_path;
@@ -650,27 +684,69 @@ impl Logs {
                     .events
                     .iter()
                     .rev()
+                    // New daemons apply this exact filter in the reader. Keep
+                    // the client guard too: an older RPC server may ignore the
+                    // newly added parameter, and must not make the run view
+                    // silently display unrelated rows.
+                    .filter(|event| {
+                        self.sop_run_id
+                            .as_deref()
+                            .is_none_or(|run_id| event_matches_sop_run_id(event, run_id))
+                    })
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
                 if has_cursor && prepended > 0 {
-                    // Prepend older events before the existing buffer
-                    let mut combined = new_entries;
-                    combined.append(&mut self.events);
-                    self.events = combined;
-                    // Shift selection to keep the same item visible
-                    if let Some(sel) = self.list_state.selected() {
-                        self.list_state.select(Some(sel + prepended));
+                    // Prepend older events before the existing buffer.
+                    // Deduplicate by id: a daemon predating segment cursors
+                    // answers an unresolvable one with the newest page rather
+                    // than the empty at-end sentinel current daemons return,
+                    // and prepending that without deduplication would show the
+                    // same events twice and scramble the chronological order.
+                    let existing_ids: std::collections::HashSet<String> =
+                        self.events.iter().map(|e| e.id.clone()).collect();
+                    let deduped: Vec<LogEntry> = new_entries
+                        .into_iter()
+                        .filter(|e| !existing_ids.contains(&e.id))
+                        .collect();
+                    let actually_prepended = deduped.len();
+                    if actually_prepended > 0 {
+                        let mut combined = deduped;
+                        combined.append(&mut self.events);
+                        self.events = combined;
+                        // Shift selection to keep the same item visible
+                        if let Some(sel) = self.list_state.selected() {
+                            self.list_state.select(Some(sel + actually_prepended));
+                        }
+                    } else {
+                        // Every returned event was a duplicate, so this page
+                        // carried no older history. Stop paging rather than
+                        // treating it as an ordinary older page.
+                        //
+                        // Recorded as a flag rather than returning early: the
+                        // cleanup at the end of this function clears
+                        // `self.loading`, and skipping it would leave the pane
+                        // on its loading indicator forever, with
+                        // `maybe_load_older`'s `!self.loading` guard blocking
+                        // every later attempt.
+                        stale_cursor_no_progress = true;
                     }
                 } else if !has_cursor {
                     self.events = new_entries;
                 }
-                // Prefer the byte-offset cursor (independent of id ordering);
-                // fall back to the legacy `[timestamp, id]` pair when the
-                // daemon has not been upgraded to expose it.
+                // Prefer the segment cursor (crosses rotated archives);
+                // fall back to the byte-offset cursor (independent of id
+                // ordering), then to the legacy `[timestamp, id]` pair when
+                // the daemon has not been upgraded to expose them.
+                self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
-                self.at_end = result.at_end;
+                // A no-progress page means this cursor cannot advance, so
+                // whatever `at_end` describes must not re-enable paging.
+                self.at_end = result.at_end || stale_cursor_no_progress;
+                // Sticky: a later page reading cleanly does not restore the
+                // segment this one could not read.
+                self.history_incomplete |= result.incomplete;
             }
             Err(_) => {
                 // Query unavailable (old daemon without logs/query, or no log file).
@@ -696,9 +772,14 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
+        self.next_cursor_segment = None;
         self.next_cursor_offset = None;
         self.next_cursor_legacy = None;
         self.at_end = false;
+        // The buffer is refetched from scratch under the new filter, so a
+        // gap reported for the old one says nothing about the new pages. A
+        // segment that is still unreadable sets this again on the next query.
+        self.history_incomplete = false;
 
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
@@ -737,7 +818,11 @@ impl Logs {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == LOGS_EVENT_METHOD => {
-                    if let Some(entry) = LogEntry::from_live_value(notif.params) {
+                    let matches_run = self
+                        .sop_run_id
+                        .as_deref()
+                        .is_none_or(|run_id| event_matches_sop_run_id(&notif.params, run_id));
+                    if matches_run && let Some(entry) = LogEntry::from_live_value(notif.params) {
                         self.events.push(entry);
                     }
                 }
@@ -815,7 +900,7 @@ impl Logs {
             .split(area);
 
         // Status bar
-        let help: String = if self.search_active {
+        let help: String = if self.search_active || self.run_filter_active {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
                 apply = crate::i18n::t("zc-logs-search-action-apply"),
@@ -835,6 +920,14 @@ impl Logs {
             } else {
                 Span::raw("")
             },
+            if self.history_incomplete {
+                Span::styled(
+                    format!("{} ", crate::i18n::t("zc-logs-status-partial")),
+                    theme::warn_style(),
+                )
+            } else {
+                Span::raw("")
+            },
             if !self.subscribed {
                 Span::styled("[no sub] ", theme::warn_style())
             } else {
@@ -845,7 +938,13 @@ impl Logs {
         frame.render_widget(Paragraph::new(status), chunks[0]);
 
         // Filter bar (always visible)
-        let filter_line = if self.search_active {
+        let filter_line = if self.run_filter_active {
+            Line::from(vec![
+                Span::styled(" run:", theme::dim_style()),
+                Span::styled(&self.run_filter_buf, theme::input_style()),
+                Span::styled("\u{2588}", theme::accent_style()),
+            ])
+        } else if self.search_active {
             Line::from(vec![
                 Span::styled(" sev\u{2265}", theme::dim_style()),
                 Span::styled(
@@ -873,6 +972,17 @@ impl Logs {
                 spans.push(Span::styled(" search: ", theme::dim_style()));
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
                 spans.push(Span::styled("  (c:clear)", theme::dim_style()));
+            }
+            if let Some(run_id) = &self.sop_run_id {
+                spans.push(Span::styled(
+                    format!(" {}: ", crate::i18n::t("zc-logs-run-filter-label")),
+                    theme::dim_style(),
+                ));
+                spans.push(Span::styled(run_id, theme::accent_style()));
+                spans.push(Span::styled(
+                    format!("  ({})", crate::i18n::t("zc-logs-run-filter-clear")),
+                    theme::dim_style(),
+                ));
             }
             Line::from(spans)
         };
@@ -1386,6 +1496,9 @@ impl Logs {
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
         use crate::keymap::LogsTabAction;
 
+        if self.run_filter_active {
+            return self.handle_run_filter_key(key).await;
+        }
         if self.search_active {
             self.copy_menu = None;
             self.text_selection = None;
@@ -1412,6 +1525,55 @@ impl Logs {
             return self.handle_detail_key(key).await;
         }
         self.handle_normal_key(key).await
+    }
+
+    async fn handle_run_filter_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::SearchBoxAction;
+        match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Accept) => {
+                let run_id = self.run_filter_buf.trim();
+                self.sop_run_id = (!run_id.is_empty()).then(|| run_id.to_string());
+                self.run_filter_active = false;
+                self.reload_for_run_filter().await;
+            }
+            Some(SearchBoxAction::Cancel) => {
+                self.run_filter_active = false;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(SearchBoxAction::Backspace) => {
+                self.run_filter_buf.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.run_filter_buf.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    async fn reload_for_run_filter(&mut self) {
+        self.events.clear();
+        self.list_state.select(None);
+        // A new run filter is a new query: every cursor from the old one,
+        // including the segment cursor into rotated archives, is stale, and a
+        // gap reported for the old query says nothing about the new pages.
+        self.next_cursor_segment = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
+        self.at_end = false;
+        self.history_incomplete = false;
+        self.detail_open = false;
+        self.detail = DetailState::Loading;
+        self.detail_request_id = None;
+        self.load_page(None, None, None).await;
+        let filtered = self.filtered_indices();
+        self.follow = true;
+        if !filtered.is_empty() {
+            self.list_state.select(Some(filtered.len() - 1));
+        }
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> bool {
@@ -1464,6 +1626,15 @@ impl Logs {
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::DetailScrollDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
@@ -1524,6 +1695,15 @@ impl Logs {
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::OpenDetail) if self.selected_event_idx().is_some() => {
                 self.detail_open = true;
@@ -1591,10 +1771,16 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
+            && (self.next_cursor_segment.is_some()
+                || self.next_cursor_offset.is_some()
+                || self.next_cursor_legacy.is_some())
         {
-            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
-                .await;
+            self.load_page(
+                self.next_cursor_segment.clone(),
+                self.next_cursor_offset,
+                self.next_cursor_legacy.clone(),
+            )
+            .await;
         }
     }
 
@@ -1764,17 +1950,18 @@ impl Logs {
         }
     }
 
-    /// Whether the pane is in a text-input mode (search bar active).
+    /// Whether the pane is in a text-input mode (search or run filter active).
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_active
+        self.search_active || self.run_filter_active
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`; ignored when search isn't active so a stray
-    /// paste can't silently mutate hidden state.
+    /// Route a bracketed-paste payload into whichever filter editor is active.
+    /// Ignored outside text-input mode so a stray paste cannot mutate hidden
+    /// state.
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if self.search_active {
+        if self.run_filter_active {
+            self.run_filter_buf.push_str(text);
+        } else if self.search_active {
             self.search_buf.push_str(text);
         }
     }
@@ -1785,7 +1972,7 @@ impl crate::widgets::HelpContext for Logs {
         use crate::help::entries_for;
         use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
-        if self.search_active {
+        if self.search_active || self.run_filter_active {
             HelpNode::entries(entries_for([
                 crate::keymap::SearchBoxAction::Accept,
                 crate::keymap::SearchBoxAction::Cancel,
@@ -1801,6 +1988,8 @@ impl crate::widgets::HelpContext for Logs {
                 L::DetailWidenRight,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
@@ -1817,6 +2006,8 @@ impl crate::widgets::HelpContext for Logs {
                 L::OpenDetail,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
@@ -1831,6 +2022,23 @@ impl crate::widgets::HelpContext for Logs {
             HelpNode::entries(entries)
         }
     }
+}
+
+/// Mirror the persisted reader's narrow SOP compatibility bridge for live
+/// broadcast events, which have not yet round-tripped through `logs/query`.
+fn event_matches_sop_run_id(event: &Value, run_id: &str) -> bool {
+    if event
+        .pointer("/zeroclaw/sop_run_id")
+        .and_then(Value::as_str)
+        == Some(run_id)
+        || event.pointer("/attributes/run_id").and_then(Value::as_str) == Some(run_id)
+    {
+        return true;
+    }
+    event
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.starts_with(&format!("SOP audit: run {run_id} ")))
 }
 
 #[cfg(test)]
@@ -1966,6 +2174,46 @@ mod tests {
         assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
     }
 
+    #[tokio::test]
+    async fn status_line_renders_partial_badge_from_catalogue() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.history_incomplete = true;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+
+        // The badge must resolve from the ZeroCode Fluent catalogue rather
+        // than a bare literal, so non-English users see a localized marker.
+        let badge = crate::i18n::t("zc-logs-status-partial");
+        assert!(!badge.contains('{'), "key must resolve: {badge:?}");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&badge), "rendered: {rendered:?}");
+
+        // A fully readable history must not show the badge.
+        logs.history_incomplete = false;
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(&badge), "rendered: {rendered:?}");
+    }
+
     #[test]
     fn preview_fallback_render_shows_active_persisted_path() {
         let entry = sample_entry();
@@ -2027,6 +2275,29 @@ mod tests {
             .collect();
         assert!(text.contains("switched-model"));
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+    }
+
+    #[test]
+    fn run_filter_matches_canonical_and_legacy_live_events() {
+        let run_id = "run-123-0001";
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "zeroclaw": { "sop_run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({
+                "message": format!("SOP audit: run {run_id} started for 'review'")
+            }),
+            run_id,
+        ));
+        assert!(!event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": "run-other" } }),
+            run_id,
+        ));
     }
 
     #[tokio::test]

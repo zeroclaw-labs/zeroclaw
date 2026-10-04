@@ -4399,7 +4399,7 @@ impl SlackChannel {
                                 "alias": self.alias,
                                 "allowed_peer_count": allowed_peers.len(),
                             })),
-                        if allowed_peers.is_empty() {
+                        if !crate::allowlist::grants_anyone(&allowed_peers) {
                             "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                         } else {
                             "ignoring message from unauthorized user"
@@ -5826,7 +5826,7 @@ impl Channel for SlackChannel {
                                     "alias": self.alias,
                                     "allowed_peer_count": allowed_peers.len(),
                                 })),
-                                if allowed_peers.is_empty() {
+                                if !crate::allowlist::grants_anyone(&allowed_peers) {
                                     "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                                 } else {
                                     "ignoring message from unauthorized user"
@@ -6063,6 +6063,10 @@ impl Channel for SlackChannel {
                 tool_name: request.tool_name.clone(),
             },
         );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
@@ -6096,7 +6100,7 @@ impl Channel for SlackChannel {
         };
 
         if let Err(err) = send_result {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -6104,16 +6108,19 @@ impl Channel for SlackChannel {
         // dropped-sender and timeout arms are the runtime denying on its own.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,

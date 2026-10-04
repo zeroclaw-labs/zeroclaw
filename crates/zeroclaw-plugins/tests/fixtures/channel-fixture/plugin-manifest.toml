@@ -8,14 +8,16 @@ version = "0.0.0"
 description = "Channel component fixture used by the plugin activation tests."
 wasm_path = "channel-fixture.wasm"
 capabilities = ["channel"]
-permissions = ["config_read"]
+permissions = ["config_read", "state_read", "state_write"]
 
 # The guest refuses to configure unless it receives a typed `retry_count` of 5, a
 # non-empty `credential_epoch`, and a scoped `api_token` secret. That is what
 # makes the end-to-end test prove operator values and secrets reached a real
 # component through the typed resolver and scoped-secret service, rather than
 # being dropped. `config_read` grants both `config.get` and `secrets.get`;
-# channels have no outbound-HTTP surface, so no `http_client` grant is needed.
+# `state_read` and `state_write` grant the durable `state` import the guest
+# uses to record its session during `configure`. Channels have no
+# outbound-HTTP surface, so no `http_client` grant is needed.
 [config_schema]
 "$schema" = "https://json-schema.org/draft/2020-12/schema"
 type = "object"

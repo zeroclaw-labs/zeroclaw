@@ -185,6 +185,20 @@ zeroclaw skills install https://github.com/vercel-labs/skills --skill find-skill
 
 </div>
 
+Discover one selected skill from an HTTPS `/.well-known/agent-skills/index.json` index:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install https://example.com --well-known --skill code-review --bundle ops
+```
+
+</div>
+
+Well-known discovery follows the pinned Agents Skills discovery schema `0.2.0` from [agentskills/agentskills commit `ab2ff8db3d5c9597985b06f94ea3caf1996ce82e`](https://github.com/agentskills/agentskills/tree/ab2ff8db3d5c9597985b06f94ea3caf1996ce82e). `--skill` is required so an index can never cause every advertised skill to be installed. The selected entry's SHA-256 digest is checked over the raw artifact bytes before use. Single `SKILL.md`, `.tar.gz`, and `.zip` artifacts are supported; archives must contain a root `SKILL.md`, stay within a 16 MiB raw artifact, 32 MiB gzip-decoded archive, and 512-entry limit, and contain no links, special files, absolute paths, traversal, or cross-platform drive paths. Index responses are capped at 256 KiB. Each redirect is revalidated for HTTPS, public DNS results, and the configured NAT64 policy, with at most 3 redirects and a 30-second request/DNS timeout; ambient proxies are disabled. No discovery cache is kept. The existing security audit and script policy still apply before publication.
+
 Install destination precedence is:
 
 1. Explicit `--bundle <alias>`.

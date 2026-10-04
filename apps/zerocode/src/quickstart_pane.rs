@@ -3665,6 +3665,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn existing_selections_survive_quickstart_submit_transport() {
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(crate::client::RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, Arc::clone(&reconnect_state));
+        pane.state_snapshot = Some(model_provider_snapshot(vec!["openrouter.shared"]));
+
+        pane.adopt_existing_provider("openrouter.shared".into());
+        pane.apply_picker_choice(Selector::RiskProfile, "risk-team".into(), true);
+        pane.apply_picker_choice(Selector::RuntimeProfile, "runtime-team".into(), true);
+        pane.apply_picker_choice(Selector::Memory, "sqlite-team".into(), true);
+        pane.adopt_existing_channel("telegram.shared".into());
+        pane.form.agent_name = "reuse-bot".into();
+
+        let submit = tokio::spawn(async move {
+            pane.submit().await;
+            pane
+        });
+
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("Quickstart submit must send an RPC request")
+            .expect("RPC writer must remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(request["method"], crate::client::method::QUICKSTART_APPLY);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "submission": {
+                    "model_provider": {"mode": "existing", "value": "openrouter.shared"},
+                    "risk_profile": {"mode": "existing", "value": "risk-team"},
+                    "runtime_profile": {"mode": "existing", "value": "runtime-team"},
+                    "memory": {"mode": "existing", "value": "sqlite-team"},
+                    "channels": [
+                        {"mode": "existing", "value": "telegram.shared"}
+                    ],
+                    "peer_groups": [],
+                    "agent": {
+                        "name": "reuse-bot",
+                        "system_prompt": "",
+                        "personality_file": null,
+                        "personality_files": []
+                    }
+                }
+            })
+        );
+
+        let id = request["id"].as_str().expect("request id");
+        outbound.dispatch_response(
+            id,
+            Some(serde_json::json!({
+                "kind": "applied",
+                "agent": {
+                    "alias": "reuse-bot",
+                    "model_provider": "openrouter.shared",
+                    "risk_profile": "risk-team",
+                    "runtime_profile": "runtime-team",
+                    "channels": ["telegram.shared"],
+                    "memory_backend": "sqlite-team"
+                },
+                "daemon_restarted": false
+            })),
+            None,
+        );
+
+        let pane = tokio::time::timeout(std::time::Duration::from_secs(2), submit)
+            .await
+            .expect("Quickstart submit must finish after the daemon response")
+            .expect("Quickstart submit task must not panic");
+        assert!(!pane.busy);
+        assert!(pane.last_errors.is_empty());
+        assert_eq!(
+            reconnect_state.lock().unwrap().pending_quickstart_chat,
+            Some(crate::app::PendingQuickstartChat::Immediate(
+                "reuse-bot".into()
+            ))
+        );
+    }
+
     fn selectable_labels(options: &[PickerOption]) -> Vec<&str> {
         options
             .iter()

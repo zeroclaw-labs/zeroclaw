@@ -9,6 +9,7 @@
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -110,6 +111,8 @@ pub(super) enum AcpError {
     Closed { phase: &'static str },
     #[error("Grok ACP stdout frame exceeded {limit} bytes")]
     FrameLimit { limit: usize },
+    #[error("Grok ACP outbound frame exceeded {limit} bytes")]
+    OutboundFrameLimit { limit: usize },
     #[error("Grok ACP stdout exceeded {limit} bytes")]
     StdoutLimit { limit: usize },
     #[error("Grok ACP assistant output exceeded {limit} bytes")]
@@ -145,6 +148,7 @@ impl AcpError {
             Self::Read { .. } => "grok_cli_acp_read_failed",
             Self::Closed { .. } => "grok_cli_acp_closed",
             Self::FrameLimit { .. } => "grok_cli_acp_frame_limit",
+            Self::OutboundFrameLimit { .. } => "grok_cli_acp_outbound_frame_limit",
             Self::StdoutLimit { .. } => "grok_cli_acp_stdout_limit",
             Self::AssistantLimit { .. } => "grok_cli_acp_assistant_limit",
             Self::InvalidJson { .. } => "grok_cli_acp_invalid_json",
@@ -517,12 +521,53 @@ fn reject_failed_stop_reason(prompt_result: &Value) -> Result<(), AcpError> {
     }
 }
 
+struct BoundedVecWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedVecWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedVecWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 async fn write_line<W, T>(stdin: &mut W, value: &T, phase: &'static str) -> Result<(), AcpError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let mut encoded = serde_json::to_vec(value).map_err(|_| AcpError::Encode)?;
+    // Reserve the trailing newline so the complete wire frame stays within the cap.
+    let mut writer = BoundedVecWriter::new(MAX_ACP_FRAME_BYTES - 1);
+    let encoded_result = serde_json::to_writer(&mut writer, value);
+    if writer.limit_exceeded {
+        return Err(AcpError::OutboundFrameLimit {
+            limit: MAX_ACP_FRAME_BYTES,
+        });
+    }
+    encoded_result.map_err(|_| AcpError::Encode)?;
+
+    let mut encoded = writer.bytes;
     encoded.push(b'\n');
     stdin
         .write_all(&encoded)
@@ -1105,6 +1150,101 @@ mod tests {
             .expect_err("invalid JSON must fail");
         assert!(matches!(error, AcpError::InvalidJson { .. }));
         assert!(!error.to_string().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn outbound_frame_at_limit_includes_trailing_newline() {
+        let value = Value::String("x".repeat(MAX_ACP_FRAME_BYTES - 3));
+        let (mut client, mut peer) = duplex(MAX_ACP_FRAME_BYTES + 1);
+
+        write_line(&mut client, &value, "test")
+            .await
+            .expect("frame at limit must succeed");
+        drop(client);
+
+        let mut encoded = Vec::new();
+        peer.read_to_end(&mut encoded)
+            .await
+            .expect("read encoded frame");
+        assert_eq!(encoded.len(), MAX_ACP_FRAME_BYTES);
+        assert_eq!(encoded.first(), Some(&b'"'));
+        assert_eq!(encoded.get(MAX_ACP_FRAME_BYTES - 2), Some(&b'"'));
+        assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&encoded[..encoded.len() - 1])
+                .expect("frame body must be valid JSON"),
+            value
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_frame_is_rejected_before_stdin_write() {
+        let sentinel = "OUTBOUND_FRAME_SENTINEL";
+        let value = Value::String(format!(
+            "{sentinel}{}",
+            "x".repeat(MAX_ACP_FRAME_BYTES - 2 - sentinel.len())
+        ));
+        let (mut client, mut peer) = duplex(MAX_ACP_FRAME_BYTES + 1);
+
+        let error = write_line(&mut client, &value, "test")
+            .await
+            .expect_err("oversized frame must fail");
+        assert!(matches!(
+            error,
+            AcpError::OutboundFrameLimit {
+                limit: MAX_ACP_FRAME_BYTES
+            }
+        ));
+        assert_eq!(error.error_key(), "grok_cli_acp_outbound_frame_limit");
+        assert!(!error.to_string().contains(sentinel));
+        assert!(!error.error_key().contains(sentinel));
+
+        drop(client);
+        let mut encoded = Vec::new();
+        peer.read_to_end(&mut encoded)
+            .await
+            .expect("read child stdin destination");
+        assert!(encoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_server_requests_keep_method_not_found_wire_response() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "session/unsupported"
+        });
+
+        for cancelled in [false, true] {
+            let (mut client, mut peer) = duplex(4096);
+            if cancelled {
+                handle_server_request_cancelled(&mut client, &request)
+                    .await
+                    .expect("cancelled unsupported response");
+            } else {
+                handle_server_request(&mut client, &request, AcpPermissionPolicy::RejectOnce)
+                    .await
+                    .expect("unsupported response");
+            }
+            drop(client);
+
+            let mut encoded = Vec::new();
+            peer.read_to_end(&mut encoded)
+                .await
+                .expect("read unsupported response");
+            assert_eq!(encoded.iter().filter(|byte| **byte == b'\n').count(), 1);
+            let response: Value =
+                serde_json::from_slice(&encoded).expect("unsupported response must be JSON");
+            assert_eq!(
+                response.pointer("/error/code"),
+                Some(&json!(METHOD_NOT_FOUND))
+            );
+            assert_eq!(
+                response.pointer("/error/message"),
+                Some(&json!("Method not supported by the ZeroClaw ACP client"))
+            );
+        }
     }
 
     #[tokio::test]

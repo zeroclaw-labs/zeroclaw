@@ -132,25 +132,32 @@ For checkbox fields, render each option as:
 
 Show the final constructed issue (title + labels + full body) for one last confirmation. If the selected template has no labels, show `Labels: none` and omit `--label` from the create command.
 
-Then submit using a HEREDOC for the body to preserve formatting:
+Create a private scratch directory outside the checkout and save the final body constructed in Step 5 to `$BODY_FILE` using a quoted heredoc. Replace the placeholder with the body; choose a delimiter that does not occur on a line by itself in the body. The quoted delimiter preserves shell-looking text literally:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body "$(cat <<'ISSUE_EOF'
+umask 077
+BODY_DIR=$(mktemp -d /tmp/zeroclaw-issue.XXXXXX) || exit 1
+BODY_FILE="$BODY_DIR/body.md"
+cat > "$BODY_FILE" <<'ISSUE_EOF' || exit 1
 <body content>
 ISSUE_EOF
-)"
+```
+
+Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. Preview the saved file for confirmation and reread it immediately before submission. If its contents changed, obtain confirmation again. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
+
+Submit the confirmed file unchanged:
+
+```bash
+gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body-file "$BODY_FILE"
 ```
 
 When the selected template has no labels:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --body "$(cat <<'ISSUE_EOF'
-<body content>
-ISSUE_EOF
-)"
+gh issue create --title "<title prefix><user title>" --body-file "$BODY_FILE"
 ```
 
-Return the resulting issue URL to the user.
+Return the resulting issue URL to the user. After successful submission, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
 
 ### Important Rules
 

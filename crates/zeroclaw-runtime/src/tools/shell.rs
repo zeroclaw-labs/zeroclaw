@@ -1,10 +1,11 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
-use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
+use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
@@ -68,7 +69,11 @@ pub struct ShellTool {
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
-    tui_env: Option<HashMap<String, String>>,
+    ///
+    /// Immutable for the session incarnation. The same Arc is held by the
+    /// Agent and RpcSession, so admission and subprocess execution inspect
+    /// one map throughout that incarnation.
+    tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
 }
 
@@ -116,67 +121,25 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = env.map(Arc::new);
+        self
+    }
+
+    /// Install an already-shared [`ForwardedEnvironment`] handle. Callers that
+    /// also hand the same `Arc` to the `Agent`/RPC session use this so the
+    /// tool, the agent and admission all observe one immutable map.
+    pub(crate) fn with_shared_tui_env(mut self, env: Option<ForwardedEnvironment>) -> Self {
         self.tui_env = env;
         self
     }
 }
 
-#[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
-    use windows::Win32::Globalization::GetACP;
-    use windows::Win32::System::Console::GetConsoleOutputCP;
-
-    // SAFETY: both Win32 functions are parameter-free code-page queries. A
-    // zero console code page selects the documented system ANSI fallback.
-    let cp = unsafe {
-        let console_cp = GetConsoleOutputCP();
-        if console_cp == 0 {
-            GetACP()
-        } else {
-            console_cp
-        }
-    };
-
-    decode_output_with_code_page(bytes, cp)
+    super::shell_output::decode_shell_output(bytes)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
-    let encoding = windows_code_page_to_encoding(cp);
-    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
-        cow.into_owned()
-    }
-}
-
-/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
-/// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(any(target_os = "windows", test))]
-fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
-    match cp {
-        932 => encoding_rs::SHIFT_JIS,
-        936 | 54936 => encoding_rs::GBK,
-        949 => encoding_rs::EUC_KR,
-        950 => encoding_rs::BIG5,
-        1250 => encoding_rs::WINDOWS_1250,
-        1251 => encoding_rs::WINDOWS_1251,
-        1252 => encoding_rs::WINDOWS_1252,
-        1253 => encoding_rs::WINDOWS_1253,
-        1254 => encoding_rs::WINDOWS_1254,
-        1255 => encoding_rs::WINDOWS_1255,
-        1256 => encoding_rs::WINDOWS_1256,
-        1257 => encoding_rs::WINDOWS_1257,
-        1258 => encoding_rs::WINDOWS_1258,
-        20127 | 65001 => encoding_rs::UTF_8,
-        _ => encoding_rs::UTF_8,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -300,10 +263,17 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        // The forwarded map is immutable for the session incarnation, so
+        // launcher resolution and the child process read the same values.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -319,16 +289,18 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
+        self.sandbox
+            .wrap_shell_command(cmd.as_std_mut(), self.runtime.shell_program())
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "shell tool: sandbox wrap_command failed"
+                );
+                anyhow::Error::msg(format!("Sandbox error: {e}"))
+            })?;
 
         cmd.env_clear();
 
@@ -346,8 +318,8 @@ impl Tool for ShellTool {
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
-        if let Some(ref tui_env) = self.tui_env {
-            for (k, v) in tui_env {
+        if let Some(tui_env) = tui_env_snapshot {
+            for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
             }
         }
@@ -358,9 +330,7 @@ impl Tool for ShellTool {
         // Detect Android at runtime (works for bionic and musl builds).
         if is_android() {
             let ambient = std::env::var("PATH").unwrap_or_default();
-            let tui_path = self
-                .tui_env
-                .as_ref()
+            let tui_path = tui_env_snapshot
                 .and_then(|env| env.get("PATH"))
                 .map(String::as_str);
             cmd.env("PATH", android_child_path(tui_path, &ambient));
@@ -405,8 +375,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -470,6 +440,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -514,12 +493,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -562,6 +549,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
@@ -646,7 +678,11 @@ mod tests {
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
-        Arc::new(NativeRuntime::new())
+        #[cfg(windows)]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(windows))]
+        let runtime = NativeRuntime::new();
+        Arc::new(runtime)
     }
 
     #[cfg(windows)]
@@ -859,6 +895,69 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn powershell_bounded_command_configures_redirected_stdout_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let encoding = tool
+            .execute(json!({
+                "command": "Write-Output $OutputEncoding.WebName",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell encoding probe should return a result");
+        assert!(encoding.success, "PowerShell command failed: {encoding:?}");
+        assert_eq!(encoding.output.trim(), "utf-8");
+
+        let output = tool
+            .execute(json!({
+                "command": "Write-Output '标准输出'",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell UTF-8 output should return a result");
+        assert!(output.success, "PowerShell command failed: {output:?}");
+        assert_eq!(output.output.trim(), "标准输出");
+        assert!(output.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_hidden_redirected_output_decodes_stdout_and_stderr_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+        // This full-script fixture is intentionally outside the bounded grammar.
+        // Emit UTF-8 bytes explicitly so this test isolates hidden redirected capture/decoding.
+        let command = "$stdout = [Text.Encoding]::UTF8.GetBytes('标准输出'); [Console]::OpenStandardOutput().Write($stdout, 0, $stdout.Length); $stderr = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($stderr, 0, $stderr.Length)";
+
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("PowerShell execution should return a result");
+
+        assert!(result.success, "PowerShell command failed: {result:?}");
+        assert_eq!(result.output, "标准输出");
+        assert_eq!(result.error.as_deref(), Some("标准错误"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
         // Native-Windows runtime boundary through the FULLY WRAPPED production
         // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
@@ -952,12 +1051,12 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
     }
 
     #[tokio::test]
@@ -1429,6 +1528,68 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SHELL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let tool = ShellTool::new(
+                test_security_with_env_cmd(),
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool
+                .execute(json!({"command": format!("set {KEY}"), "approved": true}))
+                .await
+                .unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Set the inherited value only on a separate harness process, never on
+        // the shared test process. cmd reads it without touching a cache file.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tools::shell::tests::shell_preserves_inherited_powershell_cache_path",
+                ])
+                .env(CHILD, case)
+                .kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn env_print_command() -> &'static str {
         "set"
@@ -1763,11 +1924,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1775,37 +1936,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
     }
 
     #[tokio::test]
@@ -1955,6 +2085,78 @@ mod tests {
             env_output_contains_assignment(&result.output, "ZC_TUI_TEST_VAR", "tui_injected"),
             "tui_env var should appear in subprocess env, got:\n{}",
             result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
+        let launcher = launcher_dir.path().join("tui-only-shell");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
+        let split_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-decoy"),
+            launcher_dir.path().to_path_buf(),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), split_path)])));
+        let result = tool
+            .execute(json!({"command": "echo direct_tui_path"}))
+            .await
+            .expect("shell tool should return a result");
+
+        assert!(
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
+            "TUI-only launcher should execute, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_with_no_absolute_entries_fails_closed() {
+        let unusable_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-only"),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), unusable_path)])));
+        let result = tool
+            .execute(json!({"command": "echo must_not_run"}))
+            .await
+            .expect("shell tool should return a failed result");
+
+        assert!(!result.success, "unusable TUI PATH must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("effective child PATH")),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 

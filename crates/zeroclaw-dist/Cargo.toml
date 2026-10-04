@@ -1,0 +1,9 @@
+[package]
+name = "zeroclaw-dist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical distribution-target identity registry — the single source of truth for ZeroClaw's published release-archive targets."
+publish = false
+
+[dependencies]

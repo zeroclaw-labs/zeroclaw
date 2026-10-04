@@ -946,7 +946,11 @@ impl ModelProvider for OpenRouterModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                        } else {
+                            StreamError::Http(super::format_error_chain(&e))
+                        }))
                         .await;
                     return;
                 }

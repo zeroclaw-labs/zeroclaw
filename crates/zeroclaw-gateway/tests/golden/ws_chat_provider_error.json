@@ -1,0 +1,61 @@
+{
+  "frames": [
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "connect": "/ws/chat?agent=web&session_id=golden-ws-error"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "message_count": 0,
+        "resumed": false,
+        "session_id": "golden-ws-error",
+        "type": "session_start"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "type": "connect"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "message": "Connection established",
+        "type": "connected"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "content": "Say hello to the golden frames.",
+        "type": "message"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "code": "PROVIDER_ERROR",
+        "message": "The selected model provider returned a server error. Try again or choose another provider.",
+        "type": "error"
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 2
+      }
+    }
+  ],
+  "scenario": "ws_chat_provider_error"
+}

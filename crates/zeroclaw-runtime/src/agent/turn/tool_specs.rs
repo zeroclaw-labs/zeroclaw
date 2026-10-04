@@ -59,6 +59,14 @@ pub(crate) fn build_iteration_tool_specs(
             }
         }
     }
+    // >>> herdr-prompt-cache: deterministic tool ordering
+    // Tool specs are assembled from unordered maps (the MCP registry keeps
+    // tools in a HashMap), so their order varies between processes. The tools
+    // block is the first section of every provider request, so any reshuffle
+    // changes the token prefix and invalidates prompt caching for the whole
+    // request (tools + system + messages) - cache reads become full cache
+    // writes. Sorting by name makes the prefix byte-stable across processes.
+    tool_specs.sort_by(|a, b| a.name.cmp(&b.name));
     let known_tool_names: HashSet<String> = tool_specs
         .iter()
         .map(|tool| tool.name.to_ascii_lowercase())

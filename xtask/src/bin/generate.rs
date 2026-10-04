@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
-/// `cargo generate` - maintainer surface generators. Surfaces are derived from
-/// the canonical spec; install.sh@HEAD is the behavioral reference.
+/// `cargo generate` - maintainer surface generators. Each subcommand owns a
+/// typed source and deterministic tracked outputs with a focused drift check.
 #[derive(Parser)]
 #[command(name = "generate", about = "ZeroClaw maintainer surface generation")]
 struct Cli {
@@ -17,6 +17,13 @@ enum Cmd {
         targets: Vec<String>,
         /// Regenerate to memory and diff against on-disk; nonzero on drift.
         /// Writes nothing. This is the CI drift gate.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Render tracked PR-review policy documentation from its canonical spec.
+    ReviewDocs {
+        /// Regenerate to memory and diff against on-disk; nonzero on drift.
+        /// Writes nothing. This is the focused review-docs drift gate.
         #[arg(long)]
         check: bool,
     },
@@ -46,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
+        Cmd::ReviewDocs { check } => xtask::generate::review_docs::run(check),
         Cmd::SopSyntax { check } => xtask::generate::sop_syntax::run(check),
         Cmd::Features {
             selection,

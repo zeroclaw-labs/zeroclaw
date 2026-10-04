@@ -27,6 +27,11 @@ pub const EMPTY_SERVER_FALLBACK_MODEL: &str = "empty_server_fallback_model";
 pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
     "server_fallback_model_duplicates_primary";
 
+/// Stable code for a disabled audit section, which drops the certificate
+/// issuance and renewal trail without adding any command record.
+pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
+    "security_audit_disabled_drops_certificate_record";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -42,6 +47,9 @@ pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
 ///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
+/// - `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of
+///   more than one enabled agent; without a stored owner the job is refused
+///   rather than run under an arbitrary claimant.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
 ///   the transport only consults it under `mode = "personal"`, so it currently
 ///   has no effect. `dm_policy` and `group_policy` apply under both modes and
@@ -55,6 +63,10 @@ pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `security_audit_disabled_drops_certificate_record`:
+///   `security.audit.enabled` is `false`, so certificate issuance and renewal
+///   have no audit-log record. Command execution is not audited under either
+///   value, because no production path records tool commands.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently

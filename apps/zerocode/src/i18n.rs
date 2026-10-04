@@ -1,10 +1,11 @@
-use fluent::{FluentArgs, FluentBundle, FluentResource};
+use fluent::{FluentArgs, FluentResource, concurrent::FluentBundle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use unic_langid::LanguageIdentifier;
 
 static STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static FTL_BUNDLES: OnceLock<FtlBundles> = OnceLock::new();
 static LOCALE_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
@@ -18,6 +19,20 @@ struct FtlSources {
     disk: Option<String>,
 }
 
+struct FtlBundles {
+    english: FluentBundle<FluentResource>,
+    disk: Option<FluentBundle<FluentResource>>,
+}
+
+impl FtlBundles {
+    fn format(&self, key: &str, args: &[(&str, &str)]) -> Option<String> {
+        self.disk
+            .as_ref()
+            .and_then(|bundle| format_ftl_message(bundle, key, args))
+            .or_else(|| format_ftl_message(&self.english, key, args))
+    }
+}
+
 /// Initialise i18n with the active locale and the resolved client config dir.
 /// The config dir is where downloaded locale FTL is read from (and where the
 /// Locale pane writes it), so passing it explicitly keeps the read and write
@@ -28,6 +43,7 @@ pub fn init(locale: &str, config_dir: &std::path::Path) {
     FTL_SOURCES.get_or_init(|| load_ftl_sources(locale));
     locale_strings(locale);
     STRINGS.get_or_init(|| load_strings(locale));
+    FTL_BUNDLES.get_or_init(|| load_ftl_bundles(locale));
 }
 
 pub fn t(key: &str) -> String {
@@ -59,13 +75,8 @@ pub fn try_t_locale(key: &str) -> Option<String> {
 }
 
 pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
-    let sources = FTL_SOURCES.get_or_init(|| load_ftl_sources(active_locale()));
-    if let Some(disk) = sources.disk.as_deref()
-        && let Some(value) = format_ftl_message(disk, &sources.locale, key, args)
-    {
-        return value;
-    }
-    if let Some(value) = format_ftl_message(EN_FTL, "en", key, args) {
+    let bundles = FTL_BUNDLES.get_or_init(|| load_ftl_bundles(active_locale()));
+    if let Some(value) = bundles.format(key, args) {
         return value;
     }
     record_missing(key);
@@ -102,18 +113,7 @@ fn locale_strings(locale: &str) -> &'static HashMap<String, String> {
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
-    let resource =
-        FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier: LanguageIdentifier = match locale.parse() {
-        Ok(identifier) => identifier,
-        Err(_) => "en"
-            .parse()
-            .expect("static English Fluent locale must parse"),
-    };
-    let mut bundle = FluentBundle::new(vec![language_identifier]);
-    bundle.set_use_isolating(false);
-    let _ = bundle.add_resource(resource);
-
+    let bundle = build_ftl_bundle(ftl_source, locale);
     let mut map = HashMap::new();
     for line in ftl_source.lines() {
         let trimmed = line.trim();
@@ -195,12 +195,20 @@ fn load_ftl_sources(locale: &str) -> FtlSources {
     }
 }
 
-fn format_ftl_message(
-    ftl_source: &str,
-    locale: &str,
-    key: &str,
-    args: &[(&str, &str)],
-) -> Option<String> {
+fn load_ftl_bundles(locale: &str) -> FtlBundles {
+    // Match the existing process-lifetime locale snapshot, caching structure,
+    // not formatted labels: callers supply new argument values on each draw.
+    let sources = FTL_SOURCES.get_or_init(|| load_ftl_sources(locale));
+    FtlBundles {
+        english: build_ftl_bundle(EN_FTL, "en"),
+        disk: sources
+            .disk
+            .as_deref()
+            .map(|source| build_ftl_bundle(source, &sources.locale)),
+    }
+}
+
+fn build_ftl_bundle(ftl_source: &str, locale: &str) -> FluentBundle<FluentResource> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
     let language_identifier: LanguageIdentifier = match locale.parse() {
@@ -209,10 +217,17 @@ fn format_ftl_message(
             .parse()
             .expect("static English Fluent locale must parse"),
     };
-    let mut bundle = FluentBundle::new(vec![language_identifier]);
+    let mut bundle = FluentBundle::new_concurrent(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
+    bundle
+}
 
+fn format_ftl_message(
+    bundle: &FluentBundle<FluentResource>,
+    key: &str,
+    args: &[(&str, &str)],
+) -> Option<String> {
     let message = bundle.get_message(key)?;
     let pattern = message.value()?;
     let mut fluent_args = FluentArgs::new();
@@ -242,14 +257,166 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_turn_notice_falls_back_without_reusing_localized_message_units() {
+        let english = include_str!("../locales/en/zerocode.ftl");
+        for (locale, source) in [
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundles = FtlBundles {
+                english: build_ftl_bundle(english, "en"),
+                disk: Some(build_ftl_bundle(source, locale)),
+            };
+            let args = [
+                ("reason", "limit"),
+                ("dropped", "2"),
+                ("kept", "1"),
+                ("dropped-kind", "other"),
+                ("kept-kind", "one"),
+            ];
+            let turns = bundles
+                .format("zc-chat-history-trimmed-turns", &args)
+                .unwrap();
+            assert!(turns.contains("older turns dropped"), "{locale}: {turns}");
+            assert!(turns.contains("turn kept"), "{locale}: {turns}");
+            let old_key = "zc-chat-history-trimmed";
+            assert_eq!(
+                bundles.format(old_key, &args),
+                format_ftl_message(bundles.disk.as_ref().unwrap(), old_key, &args),
+                "legacy message units should remain localized for {locale}",
+            );
+        }
+    }
+
+    #[test]
+    fn cached_bundles_format_fresh_arguments_and_preserve_fallback() {
+        let bundles = FtlBundles {
+            english: build_ftl_bundle(
+                "greeting = Hello { $name }\nmissing = English { $name }\ninvalid = English { $name }\nattribute-only = English { $name }\n",
+                "en",
+            ),
+            disk: Some(build_ftl_bundle(
+                "greeting = Bonjour { $name }\ninvalid = { $unavailable }\nattribute-only =\n    .label = Locale attribute\n",
+                "fr",
+            )),
+        };
+        for name in ["first", "second"] {
+            let args = [("name", name)];
+            assert_eq!(
+                bundles.format("greeting", &args),
+                Some(format!("Bonjour {name}"))
+            );
+            for key in ["missing", "invalid", "attribute-only"] {
+                assert_eq!(bundles.format(key, &args), Some(format!("English {name}")));
+            }
+        }
+        assert_eq!(bundles.format("greeting", &[]), None);
+        assert_eq!(bundles.format("absent", &[]), None);
+    }
+
+    #[test]
+    fn cached_bundles_recover_valid_messages_from_malformed_resource() {
+        let source = "valid = Value { $value }\nbroken = {\n";
+        assert!(FluentResource::try_new(source.to_string()).is_err());
+        let bundle = build_ftl_bundle(source, "not a valid locale");
+        assert_eq!(
+            bundle.locales,
+            vec!["en".parse::<LanguageIdentifier>().unwrap()]
+        );
+        for value in ["one", "two"] {
+            assert_eq!(
+                format_ftl_message(&bundle, "valid", &[("value", value)]),
+                Some(format!("Value {value}"))
+            );
+        }
+        assert_eq!(format_ftl_message(&bundle, "broken", &[]), None);
+    }
+
+    #[test]
+    fn t_args_reuses_initialized_bundles() {
+        let key = "zc-error-daemon-version-mismatch";
+        let first_args = [("client_version", "0.8.1"), ("server_version", "0.8.0")];
+        let first = t_args(key, &first_args);
+        let bundles = FTL_BUNDLES.get().expect("t_args initializes its bundles");
+        let pattern = bundles.english.get_message(key).unwrap().value().unwrap();
+        assert_eq!(first, bundles.format(key, &first_args).unwrap());
+
+        let next_args = [("client_version", "0.8.3"), ("server_version", "0.8.2")];
+        assert_eq!(
+            t_args(key, &next_args),
+            bundles.format(key, &next_args).unwrap()
+        );
+        let reused = FTL_BUNDLES.get().unwrap();
+        assert!(std::ptr::eq(bundles, reused));
+        assert!(std::ptr::eq(
+            pattern,
+            reused.english.get_message(key).unwrap().value().unwrap()
+        ));
+        assert_eq!(
+            t_args("zc-definitely-not-a-real-key", &[]),
+            "{zc-definitely-not-a-real-key}"
+        );
+    }
+
+    #[test]
+    fn cached_bundle_supports_concurrent_arguments() {
+        let bundle = build_ftl_bundle("value = Current { $value }", "en");
+        std::thread::scope(|scope| {
+            for value in ["first", "second"] {
+                let bundle = &bundle;
+                scope.spawn(move || {
+                    assert_eq!(
+                        format_ftl_message(bundle, "value", &[("value", value)]),
+                        Some(format!("Current {value}"))
+                    );
+                });
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "bounded formatting timing comparison; run explicitly with --ignored --nocapture"]
+    fn parameterized_bundle_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 200;
+        let key = "zc-error-daemon-version-mismatch";
+        let args = [("client_version", "0.8.1"), ("server_version", "0.8.0")];
+        let bundle = build_ftl_bundle(EN_FTL, "en");
+        let expected = format_ftl_message(&bundle, key, &args).unwrap();
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let fresh = build_ftl_bundle(black_box(EN_FTL), "en");
+            assert_eq!(
+                format_ftl_message(&fresh, key, black_box(&args)).unwrap(),
+                expected
+            );
+        }
+        let reparsed = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            assert_eq!(
+                format_ftl_message(black_box(&bundle), key, black_box(&args)).unwrap(),
+                expected
+            );
+        }
+        eprintln!(
+            "{ITERATIONS} formats: reparse={reparsed:?}, cached={:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn en_catalogue_parses() {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
         assert!(map.contains_key("zc-pane-chat"));
         assert!(map.contains_key("zc-sidebar-title"));
         let mismatch = format_ftl_message(
-            EN_FTL,
-            "en",
+            &build_ftl_bundle(EN_FTL, "en"),
             "zc-error-daemon-version-mismatch",
             &[("client_version", "0.8.1"), ("server_version", "0.8.0")],
         )
@@ -384,8 +551,7 @@ mod tests {
             );
         }
         let save_failed = format_ftl_message(
-            EN_FTL,
-            "en",
+            &build_ftl_bundle(EN_FTL, "en"),
             "zc-zerocode-config-save-failed",
             &[("error", "disk unavailable")],
         )
@@ -402,8 +568,7 @@ mod tests {
         // The malformed-section prompt carries the parser detail, so it is
         // argument-bearing too and cannot be checked by the no-arg loop above.
         let load_error = format_ftl_message(
-            EN_FTL,
-            "en",
+            &build_ftl_bundle(EN_FTL, "en"),
             "zc-zerocode-tracker-load-error",
             &[("error", "invalid type: string")],
         )
@@ -423,9 +588,9 @@ mod tests {
         ];
 
         for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
             let timeout = format_ftl_message(
-                source,
-                locale,
+                &bundle,
                 "zc-error-daemon-initialize-timeout",
                 &[("seconds", "10")],
             )
@@ -433,8 +598,7 @@ mod tests {
             assert!(timeout.contains("10"));
 
             let controls = format_ftl_message(
-                source,
-                locale,
+                &bundle,
                 "zc-app-help-controls",
                 &[("up", "↑"), ("down", "↓"), ("cancel", "Esc")],
             )
@@ -443,9 +607,29 @@ mod tests {
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
 
+            for key in [
+                "zc-chat-status-working",
+                "zc-chat-status-thinking",
+                "zc-chat-status-responding",
+                "zc-chat-status-awaiting-approval",
+                "zc-chat-status-awaiting-input",
+                "zc-chat-status-cancelling",
+            ] {
+                assert!(
+                    format_ftl_message(&bundle, key, &[]).is_some(),
+                    "{key} must format for {locale}"
+                );
+            }
+            let calling_tool = format_ftl_message(
+                &bundle,
+                "zc-chat-status-calling-tool",
+                &[("tool", "git_diff")],
+            )
+            .unwrap_or_else(|| panic!("calling-tool status must format for {locale}"));
+            assert!(calling_tool.contains("git_diff"));
+
             let picker_error = format_ftl_message(
-                source,
-                locale,
+                &bundle,
                 "zc-sidebar-picker-error",
                 &[("error", "socket closed")],
             )
@@ -466,8 +650,7 @@ mod tests {
 
         for (locale, source) in catalogues {
             let failure = format_ftl_message(
-                source,
-                locale,
+                &build_ftl_bundle(source, locale),
                 "zc-error-spawned-daemon-startup",
                 &[("details", "test failure")],
             )
@@ -497,12 +680,13 @@ mod tests {
         // Moving these two messages into the catalogue must not reword them.
         // These are the exact strings `await_spawned_daemon_ready` printed
         // before the change, with the same path and duration interpolation.
+        let english = build_ftl_bundle(EN_FTL, "en");
         assert_eq!(
-            format_ftl_message(EN_FTL, "en", "zc-daemon-wait-notice", &args).unwrap(),
+            format_ftl_message(&english, "zc-daemon-wait-notice", &args).unwrap(),
             format!("zerocode: waiting for daemon at {PATH} (up to 30s)…")
         );
         assert_eq!(
-            format_ftl_message(EN_FTL, "en", "zc-error-daemon-not-ready-timeout", &args).unwrap(),
+            format_ftl_message(&english, "zc-error-daemon-not-ready-timeout", &args).unwrap(),
             format!(
                 "daemon did not become ready within 30s (socket: {PATH}); if the socket path is \
                  long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir"
@@ -510,11 +694,12 @@ mod tests {
         );
 
         for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
             for key in ["zc-daemon-wait-notice", "zc-error-daemon-not-ready-timeout"] {
                 // Mirrors the lookup order `t_args` performs: the active
                 // locale's catalogue first, then the English fallback.
-                let rendered = format_ftl_message(source, locale, key, &args)
-                    .or_else(|| format_ftl_message(EN_FTL, "en", key, &args))
+                let rendered = format_ftl_message(&bundle, key, &args)
+                    .or_else(|| format_ftl_message(&english, key, &args))
                     .unwrap_or_else(|| panic!("`{key}` must render for {locale}"));
 
                 assert!(
@@ -532,12 +717,11 @@ mod tests {
             }
 
             // The timeout guidance has to stay actionable after formatting.
-            let timeout =
-                format_ftl_message(source, locale, "zc-error-daemon-not-ready-timeout", &args)
-                    .or_else(|| {
-                        format_ftl_message(EN_FTL, "en", "zc-error-daemon-not-ready-timeout", &args)
-                    })
-                    .expect("timeout guidance must render");
+            let timeout = format_ftl_message(&bundle, "zc-error-daemon-not-ready-timeout", &args)
+                .or_else(|| {
+                    format_ftl_message(&english, "zc-error-daemon-not-ready-timeout", &args)
+                })
+                .expect("timeout guidance must render");
             assert!(
                 timeout.contains("ZEROCLAW_SOCKET"),
                 "`{locale}` lost the ZEROCLAW_SOCKET guidance: {timeout}"
@@ -563,20 +747,20 @@ mod tests {
         ];
 
         for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
             for key in [
                 "zc-doctor-error-daemon-timeout",
                 "zc-doctor-partial-banner",
                 "zc-doctor-partial-hint",
             ] {
                 assert!(
-                    format_ftl_message(source, locale, key, &[]).is_some(),
+                    format_ftl_message(&bundle, key, &[]).is_some(),
                     "{key} must be defined for {locale}"
                 );
             }
 
             let log_path = format_ftl_message(
-                source,
-                locale,
+                &bundle,
                 "zc-doctor-log-path",
                 &[("path", "/tmp/trace-2026-08-01.jsonl")],
             )
@@ -619,14 +803,14 @@ mod tests {
         ];
 
         for (locale, source, expected_memory, expected_cpu) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
             assert_eq!(
-                format_ftl_message(source, locale, "zc-dashboard-label-daemon-memory", &[],)
-                    .as_deref(),
+                format_ftl_message(&bundle, "zc-dashboard-label-daemon-memory", &[]).as_deref(),
                 Some(expected_memory),
                 "daemon memory label for {locale}"
             );
             assert_eq!(
-                format_ftl_message(source, locale, "zc-dashboard-label-daemon-cpu", &[]).as_deref(),
+                format_ftl_message(&bundle, "zc-dashboard-label-daemon-cpu", &[]).as_deref(),
                 Some(expected_cpu),
                 "daemon CPU label for {locale}"
             );

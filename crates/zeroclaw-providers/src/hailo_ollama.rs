@@ -20,11 +20,9 @@ use crate::traits::{
     ProviderCapabilities, TokenUsage, ToolCall, ToolsPayload,
 };
 
-pub const HAILO_DEFAULT_NUM_CTX: u32 = 2048;
+pub const HAILO_DEFAULT_NUM_CTX: u32 = 0;
 pub const HAILO_DEFAULT_NUM_PREDICT: i32 = 256;
 pub const HAILO_DEFAULT_QUEUE_TIMEOUT_SECS: u64 = 30;
-const HAILO_MAX_HISTORY_MESSAGES: usize = 12;
-const HAILO_MAX_MESSAGE_CHARS: usize = 2_000;
 const TEMPERATURE_DEFAULT: f64 = 0.8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,128 +664,8 @@ impl HailoOllamaModelProvider {
         encoded
     }
 
-    /// Bound already-encoded native prompt content without splitting one of
-    /// the two-character escape units consumed by Hailo's second JSON parse.
-    fn truncate_native_content(content: &str, max_chars: usize) -> String {
-        let char_count = content.chars().count();
-        if char_count <= max_chars {
-            return content.to_string();
-        }
-
-        let has_ellipsis = max_chars > 3;
-        let head_chars = if has_ellipsis {
-            (max_chars - 3) / 2
-        } else {
-            max_chars
-        };
-        let tail_chars = max_chars.saturating_sub(3 + head_chars);
-        let mut head = String::new();
-        let mut head_used = 0;
-        let mut collecting_head = true;
-        let mut tail_units = std::collections::VecDeque::new();
-        let mut tail_used = 0;
-        let mut chars = content.char_indices().peekable();
-
-        while let Some((start, character)) = chars.next() {
-            if character == '\\' {
-                let _ = chars.next();
-            }
-            let end = chars.peek().map_or(content.len(), |(index, _)| *index);
-            let unit = &content[start..end];
-            let unit_chars = unit.chars().count();
-
-            if collecting_head {
-                if head_used + unit_chars <= head_chars {
-                    head.push_str(unit);
-                    head_used += unit_chars;
-                } else {
-                    collecting_head = false;
-                }
-            }
-
-            if has_ellipsis {
-                tail_units.push_back(unit);
-                tail_used += unit_chars;
-                while tail_used > tail_chars {
-                    if let Some(removed) = tail_units.pop_front() {
-                        tail_used -= removed.chars().count();
-                    }
-                }
-            }
-        }
-
-        if !has_ellipsis {
-            return head;
-        }
-
-        let tail = tail_units.into_iter().collect::<String>();
-        format!("{head}...{tail}")
-    }
-
     fn fold_system(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        const INSTRUCTIONS_PREFIX: &str = "Instructions: ";
-        const REQUEST_PREFIX: &str = " Request: ";
-
-        let overhead = INSTRUCTIONS_PREFIX.chars().count() + REQUEST_PREFIX.chars().count();
-        let available = HAILO_MAX_MESSAGE_CHARS.saturating_sub(overhead);
-        let system_chars = system.chars().count();
-        let user_chars = user.chars().count();
-        let has_tool_protocol = system.contains("## Tool Use Protocol");
-        let (system_budget, user_budget) = if has_tool_protocol && system_chars <= available {
-            (
-                system_chars,
-                user_chars.min(available.saturating_sub(system_chars)),
-            )
-        } else {
-            let reserved_system = system_chars.min(available / 3);
-            let user_budget = user_chars.min(available.saturating_sub(reserved_system));
-            let system_budget = system_chars.min(available.saturating_sub(user_budget));
-            (system_budget, user_budget)
-        };
-        let system_truncated = system_chars > system_budget;
-        let user_truncated = user_chars > user_budget;
-
-        if system_truncated && has_tool_protocol {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_tool_prompt_too_large",
-                        "model_provider": self.alias,
-                        "system_chars": system_chars,
-                        "system_budget": system_budget,
-                        "user_chars": user_chars,
-                    })),
-                "Hailo-Ollama rejected an oversized prompt-guided tool prompt"
-            );
-            return Err(anyhow::Error::new(NonRetryableProviderError::new(
-                "Hailo-Ollama prompt-guided tool instructions exceed the bounded system prompt; reduce enabled tools or compact the agent context",
-            )));
-        }
-
-        if system_truncated || user_truncated {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_prompt_bounded",
-                        "model_provider": self.alias,
-                        "system_chars": system_chars,
-                        "system_budget": system_budget,
-                        "user_chars": user_chars,
-                        "user_budget": user_budget,
-                    })),
-                "Hailo-Ollama bounded an oversized system/user prompt"
-            );
-        }
-
-        let system = Self::truncate_native_content(system, system_budget);
-        let user = Self::truncate_native_content(user, user_budget);
-        Ok(format!(
-            "{INSTRUCTIONS_PREFIX}{system}{REQUEST_PREFIX}{user}"
-        ))
+        Ok(format!("Instructions: {system} Request: {user}"))
     }
 
     fn push_message(&self, messages: &mut Vec<Message>, role: String, content: String) {
@@ -798,52 +676,13 @@ impl HailoOllamaModelProvider {
             && previous.role == role
         {
             let previous_content = previous.content.take().unwrap_or_default();
-            let merged_chars = previous_content.chars().count() + 1 + content.chars().count();
-            if merged_chars > HAILO_MAX_MESSAGE_CHARS {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_message_bounded",
-                            "model_provider": self.alias,
-                            "role": role.as_str(),
-                            "message_chars": merged_chars,
-                            "max_message_chars": HAILO_MAX_MESSAGE_CHARS,
-                        })),
-                    "Hailo-Ollama bounded a merged history message"
-                );
-            }
-            previous.content = Some(Self::truncate_native_content(
-                &format!("{previous_content} {content}"),
-                HAILO_MAX_MESSAGE_CHARS,
-            ));
+            previous.content = Some(format!("{previous_content} {content}"));
             return;
-        }
-
-        let message_chars = content.chars().count();
-        if message_chars > HAILO_MAX_MESSAGE_CHARS {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_message_bounded",
-                        "model_provider": self.alias,
-                        "role": role.as_str(),
-                        "message_chars": message_chars,
-                        "max_message_chars": HAILO_MAX_MESSAGE_CHARS,
-                    })),
-                "Hailo-Ollama bounded a history message"
-            );
         }
 
         messages.push(Message {
             role,
-            content: Some(Self::truncate_native_content(
-                &content,
-                HAILO_MAX_MESSAGE_CHARS,
-            )),
+            content: Some(content),
             images: None,
             tool_calls: None,
             tool_name: None,
@@ -974,55 +813,19 @@ impl HailoOllamaModelProvider {
                     (candidate.kind == MessageKind::User).then_some(index)
                 })
         };
-        let history_messages = candidates.len();
-        while candidates.len() > HAILO_MAX_HISTORY_MESSAGES {
-            let Some(next_user) = next_user_turn(&candidates) else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "hailo_latest_turn_exceeds_message_budget",
-                            "model_provider": self.alias,
-                            "retained_messages": candidates.len(),
-                            "history_message_budget": HAILO_MAX_HISTORY_MESSAGES,
-                        })),
-                    "Hailo-Ollama rejected a latest turn that exceeds its local message budget"
-                );
-                return Err(anyhow::Error::new(NonRetryableProviderError::new(format!(
-                    "Hailo-Ollama latest user-anchored turn exceeds the local history message \
-                     budget ({} messages > {HAILO_MAX_HISTORY_MESSAGES}); reduce the current \
-                     tool exchange",
-                    candidates.len()
-                ))));
-            };
-            candidates.drain(..next_user);
-        }
-        if candidates.len() < history_messages {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "hailo_history_bounded",
-                        "model_provider": self.alias,
-                        "history_messages": history_messages,
-                        "retained_messages": candidates.len(),
-                    })),
-                "Hailo-Ollama bounded chat history at complete user turns"
-            );
-        }
 
         // `num_ctx` is a local budgeting input for Hailo. Hailo-Ollama does
         // not understand the native wire option, so reserve the configured
         // output budget and bound the retained history before serialization.
-        // Four UTF-8 characters per token is an approximate heuristic here;
-        // per-message truncation below remains the final wire-size guard.
-        let history_char_budget = self
-            .tuning
-            .num_ctx
-            .saturating_sub(self.tuning.num_predict.max(0) as u32)
-            .saturating_mul(4) as usize;
+        // Four UTF-8 characters per token is an approximate heuristic here.
+        let history_char_budget = if self.tuning.num_ctx == 0 {
+            usize::MAX
+        } else {
+            self.tuning
+                .num_ctx
+                .saturating_sub(self.tuning.num_predict.max(0) as u32)
+                .saturating_mul(4) as usize
+        };
         let original_candidate_count = candidates.len();
         let system = system_parts.join(" ");
         // The fallback request is part of the wire contract, so it must enter
@@ -1054,11 +857,10 @@ impl HailoOllamaModelProvider {
                 if previous_role == Some(role) {
                     current_message_chars = current_message_chars
                         .saturating_add(1)
-                        .saturating_add(content_chars)
-                        .min(HAILO_MAX_MESSAGE_CHARS);
+                        .saturating_add(content_chars);
                 } else {
                     total_chars = total_chars.saturating_add(current_message_chars);
-                    current_message_chars = content_chars.min(HAILO_MAX_MESSAGE_CHARS);
+                    current_message_chars = content_chars;
                     previous_role = Some(role);
                 }
             }
@@ -1643,7 +1445,7 @@ mod tests {
             90,
             5,
             OllamaTuning {
-                num_ctx: 0,
+                num_ctx: 1,
                 num_predict: 0,
                 temperature_override: None,
             },
@@ -1659,6 +1461,31 @@ mod tests {
             }])
             .expect_err("fallback user turn must be counted against the local context budget");
         assert!(error.to_string().contains("local context budget"));
+    }
+
+    #[test]
+    fn system_only_history_without_budget_uses_fallback_user_turn() {
+        let provider = HailoOllamaModelProvider::new("edge", None, 90, 5, OllamaTuning::default())
+            .expect("typed default Hailo URL must be valid");
+        let messages = provider
+            .normalize_messages(vec![Message {
+                role: "system".to_string(),
+                content: Some("system instruction".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }])
+            .expect("zero local context budget must not reject the fallback user turn");
+        assert_eq!(
+            messages.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
+        assert!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref())
+                .is_some_and(|content| content.contains("Request: hello"))
+        );
     }
 
     #[test]

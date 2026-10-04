@@ -273,10 +273,7 @@ pub fn field_table(
         // `crate::env_overrides`, so the rendered example and the value the
         // runtime accepts cannot disagree.
         let env_var = format!("ZEROCLAW_{}", full_path.replace('.', "__"));
-        let full_desc = resolved
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let full_desc = description(resolved).unwrap_or_default();
 
         let _ = write!(
             rows,
@@ -309,7 +306,7 @@ pub fn field_table(
             full_path = full_path,
             set_cmd = set_cmd,
             env_var = env_var,
-            full_desc = markdown_prose(full_desc),
+            full_desc = markdown_prose(&full_desc),
         );
     }
 
@@ -339,8 +336,7 @@ fn plain_field_table(
             type_label(resolved, defs)
         };
         let default = fmt_default(resolved);
-        let desc =
-            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let desc = first_line(description(resolved).as_deref()).replace('|', "\\|");
         let req = if required.contains(&key.as_str()) {
             "\\*"
         } else {
@@ -366,6 +362,105 @@ fn html_escape(s: &str) -> String {
 /// translation while leaving the code spans untouched.
 fn markdown_prose(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Read a schema node's `description` as book-ready Markdown.
+///
+/// Every description in this reference is a Rust doc comment, so it is written
+/// for rustdoc first and may carry intra-doc links such as
+/// ``[`PairingGuard`](crate::pairing::PairingGuard)``. rustdoc resolves those;
+/// mdBook cannot. It renders `crate::pairing::PairingGuard` as a relative URL,
+/// the page does not exist, and the book's internal link check fails the whole
+/// docs build. Reduce those links to their text here, at the single point where
+/// a doc comment becomes book prose, so authors keep writing ordinary rustdoc.
+fn description(schema: &Value) -> Option<String> {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(strip_intra_doc_links)
+}
+
+/// Replace `[text](rust::path)` with `text`, leaving every other link alone.
+///
+/// A target is a Rust path when it contains `::` without a `://` scheme, which
+/// covers rustdoc's disambiguator forms (`struct@crate::Foo`, `crate::f()`,
+/// `crate::m!`) too. Real URLs, relative page links and in-page anchors carry
+/// no `::` and pass through untouched. Code spans are copied verbatim, so a doc
+/// comment that shows this syntax as an example keeps it.
+fn strip_intra_doc_links(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Copy a code span verbatim, matching its opening backtick run.
+            b'`' => {
+                let run = bytes[i..].iter().take_while(|b| **b == b'`').count();
+                let fence = &s[i..i + run];
+                let rest = &s[i + run..];
+                let end = rest.find(fence).map(|e| i + run + e + run);
+                let stop = end.unwrap_or(bytes.len());
+                out.push_str(&s[i..stop]);
+                i = stop;
+            }
+            b'[' => {
+                let Some((text, target, next)) = split_link(s, i) else {
+                    out.push('[');
+                    i += 1;
+                    continue;
+                };
+                if target.contains("::") && !target.contains("://") {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&s[i..next]);
+                }
+                i = next;
+            }
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Split `[text](target)` starting at `open`, returning the text, the target,
+/// and the index just past the closing `)`. `None` when the bytes at `open` are
+/// not a complete inline link.
+///
+/// Both halves are matched on balance, not on the first closing delimiter, so
+/// rustdoc's call form `[f](crate::m::f())` yields the whole `crate::m::f()`
+/// target instead of stopping inside it and stranding a `)`.
+fn split_link(s: &str, open: usize) -> Option<(&str, &str, usize)> {
+    let close = matching(s, open, b'[', b']')?;
+    if !s[close + 1..].starts_with('(') {
+        return None;
+    }
+    let end = matching(s, close + 1, b'(', b')')?;
+    Some((&s[open + 1..close], &s[close + 2..end], end + 1))
+}
+
+/// Index of the delimiter closing the `open`/`close` pair that starts at
+/// `start`, or `None` when it is never closed.
+fn matching(s: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + offset);
+            }
+        }
+    }
+    None
 }
 
 /// Render a `fmt_default`-style value (which may be wrapped in backticks) as
@@ -406,7 +501,7 @@ pub fn generate(root: &Value) -> String {
     out.push_str("|---------|-------------|\n");
     for (key, schema) in props {
         let resolved = resolve(schema, defs);
-        let desc = first_line(resolved.get("description").and_then(Value::as_str));
+        let desc = first_line(description(resolved).as_deref());
         let _ = writeln!(out, "| [`{key}`](#{key}) | {desc} |");
     }
     out.push('\n');
@@ -425,8 +520,8 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
     let path_str = path.join(".");
     let _ = writeln!(out, "{hashes} `{path_str}`\n");
 
-    if let Some(desc) = schema.get("description").and_then(Value::as_str) {
-        out.push_str(desc);
+    if let Some(desc) = description(schema) {
+        out.push_str(&desc);
         out.push_str("\n\n");
     }
 
@@ -455,8 +550,8 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
                 map_path.push("<alias>".to_string());
                 let map_path_str = map_path.join(".");
                 let _ = writeln!(out, "## `{map_path_str}`\n");
-                if let Some(desc) = value_schema.get("description").and_then(Value::as_str) {
-                    out.push_str(desc);
+                if let Some(desc) = description(value_schema) {
+                    out.push_str(&desc);
                     out.push_str("\n\n");
                 }
                 let map_path_refs: Vec<&str> = map_path.iter().map(String::as_str).collect();
@@ -519,8 +614,7 @@ fn write_section_fields(
         let resolved = resolve(prop_schema, defs);
         let ty = type_label(resolved, defs);
         let default = fmt_default(resolved);
-        let desc =
-            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let desc = first_line(description(resolved).as_deref()).replace('|', "\\|");
         let req = if required.contains(&key.as_str()) {
             "\\*"
         } else {
@@ -706,6 +800,7 @@ fn first_line(s: Option<&str>) -> String {
 #[cfg(all(test, feature = "schema-export"))]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn index_links_each_section_to_its_anchor() {
@@ -774,6 +869,107 @@ mod tests {
         assert_eq!(html_escape("<&>"), "&lt;&amp;&gt;");
         assert_eq!(html_escape("a & b"), "a &amp; b");
         assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn strip_intra_doc_links_keeps_the_text_and_drops_the_rust_path() {
+        // The shape that breaks the docs deploy: rustdoc resolves these,
+        // mdBook renders them as dead relative links.
+        assert_eq!(
+            strip_intra_doc_links(
+                "issues codes through the same [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing"
+            ),
+            "issues codes through the same `PairingGuard` as startup pairing"
+        );
+        // rustdoc disambiguators and call/macro suffixes are Rust paths too.
+        assert_eq!(
+            strip_intra_doc_links(
+                "see [it](struct@crate::pairing::PairingGuard) and [f](crate::m::f())"
+            ),
+            "see it and f"
+        );
+        assert_eq!(
+            strip_intra_doc_links(
+                "[`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model)"
+            ),
+            "`ModelProviders::first_entry_with_model`"
+        );
+    }
+
+    #[test]
+    fn strip_intra_doc_links_leaves_real_links_untouched() {
+        let url = "open [the dashboard](http://127.0.0.1:42617/config/gateway) now";
+        assert_eq!(strip_intra_doc_links(url), url);
+        let page = "see [the guide](../ops/observability.md#logs)";
+        assert_eq!(strip_intra_doc_links(page), page);
+        // An IPv6 literal contains `::` but is still a URL.
+        let ipv6 = "bind [here](http://[::1]:42617/config)";
+        assert_eq!(strip_intra_doc_links(ipv6), ipv6);
+        // Not a link: a bare bracket pair, and the shortcut form rustdoc also
+        // accepts (no target to strip, so it passes through unchanged).
+        assert_eq!(strip_intra_doc_links("a [b] c"), "a [b] c");
+        assert_eq!(
+            strip_intra_doc_links("see [`Config::foo`]"),
+            "see [`Config::foo`]"
+        );
+        // Unbalanced delimiters are left exactly as written rather than eaten.
+        assert_eq!(strip_intra_doc_links("[text](crate::x"), "[text](crate::x");
+        assert_eq!(strip_intra_doc_links("[text"), "[text");
+    }
+
+    #[test]
+    fn strip_intra_doc_links_copies_code_spans_verbatim() {
+        // A doc comment demonstrating the syntax keeps it inside code.
+        assert_eq!(
+            strip_intra_doc_links("write ``[`X`](crate::X)`` in rustdoc"),
+            "write ``[`X`](crate::X)`` in rustdoc"
+        );
+        assert_eq!(
+            strip_intra_doc_links("`a::b` then [`c`](crate::c)"),
+            "`a::b` then `c`"
+        );
+        // An unterminated code span must not swallow the rest as a panic.
+        assert_eq!(strip_intra_doc_links("`unclosed"), "`unclosed");
+        // Multi-byte text is preserved byte-for-byte.
+        assert_eq!(
+            strip_intra_doc_links("clé 🔑 [`x`](crate::x)"),
+            "clé 🔑 `x`"
+        );
+    }
+
+    #[test]
+    fn description_strips_links_before_the_text_reaches_the_book() {
+        let schema = json!({
+            "description": "Uses [`PairingGuard`](crate::pairing::PairingGuard) today."
+        });
+        assert_eq!(
+            description(&schema).as_deref(),
+            Some("Uses `PairingGuard` today.")
+        );
+        assert_eq!(description(&json!({})), None);
+    }
+
+    #[test]
+    fn generated_reference_has_no_rust_path_link_targets() {
+        // Whole-document guard: whatever doc comments the schema carries, the
+        // rendered reference must never ship a `crate::`-style link target,
+        // because the book's internal link check fails the docs deploy on it.
+        let out = generate(&schemars::schema_for!(crate::schema::Config).to_value());
+        for (n, line) in out.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("](") {
+                let target = &rest[at + 2..];
+                let end = target.find(')').unwrap_or(target.len());
+                let target = &target[..end];
+                let is_rust_path = target.contains("::") && !target.contains("://");
+                assert!(
+                    !is_rust_path,
+                    "line {} ships a Rust path as a link target: {target}",
+                    n + 1
+                );
+                rest = &rest[at + 2..];
+            }
+        }
     }
 
     #[test]

@@ -20,6 +20,8 @@ const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const LINE_SENDER_NAME_MAX_CHARS: usize = 20;
 
 pub struct LineChannel {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
     /// Long-lived channel access token — used for both Reply and Push APIs.
     channel_access_token: String,
     /// Channel secret — used to verify the `X-Line-Signature` header.
@@ -34,7 +36,7 @@ pub struct LineChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// Pairing guard — `Some` when `dm_policy = Pairing`.
     pairing: Option<Arc<PairingGuard>>,
     /// TCP port the embedded webhook server listens on.
@@ -73,6 +75,9 @@ struct BotInfo {
 // ---------------------------------------------------------------------------
 
 struct LineState {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
+    persistence_cancel: tokio_util::sync::CancellationToken,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     channel_secret: String,
     bot_user_id: String,
@@ -83,8 +88,8 @@ struct LineState {
     /// Resolves the configured peer allowlist at message-time. Reads
     /// canonical state, no cache.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle for the `/bind` flow.
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    /// Optional pairing-persist authority for the `/bind` flow.
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     pairing: Option<Arc<PairingGuard>>,
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     /// HTTP client and credentials for downloading audio content.
@@ -228,15 +233,25 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
     crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
 }
 
-/// Persist a newly-paired LINE userId into `peer_groups.line_<alias>.external_peers`
-/// via the shared Config handle. Mirrors telegram/wechat's `persist_allowed_identity`.
+/// The conflict message when a matching `ignore` denies `user_id`.
+///
+/// Asked before `try_pair`, because pairing consumes the one-time code.
+fn line_pairing_deny_conflict(state: &LineState, user_id: &str) -> Option<String> {
+    let config = state.persist.as_ref()?.config();
+    let cfg = config.read();
+    crate::identity_persist::external_peer_deny_conflict(
+        &cfg,
+        "line",
+        &state.alias,
+        &[user_id.trim()],
+        |entry, user| entry.trim() == user,
+    )
+}
+
+/// Persist a newly-paired LINE userId through the live-config authority.
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
-    let Some(config) = &state.persist else {
+    let Some(authority) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -250,35 +265,28 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    let group_name = format!("line_{}", state.alias);
-    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
-    let snapshot = {
-        let mut cfg = config.write();
-        if !cfg.channels.line.contains_key(&state.alias) {
-            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
-        }
-        let group = cfg
-            .peer_groups
-            .entry(group_name)
-            .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref,
-                ..PeerGroupConfig::default()
-            });
-        if group
-            .external_peers
-            .iter()
-            .any(|p| p.as_str() == normalized)
-        {
-            return Ok(());
-        }
-        group.external_peers.push(PeerUsername::new(normalized));
-        cfg.clone()
-    };
-    snapshot
-        .save()
-        .await
-        .context("Failed to persist LINE paired userId to config.toml")?;
-    Ok(())
+    let persistence = crate::identity_persist::persist_external_peer_with_cancellation(
+        Some(authority),
+        "line",
+        &state.alias,
+        &normalized,
+        |entry, user| entry == user,
+        Some(&state.persistence_cancel),
+    );
+    #[cfg(test)]
+    if let Some(waiting) = &state.persistence_waiting {
+        use std::future::Future;
+        tokio::pin!(persistence);
+        return std::future::poll_fn(|cx| {
+            let result = persistence.as_mut().poll(cx);
+            if result.is_pending() {
+                waiting.notify_one();
+            }
+            result
+        })
+        .await;
+    }
+    persistence.await
 }
 
 async fn handle_webhook(
@@ -360,6 +368,72 @@ async fn handle_webhook(
             .unwrap_or("")
             .to_string();
 
+        let source = match event.get("source") {
+            Some(source) => source,
+            None => continue,
+        };
+        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let user_id = match source.get("userId").and_then(|u| u.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let is_group = matches!(source_type, "group" | "room");
+
+        // Group authorization must precede content resolution: audio content
+        // download and transcription are attacker-triggered side effects.
+        if is_group {
+            match state.group_policy {
+                LineGroupPolicy::Disabled => continue,
+                LineGroupPolicy::Open => {}
+                LineGroupPolicy::Mention => {
+                    let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
+                    if mention_span.is_none() {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "skipping group message without bot mention (userId: {})",
+                                state.bot_user_id
+                            )
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            if !is_line_user_allowed(&*state, user_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"user_id": user_id})),
+                    "ignoring group message from unauthorized sender. Add them to the channel peer group, or pair over DM."
+                );
+                continue;
+            }
+        }
+
+        // The DM gate below runs after content resolution because `pairing`
+        // needs the text of a `/bind`. Nothing but text can carry one, so a
+        // non-text DM from an unauthorized sender is dropped here rather than
+        // being downloaded and transcribed first.
+        if !is_group
+            && msg_type != "text"
+            && !matches!(state.dm_policy, LineDmPolicy::Open)
+            && !is_line_user_allowed(&*state, user_id)
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"user_id": user_id})),
+                "skipping non-text DM from unauthorized sender before content retrieval"
+            );
+            continue;
+        }
+
         // Resolve message content: text directly, audio via transcription.
         let owned_text: String;
         let text: &str = match msg_type {
@@ -440,43 +514,6 @@ async fn handle_webhook(
             _ => continue,
         };
 
-        let source = match event.get("source") {
-            Some(s) => s,
-            None => continue,
-        };
-        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let user_id = match source.get("userId").and_then(|u| u.as_str()) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        let is_group = matches!(source_type, "group" | "room");
-
-        // 3. Group policy gate
-        if is_group {
-            match state.group_policy {
-                LineGroupPolicy::Disabled => continue,
-                LineGroupPolicy::Open => {}
-                LineGroupPolicy::Mention => {
-                    let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
-                    if mention_span.is_none() {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "skipping group message without bot mention (userId: {})",
-                                state.bot_user_id
-                            )
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
-
         // 4. DM policy gate (non-group messages only)
         if !is_group {
             match state.dm_policy {
@@ -521,13 +558,69 @@ async fn handle_webhook(
                                 LineChannel::build_sender_obj(&name, &icon)
                             };
                             if let Some(ref guard) = state.pairing {
-                                match guard.try_pair(code, user_id).await {
-                                    Ok(Some(_)) => {
+                                // Before the pairing transition: a denied identity can
+                                // never be persisted, and `try_pair` would spend the
+                                // operator's only code to reach that verdict.
+                                if let Some(conflict) = line_pairing_deny_conflict(&state, user_id)
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({"conflict": conflict})),
+                                        "refusing bind before consuming pairing code"
+                                    );
+                                    if let Some(ref token) = bind_reply_token {
+                                        send_bind_reply(
+                                            &state.client,
+                                            &state.channel_access_token,
+                                            &state.api_base_url,
+                                            token,
+                                            &i18n::get_required_cli_string(
+                                                "channel-line-bind-denied",
+                                            ),
+                                            bind_sender.clone(),
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
+                                // Reserved, not paired: `commit()` below is what
+                                // consumes the code and mints the token, so a
+                                // failed write leaves the code usable.
+                                match guard.reserve_pair(code, user_id).await {
+                                    Ok(Some(reservation)) => {
                                         if let Err(e) =
                                             persist_line_paired_identity(&*state, user_id).await
                                         {
-                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "paired userId= but persist failed");
+                                            // Reply with the failure message
+                                            // rather than the success one: the
+                                            // write is what admits this sender,
+                                            // and the spent code was their only
+                                            // retry.
+                                            drop(reservation);
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "rolled back bind: could not persist paired userId=");
+                                            if let Some(ref token) = bind_reply_token {
+                                                send_bind_reply(
+                                                    &state.client,
+                                                    &state.channel_access_token,
+                                                    &state.api_base_url,
+                                                    token,
+                                                    &i18n::get_required_cli_string(
+                                                        "channel-line-bind-not-saved",
+                                                    ),
+                                                    bind_sender.clone(),
+                                                )
+                                                .await;
+                                            }
+                                            continue;
                                         } else {
+                                            // Durable write landed, so the
+                                            // pairing may consume the code.
+                                            let _ = reservation.commit();
                                             ::zeroclaw_log::record!(
                                                 INFO,
                                                 ::zeroclaw_log::Event::new(
@@ -722,7 +815,9 @@ impl LineChannel {
 
         let alias = alias.into();
         let configured_peers = peer_resolver();
-        let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
+        let pairing = if dm_policy == LineDmPolicy::Pairing
+            && !crate::allowlist::grants_anyone(&configured_peers)
+        {
             // Chat-channel bind codes are retyped by hand into a Telegram/
             // LINE/WeChat message, so they deliberately keep the six-digit
             // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
@@ -758,6 +853,8 @@ impl LineChannel {
         };
 
         Self {
+            #[cfg(test)]
+            persistence_waiting: None,
             channel_access_token: token,
             channel_secret: secret,
             dm_policy,
@@ -777,12 +874,22 @@ impl LineChannel {
         }
     }
 
-    /// Wire the shared `Config` handle so `persist_line_paired_identity`
-    /// can write a newly-paired userId into `peer_groups.line_<alias>.external_peers`
-    /// and save. Long-running daemon sets this from the orchestrator; tests
-    /// and one-shot callers leave it unset (pairing then doesn't survive).
+    /// Wire a config handle so `persist_line_paired_identity` can write a
+    /// newly-paired userId into `peer_groups.line_<alias>.external_peers` and
+    /// save. Standalone callers get a local mutation witness; supervised
+    /// callers use [`Self::with_persistence_authority`] to share the daemon
+    /// witness.
     pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
-        self.persist = Some(config);
+        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
+        self
+    }
+
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
+        mut self,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        self.persist = Some(authority);
         self
     }
 
@@ -1080,7 +1187,13 @@ impl LineChannel {
         bot_user_id: String,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        // Axum requests can outlive the listener during graceful shutdown.
+        let persistence_cancel = tokio_util::sync::CancellationToken::new();
+        let _persistence_guard = persistence_cancel.clone().drop_guard();
         let state = Arc::new(LineState {
+            #[cfg(test)]
+            persistence_waiting: self.persistence_waiting.clone(),
+            persistence_cancel,
             tx,
             channel_secret: self.channel_secret.clone(),
             bot_user_id,
@@ -1233,6 +1346,69 @@ mod tests {
         )
     }
 
+    #[test]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
+        assert!(Arc::ptr_eq(
+            &authority.config_write_lock(),
+            &stored.config_write_lock()
+        ));
+    }
+
+    #[tokio::test]
+    async fn paired_identity_save_failure_does_not_publish_line_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".to_string(), Default::default());
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        let state = LineState {
+            persistence_waiting: None,
+            persistence_cancel: tokio_util::sync::CancellationToken::new(),
+            tx,
+            channel_secret: channel.channel_secret.clone(),
+            bot_user_id: "bot-user".to_string(),
+            dm_policy: channel.dm_policy.clone(),
+            group_policy: channel.group_policy.clone(),
+            alias: channel.alias.clone(),
+            peer_resolver: Arc::clone(&channel.peer_resolver),
+            persist: channel.persist.clone(),
+            pairing: channel.pairing.clone(),
+            pending_tokens: Arc::clone(&channel.pending_tokens),
+            client: channel.client.clone(),
+            channel_access_token: channel.channel_access_token.clone(),
+            api_base_url: channel.api_base_url.clone(),
+            content_api_base_url: channel.content_api_base_url.clone(),
+            sender_name_resolver: Arc::clone(&channel.sender_name_resolver),
+            sender_icon: Arc::clone(&channel.sender_icon),
+            transcription_manager: channel.transcription_manager.clone(),
+        };
+
+        persist_line_paired_identity(&state, "line-user")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
+    }
+
     /// Compute a valid `X-Line-Signature` for `body` signed with `secret`.
     fn sign(secret: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
@@ -1265,6 +1441,22 @@ mod tests {
                 "replyToken": reply_token,
                 "source": {"type": "group", "groupId": group_id, "userId": user_id},
                 "message": {"id": "msg002", "type": "text", "text": text}
+            }]
+        })
+    }
+
+    fn room_event(
+        user_id: &str,
+        room_id: &str,
+        text: &str,
+        reply_token: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": reply_token,
+                "source": {"type": "room", "roomId": room_id, "userId": user_id},
+                "message": {"id": "msg-room", "type": "text", "text": text}
             }]
         })
     }
@@ -1935,14 +2127,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_group_open_forwards_any_message() {
+    async fn webhook_group_open_forwards_message_from_authorized_sender() {
         let ch = LineChannel::new(
             "tok".into(),
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1960,6 +2152,462 @@ mod tests {
             .unwrap();
         assert_eq!(msg.content, "anyone home?");
         assert_eq!(msg.reply_target, "Ggroup1");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_open_drops_unauthorized_sender() {
+        // `group_policy = open` means no mention is required, not that any
+        // member of a joined room may drive the agent.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uintruder", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "group message from a sender outside the peer group must be dropped"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_room_open_authorizes_sender_and_routes_to_room_id() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uroom-user".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &room_event("Uroom-user", "Rroom1", "hello room", "rt1"),
+        )
+        .await;
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.sender, "Uroom-user");
+        assert_eq!(message.reply_target, "Rroom1");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_mention_drops_unauthorized_sender() {
+        // Mentioning the bot is not authorization: `find_bot_mention` only
+        // checks that the bot was named, never who named it.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
+
+        let payload =
+            group_mention_event("Uintruder", "Ggrp", "@Bot help me", "Ubot123", 0, 4, "rt1");
+        post_signed(port, "mysecret", &payload).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "mentioning the bot must not authorize an unlisted sender"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_empty_peer_group_denies_everyone() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "an unconfigured peer group must fail closed, not open"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_wildcard_peer_allows_public_room() {
+        // The documented opt-in for a genuinely public room.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["*".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt1"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "hello");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_wildcard_peer_still_denies_an_ignored_sender() {
+        // `external_peers = ["*"]` with `ignore = ["Ublocked"]` resolves to
+        // `["*", "!Ublocked"]`. The wildcard must not defeat the deny.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["*".to_string(), "!Ublocked".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Ublocked", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "an ignored sender must be denied even under a wildcard grant"
+        );
+
+        // Control: the wildcard still admits everybody it is not denying.
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uanyone", "Ggroup1", "hello", "rt2"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "hello");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_exact_grant_is_shadowed_by_an_ignore() {
+        // `external_peers = ["Ualice"]` with `ignore = ["Ualice"]` resolves to
+        // `["Ualice", "!Ualice"]`, which is a grant that admits nobody.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Ualice".to_string(), "!Ualice".to_string()]),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Ualice", "Ggroup1", "run something", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "a deny on the same identifier must shadow its own grant"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_does_not_consume_pairing_codes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
+        // Pairing is a DM handshake. A /bind in a room must neither authorize
+        // the sender nor reach the agent.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri());
+        let pairing = ch.pairing.clone().expect("pairing guard");
+        let code = pairing.pairing_code().expect("pending pairing code");
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uintruder", "Ggroup1", &format!("/bind {code}"), "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "a pairing code must not be redeemable from a group"
+        );
+        assert_eq!(
+            pairing.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "the group attempt must leave the real code pending"
+        );
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Uintruder", &format!("/bind {code}"), "rt2"),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while pairing.pairing_code().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the same code must remain redeemable over DM");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_group_audio_triggers_no_download_or_transcription() {
+        use wiremock::MockServer;
+
+        let api_server = MockServer::start().await;
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {
+                    "type": "group",
+                    "groupId": "Ggroup1",
+                    "userId": "Uintruder"
+                },
+                "message": {"id": "audio-denied", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        assert_eq!(post_signed(port, "mysecret", &audio_event).await, 200);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            api_server
+                .received_requests()
+                .await
+                .expect("mock request history")
+                .is_empty(),
+            "authorization must run before content fetch, transcription, or loading signals"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_dm_audio_triggers_no_download_or_transcription() {
+        use wiremock::MockServer;
+
+        let api_server = MockServer::start().await;
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Allowlist,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "user", "userId": "Uintruder"},
+                "message": {"id": "audio-denied", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        assert_eq!(post_signed(port, "mysecret", &audio_event).await, 200);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            api_server
+                .received_requests()
+                .await
+                .expect("mock request history")
+                .is_empty(),
+            "an unauthorized DM must not reach content fetch or transcription"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn authorized_group_audio_is_still_transcribed() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/v2/bot/message/.*/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "audio/x-m4a")
+                    .set_body_bytes(b"fake-audio-bytes"),
+            )
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "transcript"})),
+            )
+            .mount(&api_server)
+            .await;
+
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+            ..Default::default()
+        };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            resolver_from(vec!["Uoperator".to_string()]),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "group", "groupId": "Ggroup1", "userId": "Uoperator"},
+                "message": {"id": "audio-ok", "type": "audio", "duration": 3000}
+            }]
+        });
+
+        post_signed(port, "mysecret", &audio_event).await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for transcribed message")
+            .expect("channel closed");
+        assert_eq!(msg.content, "transcript");
+        assert_eq!(msg.sender, "Uoperator");
         abort.abort();
     }
 
@@ -2000,7 +2648,7 @@ mod tests {
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
@@ -2488,7 +3136,7 @@ mod tests {
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
             "line_test_alias",
-            empty_resolver(),
+            resolver_from(vec!["Uuser".to_string()]),
             0,
         )
         .with_api_base_url(&api_server.uri());
@@ -2556,6 +3204,107 @@ mod tests {
 
     // ---- Bind Reply Feedback ------------------------------------------------
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_listener_rejects_in_flight_webhook_pairing() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&api_server)
+            .await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".into(), Default::default());
+        config.config_path = temp.path().join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let mut channel = LineChannel::new(
+            "tok".into(),
+            "secret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence_authority(authority.clone());
+        let code = channel.pairing.as_ref().unwrap().pairing_code().unwrap();
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        channel.persistence_waiting = Some(Arc::clone(&waiting));
+        let lock = authority.config_write_lock();
+        let guard = lock.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, _rx) = mpsc::channel(1);
+        let server = zeroclaw_spawn::spawn!(async move {
+            channel
+                .listen_with_listener(listener, "bot".into(), tx)
+                .await
+        });
+        let request = zeroclaw_spawn::spawn!(async move {
+            post_signed(
+                port,
+                "secret",
+                &dm_event("line-user", &format!("/bind {code}"), "rt-retired"),
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(5), waiting.notified()).await;
+        server.abort();
+        let _ = server.await;
+        if pending.is_err() {
+            request.abort();
+            panic!("webhook did not reach pairing persistence");
+        }
+        let mut request = request;
+        let settled = tokio::time::timeout(Duration::from_secs(5), &mut request).await;
+        if settled.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        assert_eq!(
+            settled
+                .expect("retired request must settle while lock remains held")
+                .unwrap(),
+            200
+        );
+        drop(guard);
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
+        assert!(!temp.path().join("config.toml").exists());
+        let requests = api_server.received_requests().await.unwrap();
+        let reply = requests
+            .iter()
+            .find(|request| request.url.path() == "/v2/bot/message/reply")
+            .expect("persistence rejection must send a failure reply");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["replyToken"], "rt-retired");
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-not-saved")
+        );
+        assert_ne!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-success")
+        );
+        api_server.verify().await;
+    }
+
     #[tokio::test]
     async fn webhook_bind_success_sends_paired_reply() {
         use wiremock::matchers::{method, path};
@@ -2618,6 +3367,198 @@ mod tests {
         );
 
         api_server.verify().await;
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_bind_keeps_the_one_time_code_when_an_ignore_denies_the_sender() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // `try_pair` consumes the code and mints a token before persistence
+        // consults the deny; discovering it afterwards leaves the operator's
+        // only code spent on a pairing the admission matcher rejects, with no
+        // route to retry.
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/chat/loading/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.channels.line.insert(
+            "line_test_alias".to_string(),
+            zeroclaw_config::schema::LineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "line_line_test_alias".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("line.line_test_alias".to_string()),
+                ignore: vec![PeerUsername::new("Unew".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+
+        // The guard is shared into `LineState`, so it outlives the move into
+        // the webhook task and still answers for the code afterwards.
+        let guard = ch.pairing.as_ref().expect("pairing offered").clone();
+        let code = guard.pairing_code().expect("a fresh guard issues a code");
+
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Unew", &format!("/bind {code}"), "rt-denied"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a denied identity must not spend the operator's only pairing code"
+        );
+
+        let reqs = api_server.received_requests().await.unwrap();
+        let reply_req = reqs
+            .iter()
+            .find(|r| r.url.path() == "/v2/bot/message/reply")
+            .expect("the sender is told why the bind was refused");
+        let body: serde_json::Value = serde_json::from_slice(&reply_req.body).unwrap();
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-denied"),
+            "the refusal is reported, not a success reply"
+        );
+
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_bind_rolls_back_when_the_writer_rejects_a_group_collision() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        // Nothing is denied, so the precheck passes; the writer refuses because
+        // the conventional key belongs to another instance. LINE used to log
+        // that error and reply with `channel-line-bind-success` anyway.
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/chat/loading/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
+        // Isolated: `Config::default()` resolves `config_path` to the real
+        // `~/.zeroclaw/config.toml`, and a bind that persists would read and
+        // rewrite the operator's own file.
+        let cfg_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config {
+            config_path: cfg_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.channels.line.insert(
+            "line_test_alias".to_string(),
+            zeroclaw_config::schema::LineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "line_line_test_alias".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("line.other".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+
+        let guard = ch.pairing.as_ref().expect("pairing offered").clone();
+        let code = guard.pairing_code().expect("a fresh guard issues a code");
+
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Unew", &format!("/bind {code}"), "rt-collision"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a bind that could not be persisted hands the code back"
+        );
+        assert!(
+            !guard.is_paired(),
+            "no runtime-only token survives a bind the writer rejected"
+        );
+
+        let reqs = api_server.received_requests().await.unwrap();
+        let reply_req = reqs
+            .iter()
+            .find(|r| r.url.path() == "/v2/bot/message/reply")
+            .expect("the sender is told the bind was not saved");
+        let body: serde_json::Value = serde_json::from_slice(&reply_req.body).unwrap();
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-not-saved"),
+            "the failure is reported, not the success message"
+        );
+
         abort.abort();
     }
 

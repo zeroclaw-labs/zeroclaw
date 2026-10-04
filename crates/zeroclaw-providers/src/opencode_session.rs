@@ -8,9 +8,11 @@
 //! model (`deepseek-v4-flash`) rejects header-less requests outright with
 //! HTTP 400 `Model is unavailable`.
 //!
-//! Every OpenCode request — both wires, streaming and non-streaming — resolves
-//! its value through [`session_token`] so the header cannot drift per code
-//! path.
+//! Every OpenCode inference request, on both wires and on both streaming and
+//! non-streaming paths, resolves its value through [`session_token`] so the
+//! header cannot drift per code path. Model-catalog and warmup requests
+//! (`GET /models`) do not carry it: they are not a conversation turn, so there
+//! is no backend to pin.
 //!
 //! # Value derivation
 //!
@@ -91,6 +93,63 @@ pub fn is_opencode_target(base_url: &str) -> bool {
     })
 }
 
+/// True when `extra_headers` pins an `x-opencode-session` value that will
+/// actually reach the wire.
+///
+/// The provider client builders skip an `extra_headers` entry whose value is not
+/// a valid HTTP header value, logging a warning. Such an entry must not count as
+/// a pin: suppressing the derived token for it would leave the request with no
+/// affinity header at all.
+#[must_use]
+pub fn operator_pinned_session(extra_headers: &std::collections::HashMap<String, String>) -> bool {
+    extra_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER)
+            && reqwest::header::HeaderValue::from_str(value).is_ok()
+    })
+}
+
+/// Redirect hops an OpenCode client follows before giving up; reqwest's
+/// default limit.
+const MAX_REDIRECTS: usize = 10;
+
+/// Redirect policy for clients whose requests may carry the session header.
+///
+/// On a redirect to a different host, reqwest strips only credential headers
+/// (`Authorization`, cookies, and proxy credentials), so under its default
+/// policy a 3xx from an OpenCode host would carry `x-opencode-session` wherever
+/// it points. This policy follows same-host redirects up to reqwest's default
+/// limit and stops at the first hop to another host or port, handing that 3xx
+/// back to the caller instead.
+#[must_use]
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let crosses_host = attempt.previous().last().is_some_and(|previous| {
+            previous.host_str() != attempt.url().host_str()
+                || previous.port_or_known_default() != attempt.url().port_or_known_default()
+        });
+        if crosses_host {
+            attempt.stop()
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Apply [`redirect_policy`] to `builder` when `endpoint` is an OpenCode target.
+/// Every other provider keeps reqwest's default redirect handling.
+pub fn restrict_redirects(
+    builder: reqwest::ClientBuilder,
+    endpoint: &str,
+) -> reqwest::ClientBuilder {
+    if is_opencode_target(endpoint) {
+        builder.redirect(redirect_policy())
+    } else {
+        builder
+    }
+}
+
 /// Domain-separated, truncated SHA-256 of one affinity scope.
 fn digest_scope(scope: &str) -> String {
     let mut hasher = Sha256::new();
@@ -103,12 +162,12 @@ fn digest_scope(scope: &str) -> String {
     hex::encode(&hasher.finalize()[..TOKEN_BYTES])
 }
 
-/// Affinity token for requests made outside any conversation scope.
+/// Affinity token for inference requests made outside any conversation scope.
 ///
-/// Warmup probes and other calls that never enter the agent loop still have to
-/// carry a header, or the Go models that reject header-less requests would fail
-/// on exactly those paths. One process-stable random token keeps them pinned
-/// together without inventing a conversation identity for them.
+/// Model calls that never enter the agent loop still have to carry a header, or
+/// the Go models that reject header-less requests would fail on exactly those
+/// paths. One process-stable random token keeps them pinned together without
+/// inventing a conversation identity for them.
 fn process_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
     TOKEN.get_or_init(|| digest_scope(&uuid::Uuid::new_v4().to_string()))
@@ -213,7 +272,7 @@ mod tests {
     #[test]
     fn opencode_target_always_yields_a_token() {
         // Outside any conversation scope the process token still applies, so
-        // warmup-style calls are never header-less.
+        // inference calls made outside the agent loop are never header-less.
         let token = session_token("https://opencode.ai/zen/go/v1")
             .expect("OpenCode target must always carry an affinity token");
         assert_eq!(token.len(), TOKEN_BYTES * 2);
@@ -309,6 +368,120 @@ mod tests {
             process_token(),
             "a spawned read falls back to the process token"
         );
+    }
+
+    #[test]
+    fn only_a_valid_pinned_value_counts_as_an_operator_pin() {
+        let pin = |name: &str, value: &str| {
+            std::collections::HashMap::from([(name.to_string(), value.to_string())])
+        };
+        assert!(operator_pinned_session(&pin(
+            "x-opencode-session",
+            "fixed-scope"
+        )));
+        assert!(operator_pinned_session(&pin(
+            "X-Opencode-Session",
+            "fixed-scope"
+        )));
+        // The client builders drop a value that is not a valid header value, so
+        // it must not suppress the derived token.
+        assert!(!operator_pinned_session(&pin(
+            "x-opencode-session",
+            "bad\nvalue"
+        )));
+        assert!(!operator_pinned_session(&pin(
+            "x-other-header",
+            "fixed-scope"
+        )));
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_follows_same_host_and_stops_cross_host() {
+        use axum::{Router, http::StatusCode, response::Redirect, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        async fn serve(app: Router) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let _server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            addr
+        }
+
+        let elsewhere_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&elsewhere_hits);
+        let elsewhere = serve(Router::new().route(
+            "/collect",
+            get(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        ))
+        .await;
+        let cross_target = format!("http://{elsewhere}/collect");
+        let origin = serve(
+            Router::new()
+                .route("/same", get(|| async { Redirect::temporary("/final") }))
+                .route("/final", get(|| async { StatusCode::OK }))
+                .route(
+                    "/cross",
+                    get(move || {
+                        let target = cross_target.clone();
+                        async move { Redirect::temporary(&target) }
+                    }),
+                ),
+        )
+        .await;
+
+        let restricted = reqwest::Client::builder()
+            .redirect(redirect_policy())
+            .build()
+            .expect("client");
+        let send = |client: &reqwest::Client, path: &str| {
+            client
+                .get(format!("http://{origin}{path}"))
+                .header(OPENCODE_SESSION_HEADER, "affinity-token")
+                .send()
+        };
+
+        let same = send(&restricted, "/same").await.expect("same-host request");
+        assert_eq!(
+            same.status(),
+            StatusCode::OK,
+            "same-host redirects still follow"
+        );
+
+        let cross = send(&restricted, "/cross")
+            .await
+            .expect("cross-host request");
+        assert_eq!(
+            cross.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "a cross-host redirect is handed back, not followed"
+        );
+        assert_eq!(
+            elsewhere_hits.load(Ordering::SeqCst),
+            0,
+            "the header must not reach the redirect target"
+        );
+
+        // Control: reqwest's default policy does follow it, so the assertion
+        // above is what keeps the header on the origin.
+        let default_client = reqwest::Client::new();
+        let followed = send(&default_client, "/cross")
+            .await
+            .expect("default request");
+        assert_eq!(followed.status(), StatusCode::OK);
+        assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

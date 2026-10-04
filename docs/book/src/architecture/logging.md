@@ -3,10 +3,11 @@
 ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro fires a `tracing` event that the installed subscriber feeds to two sibling layers: the stderr fmt layer (terminal output) and the `LogCaptureLayer`. The fmt layer prints colored, alias-prefixed lines on stderr (muted unless `--verbose`). The `LogCaptureLayer` materializes a structured `LogEvent` and fans it out, via `writer::record_event`, to:
 
 1. The optional Observer bridge (`observer_bridge::forward`) for the subset of actions that map to typed Prometheus / OTel events, but only when a caller has installed a binding with `set_observer_bridge`. The current production bootstrap does not install one.
-2. The process-wide broadcast channel for live subscribers such as the dashboard's SSE stream.
-3. The asynchronous JSONL writer for `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
+2. The optional native OTLP log exporter (`export_bridge` plus runtime `otel_logs`) when an `observability-otel` build runs with `backend = "otel"`.
+3. The process-wide broadcast channel for live subscribers such as the dashboard's SSE stream.
+4. The asynchronous JSONL writer for `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
 
-When the Observer bridge is bound, its projection and the broadcast send happen before the persistence enqueue attempt. Those three destinations have different completeness and durability guarantees; sharing one `LogEvent` does not make them interchangeable.
+When configured, the Observer projection, OTLP queue, and broadcast send happen before the persistence enqueue attempt. Those four destinations have different completeness and durability guarantees; sharing one `LogEvent` does not make them interchangeable.
 
 ## Read this first: attribution is not attrs
 
@@ -102,6 +103,10 @@ zeroclaw_log::scope!(
 ).await
 ```
 
+SOP step execution uses the same mechanism with `sop_run_id`. Unlike a turn's
+`trace_id`, this attribution is stable across every nested step turn in the run,
+so the gateway, CLI, and TUI can all query one durable correlation key.
+
 `scope!` straddles the attribution/attrs line deliberately: field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed `zeroclaw.*` attribution slot; everything else lands in the event `attributes` map for every descendant emission. Either way the value rides on every nested `record!` without being a call-site argument.
 
 ## The `record!` macro and its call-site contract
@@ -186,6 +191,7 @@ The layer in `crates/zeroclaw-log/src/layer.rs` is a `tracing-subscriber` Layer 
 2. On span creation/record with target `"zeroclaw_log_internal_scope"` (`scope!`-opened): parses ad-hoc kvps and stashes them similarly.
 3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and hands the final event to `writer::record_event`, which fans out in this order:
    - Observer bridge (`observer_bridge.rs`) for mapped Prometheus / OTel typed events when an Observer is bound.
+   - Native structured-log bridge (`export_bridge.rs`) for every canonical event when an exporter is installed; the `observability-otel` runtime maps it to an SDK LogRecord and queues OTLP/HTTP protobuf export.
    - Broadcast hook (`broadcast.rs`) for current SSE/dashboard subscribers when a sender is installed.
    - JSONL persistence (`writer.rs`), offered last to the asynchronous writer queue only when `log_persistence` is enabled.
 
@@ -226,38 +232,119 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 | Destination | Owner | Contract and loss boundary |
 |---|---|---|
 | Optional typed Observer bridge | `observer_bridge.rs` | `forward` is a no-op until an Observer is explicitly bound, and the current production bootstrap does not bind one. When bound, it forwards synchronously but projects only actions recognized by `project`; the current mapping may omit actions or default fields. Treat it as a selective metrics/tracing projection, not a complete event ledger, and inspect `project` for the current field mapping. |
+| Native OTLP logs | `export_bridge.rs` + `observability/otel_logs.rs` | Present only in an `observability-otel` build with `backend = "otel"`. Every canonical event is synchronously handed to the OpenTelemetry SDK's nonblocking batch queue, then exported as OTLP/HTTP protobuf. Queue/export failures do not block or disable JSONL/broadcast. Reconfiguration and Observer flush request a batch flush, but an abrupt process death can still lose queued records. Ephemeral broadcast attributes never reach this bridge. |
 | Live broadcast | `broadcast.rs` and its consumer | Sends the structured event to current in-process subscribers. A subscriber only sees events emitted after it subscribes, bounded receivers can lag, and the gateway SSE adapter skips lagged frames. Broadcast-only ephemeral attributes may appear in an authenticated live frame but are excluded from persisted JSONL. This is a live notification path, not replayable evidence. |
 | Persisted JSONL | `writer.rs` | Enqueues the serialized event without blocking the runtime. The bounded queue can drop an event when full, worker write failures are warnings, and periodic `sync_all` covers only the current active file. Daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. Persistence mode then decides whether the active file is trimmed, retained indefinitely, or rotated. This is best-effort operational history, not a transactional audit log. |
 
-Do not use Observer output or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
+Do not use Observer, OTLP, or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached OTLP or live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
 
-## Reader cursors belong to one active file
+## Observer events share the same bus
 
-`GET /api/logs` resolves the writer's current active path and calls `reader::load_page`. The reader scans that one JSONL file, keeps the newest matching window, and returns events newest first. It does not merge rotated archives.
+Typed observer events (`agent_start`, `agent_end`, `llm_request`, `tool_call`, `tool_call_start`, `history_trimmed`, `error`) reach the same broadcast channel through a separate path: `zeroclaw_runtime::observability::broadcast`. Every observer built by `create_observer` tees into one process-wide broadcast hook, and an `EventBus` (the live sender plus a 500-frame history buffer) supplies that hook.
 
-The primary pagination cursor is `next_cursor_line_offset`, the byte offset immediately after the oldest matching event on the current page. A caller passes it back as `until_line_offset`; the next scan stops before that line and returns older matches. Pure appends preserve the prefix addressed by an existing cursor, so later events do not disturb an in-progress walk.
+- **Under the daemon**, `daemon::run` creates the bus and installs its hook once, whether or not the gateway runs. RPC `logs/subscribe` therefore carries these frames with the gateway off. A supervised gateway reuses the daemon's bus and installs nothing, so each frame is delivered once and buffered once.
+- **A standalone gateway** (`zeroclaw gateway start`) builds and installs its own bus.
+- **History:** `GET /api/events/history` and RPC `events/history` (grant `Logs:Read`) replay the buffered observer frames, oldest first. Like live delivery, they never carry pairing credentials: frames with the ephemeral marker are withheld from history, and `logs/subscribe` withholds them from live delivery.
 
-The offset is not a durable event identity or cross-file checkpoint. It becomes stale whenever the active file's bytes are replaced or its path changes:
+Log-layer frames sent directly on the channel are live-only; the history buffer holds observer frames only.
 
-- `rolling` trim streams the retained tail to a temporary file and renames it over the active path.
+## RPC subscriptions are replayable and never end silently
+
+RPC streams do not read the broadcast channel directly. A `SubscriptionHub` (`zeroclaw_runtime::rpc::subscription`) copies the bus into bounded rings, one per source, and every subscriber is just a cursor into a ring. Two sources exist today:
+
+| Method | Ring | Notification |
+|---|---|---|
+| `logs/subscribe` | every bus frame | `logs/event` |
+| `events/subscribe` | observer frames only | `events/event` |
+
+- **Bounds:** each ring is capped at 2,048 frames and 4 MiB, and all rings share a 16 MiB process-wide budget. Over budget, the oldest frame across all rings is evicted.
+- **Producers never wait for a subscriber;** a slow subscriber only falls behind.
+- **Sequence numbers:** start at 1 per source. Every notification carries `subscription_id` and its `seq`. The subscribe result returns the newest `seq` and the hub's `epoch`.
+- **Epochs:** every hub (every daemon start or reload) gets a new random `epoch`, and numbering restarts at 1, so a sequence number means nothing outside its epoch.
+- **Resume:** `X/subscribe{since_seq, epoch}` replays the frames after `since_seq` that are still buffered, then continues live, but only when `epoch` matches.
+  - With a different epoch, or none, the client gets `subscription/lagged` with `epoch_changed: true`, then every frame the new hub still buffers.
+  - A `since_seq` ahead of the newest frame in the same epoch is refused with `INVALID_PARAMS`.
+- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, or overrun on the bus) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`. `from_seq` is never greater than `resume_seq`. A replay batch stops at a gap, so the cursor never jumps over a recorded loss.
+- **Cancel:** `subscription/cancel{subscription_id}` (grant `Logs:Read`, the same as subscribing) ends one subscription on the calling connection. Closing the connection ends them all.
+- **Authority:** these streams and `events/history` are unscoped-only. Their frames come from every principal's work (session messages, cron results, log lines), and many name no owner, so they cannot be filtered per principal. The caller needs `Logs:Read`, and it must be an administrator or the unauthenticated shared operator, the same principals that bypass session ownership. An authenticated non-admin principal is refused, even with the `*` agent selector: addressing every agent is not owning every user's sessions.
+- **Recheck:** every delivery, whether a frame or a `lagged` notice, is rechecked against the caller's live credential. When the policy changes, the principal is resolved again, and demoting it or removing `Logs:Read` ends the stream.
+- **Replay reach:** an administrator or the shared operator can replay frames from before it connected, up to the ring caps.
+- **Pairing credentials** are dropped before they reach a ring, so neither stream can deliver or replay them.
+
+## Reader cursors span the active file and retained archives
+
+`GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns segment
+enumeration. What it merges depends on the installed storage policy: only
+`rotating` owns archives, so only under `rotating` does the reader merge the
+active file with retained archives into one logical event stream. Under
+`rolling`, `full`, and `none` it reads the active file alone, even when
+timestamped files from an earlier `rotating` configuration are still present
+beside it; those are unmanaged and not part of the policy's logical stream.
+Segments are scanned oldest-archive-first and the merged result is returned
+newest-first, identical to the prior single-file semantics. The merge is
+sequential and in-process; no event is re-serialized.
+
+Segment order comes from a sequence number written into each archive name at
+rotation time, not from file mtimes. Ordering by mtime would be an observation
+made at enumeration time, and several rotations landing during one read can
+leave it describing an order that no longer holds. Archives written before
+sequence numbering existed carry no number; they are ordered by mtime and sort
+before every numbered archive.
+
+The primary pagination cursor is `next_segment_cursor`, an opaque string. Pass
+it back verbatim as `until_segment_cursor` to resume; do not construct or parse
+it. Its internal shape depends on which segment the page ended in, because the
+three segment kinds have different stability properties:
+
+- A **numbered archive** is addressed by the sequence number written into its
+  name at rotation. A best-effort sidecar keeps numbers monotonic across normal
+  restarts. If its write fails, retention removes all numbered archives, and
+  the daemon restarts, a number can be reused and an outstanding cursor can
+  bind to newer history.
+- A **legacy archive**, written before sequence numbering existed, is addressed
+  by filename. An archive name is never reassigned to different content, so this
+  is stable in the same way.
+- The **active file** is addressed by offset plus an anchor event id. Its path
+  is stable but its content is replaced on each rotation, so the anchor is what
+  lets the reader detect that a rotation happened and resume from the archive
+  the anchored event now lives in.
+
+The legacy byte-offset cursor `next_cursor_line_offset` / `until_line_offset`
+remains valid and resolves against the active file only. It is `None` when the
+oldest event on the current page is in an archive file. For multi-segment
+deployments, use `next_segment_cursor` instead.
+
+The offset is not a durable event identity or cross-file checkpoint. A segment
+cursor becomes unresolvable when the segment it names has been pruned by
+retention; the reader then reports the history as finished rather than resuming
+at an unrelated position, so a paging client stops where it was instead of
+silently jumping back to the newest events. A byte-offset cursor becomes stale
+whenever the active file's bytes are replaced or its path changes:
+
 - `rotating` renames the active file to an archive; the next append creates a new active file.
 - schema migration rewrites the active file through a temporary file and atomic rename.
 - a daemon config reload can install a new persistence path.
 
-After one of those boundaries, restart pagination from the newest page. Reusing the old number can duplicate, skip, or return unrelated rows because the API does not attach file identity or generation metadata to the cursor. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
+After one of those boundaries, restart pagination from the newest page. The legacy timestamp/ID cursor remains for compatibility but is deprecated under [#8012](https://github.com/zeroclaw-labs/zeroclaw/issues/8012) because lexicographic ID ordering can skip tied events.
+
+Enumeration and reading are not atomic, so a rotation can land between them: the listing names the pre-rotation active file, the rename turns that file into an archive, and the scan reads the fresh replacement instead. The rotated-away events would then sit unlisted between two segments the page did read, unreachable forever because pagination only walks toward older history. The reader re-checks the archive set after the read and redoes the page when it moved. Checking afterwards rather than before is what closes the window, because a check before opening leaves room for a rotation between the check and the open. The same race exists inside enumeration itself: the archives are listed first and the active path is stat'd second, and a rotation landing between those steps hides the data from both halves, because the vacuum between the rename and the next append leaves the active path absent. So the re-check is skipped only for a page that stops short of a *listed* active file; archives are immutable, so such a scan cannot have raced anything, but a listing with no active file at all is verified like any other.
+
+A segment that cannot be read is logged, left out of the merged view, and marked in the response with `incomplete: true` rather than failing the whole query, since one bad file should not cost the caller every other segment. `at_end` is then scoped to what could be read, and the flag is what tells the caller so; the daemon's own log reaches the operator, not the client that has to decide whether to keep paging. Single-event lookup carries the same distinction: a hit is authoritative however many segments were skipped, but a miss over a skipped segment is reported as unreadable-history rather than `not found`.
+
+Archive discovery rejects symlinks. Matching the writer's filename shape is not path confinement, and following a link would let anyone who can write into the log directory point an archive-shaped name at any file the daemon can read. Validation and open are separate operations, so an actor who can replace entries in the log directory can still race a validated archive into a symlink before it is opened; deployments must keep the log directory trusted until the reader uses no-follow or descriptor-stable opens.
 
 ## Persistence policy owns rewrites and retention
 
-`StoragePolicy` in `config.rs` controls only the JSONL destination. Observer and broadcast delivery remain independent of it.
+`StoragePolicy` in `config.rs` controls only the JSONL destination. Observer, OTLP, and broadcast delivery remain independent of it.
 
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|
 | `none` | No new JSONL writes. | None. |
-| `rolling` | After an append exceeds `max_entries`, stream only the newest non-empty lines to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
+| `rolling` | After each append past `max_entries`, rewrite the retained tail entries to a temporary file and rename it over the active file. | The writer keeps the configured active-window size. It creates no archives and leaves archives from an earlier `rotating` configuration unmanaged. |
 | `full` | Append without writer-managed trim or rotation. | The operator owns file growth and any external rotation. |
-| `rotating` | Before a new UTC day's first append, or after an append reaches the byte threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
+| `rotating` | Before a new UTC day's first append, or after an append reaches the byte or entry-count threshold, rename the active file to a timestamped archive. | After each successful rotation, the writer prunes matching archives by age and then count. Removal is best-effort and never fails the enclosing append. |
 
-Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's timestamped archive shape. The live `/api/logs` reader still sees only the active file; archives are offline diagnostic artifacts.
+Age and count retention run only after rotation. They do not sweep continuously, do not apply to `full` or `rolling`, and do not delete arbitrary neighboring files: archive discovery accepts only names generated from the active path's archive shape. Under `rotating`, the live `/api/logs` reader merges the active file with all retained archives; under the other policies it reads the active file alone. See [Reader cursors](#reader-cursors-span-the-active-file-and-retained-archives).
 
 ## Schema migration is an active-file rewrite
 
@@ -269,7 +356,7 @@ Migration is best-effort. Its cheap schema check stops at the first non-empty ro
 
 ## `LogConfig` vs `ObservabilityConfig`
 
-`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_persistence_max_entries_per_segment`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
 
 ## Subscriber installation
 

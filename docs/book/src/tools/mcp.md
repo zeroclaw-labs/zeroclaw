@@ -62,6 +62,7 @@ key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
 name = "parallel"
 transport = "http"
 url = "https://search.parallel.ai/mcp"
+headers = { "User-Agent" = "ZeroClaw" }
 
 [mcp_bundles.web]
 servers = ["parallel"]
@@ -69,6 +70,12 @@ servers = ["parallel"]
 [agents.assistant]
 mcp_bundles = ["web"]
 ```
+
+The `User-Agent` identifies ZeroClaw project-wide so Parallel can measure
+aggregate integration usage to understand adoption and support it. Keep this
+header on HTTP requests if the transport changes. Preserve existing headers;
+if you already set a `User-Agent`, append `ZeroClaw` to its existing project and
+HTTP client tokens instead of replacing them.
 
 Merge these entries into your existing `config.toml`, using the alias of the
 agent you want to grant access. Add `"web"` to that agent's existing
@@ -132,9 +139,9 @@ default trust store. Stdio servers ignore it.
 
 MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
 
-- At autonomy `level = full`, no tool call prompts (MCP tools included).
+- At autonomy `level = full`, uncovered tool calls do not prompt (MCP tools included). A name (or `"*"`) in `always_ask` still prompts, including under Full.
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
-- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
+- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve` and Full autonomy.
 
 ### Authorization: `allowed_tools` / `excluded_tools`
 

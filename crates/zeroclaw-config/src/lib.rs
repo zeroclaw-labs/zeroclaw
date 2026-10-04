@@ -6,6 +6,7 @@
 #![allow(clippy::to_string_in_format_args)]
 #![allow(clippy::useless_format)]
 
+pub mod agent_bundle;
 pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
@@ -34,6 +35,7 @@ pub mod skill_bundles;
 pub mod traits;
 pub mod typed_value;
 pub mod validation_warnings;
+pub mod write_lock;
 
 /// Shim module so `Configurable` derive macro's generated `crate::config::*` paths resolve.
 /// The macro was written assuming it runs inside the root crate where `mod config` exists.

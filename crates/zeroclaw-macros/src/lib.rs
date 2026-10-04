@@ -16,9 +16,18 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     ident == "Vec" || ident == "HashMap"
 }
 
-/// Check if any `#[serde(...)]` attribute on the field contains `skip`.
+/// Check if any `#[serde(...)]` attribute on the field contains `skip` or
+/// `skip_serializing`, both of which keep the field out of property
+/// enumeration.
+///
+/// `skip_serializing` (the bare form, not `skip_serializing_if`) marks a
+/// write-only field: it may still deserialize, but it is never written back
+/// out. Such a field cannot be a settable property, because a `set_prop` on
+/// it is silently discarded by the next save and the value is gone after the
+/// following reload. Excluding it here keeps property enumeration limited to
+/// fields that actually survive a save/reload round-trip.
 fn has_serde_skip(field: &syn::Field) -> bool {
-    has_serde_meta(field, "skip")
+    has_serde_meta(field, "skip") || has_serde_meta(field, "skip_serializing")
 }
 
 fn has_serde_flatten(field: &syn::Field) -> bool {
@@ -2722,6 +2731,7 @@ fn build_integration_descriptor_method(
     let mut display_name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut status_field: Option<syn::LitStr> = None;
+    let mut status_method: Option<syn::LitStr> = None;
     let mut found = false;
 
     for attr in attrs {
@@ -2753,6 +2763,7 @@ fn build_integration_descriptor_method(
                 "display_name" => display_name = Some(value.value()),
                 "description" => description = Some(value.value()),
                 "status_field" => status_field = Some(value.clone()),
+                "status_method" => status_method = Some(value.clone()),
                 _ => {}
             }
         }
@@ -2765,9 +2776,33 @@ fn build_integration_descriptor_method(
     let category_lit = category.unwrap_or_default();
     let display_name_lit = display_name.unwrap_or_default();
     let description_lit = description.unwrap_or_default();
-    let status_field_ident = match status_field {
-        Some(name) => name.parse::<syn::Ident>()?,
-        None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
+    // Two ways to answer "is this integration active?". `status_field` names
+    // a single bool field and stays the default (`enabled`). `status_method`
+    // names a zero-argument `&self -> bool` method, for integrations whose
+    // activation is a predicate over several fields — e.g. a config that
+    // gates two separate tools on two independent flags, where neither flag
+    // alone is the operator-visible status. They are mutually exclusive:
+    // accepting both would give one descriptor two disagreeing sources.
+    let active_expr = match (status_field, status_method) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`status_field` and `status_method` are mutually exclusive; use \
+                 `status_method` when activation depends on more than one field",
+            ));
+        }
+        (None, Some(method)) => {
+            let ident = method.parse::<syn::Ident>()?;
+            quote! { self.#ident() }
+        }
+        (Some(field), None) => {
+            let ident = field.parse::<syn::Ident>()?;
+            quote! { self.#ident }
+        }
+        (None, None) => {
+            let ident = syn::Ident::new("enabled", proc_macro2::Span::call_site());
+            quote! { self.#ident }
+        }
     };
 
     Ok(quote! {
@@ -2780,7 +2815,7 @@ fn build_integration_descriptor_method(
                 display_name: #display_name_lit,
                 description: #description_lit,
                 category: #category_lit,
-                active: self.#status_field_ident,
+                active: #active_expr,
             }
         }
     })
@@ -2911,6 +2946,25 @@ mod tests {
     }
 
     #[test]
+    fn has_serde_skip_detects_skip_serializing() {
+        // A write-only compatibility shim: it still deserializes (and
+        // discards what it read), but it is never serialized back out, so it
+        // must not be enumerated as a settable property.
+        let field: syn::Field = parse_quote! {
+            #[serde(default, skip_serializing, deserialize_with = "f")]
+            pub nevis: Option<serde_json::Value>
+        };
+        assert!(has_serde_skip(&field));
+
+        // Bare `skip_serializing` only: still skipped.
+        let field: syn::Field = parse_quote! {
+            #[serde(skip_serializing)]
+            pub shim: Option<String>
+        };
+        assert!(has_serde_skip(&field));
+    }
+
+    #[test]
     fn has_serde_skip_no_serde_attr() {
         let field: syn::Field = parse_quote! {
             pub name: String
@@ -2940,5 +2994,77 @@ mod tests {
         }];
 
         assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_status_method_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_rejects_status_field_and_status_method_together() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled",
+                status_method = "integration_active"
+            )]
+        }];
+
+        assert!(
+            build_integration_descriptor_method(&attrs).is_err(),
+            "two status sources for one descriptor must be rejected"
+        );
+    }
+
+    #[test]
+    fn integration_status_method_emits_method_call() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "integration_active"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_method descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . integration_active ()"),
+            "expected a method call for the active field, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn integration_status_field_emits_field_access() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_field descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . enabled ,"),
+            "expected a plain field read for the active field, got: {tokens}"
+        );
     }
 }

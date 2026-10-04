@@ -1,4 +1,7 @@
 //! The CI gate: every fixture in evals/regression must replay green.
+//!
+//! Repository-only. The corpus lives outside this package, so `cargo package`
+//! excludes this target from the published crate archive.
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;

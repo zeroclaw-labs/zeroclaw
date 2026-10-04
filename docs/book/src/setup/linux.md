@@ -40,17 +40,15 @@ Homebrew-on-Linux installs follow Homebrew's service path convention, your works
 
 ### NixOS
 
-A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
+The upstream flake provides the ZeroClaw CLI. With Nix and flakes enabled:
 
-### A note on `cargo binstall` and `nix run`
+```sh
+nix run github:zeroclaw-labs/zeroclaw -- --version
+```
 
-Neither works yet. `cargo binstall zeroclaw` resolves crate metadata from
-crates.io, but ZeroClaw is not published there (`publish = false`), so there is
-nothing for it to fetch; `nix run github:zeroclaw-labs/zeroclaw` does not launch
-the agent because the flake exposes only a dev toolchain, not a runnable package
-([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)). `install.sh`
-already does what `binstall` would (download a prebuilt release binary), so it
-remains the supported one-liner.
+See [NixOS](./nixos.md) for source builds, the Nixpkgs package, and the
+multi-instance NixOS service module. For prebuilt binaries, use the installer
+described above.
 
 ## System dependencies
 

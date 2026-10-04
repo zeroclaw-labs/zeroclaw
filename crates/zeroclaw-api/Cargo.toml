@@ -23,6 +23,7 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [features]
+default = ["schema-export"]
 schema-export = ["dep:schemars"]
 
 [dev-dependencies]
