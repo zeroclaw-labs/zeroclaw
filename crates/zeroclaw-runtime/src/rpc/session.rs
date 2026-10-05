@@ -289,6 +289,8 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) configure_writer_waiting: tokio::sync::Notify,
     cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
@@ -388,6 +390,8 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            configure_writer_waiting: tokio::sync::Notify::new(),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),

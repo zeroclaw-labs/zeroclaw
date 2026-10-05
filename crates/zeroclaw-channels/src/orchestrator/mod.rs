@@ -10037,6 +10037,7 @@ async fn process_channel_message_body(
                 served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    run_cancellation: None,
                     live_config: Some(Arc::clone(&ctx.live_config)),
                 }),
             }));
@@ -16610,6 +16611,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
             Some(authority.execution_capability()),
+            None,
         )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the

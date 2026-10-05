@@ -149,6 +149,12 @@ pub(crate) async fn prepare_tool_calls(
     let mut retained_hook_contexts: Vec<(ToolCallHookContext, String)> = Vec::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
+        if let Err(error) = ctx.ensure_not_cancelled() {
+            for (context, tool) in &retained_hook_contexts {
+                abandon_prepared_context(ctx, context, tool).await;
+            }
+            return Err(error);
+        }
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
@@ -214,6 +220,13 @@ pub(crate) async fn prepare_tool_calls(
                     tool_name = name;
                     tool_args = args;
                 }
+            }
+            if let Err(error) = ctx.ensure_not_cancelled() {
+                for (context, tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, context, tool).await;
+                }
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                return Err(error);
             }
         }
 
@@ -282,6 +295,13 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
+        if let Err(error) = ctx.ensure_not_cancelled() {
+            for (context, tool) in &retained_hook_contexts {
+                abandon_prepared_context(ctx, context, tool).await;
+            }
+            abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+            return Err(error);
+        }
         // The batch position comes from this enumeration, so the card can say
         // which of the model's calls it is describing. It counts every call in
         // the batch, not just the ones that need approval.
@@ -316,6 +336,13 @@ pub(crate) async fn prepare_tool_calls(
                     return Err(ToolLoopCancelled.into());
                 }
             };
+        if let Err(error) = ctx.ensure_not_cancelled() {
+            for (context, tool) in &retained_hook_contexts {
+                abandon_prepared_context(ctx, context, tool).await;
+            }
+            abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+            return Err(error);
+        }
         let runtime_command_approved = approved
             && ctx
                 .approval
@@ -1245,6 +1272,65 @@ mod tests {
                 "abandoned:second:test-turn:3:1".to_string(),
             ],
             "a fully aborted execution batch abandons every executable context"
+        );
+    }
+    struct CancelRunOnSecond(tokio_util::sync::CancellationToken);
+    #[async_trait]
+    impl crate::hooks::HookHandler for CancelRunOnSecond {
+        fn name(&self) -> &str {
+            "cancel-run-on-second"
+        }
+        async fn before_tool_call_with_context(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            if name == "second" {
+                self.0.cancel();
+            }
+            crate::hooks::HookResult::Continue((name, args))
+        }
+    }
+    #[tokio::test]
+    async fn run_cancellation_after_before_hook_abandons_entire_prepared_batch_once() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: events.clone(),
+            cancel_before_for: Vec::new(),
+        }));
+        runner.register(Box::new(CancelRunOnSecond(cancellation.clone())));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        ctx.cancellation_token = Some(&cancellation);
+        let calls = [
+            parsed_call("first", serde_json::json!({}), "first"),
+            parsed_call("second", serde_json::json!({}), "second"),
+        ];
+        let result = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:first:test-turn:0:0",
+                "before:second:test-turn:0:1",
+                "abandoned:first:test-turn:0:0",
+                "abandoned:second:test-turn:0:1"
+            ]
         );
     }
 }

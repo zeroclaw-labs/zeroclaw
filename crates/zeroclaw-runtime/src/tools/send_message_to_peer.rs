@@ -24,8 +24,10 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_log::Instrument as _;
 
 const PEER_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const PEER_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -37,6 +39,103 @@ struct PeerInboxTask {
     owner_boot_id: String,
 }
 
+// Run-local ownership of inbox obligations, not a second task registry.
+// The supervisor retains this handle outside the execution runtime and drains
+// it only after that runtime has terminated all recipient work.
+#[derive(Clone)]
+pub(crate) struct PeerSettlementOwner {
+    pending: Arc<Mutex<Vec<Arc<PeerObligation>>>>,
+    outer_runtime: tokio::runtime::Handle,
+}
+
+struct PeerObligation {
+    registry: Arc<dyn TaskRegistry>,
+    task: PeerInboxTask,
+    result: Mutex<Option<std::result::Result<String, String>>>,
+    admission: Option<AgentExecutionAdmission>,
+}
+
+tokio::task_local! { static PEER_SETTLEMENT_OWNER: PeerSettlementOwner; }
+
+impl PeerSettlementOwner {
+    pub(crate) fn current() -> Option<Self> {
+        PEER_SETTLEMENT_OWNER.try_with(Clone::clone).ok()
+    }
+
+    pub(crate) fn new(outer_runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(Vec::new())),
+            outer_runtime,
+        }
+    }
+
+    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
+        PEER_SETTLEMENT_OWNER.scope(self.clone(), future).await
+    }
+
+    async fn initialize_control_plane(
+        &self,
+        data_dir: std::path::PathBuf,
+    ) -> Result<ControlPlaneHandle> {
+        self.outer_runtime
+            .spawn(
+                async move { crate::control_plane::non_daemon_control_plane(&data_dir).await }
+                    .in_current_span(),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value)
+    }
+
+    pub(crate) async fn drain(&self) {
+        // Execution runtime has stopped: no descendant can add an obligation.
+        loop {
+            let next = self.pending.lock().first().cloned();
+            let Some(next) = next else { break };
+            next.settle().await;
+            self.finish(&next);
+        }
+    }
+
+    fn finish(&self, slot: &Arc<PeerObligation>) {
+        self.pending
+            .lock()
+            .retain(|pending| !Arc::ptr_eq(pending, slot));
+    }
+}
+
+pub(crate) async fn scope_peer_settlements<F: Future>(
+    owner: Option<PeerSettlementOwner>,
+    future: F,
+) -> F::Output {
+    match owner {
+        Some(owner) => owner.scope(future).await,
+        None => future.await,
+    }
+}
+
+impl PeerObligation {
+    fn capture(&self, result: &Result<String>) {
+        *self.result.lock() = Some(match result {
+            Ok(output) => Ok(output.clone()),
+            Err(error) => Err(format!("{error:#}")),
+        });
+    }
+
+    async fn settle(&self) {
+        let result = self
+            .result
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Err("peer recipient stopped before producing a result".to_string()))
+            .map_err(anyhow::Error::msg);
+        // Keep the selected admission alive through all retries. CAS false
+        // also confirms absent/changed-owner rows without overwriting a winner.
+        let _admission = &self.admission;
+        let _ = settle_peer_inbox_task(self.registry.as_ref(), &self.task, result).await;
+    }
+}
+
 /// Send a message to a peer on a shared channel. Bound to a single
 /// calling agent's alias; the tool validates every send against that
 /// agent's resolved peer set.
@@ -45,7 +144,12 @@ pub struct SendMessageToPeerTool {
     live_config: Option<Arc<RwLock<Config>>>,
     sender_alias: String,
     description: String,
+    /// Set when the caller is a supervised run that owns a durable claim (the
+    /// cron scheduler's private runtime). See
+    /// [`with_run_owned_cancellation_token`](Self::with_run_owned_cancellation_token).
+    run_owned_cancellation: Option<CancellationToken>,
     task_control_plane: Option<ControlPlaneHandle>,
+    settlement_owner: Option<PeerSettlementOwner>,
     execution_capability: Option<AgentExecutionCapability>,
 }
 
@@ -75,9 +179,29 @@ impl SendMessageToPeerTool {
             live_config,
             sender_alias,
             description,
+            run_owned_cancellation: None,
             task_control_plane: None,
+            settlement_owner: PeerSettlementOwner::current(),
             execution_capability,
         }
+    }
+
+    /// Bind this tool to a supervised run that owns a durable claim.
+    ///
+    /// In-process delivery to a peer agent normally detaches the recipient's
+    /// turn and reports acceptance immediately. Under a supervised run the
+    /// detached task lives on the run's private runtime, which is dropped once
+    /// the run returns, so an already-accepted send would be aborted mid-turn.
+    /// With this token set, the recipient runs inline under the caller's run
+    /// instead: the run is the delivery's lifecycle owner, the run deadline
+    /// bounds it, and the tool reports the outcome it actually observed.
+    #[must_use]
+    pub fn with_run_owned_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.run_owned_cancellation = Some(token);
+        if self.settlement_owner.is_none() {
+            self.settlement_owner = PeerSettlementOwner::current();
+        }
+        self
     }
 
     pub fn with_control_plane(mut self, handle: ControlPlaneHandle) -> Self {
@@ -257,7 +381,15 @@ impl Tool for SendMessageToPeerTool {
                 .or_else(|| global_control_plane().cloned());
             let control_plane = match control_plane {
                 Some(handle) => handle,
-                None => match crate::control_plane::non_daemon_control_plane(&cfg.data_dir).await {
+                None => match if let Some(owner) = self
+                    .settlement_owner
+                    .clone()
+                    .or_else(PeerSettlementOwner::current)
+                {
+                    owner.initialize_control_plane(cfg.data_dir.clone()).await
+                } else {
+                    crate::control_plane::non_daemon_control_plane(&cfg.data_dir).await
+                } {
                     Ok(handle) => handle,
                     Err(error) => {
                         return Ok(ToolResult {
@@ -271,10 +403,31 @@ impl Tool for SendMessageToPeerTool {
                     }
                 },
             };
+            if let Some(admission) = &admission {
+                admission.revalidate()?;
+            }
             let task_store = Arc::clone(&control_plane.store);
-            let task = match admit_peer_inbox_task(
+            let owner = self
+                .settlement_owner
+                .clone()
+                .or_else(PeerSettlementOwner::current);
+            let task = PeerInboxTask {
+                id: uuid::Uuid::new_v4().to_string(),
+                owner_pid: std::process::id(),
+                owner_boot_id: control_plane.boot_id.clone(),
+            };
+            let obligation = Arc::new(PeerObligation {
+                registry: Arc::clone(&task_store),
+                task: task.clone(),
+                result: Mutex::new(None),
+                admission: admission.clone(),
+            });
+            if let Some(owner) = &owner {
+                owner.pending.lock().push(Arc::clone(&obligation));
+            }
+            let task = match admit_peer_inbox_task_with_receipt(
                 Some(task_store.as_ref()),
-                &control_plane.boot_id,
+                task,
                 &sender,
                 &recipient_alias,
                 &channel,
@@ -284,6 +437,13 @@ impl Tool for SendMessageToPeerTool {
             {
                 Ok(task) => task,
                 Err(error) => {
+                    obligation.capture(&Err(anyhow::Error::msg(format!(
+                        "peer registration failed: {error:#}"
+                    ))));
+                    obligation.settle().await;
+                    if let Some(owner) = &owner {
+                        owner.finish(&obligation);
+                    }
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -327,10 +487,115 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
-            let task_id = task.id.clone();
-            let task_owner_pid = task.owner_pid;
-            let task_owner_boot_id = task.owner_boot_id.clone();
-            zeroclaw_spawn::spawn!(async move {
+
+            if let Some(run_token) = self.run_owned_cancellation.clone() {
+                // A supervised run owns this turn, and its private runtime is
+                // dropped as soon as the run returns. Reporting the send as
+                // accepted and walking away would let that drop abort the
+                // recipient, so wait for the recipient here: the run is the
+                // delivery's lifecycle owner, its own deadline bounds the wait,
+                // and the reported outcome is the one that actually happened.
+                // The recipient stays on its own task rather than being awaited
+                // in place so this tool's future does not carry a whole agent
+                // turn's state.
+                //
+                // Re-scope the run owner on that task: a detached task does not
+                // inherit the caller's task-locals, and `process_message`
+                // rebuilds the recipient's own tool registry. Without the owner
+                // in scope the recipient's `delegate` and
+                // `send_message_to_peer` would be built with ordinary local
+                // cancellation, so a child spawned from the recipient's
+                // registry could still be running after this run releases its
+                // claim and its private runtime is dropped.
+                //
+                // `process_message` is a very large future. Keep it boxed so
+                // the delivery task holds a pointer rather than a whole agent
+                // turn's state inline, which a debug build otherwise moves
+                // across this task's stack.
+                let scoped_run_token = run_token.clone();
+                let delivery_obligation = Arc::clone(&obligation);
+                let delivery_owner = owner.clone();
+                let scope_owner = owner.clone();
+                let mut delivery = zeroclaw_spawn::spawn!(scope_peer_settlements(
+                    scope_owner,
+                    async move {
+                        crate::agent::loop_::scope_run_cancellation(scoped_run_token, async move {
+                        let principal = Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                            sender_alias: sender,
+                        });
+                        let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                            Box::pin(crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                                cfg,
+                                live_config,
+                                &recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                admission,
+                                principal,
+                            ));
+                        let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
+                        delivery_obligation.capture(&result);
+                        delivery_obligation.settle().await;
+                        if let Some(owner) = &delivery_owner { owner.finish(&delivery_obligation); }
+                        result
+                    })
+                    .await
+                    }
+                ));
+                let joined = tokio::select! {
+                    biased;
+                    () = run_token.cancelled() => None,
+                    joined = &mut delivery => Some(joined),
+                };
+                let Some(joined) = joined else {
+                    delivery.abort();
+                    let _ = delivery.await;
+                    // With a private supervisor, its runtime shutdown precedes
+                    // residual settlement. Token-only callers own termination
+                    // here and keep their ordinary settlement behavior.
+                    if owner.is_none() {
+                        obligation.settle().await;
+                    }
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} was not completed \
+                             before the owning run was cancelled; the message was not delivered"
+                        )),
+                    });
+                };
+                return Ok(match joined {
+                    Ok(Ok(_)) => ToolResult {
+                        success: true,
+                        output: format!(
+                            "delivered in-process to peer agent {canonical:?} (recipient turn completed under this run)"
+                        )
+                        .into(),
+                        error: None,
+                    },
+                    Ok(Err(e)) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} failed: {e:#}"
+                        )),
+                    },
+                    Err(join_error) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} did not run to \
+                             completion: {join_error}"
+                        )),
+                    },
+                });
+            }
+
+            let sender = self.sender_alias.clone();
+            let detached_owner = owner.clone();
+            zeroclaw_spawn::spawn!(scope_peer_settlements(detached_owner, async move {
                 // Keep the admitted recipient turn out of the cost-scope wrappers.
                 let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
                     crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
@@ -347,31 +612,12 @@ impl Tool for SendMessageToPeerTool {
                     ),
                 );
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
-                if let Err(error) = settle_peer_inbox_task(
-                    task_store.as_ref(),
-                    &PeerInboxTask {
-                        id: task_id.clone(),
-                        owner_pid: task_owner_pid,
-                        owner_boot_id: task_owner_boot_id.clone(),
-                    },
-                    result,
-                )
-                .await
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "task_id": task_id,
-                                "sender": sender,
-                                "recipient": recipient_alias,
-                                "error": format!("{error:#}"),
-                            })),
-                        "peer-message terminal settlement failed"
-                    );
+                obligation.capture(&result);
+                obligation.settle().await;
+                if let Some(owner) = &owner {
+                    owner.finish(&obligation);
                 }
-            });
+            }));
 
             return Ok(ToolResult {
                 success: true,
@@ -432,6 +678,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn admit_peer_inbox_task<F>(
     registry: Option<&dyn TaskRegistry>,
     owner_boot_id: &str,
@@ -443,14 +690,33 @@ async fn admit_peer_inbox_task<F>(
 where
     F: FnOnce(),
 {
-    let registry = registry.ok_or_else(|| {
-        anyhow::Error::msg("in-process peer delivery requires an available durable task store")
-    })?;
     let task = PeerInboxTask {
         id: uuid::Uuid::new_v4().to_string(),
         owner_pid: std::process::id(),
         owner_boot_id: owner_boot_id.to_string(),
     };
+    admit_peer_inbox_task_with_receipt(
+        registry,
+        task,
+        sender_alias,
+        recipient_alias,
+        channel,
+        dispatch,
+    )
+    .await
+}
+
+async fn admit_peer_inbox_task_with_receipt<F: FnOnce()>(
+    registry: Option<&dyn TaskRegistry>,
+    task: PeerInboxTask,
+    sender_alias: &str,
+    recipient_alias: &str,
+    channel: &str,
+    dispatch: F,
+) -> Result<PeerInboxTask> {
+    let registry = registry.ok_or_else(|| {
+        anyhow::Error::msg("in-process peer delivery requires an available durable task store")
+    })?;
     registry
         .create(TaskRecord {
             id: task.id.clone(),
@@ -894,6 +1160,83 @@ mod tests {
         }
     }
 
+    struct GatedRegistry {
+        store: SqliteTaskStore,
+        hold_create: bool,
+        created: tokio::sync::Notify,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    struct AbortCallerOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortCallerOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    struct ReleaseRegistryOnDrop(Arc<GatedRegistry>);
+    impl Drop for ReleaseRegistryOnDrop {
+        fn drop(&mut self) {
+            self.0.release.add_permits(8);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskRegistry for GatedRegistry {
+        async fn create(&self, rec: TaskRecord) -> Result<()> {
+            self.store.create(rec).await?;
+            self.created.notify_one();
+            if self.hold_create {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn heartbeat(&self, id: &str, boot: &str) -> Result<()> {
+            self.store.heartbeat(id, boot).await
+        }
+        async fn update_status(
+            &self,
+            id: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> Result<()> {
+            self.store.update_status(id, status, output, error).await
+        }
+        async fn transition_terminal_if_owner(
+            &self,
+            id: &str,
+            pid: u32,
+            boot: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> Result<bool> {
+            self.entered.notify_one();
+            let permit = self.release.acquire().await.map_err(anyhow::Error::from)?;
+            permit.forget();
+            self.store
+                .transition_terminal_if_owner(id, pid, boot, status, output, error)
+                .await
+        }
+        async fn claim_owner(&self, id: &str, pid: u32, boot: &str) -> Result<()> {
+            self.store.claim_owner(id, pid, boot).await
+        }
+        async fn get(&self, id: &str) -> Result<Option<TaskRecord>> {
+            self.store.get(id).await
+        }
+        async fn list_running(&self) -> Result<Vec<TaskRecord>> {
+            self.store.list_running().await
+        }
+        async fn list_by_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
+            self.store.list_by_agent(agent).await
+        }
+        async fn reconcile_lost(&self, id: &str, boot: &str) -> Result<bool> {
+            self.store.reconcile_lost(id, boot).await
+        }
+    }
+
     fn task_for_settlement(task_id: &str) -> PeerInboxTask {
         PeerInboxTask {
             id: task_id.to_string(),
@@ -904,6 +1247,68 @@ mod tests {
 
     fn snapshot_status(snapshot: TaskSnapshot) -> (TaskStatus, Option<String>, Option<String>) {
         (snapshot.task.status, snapshot.output, snapshot.error)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_fallback_reaper_lives_on_outer_runtime_after_private_shutdown() {
+        let directory = tempfile::tempdir().expect("isolated store");
+        let path = directory.path().to_path_buf();
+        let owner = PeerSettlementOwner::new(tokio::runtime::Handle::current());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("private runtime");
+            let handle = runtime
+                .block_on(owner.initialize_control_plane(path))
+                .expect("outer initialized store");
+            drop(runtime);
+            tx.send(handle).ok();
+        });
+        let handle = rx.await.expect("private runtime stopped");
+        worker.join().expect("worker terminated");
+        let receipt = admit_peer_inbox_task(
+            Some(handle.store.as_ref()),
+            &handle.boot_id,
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("row");
+        let mut abandoned = handle
+            .store
+            .get(&receipt.id)
+            .await
+            .expect("lookup")
+            .expect("row");
+        abandoned.id = "abandoned-after-private-shutdown".into();
+        abandoned.owner_pid = 999_999;
+        abandoned.owner_boot_id = "prior-process".into();
+        abandoned.started_at = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        handle
+            .store
+            .create(abandoned.clone())
+            .await
+            .expect("abandoned row");
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..100 {
+            if handle
+                .store
+                .get(&abandoned.id)
+                .await
+                .expect("lookup")
+                .expect("row")
+                .status
+                == TaskStatus::Lost
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("outer canonical reaper did not survive private runtime shutdown");
     }
 
     #[tokio::test]
@@ -973,6 +1378,132 @@ mod tests {
         assert!(record.parent_id.is_none());
         assert!(record.idem_key.is_none());
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_peer_result_survives_private_runtime_drop_and_blocks_retirement() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("recipient".into(), AliasedAgentConfig::default());
+        let authority = crate::LiveConfigAuthority::new(config);
+        let admission = authority
+            .execution_capability()
+            .resolve_and_admit("recipient")
+            .expect("admit");
+        let store = Arc::new(SqliteTaskStore::new_in_memory().expect("store"));
+        let task = admit_peer_inbox_task(
+            Some(store.as_ref()),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("row");
+        let owner = PeerSettlementOwner::new(tokio::runtime::Handle::current());
+        let slot = Arc::new(PeerObligation {
+            registry: store.clone(),
+            task: task.clone(),
+            result: Mutex::new(None),
+            admission: Some(admission),
+        });
+        owner.pending.lock().push(slot.clone());
+        let captured = Arc::new(tokio::sync::Notify::new());
+        let captured_worker = captured.clone();
+        let slot_worker = slot.clone();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let delivery = zeroclaw_spawn::spawn!(async move {
+                    slot_worker.capture(&Ok("immutable produced marker".into()));
+                    captured_worker.notify_one();
+                    std::future::pending::<()>().await;
+                });
+                // Receipt production occurs before JoinHandle delivery. Destroy
+                // the entire execution runtime while that delivery is pending.
+                tokio::task::yield_now().await;
+                drop(delivery);
+            });
+            drop(runtime);
+        });
+        captured.notified().await;
+        worker.join().expect("terminated execution runtime");
+        drop(slot);
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            1
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_err()
+        );
+        owner.drain().await;
+        assert!(owner.pending.lock().is_empty());
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        let snapshot = store
+            .get_snapshot(&task.id)
+            .await
+            .expect("snapshot")
+            .expect("row");
+        assert_eq!(
+            snapshot_status(snapshot),
+            (
+                TaskStatus::Completed,
+                Some("immutable produced marker".into()),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_peer_settlement_preserves_existing_terminal_winner_and_absent_receipt() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().expect("store"));
+        let task = admit_peer_inbox_task(
+            Some(store.as_ref()),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("row");
+        settle_peer_inbox_task(store.as_ref(), &task, Ok("first winner".into()))
+            .await
+            .expect("first CAS");
+        let owner = PeerSettlementOwner::new(tokio::runtime::Handle::current());
+        for receipt in [task.clone(), task_for_settlement("never-created")] {
+            let slot = Arc::new(PeerObligation {
+                registry: store.clone(),
+                task: receipt,
+                result: Mutex::new(None),
+                admission: None,
+            });
+            slot.capture(&Ok("late result".into()));
+            owner.pending.lock().push(slot);
+        }
+        owner.drain().await;
+        assert!(owner.pending.lock().is_empty());
+        assert!(store.get("never-created").await.expect("lookup").is_none());
+        let snapshot = store
+            .get_snapshot(&task.id)
+            .await
+            .expect("snapshot")
+            .expect("row");
+        assert_eq!(
+            snapshot_status(snapshot),
+            (TaskStatus::Completed, Some("first winner".into()), None)
+        );
     }
 
     #[tokio::test]
@@ -1518,6 +2049,75 @@ mod tests {
         );
     }
 
+    const PEER_COST_CHILD_ENV: &str = "ZEROCLAW_PEER_COST_EXECUTE_TEST_CHILD";
+    const PEER_COST_TEST: &str = "tools::send_message_to_peer::tests::peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget";
+    const PEER_COST_COMPLETE: &str = "peer cost execute assertions completed";
+
+    async fn run_peer_cost_child(mode: &str) -> Result<String, String> {
+        // Other suites legitimately resolve disabled process-global cost policy.
+        // A separate process isolates this real-boundary fixture, not production.
+        let output = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let stdout = output.path().join("stdout");
+        let stderr = output.path().join("stderr");
+        let mut child = tokio::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .arg(PEER_COST_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(PEER_COST_CHILD_ENV, mode)
+        .stdout(std::fs::File::create(&stdout).map_err(|error| error.to_string())?)
+        .stderr(std::fs::File::create(&stderr).map_err(|error| error.to_string())?)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+        let status =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
+                Ok(status) => status.map_err(|error| error.to_string())?,
+                Err(_) => {
+                    child.kill().await.map_err(|error| error.to_string())?;
+                    let transcript = format!(
+                        "{}\n{}",
+                        std::fs::read_to_string(&stdout).map_err(|error| error.to_string())?,
+                        std::fs::read_to_string(&stderr).map_err(|error| error.to_string())?
+                    );
+                    return Err(format!(
+                        "isolated peer cost test timed out and was reaped:\n{transcript}"
+                    ));
+                }
+            };
+        let transcript = format!(
+            "{}\n{}",
+            std::fs::read_to_string(&stdout).map_err(|error| error.to_string())?,
+            std::fs::read_to_string(&stderr).map_err(|error| error.to_string())?
+        );
+        if !status.success() {
+            return Err(format!(
+                "isolated peer cost test failed ({status}):\n{transcript}"
+            ));
+        }
+        if !transcript.contains("running 1 test")
+            || !transcript.contains("test result: ok. 1 passed;")
+            || !transcript.contains(PEER_COST_TEST)
+            || !transcript.contains(PEER_COST_COMPLETE)
+        {
+            return Err(format!(
+                "isolated peer cost body did not execute exactly once:\n{transcript}"
+            ));
+        }
+        Ok(transcript)
+    }
+
+    #[tokio::test]
+    async fn peer_cost_child_failure_propagates_status_and_output() {
+        let error = run_peer_cost_child("failure-control")
+            .await
+            .expect_err("a failing child must fail its parent wrapper");
+        assert!(error.contains("isolated peer cost test failed"), "{error}");
+        assert!(error.contains("peer cost child failure control"), "{error}");
+        assert!(error.contains("0 passed; 1 failed;"), "{error}");
+    }
+
     /// The test above exercises `deliver_peer_turn_with_cost_scope` directly
     /// with isolated trackers. This test drives the REAL tool boundary:
     /// `execute()` -> canonical-recipient resolution -> cost-context
@@ -1529,6 +2129,18 @@ mod tests {
     #[tokio::test]
     async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
     {
+        match std::env::var(PEER_COST_CHILD_ENV).as_deref() {
+            Ok("fixture") => {}
+            Ok("failure-control") => panic!("peer cost child failure control"),
+            _ => {
+                let transcript = run_peer_cost_child("fixture")
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                eprintln!("{transcript}");
+                return;
+            }
+        }
+
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::control_plane::ControlPlaneHandle;
         use crate::cost::CostTracker;
@@ -1800,6 +2412,1082 @@ mod tests {
         .await
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
+        server.abort();
+        eprintln!("{PEER_COST_COMPLETE}");
+    }
+
+    /// The in-process peer route accepts a send and, by default, lets the
+    /// recipient finish detached. A supervised cron run drops its private
+    /// runtime as soon as the parent returns, which would abort that detached
+    /// recipient after the send was already reported as accepted. Bound to a
+    /// run-owned token, the tool must instead carry the recipient to
+    /// completion under the run, so a slow recipient still finishes even
+    /// though the private runtime is destroyed the instant `execute` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_owned_peer_send_completes_delayed_recipient_before_the_runtime_is_dropped() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // The counter is bumped only after the delay, so it records a turn
+        // that ran to completion rather than one that merely started.
+        type CompletedCalls = Arc<Mutex<u32>>;
+        async fn slow_chat(
+            State(count): State<CompletedCalls>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            *count.lock() += 1;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "slow peer turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let completed: CompletedCalls = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(slow_chat))
+            .with_state(completed.clone());
+        // The mock server stays on the test runtime; only the tool call runs
+        // on the private runtime under test.
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let run_token = CancellationToken::new();
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+            Arc::new(config),
+            "sender",
+            Some(authority.config()),
+            Some(authority.execution_capability()),
+        )
+        .with_run_owned_cancellation_token(run_token);
+
+        let result = tokio::task::spawn_blocking(move || {
+            // A stand-in for the scheduler's private runtime: an owned thread
+            // driving its own current-thread runtime, destroyed the moment the
+            // supervised parent returns.
+            let worker = std::thread::Builder::new()
+                .name("peer-send-owned-test".into())
+                .spawn(move || {
+                    let private_runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("private runtime should build");
+                    let result = private_runtime.block_on(tool.execute(json!({
+                        "channel": "telegram.prod",
+                        "target": "recipient",
+                        "message": "status please"
+                    })));
+                    drop(private_runtime);
+                    result
+                })
+                .expect("private runtime thread should start");
+            worker.join()
+        })
+        .await
+        .expect("the blocking join should not panic")
+        .expect("the private runtime thread should join")
+        .expect("execute should return a tool result");
+
+        assert!(
+            result.success,
+            "a run-owned peer send must report the delivery it actually completed: {result:?}"
+        );
+        assert!(
+            result.output.as_str().contains("delivered in-process"),
+            "unexpected run-owned delivery output: {}",
+            result.output
+        );
+        assert_eq!(
+            *completed.lock(),
+            1,
+            "the slow recipient turn must have finished before the private runtime was dropped; \
+             a detached recipient would have been aborted with the send already accepted"
+        );
+
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_ok()
+        );
+        server.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_peer_send_persists_actual_provider_output_before_acknowledgement() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // The counter is bumped only after the delay, so it records a turn
+        // that ran to completion rather than one that merely started.
+        type CompletedCalls = Arc<Mutex<u32>>;
+        async fn slow_chat(
+            State(count): State<CompletedCalls>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            *count.lock() += 1;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "slow peer turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let completed: CompletedCalls = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(slow_chat))
+            .with_state(completed.clone());
+        // The mock server stays on the test runtime; only the tool call runs
+        // on the private runtime under test.
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let store = Arc::new(SqliteTaskStore::new_in_memory().expect("store"));
+        let store_for_tool = store.clone();
+        let tool_config = config.clone();
+        let capability = authority.execution_capability();
+        let live_config = authority.config();
+        let result = crate::cron::scheduler::supervise_peer_test(
+            &config,
+            Box::new(move |token| Box::pin(async move {
+                let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+                    Arc::new(tool_config), "sender", Some(live_config), Some(capability),
+                ).with_run_owned_cancellation_token(token).with_control_plane(ControlPlaneHandle {
+                    store: store_for_tool, boot_id: "supervised-test".into(),
+                });
+                tool.execute(json!({"channel": "telegram.prod", "target": "recipient", "message": "status please"})).await
+            })),
+            None,
+        ).await.expect("supervisor").expect("tool result");
+        let rows = store.list_by_agent("recipient").await.expect("rows");
+        assert_eq!(rows.len(), 1);
+        let receipt = store
+            .get_snapshot(&rows[0].id)
+            .await
+            .expect("snapshot")
+            .expect("receipt");
+        assert_eq!(
+            snapshot_status(receipt),
+            (
+                TaskStatus::Completed,
+                Some("slow peer turn complete".into()),
+                None
+            )
+        );
+
+        assert!(
+            result.success,
+            "a run-owned peer send must report the delivery it actually completed: {result:?}"
+        );
+        assert!(
+            result.output.as_str().contains("delivered in-process"),
+            "unexpected run-owned delivery output: {}",
+            result.output
+        );
+        assert_eq!(
+            *completed.lock(),
+            1,
+            "the slow recipient turn must have finished before the private runtime was dropped; \
+             a detached recipient would have been aborted with the send already accepted"
+        );
+
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_ok()
+        );
+        server.abort();
+    }
+    async fn supervised_peer_cancel_boundary(hold_create: bool, panic_root: bool) {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // The counter is bumped only after the delay, so it records a turn
+        // that ran to completion rather than one that merely started.
+        type CompletedCalls = Arc<Mutex<u32>>;
+        async fn slow_chat(
+            State(count): State<CompletedCalls>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            *count.lock() += 1;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "slow peer turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let completed: CompletedCalls = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(slow_chat))
+            .with_state(completed.clone());
+        // The mock server stays on the test runtime; only the tool call runs
+        // on the private runtime under test.
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let store = Arc::new(GatedRegistry {
+            hold_create,
+            created: tokio::sync::Notify::new(),
+            store: SqliteTaskStore::new_in_memory().expect("store"),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let _release_on_failure = ReleaseRegistryOnDrop(store.clone());
+        let store_for_tool = store.clone();
+        let tool_config = config.clone();
+        let capability = authority.execution_capability();
+        let live_config = authority.config();
+        let job =
+            crate::cron::add_job(&config, "sender", "*/5 * * * *", "echo peer").expect("cron job");
+        let raw =
+            crate::cron::claim_job_for_agent_with_token(&config, &job.id, "sender", Utc::now())
+                .expect("claim lookup")
+                .expect("claim");
+        let exact_token = raw.as_str().to_owned();
+        let claim = crate::cron::CronClaimToken::manual(&config, &job.id, raw);
+        let observed_config = config.clone();
+        let root_admission = authority
+            .execution_capability()
+            .admit("sender")
+            .expect("root admission");
+        let panic_signal = Arc::new(tokio::sync::Notify::new());
+        let worker_panic_signal = panic_signal.clone();
+        let caller = zeroclaw_spawn::spawn!(crate::cron::claim_scope::scope(claim, async move {
+            crate::cron::scheduler::supervise_peer_test(
+            &config,
+            Box::new(move |token| Box::pin(async move {
+                let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+                    Arc::new(tool_config), "sender", Some(live_config), Some(capability),
+                ).with_run_owned_cancellation_token(token).with_control_plane(ControlPlaneHandle {
+                    store: store_for_tool, boot_id: "supervised-test".into(),
+                });
+                tokio::select! {
+                    result = tool.execute(json!({"channel": "telegram.prod", "target": "recipient", "message": "status please"})) => result,
+                    () = worker_panic_signal.notified(), if panic_root => panic!("root panic after produced peer result"),
+                }
+            })),
+            Some(root_admission),
+        ).await
+        }));
+        if hold_create {
+            tokio::time::timeout(Duration::from_secs(10), store.created.notified())
+                .await
+                .expect("durable create committed before acknowledgement");
+            assert_eq!(
+                *completed.lock(),
+                0,
+                "no dispatch before create acknowledgement"
+            );
+        } else {
+            tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+                .await
+                .expect("actual provider reached terminal CAS");
+        }
+        assert!(
+            !caller.is_finished(),
+            "supervisor must not acknowledge before CAS"
+        );
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            1
+        );
+        authority.close_agent_lifecycle();
+        let caller = if panic_root {
+            panic_signal.notify_one();
+            Some(caller)
+        } else {
+            caller.abort();
+            let _ = caller.await;
+            None
+        };
+        tokio::time::timeout(Duration::from_secs(10), store.entered.notified())
+            .await
+            .expect("residual CAS after private runtime termination");
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            1
+        );
+        assert_eq!(
+            crate::cron::current_claim_for_test(&observed_config, &job.id)
+                .expect("held claim")
+                .as_str(),
+            exact_token
+        );
+        assert_eq!(
+            crate::cron::scheduler::active_owned_worker_count_for_test(&observed_config),
+            1
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("sender"), 1);
+        assert!(
+            crate::cron::claim_job_for_agent_with_token(
+                &observed_config,
+                &job.id,
+                "sender",
+                Utc::now()
+            )
+            .expect("claim lookup")
+            .is_none()
+        );
+        if let Some(caller) = &caller {
+            assert!(
+                !caller.is_finished(),
+                "root panic must wait for terminal CAS"
+            );
+        }
+        store.release.add_permits(1);
+        if let Some(caller) = caller {
+            let error = tokio::time::timeout(Duration::from_secs(10), caller)
+                .await
+                .expect("settlement completion")
+                .expect("observer task")
+                .expect_err("root panic remains an error");
+            assert_eq!(error.to_string(), "WorkerStopped");
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while authority.agent_lifecycle().active_turn_count("recipient") != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admission released after canonical settlement");
+        crate::cron::scheduler::wait_for_owned_workers_for_test(&observed_config).await;
+        assert!(crate::cron::current_claim_for_test(&observed_config, &job.id).is_err());
+        assert_eq!(authority.agent_lifecycle().active_turn_count("sender"), 0);
+        let rows = store.list_by_agent("recipient").await.expect("rows");
+        assert_eq!(rows.len(), 1);
+        let receipt = store
+            .store
+            .get_snapshot(&rows[0].id)
+            .await
+            .expect("snapshot")
+            .expect("receipt");
+        if hold_create {
+            assert_eq!(
+                snapshot_status(receipt),
+                (
+                    TaskStatus::Failed,
+                    None,
+                    Some("peer recipient stopped before producing a result".into())
+                )
+            );
+            assert_eq!(
+                *completed.lock(),
+                0,
+                "cancelled registration never dispatches"
+            );
+        } else {
+            assert_eq!(
+                snapshot_status(receipt),
+                (
+                    TaskStatus::Completed,
+                    Some("slow peer turn complete".into()),
+                    None
+                )
+            );
+            assert_eq!(*completed.lock(), 1);
+        }
+
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        server.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_peer_caller_drop_keeps_produced_result_and_admission_until_cas() {
+        supervised_peer_cancel_boundary(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_peer_create_commit_before_ack_is_settled_without_dispatch() {
+        supervised_peer_cancel_boundary(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_peer_root_panic_preserves_result_until_cas() {
+        supervised_peer_cancel_boundary(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn supervised_peer_root_panic_before_registration_remains_worker_stopped() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        let result = crate::cron::scheduler::supervise_peer_test::<()>(
+            &config,
+            Box::new(|_| panic!("root construction panic before peer registration")),
+            None,
+        )
+        .await;
+        assert_eq!(result.expect_err("root panic").to_string(), "WorkerStopped");
+        crate::cron::scheduler::wait_for_owned_workers_for_test(&config).await;
+        assert_eq!(
+            crate::cron::scheduler::active_owned_worker_count_for_test(&config),
+            0
+        );
+    }
+
+    async fn nested_peer_cancellation_boundary(mode: u8) {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+        #[derive(Clone)]
+        struct ProviderState {
+            mode: u8,
+            leaf_entered: Arc<tokio::sync::Notify>,
+        }
+        async fn chat(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let model = body["model"].as_str().expect("model");
+            if model == "leaf" {
+                state.leaf_entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let (name, args) = if model == "recipient" && state.mode != 0 {
+                (
+                    "delegate",
+                    if state.mode == 1 {
+                        json!({"agent":"child", "prompt":"send to leaf"})
+                    } else {
+                        json!({"parallel":["child"], "prompt":"send to leaf"})
+                    },
+                )
+            } else {
+                (
+                    "send_message_to_peer",
+                    json!({"channel":"telegram.prod", "target":"leaf", "message":"remain in flight"}),
+                )
+            };
+            Json(
+                json!({"choices":[{"message":{"content":"", "tool_calls":[{"id":"nested-call", "type":"function", "function":{"name":name, "arguments":args.to_string()}}]}, "finish_reason":"tool_calls"}], "usage":{"prompt_tokens":1,"completion_tokens":1}}),
+            )
+        }
+        let leaf_entered = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat))
+            .with_state(ProviderState {
+                mode,
+                leaf_entered: leaf_entered.clone(),
+            });
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let directory = tempfile::tempdir().expect("data");
+        let mut config = Config {
+            data_dir: directory.path().to_path_buf(),
+            config_path: directory.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "nested".into(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                auto_approve: vec!["delegate".into(), "send_message_to_peer".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".into(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 4,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for alias in ["sender", "recipient", "child", "leaf"] {
+            config.providers.models.ollama.insert(
+                alias.into(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(alias.into()),
+                        uri: Some(format!("http://{address}")),
+                        timeout_secs: Some(30),
+                        ..ModelProviderConfig::default()
+                    },
+                    ..OllamaModelProviderConfig::default()
+                },
+            );
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    model_provider: format!("ollama.{alias}").into(),
+                    risk_profile: "nested".into(),
+                    runtime_profile: "agentic".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config
+            .agents
+            .get_mut("recipient")
+            .expect("recipient")
+            .delegates = vec![DelegateTargetConfig {
+            agent: "child".into(),
+            mode: DelegateExecutionMode::Bounded,
+        }];
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: ["sender", "recipient", "child", "leaf"]
+                    .into_iter()
+                    .map(AgentAlias::new)
+                    .collect(),
+                ..PeerGroupConfig::default()
+            },
+        );
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let capability = authority.execution_capability();
+        let live_config = authority.config();
+        let observed_config = config.clone();
+        let caller = zeroclaw_spawn::spawn!(async move {
+            let tool_config = config.clone();
+            crate::cron::scheduler::supervise_peer_test(&config, Box::new(move |token| Box::pin(async move {
+                SendMessageToPeerTool::new_with_live_config_and_capability(Arc::new(tool_config), "sender", Some(live_config), Some(capability))
+                    .with_run_owned_cancellation_token(token)
+                    .execute(json!({"channel":"telegram.prod", "target":"recipient", "message":"nested work"})).await
+            })), None).await
+        });
+        let _abort_on_failure = AbortCallerOnDrop(caller.abort_handle());
+        tokio::time::timeout(Duration::from_secs(10), leaf_entered.notified())
+            .await
+            .expect("actual nested leaf provider reached");
+        assert_eq!(authority.agent_lifecycle().active_turn_count("leaf"), 1);
+        authority.close_agent_lifecycle();
+        caller.abort();
+        let _ = caller.await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::cron::scheduler::wait_for_owned_workers_for_test(&observed_config),
+        )
+        .await
+        .expect("root worker drained");
+        let store = SqliteTaskStore::new(directory.path()).expect("same canonical store");
+        for alias in ["recipient", "leaf"] {
+            let rows = store.list_by_agent(alias).await.expect("rows");
+            assert_eq!(rows.len(), 1, "exact inbox for {alias}");
+            assert_eq!(
+                rows[0].status,
+                TaskStatus::Failed,
+                "nested receipt must settle after runtime destruction"
+            );
+            assert_eq!(authority.agent_lifecycle().active_turn_count(alias), 0);
+        }
+        assert_eq!(authority.agent_lifecycle().active_turn_count("child"), 0);
+        server.abort();
+    }
+
+    const NESTED_PEER_CHILD: &str = "ZEROCLAW_NESTED_PEER_CHILD";
+    const NESTED_PEER_CONTROL: &str = "ZEROCLAW_NESTED_PEER_CONTROL";
+
+    async fn run_nested_peer_child(test: &str, control: &str) -> Result<String, String> {
+        use std::io::Read;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let home = directory.path().join("home");
+        let config = directory.path().join("config");
+        let data = directory.path().join("data");
+        for path in [&home, &config, &data] {
+            std::fs::create_dir(path).map_err(|error| error.to_string())?;
+        }
+        let stdout = directory.path().join("stdout");
+        let stderr = directory.path().join("stderr");
+        let mut child = tokio::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .arg(test)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(NESTED_PEER_CHILD, test)
+        .env(NESTED_PEER_CONTROL, control)
+        .env("HOME", &home)
+        .env("ZEROCLAW_CONFIG_DIR", &config)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_DATA_HOME", &data)
+        .stdout(std::fs::File::create(&stdout).map_err(|error| error.to_string())?)
+        .stderr(std::fs::File::create(&stderr).map_err(|error| error.to_string())?)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+        let read_output = || -> Result<String, String> {
+            let mut transcript = String::new();
+            for path in [&stdout, &stderr] {
+                std::fs::File::open(path)
+                    .map_err(|error| error.to_string())?
+                    .take(128 * 1024)
+                    .read_to_string(&mut transcript)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(transcript)
+        };
+        let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+            Ok(Ok(status)) => status,
+            failed => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let transcript = read_output().unwrap_or_else(|error| error);
+                return Err(format!(
+                    "nested peer child wait failed and was reaped: {failed:?}\n{transcript}"
+                ));
+            }
+        };
+        let transcript = read_output()?;
+        if !status.success() {
+            return Err(format!(
+                "nested peer child failed ({status}):\n{transcript}"
+            ));
+        }
+        if !transcript.contains("running 1 test")
+            || !transcript.contains("test result: ok. 1 passed;")
+            || !transcript.contains(&format!("nested peer assertions completed: {test}"))
+        {
+            return Err(format!(
+                "nested peer child missing exact execution witness:\n{transcript}"
+            ));
+        }
+        Ok(transcript)
+    }
+
+    async fn isolated_nested_peer_boundary(test: &str, mode: u8) {
+        if std::env::var(NESTED_PEER_CHILD).as_deref() != Ok(test) {
+            let transcript = run_nested_peer_child(test, "fixture")
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+            eprintln!("{transcript}");
+            return;
+        }
+        assert!(
+            global_control_plane().is_none(),
+            "isolated fixture must use its own config-dir store"
+        );
+        match std::env::var(NESTED_PEER_CONTROL).as_deref() {
+            Ok("failure-control") => panic!("nested peer deliberate failure control"),
+            Ok("missing-witness") => return,
+            Ok("fixture") => {}
+            other => panic!("invalid child fixture mode: {other:?}"),
+        }
+        nested_peer_cancellation_boundary(mode).await;
+        eprintln!("nested peer assertions completed: {test}");
+    }
+
+    #[tokio::test]
+    async fn nested_peer_child_propagates_failure_and_missing_witness() {
+        let test = "tools::send_message_to_peer::tests::nested_peer_retains_terminal_owner_after_private_runtime_drop";
+        let failed = run_nested_peer_child(test, "failure-control")
+            .await
+            .expect_err("nonzero child must fail");
+        assert!(failed.contains("nested peer child failed"), "{failed}");
+        assert!(
+            failed.contains("nested peer deliberate failure control"),
+            "{failed}"
+        );
+        let missing = run_nested_peer_child(test, "missing-witness")
+            .await
+            .expect_err("successful exit without original body is not evidence");
+        assert!(
+            missing.contains("missing exact execution witness"),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nested_peer_retains_terminal_owner_after_private_runtime_drop() {
+        isolated_nested_peer_boundary("tools::send_message_to_peer::tests::nested_peer_retains_terminal_owner_after_private_runtime_drop", 0).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronous_delegate_peer_retains_terminal_owner_after_private_runtime_drop() {
+        isolated_nested_peer_boundary("tools::send_message_to_peer::tests::synchronous_delegate_peer_retains_terminal_owner_after_private_runtime_drop", 1).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_delegate_peer_retains_terminal_owner_after_private_runtime_drop() {
+        isolated_nested_peer_boundary("tools::send_message_to_peer::tests::parallel_delegate_peer_retains_terminal_owner_after_private_runtime_drop", 2).await;
+    }
+
+    /// The test above proves the run-owned send waits for the recipient's own
+    /// turn. That is only half the ownership boundary: the recipient rebuilds
+    /// its own tool registry inside `process_message`, and a registry built
+    /// without the run's token hands the recipient a `delegate` tool with
+    /// ordinary local cancellation. The recipient could then detach a
+    /// background child that outlives the cron claim the parent releases on
+    /// return. This drives the whole nested path against a real (mocked at the
+    /// HTTP layer) provider: the recipient asks for `background=true`
+    /// delegation, and the run-owned contract must refuse it at the
+    /// recipient's own tool boundary, with the refusal visible on the wire in
+    /// the next provider request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_owned_peer_send_fences_background_delegation_inside_the_recipient() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // Every request body the recipient's turn puts on the wire. The first
+        // carries the tool catalogue the recipient was built with; the second
+        // carries the tool result its `delegate` call produced.
+        type CapturedRequests = Arc<Mutex<Vec<String>>>;
+        async fn delegating_chat(
+            State(captured): State<CapturedRequests>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let call_index = {
+                let mut captured = captured.lock();
+                captured.push(body.to_string());
+                captured.len()
+            };
+            if call_index == 1 {
+                return Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "delegate",
+                                    "arguments": "{\"agent\":\"child\",\"prompt\":\"keep working after I return\",\"background\":true}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "recipient turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let captured: CapturedRequests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(delegating_chat))
+            .with_state(captured.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                // Non-interactive turns deny anything that needs an operator
+                // decision, which would stop the call before it reaches the
+                // ownership boundary under test.
+                auto_approve: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "delegating".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "child".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "child".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "delegating".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let run_token = CancellationToken::new();
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+            Arc::new(config),
+            "sender",
+            Some(authority.config()),
+            Some(authority.execution_capability()),
+        )
+        .with_run_owned_cancellation_token(run_token);
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "status please"
+            }))
+            .await
+            .expect("execute should return a tool result");
+        assert!(
+            result.success,
+            "the run-owned send must carry the recipient to completion: {result:?}"
+        );
+
+        let requests = captured.lock().clone();
+        assert!(
+            requests.len() >= 2,
+            "the recipient must have issued its delegate call and then reported back; \
+             observed {} provider request(s)",
+            requests.len()
+        );
+        assert!(
+            requests[0].contains("unavailable for supervised cron runs"),
+            "the recipient's registry must advertise the run-owned delegate contract; \
+             without the owning token it advertises ordinary background delegation"
+        );
+        assert!(
+            requests[1].contains("Background delegation is unavailable for supervised cron runs"),
+            "the recipient's delegate tool must refuse background delegation under the \
+             owning run; without the owning token it detaches a child that outlives the \
+             claim. Second request body: {}",
+            requests[1]
+        );
+
+        assert_eq!(
+            authority.agent_lifecycle().active_turn_count("recipient"),
+            0
+        );
+        assert!(
+            authority
+                .agent_lifecycle()
+                .begin_delete("recipient")
+                .is_ok()
+        );
         server.abort();
     }
 }

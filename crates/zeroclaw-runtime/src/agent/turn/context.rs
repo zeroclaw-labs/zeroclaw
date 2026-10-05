@@ -3,6 +3,7 @@
 //! mutated per iteration when vision routing selects a different provider.
 
 use super::events::DraftEvent;
+use super::outcome::ToolLoopCancelled;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
@@ -65,6 +66,16 @@ pub struct TurnMeta<'a> {
 }
 
 impl<'a> TurnCtx<'a> {
+    pub(crate) fn ensure_not_cancelled(&self) -> anyhow::Result<()> {
+        if self
+            .cancellation_token
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+        Ok(())
+    }
+
     /// Materialize the route-specific view for one provider call. The base
     /// context remains the turn metadata owner; provider/model/limits are
     /// resolved at the call boundary so a vision override cannot inherit the

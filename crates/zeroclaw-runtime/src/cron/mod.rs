@@ -15,9 +15,11 @@ pub mod scheduler;
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
-pub(crate) use store::finish_agent_claim;
+#[cfg(test)]
+pub(crate) use store::current_claim_for_test;
 #[cfg(test)]
 pub(crate) use store::force_release_failure_for_tests;
+pub(crate) use store::{CronClaimToken, claim_scope};
 #[allow(unused_imports)]
 pub use store::{
     RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
@@ -28,6 +30,7 @@ pub use store::{
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
     sync_declarative_jobs, update_job, update_job_for_agent,
 };
+pub(crate) use store::{claim_job_with_token, release_claim};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
