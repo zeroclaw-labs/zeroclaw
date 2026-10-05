@@ -1336,6 +1336,61 @@ impl GitOperationsTool {
         Ok(())
     }
 
+    /// Resolve which tree `git worktree add -- <path>` materializes when the
+    /// branch argument is omitted. Git's convenience rule checks out an
+    /// EXISTING branch named after the path's basename when one exists, and
+    /// only creates a new branch from `HEAD` when it does not — so `HEAD` is
+    /// not always the tree that gets written. The exact ref is resolved
+    /// through a read-classified listing; any outcome that cannot be proven
+    /// exactly (non-UTF-8 basename, a basename whose pattern matches more than
+    /// the one expected ref, or a Git failure) refuses the operation instead
+    /// of guessing.
+    async fn resolve_worktree_add_reference(
+        &self,
+        target: &Path,
+        working_dir: &Path,
+    ) -> anyhow::Result<String> {
+        let Some(basename) = target
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_string)
+        else {
+            anyhow::bail!(
+                "Worktree add blocked: cannot determine which branch the omitted branch \
+                 argument selects (the worktree path's basename is not valid UTF-8); \
+                 refusing to authorize a tree that cannot be named exactly"
+            );
+        };
+        let expected = format!("refs/heads/{basename}");
+        let args = [
+            "--no-optional-locks",
+            "for-each-ref",
+            "--format=%(refname)",
+            &expected,
+        ];
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        let listing = String::from_utf8(stdout).map_err(|_| {
+            anyhow::Error::msg("Worktree add blocked: the branch listing is not valid UTF-8")
+        })?;
+        let matched: Vec<&str> = listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if matched.iter().any(|found| *found != expected.as_str()) {
+            anyhow::bail!(
+                "Worktree add blocked: the omitted branch argument is ambiguous (basename \
+                 '{basename}' does not name exactly one branch); refusing to authorize a \
+                 tree that cannot be named exactly"
+            );
+        }
+        if matched.is_empty() {
+            Ok("HEAD".to_string())
+        } else {
+            Ok(expected)
+        }
+    }
+
     /// Check every file `git worktree add` would materialize under `target`.
     /// The target root itself is checked by
     /// [`Self::ensure_worktree_add_target_allowed`]; this covers the tree Git
@@ -2390,11 +2445,19 @@ impl GitOperationsTool {
                     self.sanitize_git_args(branch)?;
                     git_args.push(branch);
                 }
-                // Without a branch Git creates one from HEAD, so HEAD is the
-                // tree that gets materialized.
-                let reference = if branch.is_empty() { "HEAD" } else { branch };
+                // Without a branch argument, Git checks out an existing branch
+                // named after the worktree path's basename when one exists, and
+                // only creates a new branch from HEAD otherwise. Resolve which
+                // of the two applies so the preflight inspects the tree Git
+                // actually materializes, not unconditionally `HEAD`.
+                let reference = if branch.is_empty() {
+                    self.resolve_worktree_add_reference(&worktree_path, working_dir)
+                        .await?
+                } else {
+                    branch.to_string()
+                };
                 if let Some(refused) = preflight_outcome(
-                    self.preflight_worktree_add(&worktree_path, reference, working_dir)
+                    self.preflight_worktree_add(&worktree_path, &reference, working_dir)
                         .await,
                     true,
                 )? {
@@ -7161,6 +7224,97 @@ mod tests {
             "materializing a denied path through worktree add must be refused"
         );
         assert!(!wt.exists(), "a blocked worktree add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_a_basename_named_branch_tree() {
+        // `git worktree add -- <path>` with no branch checks out an EXISTING
+        // branch named after the path's basename instead of creating one from
+        // HEAD. Branch `topic` carries a denied `.env` that HEAD lacks, so the
+        // preflight must inspect `refs/heads/topic`, not `HEAD`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!root.join(".env").exists());
+        let wt = root.join("topic");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add must inspect the basename-named branch when the branch is omitted"
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the denied branch tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_checks_head_when_no_basename_branch_exists() {
+        // No branch named `fresh` exists, so `git worktree add -- <…>/fresh`
+        // creates branch `fresh` from HEAD; the preflight inspects HEAD's tree
+        // and the add succeeds under a policy that denies nothing in it.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("fresh");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "worktree add without a branch must still work when no basename branch exists: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("notes.txt").exists(),
+            "the new worktree must materialize HEAD's tree"
+        );
     }
 
     #[tokio::test]
