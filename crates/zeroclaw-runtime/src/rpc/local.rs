@@ -19,17 +19,17 @@ use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
 
-const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Best-effort deadline for half-closing a local stream after daemon
 /// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Deadline for writing one frame to a local peer. A peer that stops reading
 /// for this long is disconnected, the same bound the WSS plane applies with
 /// its `PEER_WRITE_TIMEOUT`, so one stalled client cannot park the producers
 /// that feed its queue indefinitely.
-const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Deadline for a new connection to complete `initialize`, counted from
 /// accept. A client that connects and never initializes would otherwise hold
@@ -44,7 +44,7 @@ const LOCAL_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the reader waits for a terminal error frame to reach the peer
 /// before it closes the connection anyway.
-const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for telling a refused client why it was refused.
 const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -84,9 +84,9 @@ impl LocalListenerLimits {
 
 /// A last frame for the peer, written ahead of the ordinary queue. The writer
 /// stops after it, so the peer reads the frame and then end of stream.
-struct TerminalFrame {
-    line: String,
-    written: tokio::sync::oneshot::Sender<()>,
+pub(crate) struct TerminalFrame {
+    pub(crate) line: String,
+    pub(crate) written: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Serialize a JSON-RPC error response with a null id, for failures that are
@@ -109,7 +109,7 @@ fn unattributed_error_line(code: i32, message: String, data: serde_json::Value) 
     line
 }
 
-fn frame_too_large_line() -> String {
+pub(crate) fn frame_too_large_line() -> String {
     unattributed_error_line(
         zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
         format!("Frame exceeds the {MAX_FRAME_BYTES}-byte local RPC frame limit"),
@@ -164,11 +164,10 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     false
 }
 
+/// The endpoint this daemon binds: the shared resolver every client also
+/// uses, so a client that knows the data directory dials the same place.
 pub fn socket_path(config: &Config) -> PathBuf {
-    if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
-        return PathBuf::from(p);
-    }
-    platform::default_endpoint(&config.data_dir)
+    zeroclaw_api::rpc_endpoint::resolve_endpoint(&config.data_dir)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -329,11 +328,11 @@ pub struct LocalTransport {
 
 /// Timing bounds for one connection's writer task.
 #[derive(Debug, Clone, Copy)]
-struct WriterTimeouts {
+pub(crate) struct WriterTimeouts {
     /// Deadline for one frame; past it the connection is cancelled.
-    write: Duration,
+    pub(crate) write: Duration,
     /// Deadline for the final half-close.
-    shutdown: Duration,
+    pub(crate) shutdown: Duration,
 }
 
 enum WriteOutcome {
@@ -394,7 +393,7 @@ where
     }
 }
 
-async fn run_writer<W>(
+pub(crate) async fn run_writer<W>(
     mut writer: W,
     mut writer_rx: mpsc::Receiver<String>,
     mut terminal_rx: mpsc::Receiver<TerminalFrame>,
@@ -1062,10 +1061,6 @@ mod platform {
         }
     }
 
-    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
-        data_dir.join("daemon.sock")
-    }
-
     /// Creates the endpoint directory and tightens it to owner-only access.
     ///
     /// The chmod is best-effort on purpose: a directory this process just
@@ -1221,7 +1216,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use anyhow::{Context, Result};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
     /// On Windows the "listener" is a single pending server instance. After
@@ -1230,14 +1225,6 @@ mod platform {
     pub type LocalListener = NamedPipeServer;
     pub type LocalStream = NamedPipeServer;
     pub struct EndpointGuard;
-
-    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        data_dir.hash(&mut hasher);
-        PathBuf::from(format!(r"\\.\pipe\zeroclaw-{:x}", hasher.finish()))
-    }
 
     pub async fn prepare_parent(_path: &Path) -> Result<()> {
         // Named pipes live in the kernel object namespace, not the
@@ -1787,6 +1774,24 @@ mod tests {
 
         drop(listener);
         drop(guard);
+    }
+
+    #[test]
+    fn socket_path_is_the_shared_resolver_for_every_data_dir() {
+        // The daemon binds what every client resolves; the client crates run
+        // the same table against the same resolver.
+        for dir in zeroclaw_api::rpc_endpoint::AGREEMENT_DATA_DIRS {
+            let data_dir = std::path::PathBuf::from(dir);
+            let config = Config {
+                data_dir: data_dir.clone(),
+                ..Config::default()
+            };
+            assert_eq!(
+                socket_path(&config),
+                zeroclaw_api::rpc_endpoint::resolve_endpoint(&data_dir),
+                "{dir}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2683,7 +2688,10 @@ mod tests {
             // connection leaves its turn task unwinding. Gate on the daemon's
             // own reload drain, which is what production waits on.
             assert_eq!(
-                crate::daemon::await_rpc_connection_drain(&count1_for_gen2).await,
+                crate::daemon::await_rpc_connection_drain_with(
+                    || count1_for_gen2.load(std::sync::atomic::Ordering::Relaxed)
+                )
+                .await,
                 crate::daemon::RpcDrain::Complete,
                 "the retiring generation must finish draining within the reload budget"
             );

@@ -15,9 +15,49 @@ same machine do not collide. The data dir is derived from the config dir
 |---|---|
 | Linux | `<data_dir>/daemon.sock` (Unix domain socket) |
 | macOS | `<data_dir>/daemon.sock` (Unix domain socket) |
-| Windows | `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from `data_dir` |
+| Windows | `\\.\pipe\zeroclaw-daemon-<hash>`, where `<hash>` is a 64-bit FNV-1a hash of `data_dir` (below) |
 
-Override with the `ZEROCLAW_SOCKET` environment variable on either platform:
+The daemon and every client derive the endpoint from a data directory with the
+same function, so for the same data directory they agree. The Windows hash
+input is fixed, so the name is the same for every release and toolchain:
+
+- `data_dir` as UTF-16 code units, read without loss.
+- The Windows prefix read first: a drive (`C:`), UNC (`\\server\share`),
+  device namespace (`\\.\name`) or verbatim (`\\?\...`, only with exactly
+  that spelling; `//?/C:/x` is UNC with the server `?`). `C:\` (the drive's
+  root) and `C:` (its current directory) differ.
+- After the prefix, spellings of one directory made equal: `\` and `/` both
+  separate, repeated and trailing separators and `.` components are dropped.
+  Verbatim paths separate only on `\` and keep `.`. `..` is not resolved.
+  Trailing dots and spaces are kept, although Windows trims them from plain
+  paths, so `C:\x.` gets its own pipe rather than sharing `C:\x`'s.
+- The prefix's kind recorded in the key: device and verbatim paths are keyed
+  with their kind, so a device path never shares a pipe with a UNC path, and
+  a verbatim path never shares one with a plain spelling. Windows does not
+  normalize verbatim paths, so `\\?\C:\x.` and `C:\x.` are different
+  directories.
+- ASCII letters lower-cased. Other letters keep their case, because Windows
+  folds them per volume and a directory can be case-sensitive.
+- Each unit hashed as two little-endian bytes.
+
+Releases before this named the pipe `\\.\pipe\zeroclaw-<hash>` from Rust's
+`DefaultHasher`, which is not stable across toolchains. For one release,
+clients also try that older name when nothing listens at the new one, so they
+find a daemon an earlier binary started that has not been restarted. Finding
+it does not make it usable: zerocode still requires the daemon's version to
+equal its own, so against an older daemon it reports the mismatch, which means
+restart the daemon, instead of starting a second daemon beside it. The daemon
+binds only the new name. Clients built on `zeroclaw-rpc-client` check the
+older name exactly as they check the new one before they send a credential
+(see [Security](#security)).
+
+Clients choose the data directory themselves. zerocode uses
+`<config_dir>/data`; it does not follow `ZEROCLAW_DATA_DIR`,
+`ZEROCLAW_WORKSPACE` or the Homebrew layout. Against a daemon that uses one of
+those, set `ZEROCLAW_SOCKET` for zerocode.
+
+Override with the `ZEROCLAW_SOCKET` environment variable on either platform. A
+blank value is ignored, and surrounding whitespace is trimmed:
 
 <div class="os-tabs-src">
 
@@ -261,6 +301,23 @@ explicitly stopped.
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
+- Clients built on `zeroclaw-rpc-client` verify the endpoint before sending a
+  credential. When `initialize` would carry an `auth_token`, a TUI signature
+  or forwarded environment, the kernel's peer uid for the connected socket
+  must be the expected account (the client's own by default, or a uid the
+  launcher passes), and the socket's directory must belong to that account
+  with no group or other write access. A sticky shared directory such as
+  `/tmp` does not qualify. On Windows, the process the kernel names as the
+  pipe's server must run as the client's own account, the pipe must be owned
+  by that account (or by the Administrators group, as it is when an elevated
+  process created it), and its access list must not let Everyone, anonymous
+  callers, or all signed-in users write to it, create instances under its
+  name, or change its security. A uid owner is refused there, since a uid
+  names no Windows account. The check runs on every dial and writes nothing
+  to an endpoint it refuses, the new pipe name or the older one alike. Dials
+  that carry none of these are not gated. The only other public constructor
+  runs over the daemon's in-process duplex. zerocode has its own client and
+  does not run this check yet.
 
 ## Quick test
 
@@ -298,17 +355,33 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |
