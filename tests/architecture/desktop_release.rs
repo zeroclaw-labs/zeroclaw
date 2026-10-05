@@ -1,4 +1,5 @@
-//! Release invariant: the macOS desktop sidecar must contain the dashboard.
+//! Desktop invariants: CI runs the desktop app's unit tests, and the macOS
+//! release sidecar must contain the dashboard.
 
 use std::{fs, path::Path};
 
@@ -93,5 +94,40 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
             line.contains("cargo build") && line.contains("--features \"$FEATURES\"")
         }),
         "prepare-kernel.sh must forward the requested Cargo features"
+    );
+}
+
+#[test]
+fn desktop_app_check_runs_the_desktop_unit_tests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/desktop-check.yml"))
+        .expect("desktop app check workflow should be readable");
+    let (triggers, jobs) = workflow
+        .split_once("\njobs:\n")
+        .expect("desktop app check should define jobs");
+
+    assert!(
+        triggers.contains("\n  pull_request:\n") && triggers.contains("- \"apps/tauri/**\""),
+        "desktop app check must run on pull requests that change the desktop app"
+    );
+    assert!(
+        jobs.contains("os: [macos-14, ubuntu-22.04, windows-latest]"),
+        "desktop unit tests must run on macOS, Linux, and Windows"
+    );
+    assert!(
+        !workflow.contains("continue-on-error"),
+        "a failing desktop unit test must fail the desktop app check"
+    );
+
+    let test_step = jobs
+        .split("\n      - ")
+        .find(|step| step.starts_with("name: Test (zeroclaw-desktop)"))
+        .expect("desktop app check must have a desktop unit-test step");
+    assert!(
+        test_step
+            .lines()
+            .any(|line| line.trim() == "run: cargo test --locked -p zeroclaw-desktop")
+            && !test_step.contains("if:"),
+        "the desktop unit-test step must run every desktop test on every platform"
     );
 }
