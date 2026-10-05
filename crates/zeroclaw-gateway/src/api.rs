@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
+use zeroclaw_rpc_proto::types::SessionEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1719,6 +1720,23 @@ pub async fn handle_api_health(
 // ── Helpers ─────────────────────────────────────────────────────
 
 // ── Session API handlers ─────────────────────────────────────────
+//
+// Every session route stays in-process for now.
+// - `GET /api/sessions`: the core lists, for a non-local caller, only the
+//   sessions that caller's own connection opened, so the gateway's
+//   credential-bound connection would list none of the dashboard's sessions.
+//   The listing moves to the core once the core scopes such a connection's
+//   view by its principal. The rows already take the core's `SessionEntry`
+//   shape, so that move changes only where they come from.
+// - The routes that address one session by id: the core resolves a session
+//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
+//   told to act on exactly the row this gateway's resolver picked. A
+//   competing row with another prefix would be read or deleted instead. That
+//   needs an exact durable-row reference in the core.
+// - A delete must first cancel and wait for the gateway's own chat turn,
+//   which only the gateway can do, while only the core can authorize the
+//   delete. Until those turns run in the core, the two cannot be made one
+//   authorized step.
 
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
@@ -1741,8 +1759,8 @@ pub async fn handle_api_sessions_list(
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
-    let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
+    let entries: Vec<SessionEntry> = backend
+        .list_sessions_with_metadata()
         .into_iter()
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
         .map(|meta| {
@@ -1755,33 +1773,41 @@ pub async fn handle_api_sessions_list(
                     .and_then(|c| config.agent_for_channel(c))
                     .map(str::to_string)
             });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
-            let session_id = meta
-                .key
-                .strip_prefix("gw_")
-                .map(str::to_string)
-                .unwrap_or_else(|| meta.key.clone());
-            let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
-                "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-                "agent_alias": agent_alias,
-                "channel_id": meta.channel_id,
-            });
-            if let Some(name) = meta.name {
-                entry["name"] = serde_json::Value::String(name);
+            SessionEntry {
+                session_id: gateway_display_session_id(&meta.key).to_string(),
+                session_key: meta.key,
+                created_at: meta.created_at.to_rfc3339(),
+                last_activity: meta.last_activity.to_rfc3339(),
+                message_count: meta.message_count,
+                agent_alias,
+                channel_id: meta.channel_id,
+                name: meta.name,
             }
-            entry
         })
         .collect();
 
+    let sessions: Vec<serde_json::Value> = entries.into_iter().map(session_list_row).collect();
     Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// One row of `GET /api/sessions`, whichever path listed it.
+fn session_list_row(entry: SessionEntry) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        // Display form: `gw_` stripped for gateway sessions, full
+        // composite for channel-driven sessions.
+        "session_id": gateway_display_session_id(&entry.session_key),
+        // Full DB key for API operations (delete, messages, abort).
+        "session_key": entry.session_key,
+        "created_at": entry.created_at,
+        "last_activity": entry.last_activity,
+        "message_count": entry.message_count,
+        "agent_alias": entry.agent_alias,
+        "channel_id": entry.channel_id,
+    });
+    if let Some(name) = entry.name {
+        row["name"] = serde_json::Value::String(name);
+    }
+    row
 }
 
 /// Resolve a path `{id}` to the persisted session key.
@@ -2240,6 +2266,9 @@ pub async fn handle_claude_code_hook(
 pub(crate) use tests::test_state;
 
 #[cfg(test)]
+mod sessions_core_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
@@ -2496,7 +2525,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    pub(crate) async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
             .collect()
@@ -3489,7 +3518,7 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
+    pub(crate) fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
     ) -> AppState {
