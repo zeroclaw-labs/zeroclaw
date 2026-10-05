@@ -1,10 +1,11 @@
-//! End-to-end migration tests for the V1 → V2 → V3 chain.
+//! End-to-end migration tests for the V1 → V2 → V3 → V4 chain.
 
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::migration::{
-    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, detect_version, encrypt_secret_strings,
-    ensure_disk_at_current_version, generate, migrate_file, migrate_file_in_place,
-    migrate_to_current,
+    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, MigrationNotice, detect_version,
+    encrypt_secret_strings, ensure_disk_at_current_version, generate, migrate_file,
+    migrate_file_in_place, migrate_file_with_notices, migrate_to_current,
+    migrate_to_current_salvaged,
 };
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::v2::V2Config;
@@ -2198,14 +2199,14 @@ fn generate_current_emits_at_current_schema_version() {
 
 // ── Pairing-code policy ──────────────────────────────
 
-/// Review MAJOR-3: `zeroclaw config generate 3` must not hand the operator
-/// a config that names the retired `pairing_dashboard.code_length`, and must
+/// Review MAJOR-3: generating the current version must not hand the operator
+/// a config that names the retired `[gateway.pairing_dashboard]` (its
+/// `code_length` retired at V3, the rest of the table at V4), and must
 /// surface the `[gateway.pairing_code]` policy that actually decides pairing
 /// strength. The generator migrates the frozen V1 fixture, which still
-/// carries the retired key — so this pins the migration step, not the
-/// fixture.
+/// carries the table — so this pins the migration, not the fixture.
 #[test]
-fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
+fn generate_current_retires_the_dashboard_table_and_surfaces_pairing_code() {
     let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
         .expect("generate current succeeds");
     let parsed: toml::Value = toml::from_str(&raw).expect("generated output parses as TOML");
@@ -2214,22 +2215,14 @@ fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
         .and_then(toml::Value::as_table)
         .expect("generated config has a [gateway] section");
 
-    // The V1 fixture still carries the retired key; the migration drops it.
+    // The V1 fixture still carries the retired table; the migration drops it.
     assert!(
-        V1_FIXTURE.contains("code_length"),
-        "precondition: the frozen V1 fixture still carries the retired key"
-    );
-    let dashboard = gateway
-        .get("pairing_dashboard")
-        .and_then(toml::Value::as_table)
-        .expect("[gateway.pairing_dashboard] survives with its other fields");
-    assert!(
-        !dashboard.contains_key("code_length"),
-        "retired key must not reach a current-schema config: {dashboard:?}"
+        V1_FIXTURE.contains("[gateway.pairing_dashboard]") && V1_FIXTURE.contains("code_length"),
+        "precondition: the frozen V1 fixture still carries the retired table"
     );
     assert!(
-        dashboard.contains_key("code_ttl_secs"),
-        "the rest of the dashboard section must be preserved"
+        !gateway.contains_key("pairing_dashboard"),
+        "the retired table must not reach a current-schema config: {gateway:?}"
     );
 
     // The shared policy is surfaced, at the shipped default.
@@ -2610,7 +2603,7 @@ fn encryption_covers_compound_map_secret_field() {
     let store = SecretStore::new(tmp.path(), true);
 
     let raw_toml = r#"
-schema_version = 3
+schema_version = 4
 
 [[mcp.servers]]
 name = "primary"
@@ -2676,7 +2669,7 @@ fn encryption_preserves_onepassword_secret_references() {
     let store = SecretStore::new(tmp.path(), true);
 
     let raw_toml = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.openai.default]
 model = "gpt-5"
@@ -2779,7 +2772,7 @@ fn lookup_dotted<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 fn get_prop_resolves_model_field_for_typed_provider_alias() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
@@ -2809,7 +2802,7 @@ fn prop_fields_includes_providers_models_alias_model_path() {
     // the frontend's resolveModelToProviderType walk silently drops the alias.
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
@@ -2832,7 +2825,7 @@ model = "claude-opus-4-7"
 fn typed_family_root_is_not_a_map_keyed_section() {
     use zeroclaw_config::schema::Config;
     let raw = r#"
-schema_version = 3
+schema_version = 4
 [providers.models.anthropic.glados]
 model = "claude-opus-4-7"
 "#;
@@ -2936,7 +2929,7 @@ fn v3_explicit_empty_allowed_tools_stays_unrestricted() {
     // No schema migration touches `allowed_tools`: V3 files with an explicit
     // `allowed_tools = []` keep the legacy unrestricted meaning.
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [risk_profiles.default]
 allowed_tools = []
@@ -2968,7 +2961,7 @@ fn v3_deny_all_tools_flag_loads_without_migration() {
     // `deny_all_tools` is a plain additive V3 field: no migration step, it
     // deserializes directly and maps to deny-all at the policy boundary.
     let raw = r#"
-schema_version = 3
+schema_version = 4
 
 [risk_profiles.default]
 deny_all_tools = true
@@ -2991,5 +2984,197 @@ deny_all_tools = true
     assert!(
         !policy.is_tool_allowed("filesystem__write_file"),
         "deny_all_tools = true must deny MCP-shaped names; the __ auto-admit is nonempty-allowlist only"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// V4 fixture: the committed at-rest V4 config loads and is idempotent.
+// The fixture is regenerated from this chain with
+// `zeroclaw config generate 4`.
+// ─────────────────────────────────────────────────────────────
+
+const V4_FIXTURE: &str = include_str!("../fixtures/v4.toml");
+
+#[test]
+fn v4_fixture_is_at_current_version() {
+    let v: toml::Value = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as TOML");
+    assert_eq!(detect_version(&v).expect("detect V4"), 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn v4_fixture_loads_as_config() {
+    let cfg: Config = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as Config");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn v4_fixture_is_migration_idempotent() {
+    assert!(
+        migrate_file(V4_FIXTURE)
+            .expect("migrate_file on V4 succeeds")
+            .is_none(),
+        "a config already at CURRENT_SCHEMA_VERSION with no retired key must not be rewritten"
+    );
+}
+
+#[test]
+fn v1_to_v4_round_trip_matches_committed_fixture() {
+    // The fixture is the acceptance record of exactly what the chain produces
+    // from the V1 fixture, so compare the generated text byte for byte. (A
+    // loaded `Config` holds hash maps whose serialization order varies, so
+    // re-serialized configs are not comparable as strings.)
+    let generated = generate(4, &GenerateOptions::default()).expect("generate V4");
+    assert!(
+        generated == V4_FIXTURE,
+        "the V1 -> V4 chain drifted from fixtures/v4.toml; if intended, regenerate it with \
+         `zeroclaw config generate 4 > crates/zeroclaw-config/fixtures/v4.toml`"
+    );
+    let _: Config = toml::from_str(&generated).expect("generated V4 parses as Config");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Retired keys and a missing schema_version against real configs
+// ─────────────────────────────────────────────────────────────
+
+/// Drop every table that is empty, recursively, so two configs that differ
+/// only in empty tables compare equal.
+fn prune_empty_tables(value: &mut toml::Value) {
+    if let Some(table) = value.as_table_mut() {
+        for (_, child) in table.iter_mut() {
+            prune_empty_tables(child);
+        }
+        table.retain(|_, child| child.as_table().is_none_or(|t| !t.is_empty()));
+    }
+}
+
+/// A real, current-format config: the checked-in dev template, reached through
+/// an in-crate symlink so the published crate stays self-contained.
+const DEV_TEMPLATE: &str = include_str!("../fixtures/dev-config.template.toml");
+
+/// The dev template with one key from each retired shape added: a literal
+/// table, a per-agent tunable, and a per-profile nested key.
+fn dev_template_with_retired_keys() -> String {
+    let with_agent_tunable = DEV_TEMPLATE.replacen(
+        "[agents.default]\n",
+        "[agents.default]\nmax_tool_iterations = 40\n",
+        1,
+    );
+    assert_ne!(
+        with_agent_tunable, DEV_TEMPLATE,
+        "the template has [agents.default]"
+    );
+    format!(
+        "{with_agent_tunable}\n\
+         [runtime_profiles.default.context_compression]\n\
+         summary_model = \"haiku\"\n\n\
+         [security.nevis]\n\
+         client_secret = \"plaintext-nevis-secret\"\n"
+    )
+}
+
+#[test]
+fn current_config_without_retired_keys_is_not_rewritten() {
+    assert_eq!(
+        detect_version(&toml::from_str(DEV_TEMPLATE).unwrap()).unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+    assert!(migrate_file_with_notices(DEV_TEMPLATE).unwrap().is_none());
+    let load = migrate_to_current_salvaged(DEV_TEMPLATE);
+    assert!(load.notices.is_empty(), "{:?}", load.notices);
+}
+
+#[test]
+fn current_config_with_retired_keys_migrates_only_those_keys() {
+    let raw = dev_template_with_retired_keys();
+    let (migrated, notices) = migrate_file_with_notices(&raw)
+        .expect("a current config holding retired keys migrates")
+        .expect("and is rewritten");
+
+    let mut removed: Vec<&str> = notices
+        .iter()
+        .map(|notice| match notice {
+            MigrationNotice::Removed { path, .. } => path.as_str(),
+            other => panic!("only removals expected, got {other:?}"),
+        })
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(
+        removed,
+        [
+            "agents.default.max_tool_iterations",
+            "runtime_profiles.default.context_compression.summary_model",
+            "security.nevis",
+        ]
+    );
+
+    // Everything else is untouched: apart from tables left empty by the
+    // removals, the migrated file equals the template.
+    let mut migrated_value: toml::Value = toml::from_str(&migrated).unwrap();
+    let mut template_value: toml::Value = toml::from_str(DEV_TEMPLATE).unwrap();
+    prune_empty_tables(&mut migrated_value);
+    prune_empty_tables(&mut template_value);
+    assert_eq!(migrated_value, template_value);
+
+    assert!(!migrated.contains("plaintext-nevis-secret"));
+    assert!(
+        migrated.contains("# Ollama runs on the host."),
+        "comments in the operator's file survive the migration"
+    );
+    let _: zeroclaw_config::schema::Config =
+        toml::from_str(&migrated).expect("the migrated file loads");
+    assert!(
+        migrate_file(&migrated).unwrap().is_none(),
+        "a second migration has nothing to do"
+    );
+
+    let load = migrate_to_current_salvaged(&raw);
+    assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+    assert_eq!(load.notices, notices);
+}
+
+#[test]
+fn missing_schema_version_warns_and_migrates_instead_of_erroring() {
+    // detect_version keeps its V1 assumption for a missing key.
+    assert_eq!(
+        detect_version(&toml::from_str("foo = 1").unwrap()).unwrap(),
+        1
+    );
+
+    // A legacy V1 config without the key migrates and reports the assumption.
+    assert!(!V1_FIXTURE.lines().any(|l| l.starts_with("schema_version")));
+    let (_, notices) = migrate_file_with_notices(V1_FIXTURE).unwrap().unwrap();
+    assert_eq!(notices.first(), Some(&MigrationNotice::AssumedV1));
+
+    // A modern config that only lost its `schema_version` line is plainly in
+    // the V3 shape, so it is read as V3 rather than V1: it migrates rather
+    // than erroring, says why, and loads without resetting any section.
+    let unversioned: String = DEV_TEMPLATE
+        .lines()
+        .filter(|line| !line.starts_with("schema_version"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (migrated, notices) = migrate_file_with_notices(&unversioned)
+        .expect("an unversioned modern config does not error")
+        .expect("it is migrated from V3");
+    assert!(
+        notices.contains(&MigrationNotice::InferredV3),
+        "{notices:?}"
+    );
+    assert!(
+        !notices.contains(&MigrationNotice::AssumedV1),
+        "{notices:?}"
+    );
+    assert_eq!(
+        detect_version(&toml::from_str(&migrated).unwrap()).unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+    let load = migrate_to_current_salvaged(&unversioned);
+    assert!(load.notices.contains(&MigrationNotice::InferredV3));
+    assert!(
+        load.dropped.is_empty() && load.dropped_security.is_empty(),
+        "dropped={:?} dropped_security={:?}",
+        load.dropped,
+        load.dropped_security
     );
 }

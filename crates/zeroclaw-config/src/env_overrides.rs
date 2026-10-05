@@ -76,6 +76,29 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             );
             continue;
         }
+        // A retired key has no schema property any more. Failing on it would
+        // turn a deployment that set it into one that refuses to start, so
+        // ignore it and say so, as the file migration does for the same key.
+        let segments: Vec<&str> = tail.split(SEP).collect();
+        if let Some(retired) = crate::migration::retired_key_covering(&segments) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"env_var": env_name})),
+                &format!(
+                    "ignoring env override for a retired config key: {}",
+                    retired.reason
+                )
+            );
+            config
+                .migration_notices
+                .push(crate::migration::MigrationNotice::IgnoredEnvOverride {
+                    variable: env_name,
+                    reason: retired.reason,
+                });
+            continue;
+        }
         let path = resolve_path(&tail, config)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
@@ -621,5 +644,55 @@ mod tests {
         let mut config = Config::default();
         let err = apply_env_overrides(&mut config).expect_err("must hard-error");
         assert!(format!("{err:#}").contains("did not resolve"));
+    }
+
+    /// A deployment that sets a key since retired keeps starting: the
+    /// variable is ignored with a notice instead of failing as unknown.
+    #[tokio::test]
+    async fn an_env_override_for_a_retired_key_is_ignored_not_fatal() {
+        let _lock = env_test_lock().await;
+        let _var = EnvVarGuard::set(
+            "ZEROCLAW_runtime_profiles__fast__context_compression__summary_model",
+            "haiku",
+        );
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("a retired key does not fail");
+        assert!(applied.paths.is_empty());
+        assert!(config.migration_notices.iter().any(|notice| matches!(
+            notice,
+            crate::migration::MigrationNotice::IgnoredEnvOverride { variable, .. }
+                if variable == "ZEROCLAW_runtime_profiles__fast__context_compression__summary_model"
+        )));
+        assert!(
+            config
+                .migration_notices
+                .iter()
+                .all(|notice| !notice.changes_file()),
+            "an ignored variable is not a change to write"
+        );
+    }
+
+    /// `[gateway.pairing_dashboard]` is retired as a whole table, so a
+    /// variable naming one of its settings is ignored the same way.
+    #[tokio::test]
+    async fn an_env_override_for_a_retired_dashboard_setting_is_ignored() {
+        let _lock = env_test_lock().await;
+        let variable = "ZEROCLAW_gateway__pairing_dashboard__lockout_secs";
+        let _var = EnvVarGuard::set(variable, "60");
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("a retired key does not fail");
+        assert!(applied.paths.is_empty());
+        assert!(config.migration_notices.iter().any(|notice| matches!(
+            notice,
+            crate::migration::MigrationNotice::IgnoredEnvOverride { variable: ignored, reason }
+                if ignored == variable && reason.contains("fixed limits")
+        )));
+        assert!(
+            config
+                .migration_notices
+                .iter()
+                .all(|notice| !notice.changes_file()),
+            "an ignored variable is not a change to write"
+        );
     }
 }
