@@ -607,7 +607,7 @@ jobs:
   # assets to the required list in `publish`.
   build-desktop-linux:
     name: Build Desktop App (Linux x86_64)
-    needs: [validate]
+    needs: [validate, web]
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     continue-on-error: true
@@ -632,6 +632,11 @@ jobs:
         with:
           prefix-key: linux-tauri
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+
       - name: Install Tauri CLI
         run: bash scripts/ci/install_release_tool.sh tauri-cli
 
@@ -644,7 +649,11 @@ jobs:
           echo "Tauri version set to: $VERSION"
 
       - name: Stage bundled kernel sidecar
-        run: scripts/desktop/prepare-kernel.sh --target x86_64-unknown-linux-gnu
+        run: scripts/desktop/prepare-kernel.sh --target x86_64-unknown-linux-gnu --features embedded-web
+
+      # Guards the embedded desktop dashboard; see the bespoke gate registry in README.md.
+      - name: Smoke test embedded dashboard from an empty directory
+        run: scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/zeroclaw-x86_64-unknown-linux-gnu
 
       - name: Build Tauri app (bundled kernel)
         working-directory: apps/tauri
@@ -666,7 +675,7 @@ jobs:
 
   build-desktop-windows:
     name: Build Desktop App (Windows x86_64)
-    needs: [validate]
+    needs: [validate, web]
     runs-on: windows-latest
     timeout-minutes: 150
     continue-on-error: true
@@ -680,6 +689,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: windows-tauri
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
 
       - name: Install Tauri CLI
         shell: bash
@@ -695,7 +709,12 @@ jobs:
 
       - name: Stage bundled kernel sidecar
         shell: bash
-        run: scripts/desktop/prepare-kernel.sh --target x86_64-pc-windows-msvc
+        run: scripts/desktop/prepare-kernel.sh --target x86_64-pc-windows-msvc --features embedded-web
+
+      # Guards the embedded desktop dashboard; see the bespoke gate registry in README.md.
+      - name: Smoke test embedded dashboard from an empty directory
+        shell: bash
+        run: scripts/desktop/smoke-dashboard.sh apps/tauri/binaries/zeroclaw-x86_64-pc-windows-msvc.exe
 
       - name: Build Tauri app (bundled kernel)
         working-directory: apps/tauri
