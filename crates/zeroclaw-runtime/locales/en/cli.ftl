@@ -937,6 +937,7 @@ cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [does not 
 cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no component to load]
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
+cli-config-schema-version-inferred = warning: {$path} has no `schema_version`. Its sections are in the current format, so it was read as schema_version {$version}. Add `schema_version = {$version}` as the first line of the file: without it, a future change to this check could read the file as an old version and migrate it.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-removed-grant-kept = Its config entry '{$key}' is kept, with its egress grant ({$grants}): a package installed later as '{$name}' inherits it. Delete the [[plugins.entries]] row named '{$key}' to drop the grant.
 cli-plugin-not-found = Plugin '{$name}' not found.

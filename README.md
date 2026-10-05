@@ -92,7 +92,7 @@ One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 - [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
 - [Full config reference](https://docs.zeroclaw.com/master/en/reference/config.html) — generated from the live schema; every key documented
 
-A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
+A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. A hand-written file should also start with `schema_version = 3`. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
 
 For standard OpenAI Codex subscription auth, Quickstart can write the provider
 entry for you:

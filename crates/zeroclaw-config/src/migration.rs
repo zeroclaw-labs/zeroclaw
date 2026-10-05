@@ -44,6 +44,7 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
         .as_table()
         .context("config root must be a TOML table")?;
     match table.get("schema_version") {
+        None if is_plainly_current_shape(table) => Ok(CURRENT_SCHEMA_VERSION),
         None => Ok(1),
         Some(toml::Value::Integer(n)) if *n >= 1 => Ok(*n as u32),
         Some(other) => {
@@ -57,6 +58,90 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
             anyhow::bail!("schema_version must be a positive integer, got {other}")
         }
     }
+}
+
+/// [`V1_LEGACY_KEYS`] that are also top-level sections of the current schema
+/// (with a different shape), so their presence says nothing about the
+/// version. Kept in step with the schema by
+/// `v1_keys_still_current_are_exactly_the_current_top_level_sections`.
+const V1_KEYS_STILL_CURRENT: &[&str] = &["model_routes", "embedding_routes", "cron"];
+
+/// Whether a config with no `schema_version` key was read as the current
+/// version because its shape leaves no doubt: an alias-keyed
+/// `providers.models.<family>` or `channels.<type>` section, no section in
+/// the older flat shape, and no V1-only top-level key.
+///
+/// Loaders use this to warn the operator: the key is missing and should be
+/// added, even though the file loads correctly.
+#[must_use]
+pub fn schema_version_inferred(value: &toml::Value) -> bool {
+    value.as_table().is_some_and(|table| {
+        !table.contains_key("schema_version") && is_plainly_current_shape(table)
+    })
+}
+
+/// Whether a config with no `schema_version` key is unmistakably written in
+/// the current (V3) shape.
+///
+/// A missing key historically meant V1, since V1 files predate the key. But a
+/// hand-written or template-generated V3 file can omit it too, and running
+/// such a file through the V1→V3 chain silently destroys it: alias-keyed
+/// channel sections collapse into `default` and the other aliases are
+/// dropped. So a missing key is read as V3 when the file carries the V3
+/// shape and nothing older:
+///
+/// - no V1-only top-level key ([`V1_LEGACY_KEYS`] minus
+///   [`V1_KEYS_STILL_CURRENT`]);
+/// - at least one alias-keyed section, `providers.models.<family>` or
+///   `channels.<type>`, meaning a table whose every value is a table
+///   (`[providers.models.ollama.default]`, `[channels.discord.work]`);
+/// - no such section holding fields directly, which is the V2 shape
+///   (`[providers.models.ollama] model = "..."`, `[channels.discord]
+///   bot_token = "..."`).
+///
+/// Anything else keeps the V1 reading.
+fn is_plainly_current_shape(table: &toml::Table) -> bool {
+    if V1_LEGACY_KEYS
+        .iter()
+        .filter(|key| !V1_KEYS_STILL_CURRENT.contains(key))
+        .any(|key| table.contains_key(*key))
+    {
+        return false;
+    }
+
+    let provider_families = table
+        .get("providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get("models"))
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(toml::Table::values);
+    let channel_types = table
+        .get("channels")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|channels| {
+            crate::schema::v2::V3_CHANNEL_TYPES
+                .iter()
+                .filter_map(|kind| channels.get(*kind))
+        });
+
+    let mut alias_keyed = false;
+    for section in provider_families.chain(channel_types) {
+        let Some(section) = section.as_table() else {
+            continue;
+        };
+        if section.is_empty() {
+            continue;
+        }
+        if section.values().all(toml::Value::is_table) {
+            alias_keyed = true;
+        } else {
+            // A field held directly on the section: the V2 shape.
+            return false;
+        }
+    }
+    alias_keyed
 }
 
 pub fn migrate_file(input: &str) -> Result<Option<String>> {
@@ -918,6 +1003,140 @@ mod tests {
     fn detect_version_missing_is_v1() {
         let v: toml::Value = toml::from_str("foo = 1").unwrap();
         assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    /// The case that lost a contributor's channels: a hand-written V3 file
+    /// with alias-keyed sections and no `schema_version`. It used to be read
+    /// as V1 and migrated, which collapsed `work`/`home` into `default`.
+    const HAND_WRITTEN_V3_WITHOUT_VERSION: &str = r#"
+[providers.models.ollama.default]
+model = "llama3"
+
+[channels.discord.work]
+enabled = true
+bot_token = "work-token"
+mention_only = true
+
+[channels.discord.home]
+enabled = true
+bot_token = "home-token"
+mention_only = false
+"#;
+
+    #[test]
+    fn a_plainly_current_file_without_the_key_is_read_as_current() {
+        let v: toml::Value = toml::from_str(HAND_WRITTEN_V3_WITHOUT_VERSION).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(schema_version_inferred(&v));
+    }
+
+    #[test]
+    fn an_inferred_current_file_keeps_every_channel_alias() {
+        let config = migrate_to_current(HAND_WRITTEN_V3_WITHOUT_VERSION)
+            .expect("a V3-shaped file loads without migration");
+        let discord = &config.channels.discord;
+        assert!(
+            discord.get("work").is_some_and(|work| work.mention_only),
+            "the `work` alias must survive with its own settings"
+        );
+        assert!(
+            discord.get("home").is_some_and(|home| !home.mention_only),
+            "the `home` alias must survive with its own settings"
+        );
+        assert!(
+            !discord.contains_key("default"),
+            "nothing may be collapsed into a synthesized `default` alias"
+        );
+    }
+
+    #[test]
+    fn an_explicit_version_is_never_reported_as_inferred() {
+        let raw = format!("schema_version = 3\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 3);
+        assert!(!schema_version_inferred(&v));
+    }
+
+    #[test]
+    fn a_v2_shaped_file_without_the_key_keeps_the_v1_reading() {
+        // V2 held fields directly on the family and channel sections.
+        for raw in [
+            "[providers.models.ollama]\nmodel = \"llama3\"\n",
+            "[channels.discord]\nbot_token = \"t\"\nenabled = true\n",
+            // One alias-keyed section does not outvote a flat one.
+            "[providers.models.ollama.default]\nmodel = \"llama3\"\n\n[channels.discord]\nbot_token = \"t\"\n",
+        ] {
+            let v: toml::Value = toml::from_str(raw).unwrap();
+            assert_eq!(detect_version(&v).unwrap(), 1, "{raw}");
+            assert!(!schema_version_inferred(&v), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_v1_only_key_keeps_the_v1_reading() {
+        let raw = format!("default_model = \"gpt-4\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    #[test]
+    fn keys_shared_with_the_current_schema_do_not_veto_the_inference() {
+        let raw =
+            format!("[cron.nightly]\nschedule = \"0 0 * * *\"\n{HAND_WRITTEN_V3_WITHOUT_VERSION}");
+        let v: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_file_with_no_alias_keyed_section_keeps_the_v1_reading() {
+        for raw in [
+            "",
+            "[gateway]\nport = 42617\n",
+            "[providers.models.ollama]\n",
+        ] {
+            let v: toml::Value = toml::from_str(raw).unwrap();
+            assert_eq!(detect_version(&v).unwrap(), 1, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_bundled_v1_fixture_is_still_read_as_v1() {
+        let v: toml::Value = toml::from_str(V1_FIXTURE).unwrap();
+        assert_eq!(detect_version(&v).unwrap(), 1);
+    }
+
+    /// `V1_KEYS_STILL_CURRENT` must name exactly the V1 legacy keys that are
+    /// also top-level sections today: missing one would let a current file
+    /// that uses it be read as V1; listing a V1-only key would let a V1 file
+    /// be read as current.
+    #[test]
+    fn v1_keys_still_current_are_exactly_the_current_top_level_sections() {
+        let current: std::collections::BTreeSet<String> = Config::default()
+            .prop_fields()
+            .iter()
+            .filter_map(|field| field.name.split('.').next().map(str::to_string))
+            // Keyed sections (`cron`, `model_routes`, …) are empty by default,
+            // so neither of the other two sources lists them.
+            .chain(
+                Config::map_key_sections()
+                    .iter()
+                    .filter_map(|section| section.path.split('.').next().map(str::to_string)),
+            )
+            .chain(
+                toml::Value::try_from(Config::default())
+                    .expect("serialize default config")
+                    .as_table()
+                    .expect("config is a table")
+                    .keys()
+                    .cloned(),
+            )
+            .collect();
+        let shared: Vec<&str> = V1_LEGACY_KEYS
+            .iter()
+            .copied()
+            .filter(|key| current.contains(*key))
+            .collect();
+        assert_eq!(shared, V1_KEYS_STILL_CURRENT);
     }
 
     #[test]
