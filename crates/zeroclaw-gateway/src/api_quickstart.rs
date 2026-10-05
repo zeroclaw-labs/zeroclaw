@@ -91,25 +91,68 @@ pub async fn handle_apply(
     principal: crate::principal_gate::RequestPrincipal,
     Json(submission): Json<BuilderSubmission>,
 ) -> axum::response::Response {
-    // Held through the swap below (and across `apply_with_surface`'s own
-    // save, which runs while this guard is held) so a concurrent config
-    // writer can't land between this read and the swap.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+    let cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
         .lock_owned()
         .await;
-    // Quickstart writes wherever the submission leads and saves on its
-    // own; the write set cannot be enumerated up front, so a scoped
-    // principal needs the wildcard selector.
+    // Quickstart can write an open-ended set of config paths. Refuse a
+    // principal without whole-config authority before reserving the alias.
     let authorization = match crate::principal_gate::authorize_whole_config_write(
         &principal,
         &[
             zeroclaw_api::grants::Verb::Create,
             zeroclaw_api::grants::Verb::Update,
         ],
+        &cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
+    let reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(&submission.agent.name)
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(ApplyResult::Errors {
+                    errors: vec![QuickstartError {
+                        step: QuickstartStep::Agent,
+                        field: "agent.name".into(),
+                        message: error.to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+    // Keep admission and save/publication together if the request disconnects.
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let _reservation = reservation;
+            apply_reserved(state, submission, authorization, cfg_guard).await
+        }));
+    match task.await {
+        Ok(response) => response,
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Quickstart completion failed: {error}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn apply_reserved(
+    state: AppState,
+    submission: BuilderSubmission,
+    authorization: crate::principal_gate::ConfigWriteAuthorization,
+    _cfg_guard: crate::ConfigWriteGuard,
+) -> axum::response::Response {
+    // Held through the swap below (and across `apply_with_surface`'s own
+    // save, which runs while this guard is held) so a concurrent config
+    // writer can't land between this read and the swap.
     let mut working = state.config.read().clone();
     // The staged policy is compiled BEFORE Quickstart's first write, so a
     // rejected one cannot reach disk and then be reported as not saved.
@@ -179,3 +222,78 @@ fn signal_daemon_reload(state: &AppState) -> bool {
 // Per-family alias collection lives in
 // `zeroclaw_runtime::quickstart::snapshot_state` so both transports
 // share one implementation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::presets::{
+        AgentIdentity, MemoryChoice, ModelProviderChoice, SelectorChoice,
+    };
+
+    #[tokio::test]
+    async fn quickstart_creation_waits_for_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let workspace = config.agent_workspace_dir("recreated");
+        let state = crate::api::tests::test_state(config);
+        let mut cleanup = state.agent_lifecycle.begin_delete("recreated").unwrap();
+        cleanup.commit_destructive_mutation();
+        let submission = || BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([("api_key".into(), "sk-test".into())]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "recreated".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let response = handle_apply(State(state.clone()), None, Json(submission()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["kind"], "errors");
+        assert!(
+            result["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("recreated")
+        );
+        assert!(!state.config.read().agents.contains_key("recreated"));
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+        assert!(!workspace.exists());
+
+        drop(cleanup);
+        let response = handle_apply(State(state.clone()), None, Json(submission()))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["kind"], "applied", "{result}");
+        assert!(state.config.read().agents.contains_key("recreated"));
+    }
+}

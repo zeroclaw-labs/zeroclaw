@@ -63,7 +63,7 @@ pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
-pub use zeroclaw_tools::file_download::FileDownloadTool;
+pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
@@ -123,6 +123,8 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
 
+use crate::live_config_authority::AgentExecutionCapability;
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -172,6 +174,7 @@ use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
@@ -222,10 +225,6 @@ impl Tool for ArcToolRef {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.0.invocation_triggers()
-    }
-
-    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
-        self.0.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -312,10 +311,6 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
-    }
-
-    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
-        self.inner.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -644,6 +639,16 @@ impl AllToolsResult {
     }
 }
 
+fn runtime_for_all_tools(
+    root_config: &zeroclaw_config::schema::Config,
+    tui_env: Option<&HashMap<String, String>>,
+) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
+    let tui_path = tui_env.and_then(|env| env.get("PATH")).map(OsStr::new);
+    Ok(Arc::from(
+        zeroclaw_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
+    ))
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -669,12 +674,13 @@ pub fn all_tools(
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
 ) -> anyhow::Result<AllToolsResult> {
+    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())?;
     all_tools_with_runtime(
         config,
         security,
         risk_profile,
         agent_alias,
-        Arc::new(NativeRuntime::new()),
+        runtime,
         memory,
         composio_key,
         composio_entity_id,
@@ -1081,13 +1087,13 @@ pub fn all_tools_with_runtime(
     )
 }
 
-/// Create the full tool registry with an optional ACP session read view.
+/// Build the registry on its dedicated stack with lifecycle and ACP context.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
-pub fn all_tools_with_runtime_and_acp_sessions(
+pub(crate) fn all_tools_with_runtime_context(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
@@ -1112,6 +1118,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
     let builder = move || {
@@ -1145,6 +1152,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
             sop_engine,
             sop_audit,
             live_config,
+            execution_capability,
             acp_sessions,
         )
     };
@@ -1168,8 +1176,125 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     })
 }
 
-/// Registry build body; runs on the dedicated builder thread spawned by
-/// [`all_tools_with_runtime`].
+/// Create the full tool registry with an optional ACP session read view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_acp_sessions(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<ForwardedEnvironment>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
+) -> anyhow::Result<AllToolsResult> {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+        acp_sessions,
+    )
+}
+
+/// Create the managed registry while carrying the authority-backed execution
+/// capability into tools that can start work for another target alias.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_execution_capability(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> anyhow::Result<AllToolsResult> {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env.map(Arc::new),
+        sop_engine,
+        sop_audit,
+        live_config,
+        execution_capability,
+        None,
+    )
+}
+
+/// Registry build body; runs on the dedicated builder thread.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -1196,10 +1321,8 @@ fn all_tools_with_runtime_on_thread(
     tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    // Live config handle for `send_via` peer-group authority. `Some` from the
-    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
-    // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
@@ -1300,11 +1423,12 @@ fn all_tools_with_runtime_on_thread(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunTool::new_with_runtime(
+        Arc::new(CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
+            execution_capability.clone(),
         )),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -1324,11 +1448,14 @@ fn all_tools_with_runtime_on_thread(
                 agent_alias,
                 security.clone(),
             )
-            .with_subagent_caller(is_subagent_caller),
+            .with_subagent_caller(is_subagent_caller)
+            .with_execution_capability(execution_capability.clone()),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
+            live_config.clone(),
+            execution_capability.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -2034,11 +2161,30 @@ fn all_tools_with_runtime_on_thread(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+        let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || {
+                    let config = live.read();
+                    FileDownloadSsrfPolicy {
+                        allowed_private_hosts: config.file_download.allowed_private_hosts.clone(),
+                        nat64_prefixes: config.security.nat64_prefixes.clone(),
+                    }
+                })
+            } else {
+                let snapshot = FileDownloadSsrfPolicy {
+                    allowed_private_hosts: root_config.file_download.allowed_private_hosts.clone(),
+                    nat64_prefixes: root_config.security.nat64_prefixes.clone(),
+                };
+                Arc::new(move || snapshot.clone())
+            };
+        tool_arcs.push(Arc::new(
+            FileDownloadTool::new_with_persistence_and_resolver(
+                security.clone(),
+                root_config.file_download.clone(),
+                persistent_writes,
+                move || policy_resolver(),
+            ),
+        ));
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -2299,6 +2445,7 @@ fn all_tools_with_runtime_on_thread(
         // resolve against that snapshot forever. Same contract as the
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
+        .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
@@ -2549,8 +2696,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
-        SopApprovalConfig,
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
+        MemoryConfig, SopApprovalConfig,
     };
 
     /// RFC 6996 canonical boundary coverage: every tool in the default
@@ -2930,6 +3077,53 @@ mod tests {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shell = tmp.path().join("all-tools-configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut root_config = Config::default();
+        root_config.runtime.shell = Some("all-tools-configured-shell".to_string());
+        let path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-decoy"),
+            shell.parent().unwrap().as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let command = runtime
+            .build_shell_command("echo all-tools", tmp.path())
+            .unwrap();
+
+        assert_eq!(
+            command.as_std().get_program(),
+            shell.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+        use std::ffi::OsString;
+
+        for path in [OsString::new(), OsString::from("relative-only")] {
+            let mut root_config = Config::default();
+            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            let tui_env =
+                HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
         }
     }
 
@@ -5926,6 +6120,92 @@ permissions = ["http_client"]
             "llm_task should construct the Codex provider for \
              openai.codex (requires_openai_auth=true), producing an \
              openai-codex credential error; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(root_config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live_config.clone()),
+        )
+        .expect("tool registry should build")
+        .tools;
+        let file_download = tools
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered when file_download.url is set");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download.execute(args.clone()).await.unwrap();
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.unwrap();
+        assert!(
+            !second.success,
+            "same tool instance must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
         );
     }
 }

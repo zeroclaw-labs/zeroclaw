@@ -971,6 +971,7 @@ mod tests {
             wasm_path: None,
             wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
+            provides: None,
             permissions: vec![PluginPermission::WebSocketClient],
             config_schema: None,
             signature: None,

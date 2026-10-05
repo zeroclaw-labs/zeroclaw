@@ -74,6 +74,11 @@ tool-file-download-error-missing-dest-path = Missing 'dest_path' parameter
 tool-file-download-error-invalid-file-name = Invalid dest_path '{ $dest_path }': must end in a concrete file name
 tool-file-download-error-no-parent = Invalid dest_path '{ $dest_path }': has no parent directory
 tool-file-download-error-resolve-dir = Cannot resolve destination directory for '{ $dest_path }': { $err }
+tool-file-download-error-bad-scheme = file_download endpoint URL scheme '{ $scheme }' is not supported; only http:// and https:// are allowed
+tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { $err }
+tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
+tool-file-download-error-metadata-endpoint = file_download endpoint host '{ $host }' resolved to cloud metadata or credential-delivery address { $ip }, which cannot be enabled by file_download.allowed_private_hosts
+tool-file-download-error-invalid-nat64-prefix = file_download config '{ $config_key }' contains malformed entry '{ $prefix }': fix or remove it, then retry (a network-specific NAT64 prefix must be an IPv6 CIDR with length 32, 40, 48, 56, 64, or 96)
 tool-file-download-error-client-build = Failed to build download client: { $err }
 tool-file-download-error-request = Download request failed: { $err }
 tool-file-download-error-status = Download endpoint returned status { $status }
@@ -181,6 +186,12 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-param-session-id = The existing Chat session ID whose legacy history should be appended (for example, telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>.
+tool-sessions-send-param-message = Legacy content to append as an ordinary 'user' message; this does not notify or run the session.
+tool-sessions-send-output-appended = Legacy content appended to session '{ $session_id }' as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-output-appended-alias = Legacy content appended to session '{ $session_id }' (requested '{ $requested_id }') as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-error-append = Failed to append content to session history: { $error }
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
 

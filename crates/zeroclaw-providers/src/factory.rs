@@ -319,6 +319,9 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
     // The configured `[multimodal]` policy. Without this the provider boundary
     // would re-normalize already-prepared messages under defaults and could
     // trim images the runtime had accepted under the operator's settings.

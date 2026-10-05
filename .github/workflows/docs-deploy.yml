@@ -462,7 +462,9 @@ jobs:
             --pages "$PAGES_DIR" --repo "$GITHUB_REPOSITORY"
             --master-sha "$GITHUB_SHA" --tag "$TAG" --minimum "$DOCS_MIN_VERSION")
           "${PROMOTE[@]}"
-          if git -C "$PAGES_DIR" diff --quiet; then
+          # status, not diff: a promotion that only adds the root llms pair
+          # creates untracked files, which `git diff --quiet` does not report.
+          if [ -z "$(git -C "$PAGES_DIR" status --porcelain)" ]; then
             echo "Stable docs already point to $TAG."
             exit 0
           fi

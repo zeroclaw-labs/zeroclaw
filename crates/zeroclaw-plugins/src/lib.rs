@@ -65,6 +65,19 @@ pub struct PluginManifest {
     pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
+    /// The compiled-in channel id this plugin *mirrors*, when it is a drop-in
+    /// for a built-in channel: the snake_case config id (`"telegram"`,
+    /// `"gmail_push"`).
+    ///
+    /// When set, the host admits one logical instance per configured and
+    /// enabled `[channels.<id>.<alias>]` and binds each to that alias, instead
+    /// of the single `[channels.plugin.<alias>]` declaration a novel channel
+    /// plugin uses. Canonical channel config stays the one home for those
+    /// settings: a mirror never gets a second config surface.
+    ///
+    /// `None` (the default) is a novel plugin with no built-in equivalent.
+    #[serde(default)]
+    pub provides: Option<String>,
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,

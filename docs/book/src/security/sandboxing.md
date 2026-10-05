@@ -120,19 +120,18 @@ Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].t
 
 ### Shell binary
 
-When `[runtime].shell` is unset, the native runtime detects a platform default.
-Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the
-current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`.
-Linux first uses the passwd login shell, then tries `bash`, `zsh`, and
-`/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell`
-to choose an interpreter explicitly:
+When `[runtime].shell` is unset, the native runtime detects a platform default. Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`. Linux first uses the passwd login shell, then tries `bash`, `zsh`, and `/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell` to choose an interpreter explicitly:
 
 ```toml
 [runtime]
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Explicit configuration always takes precedence over detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used.
+On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); configuration validation rejects empty values and relative paths with separators (e.g. `"./sh"`, `"bin/sh"`). Before spawn, ZeroClaw canonicalizes an absolute shell path directly and resolves a bare name against the effective `PATH` when one is supplied; a runtime factory may resolve and retain that canonical launcher earlier, while other paths use the retained or ambient resolution during command preparation. The target must be a regular executable file, and failure returns from runtime construction or command preparation before execution. Explicit configuration takes precedence over default detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used. If an injected `PATH` omits a selected bare default, preparation fails rather than switching interpreters.
+
+Firejail, Bubblewrap, and macOS Seatbelt replace the host command with a sandbox launcher. When the requested shell identity differs from the canonical executable path, the wrapper must preserve that identity (for example, `sh` selecting a BusyBox applet or Bash compatibility mode) while executing the validated canonical target. On Linux, Firejail and Bubblewrap require a GNU-compatible `env` or `genv` with `--argv0` support on the host process's absolute `PATH` entries. ZeroClaw probes each candidate for up to two seconds; the helper and its libraries must be accessible inside the sandbox. On macOS, Seatbelt uses the system `/bin/bash` with a fixed `exec -a` trampoline, so a separate GNU coreutils installation is not required. The trampoline passes the requested identity and command arguments as process arguments, not interpolated shell source. ZeroClaw does not widen filesystem access or fall back to an unsandboxed command when a required helper cannot execute. The Linux host-helper lookup does not use the TUI-only environment overlay.
+
+For these identity-preserving wrapped launches, canonical shell paths containing `=` remain rejected; on Linux, `env` would interpret such operands as environment assignments. Linux helper paths containing `=` are rejected for the same reason, and missing or unsupported helpers produce a preparation error. Direct native execution, Landlock, and Docker's separate in-container shell selection do not require a host identity helper.
 
 On **Windows**, the value selects the interpreter family by its file name:
 

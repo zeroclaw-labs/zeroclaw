@@ -34,6 +34,9 @@ cli-integrations-chat-slack-prepare = Create an app at {$url}, configure its bot
 cli-integrations-chat-configure = Run {$command}, open Config, and configure a {$channel} instance and its credentials.
 cli-integrations-chat-bind = Bind the channel alias to an agent and review peer-group access.
 cli-integrations-chat-enable = Enable the channel instance only after reviewing its settings and access.
+cli-integrations-chat-imessage-transport = Sends messages through AppleScript automation and receives messages by reading the local Messages database.
+cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
+cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
@@ -112,6 +115,9 @@ cli-skills-install-git-failed = failed to install git skill source: {$source}
 cli-skills-install-registry-failed = failed to install skill from registry: {$source}
 cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
 cli-skills-install-local-failed = failed to install local skill source: {$source}
+cli-skills-install-well-known-requires-skill = --well-known requires --skill <name>; refusing to install every advertised skill
+cli-skills-install-resolving-well-known = { "  " }Resolving selected skill '{$skill}' from well-known index at {$source}...
+cli-skills-install-well-known-failed = failed to install well-known skill '{$skill}' from {$source}
 cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
 cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
 cli-skills-install-into-bundle = { "  " }Installed into bundle '{$alias}'. Agents that list this bundle in skill_bundles will load it.
@@ -454,6 +460,7 @@ channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} 
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
@@ -514,6 +521,7 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -881,6 +889,7 @@ cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
+cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
@@ -1265,6 +1274,8 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── daemon mTLS and enrollment operator output ──
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
+cli-relay-claim-wss-disabled = Note: [wss] is disabled, and the relay refuses registration until it is enabled. The claim above is saved and stays valid - enable the WSS listener (see the secure-transport guide) and the binding takes effect on the next start.
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
@@ -1402,6 +1413,10 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
 # ── RPC inbound authentication ──
@@ -1420,3 +1435,8 @@ rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revali
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
+
+# Atomic RPC configuration batches
+rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
+rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
+rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }

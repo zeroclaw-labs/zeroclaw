@@ -30,7 +30,7 @@ env:
 # installer-drift) and the Linux `build` matrix entry name their runner label
 # directly, so runner selection does not wait for fmt. Only the separate
 # windows-task-owner-recovery job waits for path-changes; the build matrix
-# starts immediately.
+# waits only for the push debounce, which is skipped on PR and merge-queue events.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -69,6 +69,27 @@ env:
 # and is not an exposure.
 
 jobs:
+  # ── Master-push debounce ─────────────────────────────────────────────────
+  # Master pushes arrive in bursts (median gap ~10 min, many under 5), and the
+  # run-level `cancel-in-progress` cancels each superseded push only after its
+  # compile fleet has started: over one week, 33+ master runs were cancelled
+  # mid-compile. On push events the compile-heavy jobs wait here first, so a
+  # push that is superseded within the window is cancelled while this job is
+  # sleeping, before any compile begins. On pull_request and merge_group this
+  # job is skipped: a skipped job resolves without a runner, so PR and queue
+  # latency are unchanged. Gated jobs use
+  # `!cancelled() && needs.master-debounce.result != 'failure'` so a skip lets
+  # them run; `gate` needs this job so a debounce failure cannot turn skipped
+  # compile jobs into a green gate.
+  master-debounce:
+    name: Debounce master push
+    if: github.event_name == 'push'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Wait for a newer push to supersede this run
+        run: sleep 300
+
   # ── Required formatting check ────────────────────────────────────────────
   # Ordering note: neither GitHub-hosted nor compile jobs wait on `fmt`.
   # Path-detector and other job dependencies still apply. Compile jobs pin
@@ -164,6 +185,12 @@ jobs:
       - name: Test crates.io publish ordering and preflight
         run: python3 scripts/release/publish_crates_test.py
 
+      - name: Test crates.io release commit resolution
+        run: python3 scripts/release/resolve_crates_release_test.py
+
+      - name: Test crates.io version-bump preflight trigger
+        run: bash scripts/ci/crates_preflight_trigger.test.sh
+
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
 
@@ -254,6 +281,8 @@ jobs:
 
   lint:
     name: Lint
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
@@ -295,11 +324,17 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: Container build inputs gate (root build.rs reaches every source build)
+        run: |
+          bash scripts/ci/container_build_inputs_gate.test.sh
+          bash scripts/ci/container_build_inputs_gate.sh
       - name: act-local artifact compatibility tests
         run: bash scripts/dev/act-local.test.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -343,7 +378,7 @@ jobs:
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
     needs: [windows-clippy-tools-changes]
-    if: needs.windows-clippy-tools-changes.outputs.run == 'true'
+    if: ${{ !cancelled() && needs.windows-clippy-tools-changes.result == 'success' && needs.windows-clippy-tools-changes.outputs.run == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -372,10 +407,103 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
+  windows-service-smoke-changes:
+    name: Detect Windows Service Smoke changes
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect Windows service smoke changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(src/main\.rs|crates/zeroclaw-runtime/(src/service/mod\.rs|examples/windows_service_smoke_fixture\.rs)|scripts/ci/windows_service_smoke\.ps1|\.github/workflows/ci\.yml)$' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-service-smoke:
+    name: Windows Service Smoke
+    needs: [windows-service-smoke-changes]
+    if: needs.windows-service-smoke-changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: dev-fixture-v1
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build controlled Windows service fixture
+        # This unshipped fixture proves service lifecycle behavior, so avoid
+        # release optimization and thin LTO before the short smoke.
+        shell: bash
+        run: >-
+          cargo build --profile dev --locked -p zeroclaw-runtime
+          --example windows_service_smoke_fixture
+          --target x86_64-pc-windows-msvc
+      - name: Exercise installed Windows service lifecycle
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
+      - name: Clean up Windows service smoke
+        if: always()
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
+            -CleanupOnly
+      - name: Upload Windows service smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-service-smoke-evidence
+          path: ${{ runner.temp }}/windows-service-smoke-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
   # ── Build + check fan-out ─────────────────────────────────────────────────
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -468,8 +596,8 @@ jobs:
   # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
   windows-task-owner-recovery:
     name: Test Windows task-owner recovery
-    needs: [path-changes]
-    if: needs.path-changes.outputs.windows_recovery != 'false'
+    needs: [path-changes, master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.path-changes.result == 'success' && needs.path-changes.outputs.windows_recovery != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -504,6 +632,8 @@ jobs:
 
   check:
     name: Check (${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
@@ -553,6 +683,8 @@ jobs:
 
   check-plugin-backends:
     name: Check (${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     strategy:
@@ -663,6 +795,9 @@ jobs:
   msrv:
     name: MSRV (declared floor)
     needs: [installer-drift]
+    # Explicit status check: an implicit success() would be skipped on PRs,
+    # because the skipped push-only master-debounce is a transitive ancestor.
+    if: ${{ !cancelled() && needs.installer-drift.result == 'success' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -704,6 +839,8 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -727,13 +864,14 @@ jobs:
 
   bench:
     name: Benchmarks Compile
+    needs: [master-debounce]
     # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
     # without running it. Zero failures across 22 red runs and no bench-fix
     # commit in 6 months, and its narrow form was introduced by #8896 as a
     # measurement slice for #7108 rather than as coverage. Master, merge-queue
     # and manual runs still execute it, so benches cannot rot undetected before
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
-    if: github.event_name != 'pull_request'
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -788,6 +926,8 @@ jobs:
 
   test:
     name: Test
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -823,11 +963,47 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Informational until the gateway starts calling the core over RPC: the
+      # golden-frame replay compares the gateway's WebSocket, SSE, webhook and
+      # ACP output with recorded fixtures and reports drift without failing
+      # the job. It reuses the workspace build above (same package set and
+      # features), so it adds no compile.
+      - name: Golden-frame replay (informational)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set +e
+          cargo nextest run --locked --workspace --exclude zeroclaw-desktop \
+            --run-ignored only --no-fail-fast \
+            -E 'package(zeroclaw-gateway) & binary(golden_frames)' 2>&1 | tee golden-frames.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "### Golden-frame replay (informational)"
+            if [ "$status" -eq 0 ]; then
+              echo "All gateway golden-frame scenarios match their fixtures."
+            else
+              echo "Gateway output drifted from the recorded fixtures. This does not fail CI."
+              echo "Re-record intended changes with \`ZEROCLAW_GOLDEN_RECORD=1\` (see \`crates/zeroclaw-gateway/tests/golden_frames.rs\`)."
+              echo
+              echo '```text'
+              grep -E '^\s+(FAIL|PASS) |golden-frame mismatch|^[+-] {0,3}[0-9]+ ' golden-frames.log | head -200
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=Golden-frame drift::Gateway output differs from tests/golden fixtures (informational)."
+          fi
+          exit "$status"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # Feature configurations keep their original defaults and test filters.
   # In particular, Lark runs without defaults and QQ excludes live-auth tests.
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
@@ -869,6 +1045,8 @@ jobs:
 
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     services:
@@ -916,6 +1094,8 @@ jobs:
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -963,7 +1143,7 @@ jobs:
   parallel-runtime-test:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
-    if: needs.parallel-runtime-test-changes.outputs.run == 'true'
+    if: ${{ !cancelled() && needs.parallel-runtime-test-changes.result == 'success' && needs.parallel-runtime-test-changes.outputs.run == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -991,6 +1171,8 @@ jobs:
 
   test-landlock:
     name: Test (Landlock)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1052,6 +1234,7 @@ jobs:
               ".github/workflows/ci.yml",
               ".github/workflows/windows-tests.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-risk-labeler.yml",
               ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
@@ -1224,6 +1407,8 @@ jobs:
   # Guards generated installation surfaces against canonical-spec drift from PR #7558; see the bespoke gate registry in README.md.
   installer-drift:
     name: Installer Drift
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -1299,10 +1484,50 @@ jobs:
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
 
+  # ── crates.io package preflight on version bumps ─────────────────────────
+  # A pull request or merge-queue entry that changes [workspace.package]
+  # version to a stable X.Y.Z is a release's version bump. It must not merge
+  # unless every crate packages and compiles from its own tarball, the same
+  # tokenless check the stable release repeats before the GitHub Release.
+  # Other changes skip it; the static publish contract still runs in `test`.
+  crates-preflight-changes:
+    name: Detect crates.io version bump
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.bump.outputs.run }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect workspace version change
+        id: bump
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: bash scripts/ci/crates_preflight_trigger.sh "$EVENT_NAME" "$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+  # Blocking by design: retry an infrastructure failure and keep the bump
+  # unmerged until required CI is green. The release run independently
+  # repeats the preflight before publishing the GitHub Release.
+  crates-preflight:
+    name: crates.io Package Preflight
+    needs: [crates-preflight-changes]
+    if: needs.crates-preflight-changes.outputs.run == 'true'
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.crates-preflight-changes.outputs.tag }}
+      release_sha: ${{ github.sha }}
+      stage: preflight
+      dry_run: true
+      runner: blacksmith-8vcpu-ubuntu-2404
+
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results

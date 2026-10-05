@@ -512,6 +512,25 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // file_edit is a read-modify-write operation. If another file mutation in
+    // the same prepared batch runs concurrently, either call can overwrite a
+    // result computed from stale contents. Preserve model order for the whole
+    // batch whenever at least one edit shares the batch with another edit or
+    // full-file write. Two file_write calls remain parallel-eligible because
+    // their atomic replacement already has sequential-equivalent
+    // last-writer-wins semantics.
+    let file_edit_count = tool_calls
+        .iter()
+        .filter(|call| call.name == "file_edit")
+        .count();
+    let file_mutation_count = tool_calls
+        .iter()
+        .filter(|call| matches!(call.name.as_str(), "file_edit" | "file_write"))
+        .count();
+    if file_edit_count > 0 && file_mutation_count > 1 {
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -2341,6 +2360,52 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    #[test]
+    fn two_file_edits_force_sequential_execution() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_edit")];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "concurrent read-modify-write calls can silently lose one edit"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_file_write_force_sequential_execution() {
+        let calls = vec![
+            parsed_tool_call("file_edit"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "a full-file write must not race an edit computed from stale contents"
+        );
+    }
+
+    #[test]
+    fn file_edit_and_non_mutating_tool_remain_parallel_eligible() {
+        let calls = vec![parsed_tool_call("file_edit"), parsed_tool_call("file_read")];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "one file mutation does not create a same-batch lost-update hazard"
+        );
+    }
+
+    #[test]
+    fn two_atomic_file_writes_remain_parallel_eligible() {
+        let calls = vec![
+            parsed_tool_call("file_write"),
+            parsed_tool_call("file_write"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "atomic full replacements retain last-writer-wins semantics"
         );
     }
 

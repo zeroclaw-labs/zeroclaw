@@ -25,10 +25,16 @@ For the local platform:
 #### sh
 
 ```sh
-docker build -f Dockerfile.alpine -t zeroclaw:alpine .
+docker build -f Dockerfile.alpine -t zeroclaw:alpine \
+  --build-arg ZEROCLAW_BUILD_ID="$(git rev-parse HEAD)" .
 ```
 
 </div>
+
+A build context carries no `.git` (`.dockerignore`), so that `--build-arg` is what
+lets `zeroclaw --version` name its commit; without it the image reports
+`0.8.5 (unknown)`. Images published to `ghcr.io` are stamped by the release
+workflow and need nothing passed by hand.
 
 For a multi-platform registry image, create a builder once and push the manifest. If you already have a buildx builder selected, omit the first command:
 
@@ -40,6 +46,7 @@ For a multi-platform registry image, create a builder once and push the manifest
 docker buildx create --use --name zeroclaw-multiarch
 docker buildx build -f Dockerfile.alpine \
   --platform linux/amd64,linux/arm64 \
+  --build-arg ZEROCLAW_BUILD_ID="$(git rev-parse HEAD)" \
   -t registry.example.com/zeroclaw:alpine \
   --push .
 ```
@@ -57,6 +64,10 @@ docker compose -f docker-compose.yml -f docker-compose.alpine.yml up --build
 ```
 
 </div>
+
+Compose passes no build args here, so an image built this way reports `0.8.5
+(unknown)`; the published `ghcr.io` image the default compose file pulls is
+stamped by the release workflow.
 
 The Alpine image uses the same `/zeroclaw-data` mount, schema-mirror environment variables, dashboard path, and gateway port as the existing images.
 

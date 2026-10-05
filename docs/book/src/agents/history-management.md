@@ -47,9 +47,13 @@ The token budget comes from `ResolvedRuntime::effective_context_budget()`:
 - When `history_pruning.enabled` is set with a positive
   `history_pruning.max_tokens`, that value pulls the budget down (never up),
   letting operators trim earlier.
-- Every positive effective budget is capped by the selected model's capacity.
-  The explicit zero sentinel remains zero and continues to disable proactive
-  trimming.
+- Every positive effective budget is capped by the selected model's
+  *configured* capacity. The 32,000 fallback is a compatibility stub, not
+  model truth: when the provider profile declares no `context_window` and the
+  runtime profile sets a positive `max_context_tokens`, that budget is honored
+  and also becomes the window operand (so a ratio applies to it) instead of
+  being clamped down to 32,000. The explicit zero sentinel remains zero and
+  continues to disable proactive trimming.
 
 The effective budget is a proactive trimming target, not a hard request limit.
 After dropping all eligible older turns, the runtime retains the newest complete

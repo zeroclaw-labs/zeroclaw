@@ -151,7 +151,7 @@ fn build_linker(imports: crate::component::OptionalImports) -> Result<Linker<Plu
 ///   resolved from canonical config at request time.
 ///
 /// This is what closes the egress SSRF hole (issue 9395) for channels without
-/// withholding the surface: the ungoverned `wasmtime_wasi_http::p2::default_hooks()`
+/// withholding the surface: the ungoverned `wasmtime_wasi_http::default_hooks()`
 /// is never installed — [`PluginState`] hands `wasi:http` the policy hooks
 /// instead — so the host owns reach even though the guest links the import
 /// (issue 9582 threads `EgressHostService` through channel construction).

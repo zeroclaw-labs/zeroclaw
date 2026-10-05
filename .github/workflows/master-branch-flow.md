@@ -36,6 +36,7 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 | `cross-platform-clippy.yml` | `workflow_dispatch`; weekly schedule | Advisory macOS/Windows Clippy coverage, outside the required PR gate |
 | `pr-path-labeler.yml` | `pull_request_target` lifecycle | Automatic path-based PR labeling |
 | `pr-size-labeler.yml` | `pull_request_target` lifecycle | Automatic canonical `size:*` labeling from PR file metadata |
+| `pr-risk-labeler.yml` | `pull_request_target` lifecycle, risk/security label changes, `workflow_dispatch` | Report-only PR risk evidence; no label, status, or ProjectV2 mutation |
 | `project-dashboard-plan.yml` | `workflow_dispatch` | Manual report-only issue Project Status planning; does not mutate ProjectV2, issues, or labels |
 
 ---
@@ -44,11 +45,11 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (required lint + test + build), `windows-tests.yml` (advisory tests only with `ci:windows`), `pr-path-labeler.yml`, and `pr-size-labeler.yml`; `platform-tests.yml` only when that workflow changes |
+| PR opened or updated against `master` | `ci.yml` (required lint + test + build), `windows-tests.yml` (advisory tests only with `ci:windows`), `pr-path-labeler.yml`, `pr-size-labeler.yml`, and report-only `pr-risk-labeler.yml`; `platform-tests.yml` only when that workflow changes |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Nightly at 03:17 UTC | `platform-tests.yml` (scheduled macOS/Windows tests) |
-| Manual dispatch | `platform-tests.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docker-publish.yml`, `trivy-scheduled.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
+| Manual dispatch | `platform-tests.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docker-publish.yml`, `trivy-scheduled.yml`, `pr-risk-labeler.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) and `docker-publish.yml` (generated variant matrix) |
 
 There is no automatic release on merge. `ci.yml` does run after trusted

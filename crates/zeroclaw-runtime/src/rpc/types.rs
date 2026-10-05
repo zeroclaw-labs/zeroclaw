@@ -371,6 +371,10 @@ rpc_type! {
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
     }
 }
 
@@ -381,6 +385,10 @@ rpc_type! {
         pub limit: Option<usize>,
         #[serde(default)]
         pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
     }
 }
 
@@ -679,12 +687,33 @@ rpc_type! {
     pub struct ConfigSetParams {
         pub prop: String,
         pub value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
     }
 }
 
 rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry and at most the
+    /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
         pub set: bool,
     }
 }
@@ -799,6 +828,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default)]
+        pub rewritten: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub warnings: Vec<String>,
     }
@@ -867,6 +898,33 @@ rpc_type! {
 rpc_type! {
     pub struct AgentsStatusResult {
         pub agents: Vec<AgentStatusEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteParams {
+        pub alias: String,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeletePreviewResult {
+        pub alias: String,
+        pub allowed: bool,
+        pub blockers: Vec<String>,
+        pub scrubs: Vec<String>,
+        pub owned_state: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteResult {
+        pub alias: String,
+        pub deleted: bool,
+        pub scrubbed: usize,
+        pub warnings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
     }
 }
 
@@ -1319,6 +1377,57 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Parameters for `file/upload/begin`: announce one upload for a session.
+    pub struct FileUploadBeginParams {
+        pub session_id: String,
+        /// Display name, at most 255 bytes; storage is content-addressed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+        /// Exact decoded size of the whole payload.
+        pub size_bytes: u64,
+        /// Optional hex SHA-256 of the whole payload, verified at commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadBeginResult {
+        /// Identifies the upload on this connection only.
+        pub upload_id: String,
+        /// Largest decoded chunk `file/upload/chunk` accepts.
+        pub chunk_bytes: u64,
+        /// Largest payload an upload may declare.
+        pub max_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/chunk`. Chunks arrive in order: `offset`
+    /// must equal the bytes received so far. Resending an already-accepted
+    /// chunk with identical bytes is acknowledged without change.
+    pub struct FileUploadChunkParams {
+        pub upload_id: String,
+        pub offset: u64,
+        pub data_b64: String,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadChunkResult {
+        pub received_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/commit`. The result is the same
+    /// `FileEntryResult` that `file/attach` returns for one file.
+    pub struct FileUploadCommitParams {
+        pub upload_id: String,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Session approval ─────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
@@ -1346,8 +1455,70 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    /// Parameters shared by every `X/subscribe` method.
+    #[derive(Default)]
+    pub struct SubscribeParams {
+        /// Resume after this sequence number: frames from `since_seq + 1`
+        /// that are still buffered are replayed before live delivery. Omit
+        /// for live frames only.
+        #[serde(default)]
+        pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Every notification of the subscription carries `subscription_id` and
+    /// its `seq`. `seq` here is the newest sequence number at subscribe time.
     pub struct LogsSubscribeResult {
         pub subscribed: bool,
+        pub subscription_id: String,
+        pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelParams {
+        pub subscription_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelResult {
+        /// `false` when no subscription with that id is open on this
+        /// connection (already ended, or never existed).
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `subscription/lagged`: frames `from_seq` up to (not including)
+    /// `resume_seq` are gone; delivery continues at `resume_seq`.
+    pub struct SubscriptionLagged {
+        pub subscription_id: String,
+        pub from_seq: u64,
+        pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
+    }
+}
+
+rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
     }
 }
 
@@ -1798,6 +1969,18 @@ mod tests {
             let wire = serde_json::to_value(&params).unwrap();
             assert_eq!(wire["keep_siblings"], json!(keep));
         }
+    }
+
+    #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
     }
 
     #[test]

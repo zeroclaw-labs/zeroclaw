@@ -52,9 +52,10 @@ one.
    identity guarantee for the retained bytes, not a claim of race-free
    filesystem namespace resolution.
 6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
-   appended after the built-ins. Tool dispatch resolves names first-match, so a
-   plugin tool that collides with a built-in name is never selected; give plugin
-   tools unique names. Tool and skill plugins are *auto-discovered*, so this
+   appended after the built-ins. A plugin whose package name or tool name
+   conflicts with an already registered tool is refused with a warning instead
+   of being registered; see [Tool name conflicts](#tool-name-conflicts).
+   Tool and skill plugins are *auto-discovered*, so this
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
@@ -88,6 +89,31 @@ This policy is enforced uniformly: the same check that the host applies when you
 list plugins is the check the agent runtime applies when it builds the tool set,
 so a plugin you cannot see in `strict` mode is also a plugin the agent cannot
 call.
+
+## Tool name conflicts
+
+Registration refuses a name conflict instead of letting one tool shadow
+another. Tool plugins register in package-name order, and the host checks each
+one twice:
+
+1. **Package name.** A plugin whose package name (the manifest `name`) matches
+   an already registered tool is refused before its component is instantiated.
+   The host logs a `WARN` event with `error_key`
+   `plugin_package_name_conflict` in its `attributes`.
+2. **Tool name.** The guest declares its own tool name, so the host learns it
+   only by instantiating the component to read its metadata. A plugin whose
+   tool name matches an already registered tool is not registered. The host
+   logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
+   `attributes`.
+
+The names checked are the tools that registry build has already registered,
+including plugin tools accepted earlier in the same pass, plus
+`execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
+of every built-in name: a built-in that a build does not register, for example
+because its config section is disabled, is not reserved in that build. Tools
+that join the registry after plugin registration are outside this check. Give
+plugin packages and tools names that are unique outright rather than relying
+on it.
 
 ## Capabilities and permissions
 
@@ -157,9 +183,9 @@ Even with every permission granted, the sandbox bounds a plugin:
   injection and cross-instance selection, but a plaintext-returning import
   cannot prevent a malicious guest from retaining what it reads. Compliant
   channel plugins must resolve config and credentials at each point of use.
-- It cannot displace a built-in tool: the built-ins register first and tool
-  dispatch resolves names first-match, so a colliding plugin tool is simply
-  never selected.
+- It cannot take the name of an already registered tool. Registration refuses
+  the conflicting plugin instead of registering its tool, within the bounds
+  described in [Tool name conflicts](#tool-name-conflicts).
 
 The sandbox and namespace bounds hold regardless of what plugin code attempts.
 The no-retention rule is instead part of the trusted channel-plugin contract,

@@ -753,7 +753,9 @@ jobs:
     name: Publish Stable Release
     # The Linux/Windows desktop jobs are continue-on-error: listing them in
     # needs only sequences the download; their failure cannot block publish.
-    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom]
+    # crates-preflight is a hard gate: a release whose crates cannot publish
+    # must fail before the GitHub Release makes the version public.
+    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1231,14 +1233,32 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
   # ── Post-publish: package manager auto-sync ─────────────────────────
-  crates:
-    name: Publish crates.io Workspace
-    needs: [validate, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+  # Packages and compiles every crate beside the binary builds, before any
+  # irreversible step. It verifies github.sha because a dispatched release has
+  # no tag until `publish` creates it. No token: this stage cannot upload.
+  crates-preflight:
+    name: Preflight crates.io Workspace
+    needs: [validate]
     uses: ./.github/workflows/pub-crates.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_sha: ${{ github.sha }}
+      stage: preflight
+      dry_run: true
+
+  # Uploads what crates-preflight verified, without verifying again. The
+  # called workflow requires the new tag to resolve to the same commit and the
+  # restored dashboard bundle to match the recorded digest.
+  crates:
+    name: Publish crates.io Workspace
+    needs: [validate, publish, crates-preflight]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.crates-preflight.result == 'success' }}
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_sha: ${{ github.sha }}
+      stage: publish
+      verified_web_dist_digest: ${{ needs.crates-preflight.outputs.web_dist_digest }}
       dry_run: false
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

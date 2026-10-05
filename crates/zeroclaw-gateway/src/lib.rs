@@ -15,7 +15,6 @@ pub mod api_logs;
 pub mod api_oidc;
 pub mod api_pairing;
 pub mod api_personality;
-#[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 pub mod api_quickstart;
 pub mod api_sections;
@@ -34,7 +33,6 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -168,7 +166,8 @@ use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
-    PairingCodePolicy, PairingGuard, constant_time_eq, is_public_bind,
+    GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, constant_time_eq,
+    gateway_admin_token_path, is_public_bind,
 };
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -696,6 +695,7 @@ pub struct AppState {
     /// that writer's change — clobbered in memory and, if its save hadn't
     /// landed yet, on disk too.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -756,7 +756,7 @@ pub struct AppState {
     /// here; the daemon's wait loop reacts and re-instantiates every
     /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
     /// — reload then degrades to a 503 with a clear message.
-    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub reload_tx: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// LAN-local peer hints discovered by multicast. These are informational
@@ -801,10 +801,24 @@ pub struct AppState {
     pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
+impl AppState {
+    pub(crate) fn reserve_agent_turn_at(
+        &self,
+        alias: impl Into<String>,
+        generation: u64,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::AgentTurnLease,
+        zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    > {
+        self.agent_lifecycle.reserve_turn_at(alias, generation)
+    }
+}
+
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
     /// The daemon generation's driver supervisor set. Approval surfaces
     /// register resumed headless drivers here so a reload drains them with the
     /// generation that owns them. `None` standalone, where no generation exists.
@@ -817,11 +831,13 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            authority,
             sop_driver_handles,
         }
     }
@@ -932,7 +948,10 @@ pub async fn run_gateway(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // The daemon's event bus. The daemon owns the observer broadcast hook, so a
+    // supervised gateway reuses its sender and history and installs nothing;
+    // a standalone gateway (`None`) builds and installs its own.
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     // Reload controls owned by the daemon for supervised runs. RPC reloads
     // write to `shutdown_tx` before signalling daemon reload so the listener
     // releases its socket before the replacement gateway binds. /admin/reload
@@ -944,29 +963,67 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    // The daemon's canonical live pairing authority, shared with the RPC
-    // native auth provider. `None` (standalone gateway) constructs a
-    // local guard from config as before.
-    shared_pairing: Option<PairingGuard>,
+    // The daemon generation's one inbound-auth state (pairing guard,
+    // accepted policy, live configuration), shared with the RPC context.
+    // `None` (standalone gateway) builds all three locally from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
     // The daemon generation's driver supervisor set: approval surfaces
     // register resumed headless drivers here so reload drains them.
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
-    Box::pin(run_gateway_with_plugin_webhooks(
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
+    run_gateway_with_authority(
         host,
         port,
         config,
-        external_event_tx,
+        external_event_bus,
         reload_controls,
         tui_registry,
         canvas_store,
         sop_engine,
         sop_audit,
-        shared_pairing,
+        daemon_authority,
+        sop_driver_handles,
+        readiness,
+        authority,
+    )
+    .await
+}
+
+/// Run the gateway with the live config authority owned by its daemon
+/// generation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_gateway_with_authority(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+) -> Result<()> {
+    Box::pin(run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        external_event_bus,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        daemon_authority,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            authority,
             sop_driver_handles,
         ),
     ))
@@ -974,31 +1031,40 @@ pub async fn run_gateway(
 }
 
 /// Run the supervised gateway with the daemon generation's channel-plugin
-/// webhook registry. Standalone callers use [`run_gateway`], because no channel
-/// supervisor exists there to publish live routes.
+/// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-    // The daemon's canonical live pairing authority, shared with the RPC
-    // inbound-auth layer so pairing and revocation reach both surfaces.
-    // Standalone runs pass `None` and build their own guard from config.
-    shared_pairing: Option<PairingGuard>,
+    // The daemon generation's one inbound-auth state, shared with the RPC
+    // context so pairing, revocation and policy changes persisted through
+    // either surface bind both. Standalone runs pass `None` and build their
+    // own guard, authority and configuration state from config.
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        authority,
         sop_driver_handles,
     } = supervision;
+    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
+        Some(authority) => (
+            Some(authority.pairing),
+            Some(authority.inbound_auth),
+            Some(authority.config),
+        ),
+        None => (None, None, None),
+    };
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -1014,17 +1080,10 @@ pub async fn run_gateway_with_plugin_webhooks(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
-
-    // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
+    // Supervised runs read and write the daemon's live configuration, the
+    // one the RPC context holds, so a persist through either surface is the
+    // state the other next reads and compiles policy from.
+    let config_state = shared_config.unwrap_or_else(|| authority.config());
 
     let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
@@ -1403,20 +1462,26 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
-    // Live model-pricing refresher (once per process; idempotent, no-op unless a
-    // provider sets `live_pricing = true`). Each call re-binds the refresher's
-    // config handle, so reloads that re-instantiate the config Arc are honored
-    // without a restart; shares the global price snapshot the cost path reads.
-    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
+    // The live-pricing refresher and the gateway-start hook belong to the
+    // process that owns this listener (the daemon, or the standalone
+    // `zeroclaw gateway` command), not to the listener: the refresher must run
+    // with the gateway disabled, and the hook fires from the readiness report.
+    // The gateway does own the live config handle its config API writes in
+    // place, so it points the refresher at that handle. An operator's change
+    // (an opt-out, a new endpoint or model) then reaches the next refresh
+    // without a reload.
+    zeroclaw_providers::pricing::bind_config(config_state.clone());
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
     // components (cron, heartbeat) can publish events to the same bus.
-    let event_tx = external_event_tx.unwrap_or_else(|| {
-        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
-        tx
-    });
-    let event_buffer = Arc::new(sse::EventBuffer::new(500));
+    // Under the daemon the bus and its observer hook are already live; a
+    // standalone gateway builds and installs its own. Either way there is one
+    // hook, so each observer event is delivered once and buffered once.
+    let (event_bus, broadcast_hook_guard) =
+        zeroclaw_runtime::observability::EventBus::shared_or_installed(external_event_bus);
+    let event_tx = event_bus.sender().clone();
+    let event_buffer = Arc::clone(event_bus.history());
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1798,6 +1863,24 @@ pub async fn run_gateway_with_plugin_webhooks(
              (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
         );
     }
+    // Start this run's admin-token generation. The pairing-code admin routes
+    // accept only the token the guard holds in memory. If the file cannot be
+    // written the guard holds none, so they refuse everyone (fail closed) and
+    // no file left by an earlier run is honoured; the banner below stays the
+    // way to read the first-run code.
+    let admin_token_path = gateway_admin_token_path(&config.data_dir);
+    if let Err(e) = pairing.rotate_admin_token(&config.data_dir) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "path": admin_token_path.display().to_string(),
+                    "error": e.to_string(),
+                })),
+            "gateway admin token could not be written; pairing-code admin routes will refuse all callers"
+        );
+    }
     if let Some(code) = pairing.pairing_code() {
         // The box is sized from the code, not from a literal: since the policy became config-driven,
         // the code length is operator-configurable (6..=128 chars).
@@ -1809,7 +1892,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
-        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+        for line in already_paired_pairing_notice(host, actual_port, pfx, &admin_token_path) {
             println!("{line}");
         }
         println!();
@@ -1843,21 +1926,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
 
-    // Fire gateway start hook
-    if let Some(ref hooks) = hooks {
-        hooks.fire_gateway_start(host, actual_port).await;
-    }
-
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
-    let broadcast_hook_guard =
-        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
-
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    // Bound into AppState. Not a broadcaster — the broadcaster is the
-    // `broadcast_layer` installed above as the global hook. This is the
+    // Bound into AppState. Not a broadcaster — the broadcaster is the event
+    // bus's hook (`EventBus::shared_or_installed` above). This is the
     // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
     // which tees events into the hook on every record.
     let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
@@ -1866,7 +1938,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let (shutdown_tx, reload_tx) = reload_controls
-        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .map(|controls| (controls.shutdown_tx.clone(), Some(controls)))
         .unwrap_or((owned_shutdown_tx, None));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -1946,17 +2018,21 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
-    // The gateway's inbound-auth authority: same registry/resolver stack
-    // as the RPC layer, same canonical pairing guard. Its accepted policy
-    // moves only when a config mutation persists (see `persist_and_swap`).
-    let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
-        &config,
-        Arc::clone(&pairing),
-    )?);
+    // The gateway's inbound-auth authority. Supervised runs share the
+    // daemon's accepted policy with the RPC context, so a revocation
+    // persisted through either surface binds this one without a reload.
+    // Standalone runs build their own from config and the local pairing
+    // guard. Either way the policy moves only when a config mutation
+    // persists (see `persist_and_swap`).
+    let inbound_auth = Arc::new(match shared_inbound_auth {
+        Some(shared) => principal_gate::GatewayInboundAuth::from_shared(shared),
+        None => principal_gate::GatewayInboundAuth::from_config(&config, Arc::clone(&pairing))?,
+    });
 
     let state = AppState {
         config: config_state,
-        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
+        config_write_lock: authority.config_write_lock(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider,
         model,
         temperature,
@@ -2286,12 +2362,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             delete(api_webauthn::handle_delete_credential),
         );
 
-    // ── Plugin management API (requires plugins-wasm feature) ──
-    #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    // The read-only package catalog remains discoverable in every gateway
+    // build; WASM-specific sources degrade explicitly when support is absent.
+    let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
 
     let inner = inner
         // ── SSE event stream ──
@@ -2523,7 +2596,12 @@ fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
     format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
-fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+fn already_paired_pairing_notice(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> Vec<String> {
     vec![
         "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
          one-time code was generated on this start."
@@ -2533,18 +2611,31 @@ fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Ve
             format_paircode_recovery_command(host, port)
         ),
         format!(
-            "     Fallback (localhost only): {}",
-            format_paircode_recovery_curl(host, port, path_prefix)
+            "     Fallback (on this host, as this user): {}",
+            format_paircode_recovery_curl(host, port, path_prefix, admin_token_path)
         ),
     ]
 }
 
-fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+fn format_paircode_recovery_curl(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> String {
     // Admin paircode routes are localhost-only, so the curl fallback must point
     // at loopback. Bind-only hosts and non-loopback advertised hosts are
-    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved. They
+    // also require this run's admin secret, read from its owner-only file.
     let recovery_host = paircode_recovery_curl_host(host);
-    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+    format!(
+        "curl -s -X POST -H \"{GATEWAY_ADMIN_TOKEN_HEADER}: $(cat '{}')\" \
+         http://{recovery_host}:{port}{path_prefix}/admin/paircode/new",
+        admin_token_path
+            .display()
+            .to_string()
+            .replace('\'', "'\\''")
+    )
 }
 
 fn paircode_recovery_curl_host(host: &str) -> &str {
@@ -2903,7 +2994,10 @@ async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuar
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2961,8 +3055,25 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
     #[cfg(not(test))]
     {
-        let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let initial_config = state.config.read().clone();
+        let requested_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
+        let execution_capability =
+            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                std::sync::Arc::clone(&state.config),
+                state.agent_lifecycle.clone(),
+            );
+        let execution_admission = execution_capability
+            .resolve_and_admit(&requested_alias)
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let agent_alias = execution_admission.alias().to_string();
+        let config = execution_admission.config().as_ref().clone();
+        // The admission snapshot is authoritative for both the alias and the
+        // target config, so a delete/recreate cannot run with predecessor data.
+        let current_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        anyhow::ensure!(
+            current_alias == agent_alias,
+            "gateway chat agent changed during turn admission"
+        );
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -2989,12 +3100,14 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                zeroclaw_runtime::agent::loop_::process_message_with_live_config_and_admission(
                     config,
+                    Arc::clone(&state.config),
                     &agent_alias,
                     message,
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    Some(execution_admission),
                 ),
             ),
         ))
@@ -4241,19 +4354,25 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut approvals = wa.pending_approvals().lock().await;
-    verified.retain(|msg| {
+    let mut handled_approval_messages = std::collections::HashSet::new();
+    for msg in verified.messages() {
         let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         else {
-            return true;
+            continue;
         };
-        let Some(sender) = approvals.remove(&token) else {
-            return true;
-        };
-        let _ = sender.send(response);
-        false
-    });
-    drop(approvals);
+        if wa
+            .resolve_pending_approval(
+                &token,
+                response,
+                msg.sender.as_str(),
+                msg.reply_target.as_str(),
+            )
+            .await
+        {
+            handled_approval_messages.insert(msg.id.clone());
+        }
+    }
+    verified.retain(|msg| !handled_approval_messages.contains(&msg.id));
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
@@ -4529,6 +4648,14 @@ async fn process_nextcloud_talk_webhook(
 #[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
+/// Compare the presented Gmail push bearer against the configured secret in
+/// constant time, so a wrong token's rejection latency does not reveal how
+/// many leading bytes matched.
+#[cfg(feature = "channel-email")]
+fn gmail_bearer_matches(provided: &str, secret: &str) -> bool {
+    zeroclaw_config::pairing::constant_time_eq(provided, secret)
+}
+
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
 #[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
@@ -4560,7 +4687,7 @@ async fn handle_gmail_push_webhook(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if provided != secret {
+        if !gmail_bearer_matches(provided, &secret) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4636,6 +4763,36 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "Admin endpoints are restricted to localhost"
+            })),
+        ))
+    }
+}
+
+/// Reject a pairing-code admin request that does not present this run's admin
+/// secret. [`require_localhost`] alone is not enough for these routes: a reverse
+/// proxy or tunnel on the same host relays remote callers from loopback, and
+/// a code read or minted here is exchanged at `/pair` for a shared-operator
+/// bearer. The secret reaches local clients through an owner-only file, so
+/// presenting it proves the caller runs as the gateway's user on its host.
+/// Admission compares against the token the pairing guard holds for this
+/// run, never the file, so a stale file or a failed rotation matches nothing.
+fn require_gateway_admin_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let presented = headers
+        .get(GATEWAY_ADMIN_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if state.pairing.admin_token_matches(presented) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Pairing-code admin requests need this gateway's admin token. \
+                          Run `zeroclaw gateway get-paircode` on the gateway host, as the \
+                          user that runs the gateway."
             })),
         ))
     }
@@ -4780,12 +4937,15 @@ async fn handle_admin_reload(
     ))
 }
 
-/// GET /admin/paircode — fetch current pairing code (localhost only)
+/// GET /admin/paircode — fetch current pairing code (localhost only, and only
+/// with this run's admin token)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -4831,9 +4991,11 @@ pub struct AdminPaircodeQuery {
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
 
     if !state.pairing.require_pairing() {
         let body = serde_json::json!({
@@ -4977,25 +5139,30 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// GET /pair/code — whether pairing is required. It never returns the code.
+///
+/// No HTTP caller can prove it is on this host: a reverse proxy or tunnel on
+/// the same host relays remote callers from loopback, with or without
+/// forwarding headers, and whoever reads a first-run code can pair as the
+/// shared operator. The code reaches operators only through the startup
+/// banner in the gateway log and `zeroclaw gateway get-paircode`, which
+/// presents the owner-only admin token. `pairing_code` stays in the response,
+/// always `null`, so existing dashboard clients fall back to manual entry.
 async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
-    let require = state.pairing.require_pairing();
-    let is_paired = state.pairing.is_paired();
-
-    // Only expose the code during initial setup (before first pairing)
-    let code = if require && !is_paired {
-        state.pairing.pairing_code()
-    } else {
-        None
-    };
-
     let body = serde_json::json!({
         "success": true,
-        "pairing_required": require,
-        "pairing_code": code,
+        "pairing_required": state.pairing.require_pairing(),
+        "pairing_code": serde_json::Value::Null,
     });
 
     (StatusCode::OK, Json(body))
 }
+
+/// Serializes tests that start `run_gateway`, which binds the process-global
+/// pricing config handle, so a test that reads that handle sees its own bind.
+#[cfg(test)]
+pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -5172,9 +5339,15 @@ mod tests {
             "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
         );
 
-        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        let curl = format_paircode_recovery_curl(
+            "192.168.1.20",
+            42617,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         assert_eq!(
-            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            curl,
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new",
             "curl fallback must target loopback, not the non-loopback bound host"
         );
         assert!(
@@ -5184,16 +5357,26 @@ mod tests {
 
         // Path prefix is still preserved while the host is normalized.
         assert_eq!(
-            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "192.168.1.20",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_targets_running_instance() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
@@ -5203,7 +5386,12 @@ mod tests {
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
         // hits the dashboard's pairing-code prompt with no code printed
         // anywhere.
-        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let lines = already_paired_pairing_notice(
+            "127.0.0.1",
+            3001,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains("already paired"),
@@ -5220,14 +5408,24 @@ mod tests {
         // The notice is the single source of truth for the on-demand recovery
         // commands; it must reuse the loopback-safe builders so the banner and
         // any future surface never drift from's no-`--host` rule.
-        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let lines = already_paired_pairing_notice(
+            "192.168.1.20",
+            3001,
+            "/gw",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
             "notice must surface the get-paircode recovery command: {joined}"
         );
         assert!(
-            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            joined.contains(&format_paircode_recovery_curl(
+                "192.168.1.20",
+                3001,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            )),
             "notice must surface the curl fallback (honoring the path prefix): {joined}"
         );
         // never advertise the non-loopback bound host in the hint.
@@ -5240,32 +5438,82 @@ mod tests {
     #[test]
     fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "0.0.0.0",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("localhost", 42617, ""),
-            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "localhost",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://localhost:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::1", 42617, ""),
-            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://[::1]:42617/admin/paircode/new"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paircode_recovery_curl_quotes_admin_token_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("owner's $(touch escaped).token");
+        std::fs::write(&token_path, "synthetic-admin-token").unwrap();
+        let command = format_paircode_recovery_curl("127.0.0.1", 42617, "", &token_path);
+        // Intercept curl: exercise actual shell parsing and cat without a
+        // network call, and verify path contents cannot become shell syntax.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("curl() {{ printf '%s\\n' \"$@\"; }}; {command}"))
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let args = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            args.lines()
+                .any(|arg| arg == "x-zeroclaw-admin-token: synthetic-admin-token"),
+            "{args}"
+        );
+        assert!(!tmp.path().join("escaped").exists());
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_path_prefix() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-zeroclaw-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
@@ -5396,6 +5644,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5457,6 +5706,28 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    #[test]
+    fn gateway_and_ws_turn_admission_blocks_destructive_alias_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&temp, false, false);
+        let generation = state.agent_lifecycle.alias_generation("alpha");
+        let turn = state
+            .reserve_agent_turn_at("alpha", generation)
+            .expect("gateway turn is admitted");
+
+        assert!(matches!(
+            state.agent_lifecycle.begin_delete("alpha"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+        drop(turn);
+        assert!(state.agent_lifecycle.begin_delete("alpha").is_ok());
     }
 
     fn webhook_sop_state(
@@ -5654,6 +5925,48 @@ path = "{trigger_path}"
         token
     }
 
+    #[tokio::test]
+    async fn plugin_catalog_rejects_missing_and_invalid_bearer_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+
+        let response = api_plugins::list_plugins(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer invalid-token"),
+        );
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugin_catalog_accepts_a_paired_bearer_in_every_gateway_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "plugin-catalog-browser").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = api_plugins::list_plugins(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["wasm_plugins_available"],
+            cfg!(feature = "plugins-wasm")
+        );
+        assert!(json["plugins"].is_array());
+        assert!(json["issues"].is_array());
+    }
+
     async fn admin_paircode_response_json(
         result: Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)>,
     ) -> (StatusCode, serde_json::Value) {
@@ -5674,6 +5987,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5709,6 +6023,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5730,6 +6045,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -5766,6 +6082,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -5805,6 +6122,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
                 }),
@@ -5841,6 +6159,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
                 }),
@@ -5863,8 +6182,9 @@ path = "{trigger_path}"
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
-                State(state),
+                State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -5884,8 +6204,13 @@ path = "{trigger_path}"
 
         let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
         let (status, _json) = admin_paircode_response_json(
-            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
-                .await,
+            handle_admin_paircode_new(
+                State(state.clone()),
+                remote,
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
         )
         .await;
 
@@ -5894,6 +6219,258 @@ path = "{trigger_path}"
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    /// Headers carrying this test gateway's admin secret, minted the way a
+    /// gateway start mints it.
+    fn admin_headers(state: &AppState) -> HeaderMap {
+        let data_dir = state.config.read().data_dir.clone();
+        let secret = state
+            .pairing
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_str(&secret).expect("admin token is a valid header value"),
+        );
+        headers
+    }
+
+    /// Headers a same-host reverse proxy or tunnel produces for a remote
+    /// caller. Some proxies add a forwarding header and some add none; the
+    /// admin gates must not depend on either.
+    fn proxied_headers(with_forwarding_header: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if with_forwarding_header {
+            headers.insert("X-Forwarded-For", HeaderValue::from_static("203.0.113.7"));
+        }
+        headers
+    }
+
+    async fn json_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn pair_with(state: &AppState, code: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Pairing-Code",
+            HeaderValue::from_str(code).expect("code is a valid header value"),
+        );
+        json_of(
+            handle_pair(State(state.clone()), test_connect_info(), headers)
+                .await
+                .into_response(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pair_code_never_returns_the_code_even_to_a_loopback_caller() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        assert!(
+            state.pairing.pairing_code().is_some(),
+            "a fresh guard holds a first-run code"
+        );
+
+        let (status, json) = json_of(handle_pair_code(State(state)).await.into_response()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_required"], true);
+        assert!(
+            json["pairing_code"].is_null(),
+            "no HTTP caller can prove it is local, so the code is never served: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let _current = admin_headers(&state);
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_static("zc_wrong"),
+        );
+        for headers in [proxied_headers(true), proxied_headers(false), wrong] {
+            let (status, json) = admin_paircode_response_json(
+                handle_admin_paircode(State(state.clone()), test_connect_info(), headers).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert!(json.get("pairing_code").is_none(), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_serves_the_code_with_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let expected = state.pairing.pairing_code();
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_code"].as_str(), expected.as_deref());
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let _current = admin_headers(&state);
+        let before = state.pairing.pairing_code();
+
+        for headers in [proxied_headers(true), proxied_headers(false)] {
+            let (status, _json) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    headers,
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            state.pairing.pairing_code(),
+            before,
+            "a refused mint must not issue or replace a code"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_token_from_an_earlier_gateway_start_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let stale = admin_headers(&state);
+        let _restart = admin_headers(&state);
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), stale).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A rotation that cannot write its file must fail closed: the token that
+    /// worked before, still sitting in the file, is refused afterwards.
+    #[tokio::test]
+    async fn failed_admin_token_rotation_refuses_the_token_left_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let working = admin_headers(&state);
+        let data_dir = state.config.read().data_dir.clone();
+        let on_disk = std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap();
+
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        assert!(state.pairing.rotate_admin_token(&unwritable).is_err());
+        assert_eq!(
+            std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap(),
+            on_disk,
+            "the previous token file is still in place"
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), working).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert!(json.get("pairing_code").is_none(), "{json}");
+    }
+
+    /// The composed attack from review A1: a remote caller relayed from
+    /// loopback by a same-host proxy tries every route that reads or mints a
+    /// code, then tries to pair. It must end with no code, no paired token and
+    /// no authenticated access. A caller holding the admin token completes the
+    /// same sequence, so the admin token is the only thing standing between.
+    #[tokio::test]
+    async fn proxied_loopback_caller_cannot_reach_operator_access_through_any_code_route() {
+        for with_forwarding_header in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let _current = admin_headers(&state);
+
+            let (_, public) =
+                json_of(handle_pair_code(State(state.clone())).await.into_response()).await;
+            assert!(public["pairing_code"].is_null());
+
+            let (read_status, _) = admin_paircode_response_json(
+                handle_admin_paircode(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::FORBIDDEN);
+
+            let (mint_status, _) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(mint_status, StatusCode::FORBIDDEN);
+
+            // With no code in hand, a guess cannot pair.
+            let (pair_status, _) = pair_with(&state, "000000").await;
+            assert_ne!(pair_status, StatusCode::OK);
+            assert!(!state.pairing.is_paired(), "no token may have been minted");
+            assert!(
+                api::require_auth(&state, &HeaderMap::new()).is_err(),
+                "the caller must end with no authenticated access"
+            );
+        }
+
+        // Control: the same sequence with the admin token reaches a bearer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let (_, minted) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        let code = minted["pairing_code"]
+            .as_str()
+            .expect("admin mint issues a code");
+        let (pair_status, paired) = pair_with(&state, code).await;
+        assert_eq!(pair_status, StatusCode::OK, "{paired}");
+        let bearer = paired["token"].as_str().expect("pairing returns a bearer");
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+        );
+        assert!(api::require_auth(&state, &auth).is_ok());
     }
 
     #[test]
@@ -6088,6 +6665,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         // Isolate data_dir so parallel nextest runs don't race on the
         // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6154,6 +6733,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
@@ -6218,6 +6799,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let mut config = Config::default();
         config.providers.models.anthropic.insert(
             "default".to_string(),
@@ -6275,6 +6858,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -6289,10 +6874,10 @@ path = "{trigger_path}"
 
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (reload_tx, _) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
-            shutdown_tx: shutdown_tx.clone(),
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
             reload_tx,
-        };
+        );
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
             let _ = ready_tx.send(Some(addr));
@@ -6352,6 +6937,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -6401,6 +6988,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6488,6 +7076,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7159,6 +7748,7 @@ path = "{trigger_path}"
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -8744,6 +9334,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9664,6 +10255,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9786,6 +10378,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -9887,6 +10480,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10095,6 +10689,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10183,6 +10778,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10276,6 +10872,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10374,6 +10971,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10469,6 +11067,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10570,6 +11169,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10711,6 +11311,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -11349,7 +11950,10 @@ data: [DONE]\n\n";
             tokens,
             PairingCodePolicy::default(),
         ));
-        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state.reload_tx = Some(zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            tokio::sync::watch::channel(false).0,
+            tokio::sync::watch::channel(false).0,
+        ));
         state
     }
 
@@ -11603,6 +12207,7 @@ data: [DONE]\n\n";
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11689,6 +12294,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12302,6 +12908,7 @@ data: [DONE]\n\n";
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12368,6 +12975,19 @@ data: [DONE]\n\n";
             "access-token".into(),
             "phone-number-id".into(),
             verify_token.into(),
+            alias,
+            peer_resolver,
+        ))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_instance_allowing_all(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            verify_token.into(),
             alias.to_string(),
             peer_resolver,
         ))
@@ -12380,6 +13000,36 @@ data: [DONE]\n\n";
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_webhook_body(sender: &str, text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": sender,
+                            "timestamp": "1700000000",
+                            "type": "text",
+                            "text": { "body": text }
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .expect("WhatsApp test payload must serialize")
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_signed_headers(secret: &str, body: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature(secret, body)).unwrap(),
+        );
+        headers
     }
 
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -12513,6 +13163,109 @@ data: [DONE]\n\n";
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn authenticated_webhook_binds_approval_to_alias_responder_and_destination() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        const SECRET: &str = "app-secret";
+        const TOKEN: &str = "gw1024";
+        const APPROVER: &str = "+15551234567";
+        const APPROVER_WEBHOOK: &str = "15551234567";
+
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([
+            (
+                "work".to_string(),
+                whatsapp_instance_allowing_all("work", "tok-work"),
+            ),
+            (
+                "personal".to_string(),
+                whatsapp_instance_allowing_all("personal", "tok-personal"),
+            ),
+        ]);
+        state.whatsapp_app_secret = HashMap::from([
+            ("work".to_string(), Arc::<str>::from(SECRET)),
+            ("personal".to_string(), Arc::<str>::from(SECRET)),
+        ]);
+
+        let mut decision = zeroclaw_channels::whatsapp::register_pending_approval_for_test(
+            TOKEN, "work", APPROVER,
+        )
+        .await;
+
+        let wrong_alias = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("personal".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_alias),
+            Bytes::from(wrong_alias),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let wrong_responder = whatsapp_webhook_body("15557654321", &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_responder),
+            Bytes::from(wrong_responder),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let correct = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &correct),
+            Bytes::from(correct),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(decision.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let ordinary_text = "continue with the ordinary request";
+        let ordinary = whatsapp_webhook_body(APPROVER_WEBHOOK, ordinary_text);
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &ordinary),
+            Bytes::from(ordinary),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .filter(|capture| capture.message == ordinary_text)
+                .count(),
+            1,
+            "a non-approval message must still dispatch through the gateway"
+        );
     }
 
     /// Fail closed. A configured alias with no app secret cannot verify
@@ -12664,5 +13417,130 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+
+    /// The gateway points the pricing refresher at the live config handle its
+    /// config API writes. An operator opt-out made through `PUT
+    /// /api/config/prop` on a running standalone gateway must therefore reach
+    /// the refresher without a restart, instead of being lost on a private
+    /// copy of the startup config.
+    #[tokio::test]
+    async fn a_config_api_opt_out_reaches_the_pricing_refresher_without_a_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // The exact property path the config API accepts for this flag, taken
+        // from the schema rather than spelled by hand.
+        let live_pricing_path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.contains(".priced.") && name.contains("live"))
+            .expect("the schema exposes the provider's live-pricing flag");
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let addr_tx = std::sync::Mutex::new(Some(addr_tx));
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            if let Some(tx) = addr_tx.lock().unwrap().take() {
+                let _ = tx.send(addr);
+            }
+        });
+        let server = zeroclaw_spawn::spawn!(async move {
+            crate::run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(10), addr_rx)
+            .await
+            .expect("the gateway reports readiness")
+            .expect("the readiness sender is kept until it fires");
+        assert!(
+            zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the refresher is bound to the gateway's config, which opts in"
+        );
+
+        let body = serde_json::json!({
+            "path": live_pricing_path,
+            "value": false,
+        })
+        .to_string();
+        let request = format!(
+            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the config API accepts the opt-out: {response}"
+        );
+
+        assert!(
+            !zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the opt-out written through the config API must reach the refresher \
+             without a restart"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+mod gmail_bearer_tests {
+    use super::gmail_bearer_matches;
+
+    #[test]
+    fn matching_bearer_is_accepted() {
+        assert!(gmail_bearer_matches("s3cret-token", "s3cret-token"));
+    }
+
+    #[test]
+    fn prefix_and_same_length_mismatches_are_rejected() {
+        // A correct prefix must fail exactly like an equal-length mismatch:
+        // the compare runs over the longer input regardless of where the
+        // first differing byte is, so neither shape leaks progress.
+        assert!(!gmail_bearer_matches("s3cret", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-tokeN", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-token-longer", "s3cret-token"));
+    }
+
+    #[test]
+    fn missing_bearer_never_matches_a_configured_secret() {
+        assert!(!gmail_bearer_matches("", "s3cret-token"));
     }
 }

@@ -279,13 +279,19 @@ fn resolve(
                 )
             })?
     };
-    let config = state.config.read();
-    zeroclaw_runtime::sop::drive_resumed_broker_action(
+    let config = state.config.read().clone();
+    zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
         &config,
         std::sync::Arc::clone(engine),
         state.sop_audit.clone(),
         state.sop_driver_handles.as_ref(),
         &outcome,
+        Some(
+            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                std::sync::Arc::clone(&state.config),
+                state.agent_lifecycle.clone(),
+            ),
+        ),
     );
     let (code, label) = broker_outcome_response(&outcome);
     Ok((

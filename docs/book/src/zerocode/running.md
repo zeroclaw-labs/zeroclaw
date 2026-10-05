@@ -20,11 +20,20 @@ zerocode spawns an ephemeral one.
 
 ## Session working directories
 
-Fresh **Chat** sessions, and fresh **Code** sessions on a local connection, use
-the selected agent's configured workspace, so file and shell tools operate there
-unless you choose a directory yourself. The daemon resolves that root and
-reports it back; zerocode does not substitute the directory you launched it
-from.
+On a local connection, fresh **Chat** and **Code** sessions start in the
+directory you launched zerocode from, so file and shell tools operate on that
+project. A restarted local session does the same. If zerocode cannot determine that
+directory, or its path is not valid UTF-8, the session is not created and the
+reason is shown, rather than silently starting somewhere else.
+
+Over a remote (WSS) connection, the directory you launched zerocode from is on
+another machine, so it is never sent. Fresh remote **Chat** sessions use the
+selected agent's configured workspace on the daemon.
+
+The daemon resolves the requested root, checks it against the agent's policy,
+and reports back the directory the session actually uses. The agent's identity
+and personality files are still read from its configured workspace, wherever
+the session starts.
 
 Remote (WSS) **Code** always asks first. A fresh or restarted remote Code
 session opens the daemon-side directory picker before the session is created, so
@@ -41,8 +50,10 @@ the daemon rejects, returns you to that session unchanged and reports why.
 
 Resumed Code sessions keep the working directory they were created with, even
 if your launch directory or the agent's configured workspace changes afterwards.
-**Chat** differs here: a reattached Chat session can resolve against the selected
-agent's current workspace.
+**Chat** differs here: a Chat session that is still running on the daemon keeps
+its directory when zerocode reattaches, but the daemon does not save a Chat
+session's directory. A Chat session the daemon has to rebuild, for example
+after the daemon restarts, starts at the selected agent's current workspace.
 
 ## Switching sessions
 
@@ -51,13 +62,19 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - **Switch session** opens the session list (default chord: Ctrl+S; rebindable in the keymap).
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
-- **New session** starts fresh (default chord: Ctrl+N; rebindable).
+- **New session** opens the same add-agent picker as the sidebar `[+]` and adds a session for the agent you choose, leaving the focused session tracked (default chord: Ctrl+N; rebindable).
+
+Clicking a session row's body focuses it; clicking its right-edge `✕` closes that specific session without focusing it first.
+Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
+Closing a live session safely stops its current work while preserving durable history.
 
 Switching to an existing **Code** session resumes it at its own saved root,
-while **New session** starts fresh: at the selected agent's workspace over a
-local connection, or in the directory you pick in the daemon-side picker over
-WSS. Neither action changes the root of a session that is already running; use
-`/change-directory` when you want a Code session somewhere else.
+while **New session** starts fresh: a local session in the directory you
+launched zerocode from, a remote Chat session at the selected agent's
+workspace, and a remote Code session in the directory you pick in the
+daemon-side picker. Neither action changes the root of a session that is
+already running; use `/change-directory` when you want a Code session
+somewhere else.
 
 The in-app help overlay shows your live key bindings for these actions.
 
@@ -69,6 +86,26 @@ zerocode runs as a terminal UI in raw mode. It receives terminal key and paste
 events, not native platform text-field events. On macOS, system text
 replacements therefore work only when your terminal expands them before
 zerocode receives the input.
+
+### Composer editing
+
+The Chat and Code composers support these defaults. “Primary” means Command on macOS and Control elsewhere; literal Control aliases also work when your terminal delivers them.
+
+| Action | Default shortcut |
+| --- | --- |
+| Undo / redo | Primary+Z / Primary+Shift+Z (also Control+Z / Control+Shift+Z) |
+| Select all | Primary+A (also Control+A) |
+| Copy / cut selection | Primary+C / Primary+X (also Control+C / Control+X) |
+| Extend selection | Shift+arrows, Shift+Home/End |
+| Extend selection by word | Alt+Shift+Left/Right |
+| Delete next word | Alt+Delete |
+| Clear text | Primary+U (also Control+U) |
+
+Undo history belongs to the current draft and retains at most 100 edit groups. Consecutive typing, including spaces, undoes in one step. A pause of two seconds, cursor or selection movement, a mouse click or drag, or another editing command ends the typing group. Pasted text, completion, cut, clear, and newline each form a separate edit. Typing over a selection starts a new group; undo restores the selected text and selection. Cursor movement does not create an edit. A new text edit after undo discards redo. Undo and redo restore text, cursor, and selection, but never add or remove attachments. Sending, switching sessions, or loading a queued message for editing starts fresh history.
+
+Selection shortcuts act on the focused composer, not the queue sidebar. Copying selected input does not cancel a running turn or quit; with no input selection, Control+C retains its cancel/quit behavior. Dialogs and transcript browsing keep their own shortcuts. Use `/attach` to browse files; the configurable **browse files** action has no default shortcut because Primary+A now selects text. The Help overlay shows the current configured bindings.
+
+Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. Clipboard copy uses the terminal's OSC 52 support; bracketed paste remains available.
 
 ## CLI flags
 

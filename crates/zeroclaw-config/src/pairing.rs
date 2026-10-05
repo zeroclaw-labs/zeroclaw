@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -342,6 +342,16 @@ fn take_live(slot: &mut Option<PendingCode>) -> Option<PendingCode> {
     slot.clone()
 }
 
+/// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashSet<String>>);
+
+impl HeldPairedTokens<'_> {
+    /// Whether `token_hash` is paired, as of this hold.
+    pub fn contains_hash(&self, token_hash: &str) -> bool {
+        self.0.contains(token_hash)
+    }
+}
+
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
@@ -350,9 +360,17 @@ pub struct PairingGuard {
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<PendingCode>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    paired_tokens: Arc<Mutex<HashSet<String>>>,
+    /// A reader-writer lock so that a caller holding it across an effect
+    /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// revocation, not other liveness checks.
+    paired_tokens: Arc<RwLock<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
+    /// The admin token this gateway run accepts on the pairing-code admin
+    /// routes. This is the authority; the token file is only how local
+    /// clients learn it. `None` until a rotation fully succeeds, so a failed
+    /// rotation refuses every caller rather than honouring an older file.
+    admin_token: Arc<Mutex<Option<String>>>,
 }
 
 /// A successfully matched pairing code whose final token is not yet committed.
@@ -379,7 +397,7 @@ impl PairingReservation {
     /// Commit the reservation, consuming the one-time code and storing the token.
     pub fn commit(mut self) -> String {
         let token = self.token.clone();
-        self.guard.paired_tokens.lock().insert(hash_token(&token));
+        self.guard.paired_tokens.write().insert(hash_token(&token));
         self.committed = true;
         token
     }
@@ -429,9 +447,35 @@ impl PairingGuard {
         Self {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
-            paired_tokens: Arc::new(Mutex::new(tokens)),
+            paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
+            admin_token: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Start a new admin-token generation: forget the current token, mint a
+    /// fresh one, write it owner-only into `data_dir`, and accept it only
+    /// once the file is in place. On any failure the guard accepts no admin
+    /// token at all, and whatever file an earlier run left behind never
+    /// matches, so the pairing-code admin routes fail closed.
+    pub fn rotate_admin_token(&self, data_dir: &std::path::Path) -> std::io::Result<String> {
+        let mut current = self.admin_token.lock();
+        *current = None;
+        let token = write_gateway_admin_token(data_dir)?;
+        *current = Some(token.clone());
+        Ok(token)
+    }
+
+    /// True only when `presented` equals this run's admin token, compared in
+    /// constant time. With no successful rotation, nothing matches.
+    pub fn admin_token_matches(&self, presented: &str) -> bool {
+        let presented = presented.trim();
+        !presented.is_empty()
+            && self
+                .admin_token
+                .lock()
+                .as_deref()
+                .is_some_and(|token| constant_time_eq(presented, token))
     }
 
     /// The one-time pairing code (generated only on first startup when no tokens exist).
@@ -618,7 +662,7 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.contains(&hashed)
     }
 
@@ -630,42 +674,65 @@ impl PairingGuard {
     /// so an empty token set denies everything.
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        self.paired_tokens.lock().contains(&hashed)
+        self.paired_tokens.read().contains(&hashed)
     }
 
     /// Strict membership check by pre-computed SHA-256 hash (see
     /// [`Self::token_is_paired`]). Lets an established connection re-check
     /// liveness of its pairing without retaining the bearer itself.
     pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
-        self.paired_tokens.lock().contains(token_hash)
+        self.paired_tokens.read().contains(token_hash)
+    }
+
+    /// Hold the paired-token set still: no token can be paired or revoked
+    /// until the returned guard is dropped, while other readers proceed.
+    ///
+    /// For a caller that must keep a liveness decision true through the
+    /// effect it guards. Keep the hold short, and do not call this guard's
+    /// other methods while holding it: a pairing or revocation queued behind
+    /// the hold makes a second read on the same thread wait forever.
+    pub fn hold_paired_tokens(&self) -> HeldPairedTokens<'_> {
+        HeldPairedTokens(self.paired_tokens.read())
+    }
+
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         !tokens.is_empty()
     }
 
     /// Get all paired token hashes (for persisting to config).
     pub fn tokens(&self) -> Vec<String> {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.iter().cloned().collect()
     }
 
     pub fn revoke_token(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(&hashed)
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
     pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
         count
@@ -779,6 +846,62 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     // Intentional use of bitwise & (not &&) to ensure constant-time execution
     // and prevent timing side-channel attacks. Both comparisons must execute.
     (len_diff == 0) & (byte_diff == 0)
+}
+
+/// Request header that carries the gateway admin secret on the pairing-code
+/// admin routes (`/admin/paircode`, `/admin/paircode/new`).
+pub const GATEWAY_ADMIN_TOKEN_HEADER: &str = "x-zeroclaw-admin-token";
+
+const GATEWAY_ADMIN_TOKEN_FILE: &str = "gateway-admin.token";
+
+/// Where a gateway whose data directory is `data_dir` keeps its admin secret.
+///
+/// The secret is what proves a caller is local. A loopback TCP peer is not
+/// proof: a reverse proxy or tunnel on the same host relays remote callers
+/// from loopback too, with or without forwarding headers. Reading this
+/// owner-only file requires running as the gateway's user on its host.
+pub fn gateway_admin_token_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(GATEWAY_ADMIN_TOKEN_FILE)
+}
+
+/// Mint a fresh admin secret and write it owner-only (mode `0o600` on Unix),
+/// replacing any previous file. Only [`PairingGuard::rotate_admin_token`]
+/// calls this: the guard, not the file, decides what is accepted.
+fn write_gateway_admin_token(data_dir: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Write;
+
+    let token = generate_token();
+    std::fs::create_dir_all(data_dir)?;
+    let path = gateway_admin_token_path(data_dir);
+    let staging = path.with_extension("token.tmp");
+    // A leftover staging file from a crash would make `create_new` fail.
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staging)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staging, &path)?;
+    Ok(token)
+}
+
+/// Read the current admin secret, or `None` when no gateway has written one
+/// or the caller cannot read it.
+pub fn read_gateway_admin_token(data_dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(gateway_admin_token_path(data_dir)).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 /// Check if a host string represents a non-localhost bind address.
@@ -1409,6 +1532,91 @@ mod tests {
                 "serde must emit config_name {name:?}; got: {serialized}"
             );
         }
+    }
+
+    #[test]
+    async fn admin_token_rotation_publishes_the_token_and_matches_only_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let guard = new_guard(true, &[]);
+
+        assert!(
+            !guard.admin_token_matches("anything"),
+            "before any rotation the guard accepts no admin token"
+        );
+        assert_eq!(read_gateway_admin_token(&data_dir), None);
+
+        let token = guard
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(token.as_str()),
+            "local clients learn the token from the file"
+        );
+        assert!(guard.admin_token_matches(&token));
+        assert!(!guard.admin_token_matches(""));
+        assert!(!guard.admin_token_matches("zc_wrong"));
+    }
+
+    #[test]
+    async fn admin_token_from_an_earlier_rotation_stops_matching() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let guard = new_guard(true, &[]);
+        let first = guard.rotate_admin_token(tmp.path()).unwrap();
+        let second = guard.rotate_admin_token(tmp.path()).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!guard.admin_token_matches(&first));
+        assert!(guard.admin_token_matches(&second));
+    }
+
+    #[test]
+    async fn failed_admin_token_rotation_fails_closed_despite_an_older_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        // An earlier run left a valid-looking token file behind.
+        let previous_run = new_guard(true, &[]);
+        let stale = previous_run.rotate_admin_token(&data_dir).unwrap();
+
+        // This run cannot write: its data dir path is a regular file.
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        let guard = new_guard(true, &[]);
+        let last_good = guard.rotate_admin_token(&data_dir).unwrap();
+        assert!(guard.rotate_admin_token(&unwritable).is_err());
+
+        assert!(
+            !guard.admin_token_matches(&stale),
+            "a file from an earlier run must never be honoured"
+        );
+        assert_eq!(
+            read_gateway_admin_token(&data_dir).as_deref(),
+            Some(last_good.as_str()),
+            "the last good token is still on disk"
+        );
+        assert!(
+            !guard.admin_token_matches(&last_good),
+            "after a failed rotation even the last good token on disk is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn gateway_admin_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        new_guard(true, &[]).rotate_admin_token(tmp.path()).unwrap();
+        let mode = std::fs::metadata(gateway_admin_token_path(tmp.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the admin secret must be owner-only, got {mode:o}"
+        );
     }
 
     #[test]

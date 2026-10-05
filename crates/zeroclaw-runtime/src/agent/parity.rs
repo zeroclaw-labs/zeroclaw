@@ -166,6 +166,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                security: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -383,6 +384,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
     // The live-SOP path: re-assemble the step agent's own execution context.
     let owned = crate::agent::turn::assemble_owned_execution(
         &config,
+        None,
         "restricted",
         Arc::clone(&engine),
         None,

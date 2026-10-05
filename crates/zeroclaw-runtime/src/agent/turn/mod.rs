@@ -28,7 +28,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    ContextRecovery, record_llm_failure, try_recover_context_overflow,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -79,6 +81,7 @@ use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
+use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -91,6 +94,103 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+/// The injector's exact raw-history position, carried through prefix trims.
+#[derive(Clone)]
+pub struct MemoryPreamble {
+    pub preamble: String,
+    pub index: usize,
+}
+
+fn retention_layout(history: &[ChatMessage], crumb: bool) -> (usize, usize, bool) {
+    (
+        history.len(),
+        history
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count(),
+        crumb,
+    )
+}
+
+fn remap_memory_after_trim(
+    injected: &mut Option<MemoryPreamble>,
+    before: (usize, usize, bool),
+    history: &[ChatMessage],
+    crumb: bool,
+) {
+    let inserted = usize::from(crumb && !before.2);
+    let dropped = before
+        .0
+        .saturating_add(inserted)
+        .saturating_sub(history.len());
+    let start = before.1 + usize::from(before.2);
+    if let Some(target) = injected {
+        if (start..start.saturating_add(dropped)).contains(&target.index) {
+            *injected = None;
+        } else if target.index >= start {
+            target.index = target
+                .index
+                .saturating_sub(dropped)
+                .saturating_add(inserted);
+        }
+    }
+}
+
+pub(crate) fn retained_context_snapshot(
+    injected: &Option<MemoryPreamble>,
+    history: &[ChatMessage],
+    breadcrumb: bool,
+) -> zeroclaw_api::agent::RetainedContextSnapshot {
+    retained_context_snapshot_with_memory(
+        history,
+        breadcrumb,
+        injected
+            .as_ref()
+            .map(|target| (target.preamble.as_str(), target.index)),
+    )
+}
+
+pub(crate) fn retained_context_snapshot_with_memory(
+    history: &[ChatMessage],
+    breadcrumb: bool,
+    injected: Option<(&str, usize)>,
+) -> zeroclaw_api::agent::RetainedContextSnapshot {
+    zeroclaw_api::agent::RetainedContextSnapshot {
+        // Reuse the Agent's canonical replay path so native tool calls/results
+        // stay typed and the owner-tracked memory provenance is honored by the
+        // caller that has it. This is deliberately not a role-only projection.
+        retained_messages: injected
+            .map_or_else(
+                || crate::agent::Agent::replay_loop_messages_for_retention(history),
+                |(preamble, index)| {
+                    crate::agent::Agent::replay_loop_messages_with_memory(history, preamble, index)
+                },
+            )
+            .into_iter()
+            .filter(|message| {
+                !matches!(
+                    message,
+                    zeroclaw_api::model_provider::ConversationMessage::Chat(chat)
+                        if chat.role == "system"
+                )
+            })
+            .map(|message| match message {
+                zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content: _,
+                } => zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content: None,
+                },
+                other => other,
+            })
+            .collect(),
+        breadcrumb,
+    }
+}
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
@@ -250,7 +350,7 @@ pub struct ToolLoop<'a> {
     /// recorded position still holds the injected message, following the
     /// same recorded-not-inferred principle as
     /// `history_has_trim_breadcrumb`.
-    pub injected_memory_preamble: &'a mut Option<String>,
+    pub injected_memory_preamble: &'a mut Option<MemoryPreamble>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -479,11 +579,13 @@ fn record_dispatch_trim(
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
 fn surface_oversized_dispatch_if_needed(
+    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
 ) -> PreDispatchTrimResult {
+    let before = retention_layout(history, *crumb_present);
     let outcome;
     let mut dropped_messages = 0;
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
@@ -499,6 +601,7 @@ fn surface_oversized_dispatch_if_needed(
             outcome = PreDispatchOutcome::Trimmed;
         }
     }
+    remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
     PreDispatchTrimResult {
         outcome,
         dropped_messages,
@@ -509,6 +612,7 @@ fn surface_oversized_dispatch_if_needed(
 
 #[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
+    injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
     // Estimated token count of the exact message population that produced
@@ -565,6 +669,7 @@ async fn enforce_reported_budget(
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
+    let retention_before = retention_layout(history, *crumb_present);
     let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
@@ -727,6 +832,12 @@ async fn enforce_reported_budget(
             zeroclaw_api::agent::TokenCountSource::Calibrated,
         );
         *history = trimmed;
+        remap_memory_after_trim(
+            injected_memory_preamble,
+            retention_before,
+            history,
+            *crumb_present,
+        );
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
@@ -744,6 +855,11 @@ async fn enforce_reported_budget(
                     tokens_before_source: Some(tokens_before_source),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     unsatisfiable_floor: None,
+                    retained_context: Some(retained_context_snapshot(
+                        injected_memory_preamble,
+                        history,
+                        *crumb_present,
+                    )),
                 })
                 .await;
         }
@@ -972,6 +1088,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         observer,
         silent,
         approval,
+        security,
         multimodal_config,
         config,
         max_tool_iterations,
@@ -995,6 +1112,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
+
+    // Stamp the initiating internal principal into the turn trace, keyed by
+    // the same trace id every other turn event carries. The principal is
+    // runtime-resolved at the dispatch surface and immutable for the turn;
+    // this record is the trace half of that contract (run records carry it
+    // separately). External turns have none and stay unstamped.
+    if let Some(principal) = &ingress.internal_principal {
+        ::zeroclaw_log::record!(
+            INFO,
+            internal_principal_event(turn_id, ingress.origin, principal, agent_alias),
+            "turn_internal_principal"
+        );
+    }
+
     let p1_text = turn_state
         .history
         .iter()
@@ -1057,7 +1188,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
-                *injected_memory_preamble = Some(context.clone());
+                *injected_memory_preamble = Some(MemoryPreamble {
+                    preamble: context,
+                    index: last_user_idx,
+                });
             }
         }
     }
@@ -1194,6 +1328,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     let mut final_knobs = knobs.clone();
                     final_knobs.max_iteration_behavior = MaxIterationBehavior::GracefulSummary;
                     let summary_result = finish_after_max_iterations(
+                        injected_memory_preamble,
                         model_provider,
                         turn_state.history,
                         provider_name,
@@ -1211,6 +1346,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         turn_state.canonical.as_deref_mut(),
                         config,
                         multimodal_config,
+                        security,
                         hooks,
                         image_cache.as_deref_mut(),
                         |provider, selected_model| {
@@ -1282,7 +1418,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_name,
             model,
             dispatch_model,
-        )?;
+            security,
+        )
+        .await?;
 
         let (
             active_model_provider,
@@ -1520,6 +1658,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
         let mut trim_result = surface_oversized_dispatch_if_needed(
+            injected_memory_preamble,
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
@@ -1604,6 +1743,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
                 trim_result = surface_oversized_dispatch_if_needed(
+                    injected_memory_preamble,
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
@@ -1647,6 +1787,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: exceeds_model_window.then_some(true),
+                        retained_context: Some(retained_context_snapshot(
+                            injected_memory_preamble,
+                            turn_state.history,
+                            turn_state.crumb_present,
+                        )),
                     })
                     .await;
             }
@@ -1685,6 +1830,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: Some(true),
+                        retained_context: Some(retained_context_snapshot(
+                            injected_memory_preamble,
+                            turn_state.history,
+                            turn_state.crumb_present,
+                        )),
                     })
                     .await;
             }
@@ -1934,6 +2084,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
+                    injected_memory_preamble,
                     turn_state.history,
                     &e,
                     iteration,
@@ -1946,7 +2097,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut turn_state.crumb_present,
                 )
                 .await;
-                if recovered {
+                if recovered.recovered() {
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the
@@ -1975,7 +2126,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ));
                     turn_state.push_dual(msg);
                 }
-                return Err(e);
+                return Err(if recovered == ContextRecovery::Unrecoverable {
+                    zeroclaw_api::turn_stop::tag(
+                        e,
+                        zeroclaw_api::turn_stop::TurnStop::fatal(
+                            zeroclaw_api::turn_stop::TurnStopCode::ContextOverflow,
+                            "context window exceeded and history cannot be trimmed further",
+                        ),
+                    )
+                } else {
+                    e
+                });
             }
         };
 
@@ -2151,6 +2312,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // modifying `before_llm_call` hook merely to estimate a request
                 // that will never be sent.
                 Box::pin(enforce_reported_budget(
+                    injected_memory_preamble,
                     turn_state.history,
                     reported as usize,
                     reported_population_estimated,
@@ -2225,10 +2387,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 .await;
         }
 
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -2245,6 +2403,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+
+        // Hooks and preparation may rewrite tool names or arguments. Decide
+        // parallel eligibility from the final executable calls so policy is
+        // applied to what the runtime will actually dispatch.
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
@@ -2460,6 +2624,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
                 silent,
                 approval,
+                security,
                 multimodal_config,
                 config,
                 max_tool_iterations,
@@ -2487,7 +2652,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
-                sop_reassembly,
+                sop_reassembly.clone(),
                 &mut sop_exec_cache,
             ))
             .await?;
@@ -2507,6 +2672,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     }
 
     let summary_result = finish_after_max_iterations(
+        injected_memory_preamble,
         model_provider,
         turn_state.history,
         provider_name,
@@ -2524,6 +2690,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.canonical.as_deref_mut(),
         config,
         multimodal_config,
+        security,
         hooks,
         image_cache,
         |provider, selected_model| {
@@ -2650,9 +2817,10 @@ fn sop_step_excluded_tools(
 /// at every depth — no separate baseline field is needed: a depth >= 2 step
 /// naming the outer agent compares against the re-assembled child's alias and
 /// re-assembles correctly instead of inheriting the child's scope.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2708,6 +2876,26 @@ pub(crate) struct OwnedAgentExecution {
     /// system prompt reports the same dialect the step will execute under.
     /// `None` for a shell-less runtime.
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// Keeps the target admission alive for the cached nested execution
+    /// surface, and prevents an alias-generation change from reusing it.
+    execution_admission: Option<AgentExecutionAdmission>,
+    /// The step agent's own filesystem policy, built by
+    /// `assemble_owned_execution` the same way a fresh agent turn builds it.
+    /// Carried so the nested sub-loop's no-vision image-marker gate applies
+    /// the step agent's read ledger, never the parent's.
+    security: Arc<crate::security::SecurityPolicy>,
+}
+
+impl OwnedAgentExecution {
+    fn matches_admission(&self, next: Option<&AgentExecutionAdmission>) -> bool {
+        match (self.execution_admission.as_ref(), next) {
+            (None, None) => true,
+            (Some(admission), Some(next)) => {
+                admission.alias() == next.alias() && admission.generation() == next.generation()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -2721,13 +2909,49 @@ pub(crate) struct OwnedAgentExecution {
 /// SOP so the nested step keeps its SOP tools bound to the same engine. This
 /// connects MCP servers, so the driver memoizes the result per alias across a
 /// drain and re-assembles only on an alias change.
+#[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
 ) -> Result<OwnedAgentExecution> {
+    assemble_owned_execution_with_admission(
+        config,
+        live_config,
+        alias,
+        sop_engine,
+        sop_audit,
+        parent_approval,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn assemble_owned_execution_with_admission(
+    config: &zeroclaw_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    alias: &str,
+    sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    parent_approval: Option<&crate::approval::ApprovalManager>,
+    execution_admission: Option<AgentExecutionAdmission>,
+) -> Result<OwnedAgentExecution> {
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate().map_err(|error| {
+            anyhow::Error::msg(format!(
+                "SOP authority witness rejected before nested execution assembly: {error}"
+            ))
+        })?;
+        if admission.alias() != alias {
+            anyhow::bail!(
+                "SOP authority witness targets `{}` but nested execution requested `{alias}`",
+                admission.alias()
+            );
+        }
+    }
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     // The one canonical per-agent runtime-knob surface: identity plus every
     // runtime-profile override baked in. Fail closed on an unknown alias —
@@ -2768,7 +2992,7 @@ pub(crate) async fn assemble_owned_execution(
         (None, None)
     };
 
-    let built = crate::tools::all_tools_with_runtime(
+    let built = crate::tools::all_tools_with_runtime_and_execution_capability(
         Arc::new(config.clone()),
         &security,
         &risk_profile,
@@ -2789,7 +3013,10 @@ pub(crate) async fn assemble_owned_execution(
         None,
         Some(sop_engine),
         sop_audit,
-        None,
+        live_config,
+        execution_admission
+            .as_ref()
+            .map(AgentExecutionAdmission::capability),
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -2871,6 +3098,10 @@ pub(crate) async fn assemble_owned_execution(
         // Captured from the same adapter this step's tools were built with, so
         // the prompt names the shell the step will actually run under.
         shell_profile,
+        execution_admission,
+        // The same policy the step's tools were built with, carried for the
+        // nested sub-loop's no-vision image-marker gate.
+        security,
     })
 }
 
@@ -2937,6 +3168,11 @@ async fn drive_live_sop_actions(
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
+    // The enclosing agent's filesystem policy, threaded from the turn loop's
+    // execution context. Same-agent nested SOP steps run under it; a
+    // cross-agent step uses its own re-assembled policy (see
+    // `OwnedAgentExecution::security`).
+    security: Option<&crate::security::SecurityPolicy>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     // Full config so the live-SOP sub-turn's vision route resolves the configured
     // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
@@ -2998,7 +3234,45 @@ async fn drive_live_sop_actions(
                     run_id,
                     step,
                     context,
+                    execution_witness,
                 } => {
+                    let managed = match queued.engine.lock() {
+                        Ok(engine) => engine.has_execution_capability(),
+                        Err(poisoned) => poisoned.into_inner().has_execution_capability(),
+                    };
+                    if managed && execution_witness.is_none() {
+                        return Err(anyhow::Error::msg(
+                            "managed SOP ExecuteStep is missing its authority witness",
+                        ));
+                    }
+                    let execution_admission = execution_witness
+                        .as_ref()
+                        .map(|witness| {
+                            let alias = step.agent.as_deref().or(agent_alias).ok_or_else(|| {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": run_id,
+                                            "step": step.number,
+                                        })
+                                    ),
+                                    "managed SOP step has no executing agent"
+                                );
+                                anyhow::Error::msg("managed SOP step has no executing agent")
+                            })?;
+                            witness.admit(alias).map_err(anyhow::Error::from)
+                        })
+                        .transpose()?;
+                    let execution_config = execution_admission
+                        .as_ref()
+                        .map(AgentExecutionAdmission::config);
                     let started_at = crate::sop::engine::now_iso8601();
                     let user_message = ChatMessage::user(context.clone());
                     history.push(user_message.clone());
@@ -3025,14 +3299,19 @@ async fn drive_live_sop_actions(
                     if needs_reassembly {
                         let alias =
                             step_alias.expect("needs_reassembly implies a step agent alias");
-                        if let Some(reassembly) = sop_reassembly {
-                            if !exec_cache.contains_key(alias) {
-                                match assemble_owned_execution(
-                                    reassembly.config,
+                        if let Some(reassembly) = sop_reassembly.as_ref() {
+                            let cache_matches = exec_cache.get(alias).is_some_and(|owned| {
+                                owned.matches_admission(execution_admission.as_ref())
+                            });
+                            if !cache_matches {
+                                match assemble_owned_execution_with_admission(
+                                    execution_config.as_deref().unwrap_or(reassembly.config),
+                                    reassembly.live_config.clone(),
                                     alias,
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
                                     approval,
+                                    execution_admission.clone(),
                                 )
                                 .await
                                 {
@@ -3093,6 +3372,10 @@ async fn drive_live_sop_actions(
                         } else {
                             None
                         };
+                        let execution_config = owned
+                            .and_then(|owned| owned.execution_admission.as_ref())
+                            .map(AgentExecutionAdmission::config)
+                            .or(execution_config);
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -3145,9 +3428,14 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.max_tool_result_chars,
                                 o.agent.resolved.context_limits(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
-                                &sop_reassembly
-                                    .expect("owned implies a reassembly handle")
-                                    .config
+                                &execution_config
+                                    .as_deref()
+                                    .unwrap_or(
+                                        sop_reassembly
+                                            .as_ref()
+                                            .expect("owned implies a reassembly handle")
+                                            .config,
+                                    )
                                     .pacing,
                             ),
                             None => (
@@ -3207,9 +3495,12 @@ async fn drive_live_sop_actions(
                         if let Some(o) = owned {
                             match build_owned_step_system_prompt(
                                 o,
-                                sop_reassembly
-                                    .expect("owned implies a reassembly handle")
-                                    .config,
+                                execution_config.as_deref().unwrap_or(
+                                    sop_reassembly
+                                        .as_ref()
+                                        .expect("owned implies a reassembly handle")
+                                        .config,
+                                ),
                                 step_alias.expect("needs_reassembly implies a step agent alias"),
                                 &sop_excluded_tools,
                             ) {
@@ -3243,7 +3534,7 @@ async fn drive_live_sop_actions(
                             // future is built inside the run-attribution scope and
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
-                            let mut nested_memory_preamble: Option<String> = None;
+                            let mut nested_memory_preamble: Option<MemoryPreamble> = None;
                             let step_result = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
@@ -3263,6 +3554,14 @@ async fn drive_live_sop_actions(
                                             observer,
                                             silent,
                                             approval: eff_approval,
+                                            // Same-agent steps run under the
+                                            // enclosing agent's policy; a
+                                            // cross-agent step runs under its
+                                            // own re-assembled one.
+                                            security: match owned {
+                                                Some(o) => Some(o.security.as_ref()),
+                                                None => security,
+                                            },
                                             multimodal_config,
                                             config,
                                             hooks,
@@ -3347,7 +3646,7 @@ async fn drive_live_sop_actions(
                                     },
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
-                                    sop_reassembly,
+                                    sop_reassembly: sop_reassembly.clone(),
                                     })),
                                 )
                             )
@@ -3651,6 +3950,7 @@ mod reported_budget_tests {
     // below calls the production function with an explicit turn identity.
     #[allow(clippy::too_many_arguments)]
     async fn enforce_reported_budget(
+        injected_memory_preamble: &mut Option<MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         reported_input_tokens: usize,
         reported_population_estimated: usize,
@@ -3666,6 +3966,7 @@ mod reported_budget_tests {
         crumb_present: &mut bool,
     ) {
         super::enforce_reported_budget(
+            injected_memory_preamble,
             history,
             reported_input_tokens,
             reported_population_estimated,
@@ -3725,6 +4026,7 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let observer = TrimObserver::default();
         super::enforce_reported_budget(
+            &mut None,
             &mut history,
             estimated * 4,
             estimated,
@@ -3762,6 +4064,7 @@ mod reported_budget_tests {
         let reported = estimated * 4;
         let budget = reported / 2;
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -3798,6 +4101,7 @@ mod reported_budget_tests {
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             estimated,
             estimated,
@@ -3827,6 +4131,7 @@ mod reported_budget_tests {
         // model's 100-token context budget and must not trim history.
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             80,
             estimated,
@@ -3855,6 +4160,7 @@ mod reported_budget_tests {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         enforce_reported_budget(
+            &mut None,
             &mut history,
             usize::MAX,
             usize::MAX,
@@ -3882,6 +4188,7 @@ mod reported_budget_tests {
         let budget = reported / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -3945,6 +4252,7 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4039,6 +4347,7 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             prepared_estimated,
@@ -4126,6 +4435,7 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4200,6 +4510,7 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4268,6 +4579,7 @@ mod reported_budget_tests {
         let budget = estimated / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4344,6 +4656,7 @@ mod reported_budget_tests {
         let taken: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4409,6 +4722,7 @@ mod reported_budget_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut crumb_present = false;
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4555,6 +4869,7 @@ mod reported_budget_tests {
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4644,6 +4959,7 @@ mod reported_budget_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         enforce_reported_budget(
+            &mut None,
             &mut history,
             reported,
             estimated,
@@ -4736,6 +5052,7 @@ mod trim_budget_tests {
         let mut crumb_present = false;
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         let result = surface_oversized_dispatch_if_needed(
+            &mut None,
             &mut history,
             &mut crumb_present,
             tokens_before as u64,
@@ -4748,6 +5065,7 @@ mod trim_budget_tests {
             "the breadcrumb itself must push the kept history over budget ({final_tokens} > {budget})"
         );
         let floor = surface_oversized_dispatch_if_needed(
+            &mut None,
             &mut history,
             &mut crumb_present,
             final_tokens as u64,
@@ -4874,6 +5192,7 @@ mod active_route_context_tests {
         let tokens_before = crate::agent::history::estimate_history_tokens(&history);
         assert!(tokens_before < text_limits.context_token_budget);
         let trim = surface_oversized_dispatch_if_needed(
+            &mut None,
             &mut history,
             &mut false,
             tokens_before as u64,
@@ -5279,6 +5598,7 @@ vision_model_provider = "custom.vision"
                     activated_tools: None,
                     model_switch_callback: None,
                     receipt_generator: None,
+                    security: None,
                 },
                 ResolvedRuntimeKnobs {
                     max_tool_iterations: 3,
@@ -5382,6 +5702,26 @@ mod shared_iteration_budget_tests {
     }
 }
 
+/// The trace stamp for an internally initiated turn: initiating principal
+/// and executing agent side by side, correlated by the turn's trace id.
+/// Attributes carry runtime-resolved identity only, never message text.
+pub(crate) fn internal_principal_event(
+    turn_id: &str,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    principal: &zeroclaw_api::ingress::InternalPrincipal,
+    executing_agent: Option<&str>,
+) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        .with_category(::zeroclaw_log::EventCategory::Agent)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "trace_id": turn_id,
+            "origin": origin,
+            "internal_principal": principal,
+            "executing_agent": executing_agent,
+        }))
+}
+
 /// Live SOP nested-step re-assembly gate, isolation, and fail-closed regressions.
 ///
 /// Privilege-scope properties of the live driver:
@@ -5401,6 +5741,39 @@ mod shared_iteration_budget_tests {
 /// - **Fail-closed.** A cross-agent step with no re-assembly handle, or whose
 ///   agent context cannot be assembled, FAILS rather than running with the
 ///   parent agent's broader context.
+#[cfg(test)]
+mod internal_principal_event_tests {
+    use super::*;
+
+    #[test]
+    fn trace_stamp_carries_both_identities_keyed_by_trace_id() {
+        let principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: "job-1".to_string(),
+            job_name: Some("nightly".to_string()),
+        };
+        let event = internal_principal_event(
+            "trace-1",
+            zeroclaw_api::ingress::TurnOrigin::Cron,
+            &principal,
+            Some("assistant"),
+        );
+        assert_eq!(event.outcome, ::zeroclaw_log::EventOutcome::Unknown);
+        let attrs = event.attrs.expect("event carries attributes");
+        assert_eq!(attrs["trace_id"], "trace-1");
+        assert_eq!(attrs["origin"], "cron");
+        assert_eq!(
+            attrs["internal_principal"],
+            serde_json::json!({"cron": {"job_id": "job-1", "job_name": "nightly"}})
+        );
+        assert_eq!(attrs["executing_agent"], "assistant");
+        assert_eq!(
+            attrs.as_object().map(serde_json::Map::len),
+            Some(4),
+            "identity attributes only — never message text"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sop_step_reassembly_tests {
     use super::*;
@@ -5520,12 +5893,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -5545,6 +5920,110 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    #[tokio::test]
+    async fn reassembled_step_file_download_observes_live_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, FileDownloadConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let owned = assemble_owned_execution(
+            &config,
+            Some(Arc::clone(&live_config)),
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+        )
+        .await
+        .expect("stepper assembles");
+        let file_download = owned
+            .tools_registry
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered for the step agent");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download
+            .execute(args.clone())
+            .await
+            .expect("first run");
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.expect("second run");
+        assert!(
+            !second.success,
+            "same reassembled step tool must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
+        );
     }
 
     /// A parent approval manager with a live back-channel survives delegation:
@@ -5604,6 +6083,7 @@ mod sop_step_reassembly_tests {
         );
         let owned = assemble_owned_execution(
             &config,
+            None,
             "restricted",
             Arc::clone(&engine),
             None,
@@ -5958,6 +6438,7 @@ mod sop_step_reassembly_tests {
             cancellation_token,
             max_tool_iterations,
             None,
+            None,
         )
         .await
     }
@@ -5969,6 +6450,7 @@ mod sop_step_reassembly_tests {
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
+        security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
     ) -> Result<String> {
         let observer = crate::observability::NoopObserver {};
@@ -5998,6 +6480,7 @@ mod sop_step_reassembly_tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security,
                     multimodal_config: &multimodal,
                     config: None,
                     hooks,
@@ -6141,6 +6624,10 @@ mod sop_step_reassembly_tests {
         )
         .unwrap();
         let prompt = format!("describe [IMAGE:{}]", image.display());
+        let security = crate::security::SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
         let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
         for (cancel, change_model) in [(false, false), (false, true), (true, true)] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -6166,6 +6653,7 @@ mod sop_step_reassembly_tests {
                 budget.clone(),
                 CancellationToken::new(),
                 10,
+                None,
                 Some(&hooks),
             )
             .await;
@@ -6193,13 +6681,15 @@ mod sop_step_reassembly_tests {
             );
         }
         let mut history = vec![ChatMessage::user(prompt)];
-        let result = run_budgeted_test_loop(
+        let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
             &tools,
             ExecutionTreeBudget::root(1),
             CancellationToken::new(),
             10,
+            Some(&security),
+            None,
         )
         .await;
         assert!(
@@ -6373,6 +6863,11 @@ mod sop_step_reassembly_tests {
             mcp_tool_names,
             mcp_prompt_section: String::new(),
             shell_profile: None,
+            execution_admission: None,
+            // Test fixture: no config-backed policy, so the default (its
+            // `workspace_dir` is ".") stands in and the marker gate fails
+            // closed under it.
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -6381,6 +6876,17 @@ mod sop_step_reassembly_tests {
     /// `ExecuteStep` action (already resolved to a cross-agent step).
     fn start_single_cross_agent_step(
         step_agent: &str,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        start_single_step_with_capability(Some(step_agent), None)
+    }
+
+    fn start_single_step_with_capability(
+        step_agent: Option<&str>,
+        capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     ) -> (
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
@@ -6403,7 +6909,7 @@ mod sop_step_reassembly_tests {
                 number: 1,
                 title: "delegate".to_string(),
                 body: "run".to_string(),
-                agent: Some(step_agent.to_string()),
+                agent: step_agent.map(str::to_string),
                 ..SopStep::default()
             }],
             cooldown_secs: 0,
@@ -6416,6 +6922,9 @@ mod sop_step_reassembly_tests {
             decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        if let Some(capability) = capability {
+            engine = engine.with_execution_capability(capability);
+        }
         engine.set_sops_for_test(vec![sop]);
         let event = SopEvent {
             source: SopTriggerSource::Manual,
@@ -6428,7 +6937,7 @@ mod sop_step_reassembly_tests {
             SopRunAction::ExecuteStep { run_id, step, .. } => {
                 assert_eq!(
                     step.agent.as_deref(),
-                    Some(step_agent),
+                    step_agent,
                     "the step must resolve to a cross-agent delegation"
                 );
                 run_id.clone()
@@ -6483,6 +6992,8 @@ mod sop_step_reassembly_tests {
             parent_tools,
             observer,
             true,
+            None,
+            // security: no policy on the test path
             None,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             None,
@@ -6542,6 +7053,61 @@ mod sop_step_reassembly_tests {
 
     const PARENT_MARKER: &str = "PARENT-ONLY-SECRET-7f3a";
 
+    #[tokio::test]
+    async fn managed_unnamed_live_sop_step_admits_the_executing_agent() {
+        struct AdmissionObserver(crate::live_config_authority::AgentLifecycleCoordinator);
+        impl crate::observability::Observer for AdmissionObserver {
+            fn record_event(&self, event: &crate::observability::ObserverEvent) {
+                if matches!(
+                    event,
+                    crate::observability::ObserverEvent::LlmRequest { .. }
+                ) {
+                    assert_eq!(self.0.active_turn_count("alpha"), 0);
+                    assert_eq!(self.0.active_turn_count("zeta"), 1);
+                    assert!(self.0.begin_delete("zeta").is_err());
+                }
+            }
+            fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "admission-observer"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert("alpha".into(), Default::default());
+        config.agents.insert("zeta".into(), Default::default());
+        let authority = crate::LiveConfigAuthority::new(config);
+        let lifecycle = authority.agent_lifecycle();
+        let (engine, run_id, action) =
+            start_single_step_with_capability(None, Some(authority.execution_capability()));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("test")];
+        let mut cache = std::collections::HashMap::new();
+        drive_step(
+            engine.clone(),
+            action,
+            &TextProvider,
+            &tools,
+            &AdmissionObserver(lifecycle.clone()),
+            &mut history,
+            None,
+            None,
+            None,
+            Some("zeta"),
+            None,
+            None,
+            &mut cache,
+        )
+        .await;
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+        assert!(lifecycle.begin_delete("zeta").is_ok());
+    }
+
     /// Cross-agent steps run on an isolated child transcript: the parent
     /// history (distinct provider, marker message) never reaches the child
     /// provider; the child sees its own system prompt + the step context; the
@@ -6551,7 +7117,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6650,7 +7219,10 @@ mod sop_step_reassembly_tests {
 
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6745,7 +7317,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6806,7 +7381,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_keeps_shared_history_and_identity() {
         let (engine, run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -6859,7 +7437,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_excludes_existing_breadcrumb_from_trim_turn_count() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let parent_provider = TextProvider;
         let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6920,7 +7501,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -6974,7 +7558,10 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         // Bare config: no "stepper" agent exists, so assembly must fail.
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
         let parent_tools =
@@ -7174,7 +7761,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let mut exec_cache = std::collections::HashMap::new();
         let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
@@ -7206,6 +7796,9 @@ mod sop_step_reassembly_tests {
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
                 shell_profile: None,
+                execution_admission: None,
+                // Test fixture: see the helper above.
+                security: Arc::new(crate::security::SecurityPolicy::default()),
             },
         );
 
@@ -7676,7 +8269,7 @@ mod tool_lifecycle_abandonment_tests {
         context_token_budget: usize,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
-        let mut injected_preamble: Option<String> = None;
+        let mut injected_preamble = None;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -7711,6 +8304,7 @@ mod tool_lifecycle_abandonment_tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history,
             history_has_trim_breadcrumb: &mut crumb_present,

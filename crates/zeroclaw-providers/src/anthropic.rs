@@ -19,16 +19,16 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -267,17 +267,26 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
+/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
+/// 400 and require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+/// Substring matching on purpose: gateway model IDs may carry routing
+/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
+/// style as the bare model name. The whole Fable 5 family is adaptive-only,
+/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
+/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
+/// family would need this matcher revisited.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
         AnthropicThinkingStyle::Adaptive
     } else {
         AnthropicThinkingStyle::Budget
@@ -3204,10 +3213,17 @@ impl ModelProvider for AnthropicModelProvider {
                 {
                     req = req.header("anthropic-beta", beta_features);
                 }
-                let response = req
-                    .send()
-                    .await
-                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                let response = req.send().await.map_err(|e| {
+                    // Tag the transport's verdict at the send site: a
+                    // connect failure gets the typed variant Reliable reads
+                    // for its recovery exception. See the variant's doc for
+                    // the redirect limit.
+                    if e.is_connect() {
+                        StreamError::ConnectFailed(e.to_string())
+                    } else {
+                        StreamError::Http(e.to_string())
+                    }
+                })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response
@@ -3355,9 +3371,17 @@ impl ModelProvider for AnthropicModelProvider {
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                    // Tag the transport's verdict at the send site: a connect
+                    // failure gets the typed variant Reliable reads for its
+                    // recovery exception (the variant's doc carries the
+                    // redirect limit). Any other send error keeps the
+                    // unclassified Http form.
+                    let error = if e.is_connect() {
+                        StreamError::ConnectFailed(super::format_error_chain(&e))
+                    } else {
+                        StreamError::Http(super::format_error_chain(&e))
+                    };
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
                 Err(_) => {
@@ -4444,6 +4468,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(
             anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // The whole Fable 5 family is adaptive-only: bare fable-5 and
+        // gateway-prefixed IDs resolve like fable-5-1.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
             AnthropicThinkingStyle::Adaptive
         );
         // Budget-based families keep the `enabled` shape.
@@ -9790,6 +9824,142 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
     }
 
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!("connect failure must be tagged ConnectFailed, got {other:?}"),
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// B1's counterexample at the adapter boundary: an accepted HTTP 200
+    /// stream whose SSE error frame says `failed to resolve backend` is a
+    /// provider-side error, never `ConnectFailed`, so error text cannot
+    /// purchase the connect-failed recovery grant.
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_sse_error_frame_after_accepted_response() {
+        use futures_util::StreamExt;
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed to resolve backend\"}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let mut saw_error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                saw_error = Some(err);
+                break;
+            }
+        }
+        server.abort();
+        match saw_error.expect("the SSE error frame must surface an error") {
+            StreamError::ModelProvider(message) => {
+                assert!(
+                    message.contains("failed to resolve backend"),
+                    "the frame text must stay in the message: {message}"
+                );
+            }
+            other => panic!(
+                "an accepted stream's error frame must not be tagged ConnectFailed, got {other:?}"
+            ),
+        }
+    }
+
+    /// The redirect limit documented on `StreamError::ConnectFailed`: a
+    /// client that follows redirects may already have delivered an earlier
+    /// hop. A local gateway accepts the POST and answers 303 See Other
+    /// pointing at a closed local port; the follow-up GET fails at
+    /// connect, and the adapter still tags the error `ConnectFailed`, so
+    /// the tag alone is not proof that nothing was delivered.
+    #[tokio::test]
+    async fn connect_failed_on_redirect_hop_is_tagged_known_limit() {
+        use futures_util::StreamExt;
+
+        // The redirect target: a port with nothing listening.
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        // The first hop: accepts the POST, answers 303 See Other.
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                axum::response::Redirect::to(&format!("http://{closed_addr}/v1/messages"))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("the redirect-following stream must fail");
+        match first.expect("the redirect stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => panic!(
+                "a connect failure on the redirect hop must still be tagged ConnectFailed, got {other:?}"
+            ),
+            Ok(_) => panic!("a closed redirect target cannot produce stream events"),
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn unwrapped_anthropic_refusal_recovery_bills_exactly_one_attempt() {
         use futures_util::StreamExt;
@@ -10474,5 +10644,152 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sigX");
+    }
+
+    /// Remove every `cache_control` key at any depth. The rolling cache
+    /// breakpoint moves to the newest message by design, so eviction
+    /// stability is asserted with every breakpoint stripped: everything
+    /// else must stay byte-identical across requests.
+    fn strip_cache_control(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("cache_control");
+                for child in map.values_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items.iter_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Eviction stability must survive the Anthropic request converter, not
+    /// just prepared-message equality. The same fixture as the multimodal
+    /// contract test (four user images, a fifth image, then an image-free
+    /// user turn; `max_images: 4`, `max_image_turns: 0`) goes through the
+    /// production conversion sequence of `chat`: prepare, convert, then the
+    /// rolling cache breakpoint. The breakpoint moves by design; everything
+    /// else must not.
+    #[tokio::test]
+    async fn image_cap_eviction_keeps_prior_native_messages_identical() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A real PNG: preparation decodes pixels and drops corrupt images.
+        let png_data = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", img(i).display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+
+        // The conversion sequence of `chat`, mirrored: prepare, convert,
+        // then the rolling breakpoint on a long conversation.
+        async fn convert_stripped(
+            messages: &[ChatMessage],
+            config: &zeroclaw_config::schema::MultimodalConfig,
+        ) -> Vec<String> {
+            let prepared = crate::multimodal::prepare_messages_for_provider(messages, config)
+                .await
+                .expect("preparation must succeed");
+            let (_, mut native) =
+                AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+            if AnthropicModelProvider::should_cache_conversation(&prepared.messages) {
+                AnthropicModelProvider::apply_cache_to_last_message(
+                    &mut native,
+                    CacheTtl::default(),
+                );
+            }
+            native
+                .iter()
+                .map(|message| {
+                    let mut value =
+                        serde_json::to_value(message).expect("serialize native message");
+                    strip_cache_control(&mut value);
+                    value.to_string()
+                })
+                .collect()
+        }
+
+        let p0 = convert_stripped(&history, &config).await;
+
+        // Fifth image arrives: the oldest image message loses its image.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = convert_stripped(&history, &config).await;
+        // The fixtures must reach the wire as image blocks; otherwise the
+        // stability assertions below hold with no image in play.
+        let image_blocks = |messages: &[String]| {
+            messages
+                .iter()
+                .map(|m| m.matches("\"type\":\"image\"").count())
+                .sum::<usize>()
+        };
+        assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
+        assert_eq!(
+            image_blocks(&p1),
+            4,
+            "the cap keeps exactly four image blocks"
+        );
+
+        // Image-free follow-up.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = convert_stripped(&history, &config).await;
+
+        // Every pre-existing serialized native message stays byte-identical
+        // on the image-free follow-up, breakpoints aside.
+        assert_eq!(
+            &p2[..p1.len()],
+            p1.as_slice(),
+            "the image-free follow-up must not change any prior native message"
+        );
+
+        // Exactly one message differs from before the fifth image: the
+        // position holding the oldest image, the first user message.
+        let changed: Vec<usize> = p0
+            .iter()
+            .zip(p1.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![0],
+            "the fifth image must rewrite only the oldest image message"
+        );
     }
 }

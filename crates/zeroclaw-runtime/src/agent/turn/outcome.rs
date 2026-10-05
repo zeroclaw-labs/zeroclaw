@@ -104,6 +104,9 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    /// The typed stream error that produced this outcome. `Terminal` is
+    /// load-bearing: the provider-call step reads it to skip the
+    /// non-streaming fallback the error's producer already performed.
     pub(crate) source: zeroclaw_api::model_provider::StreamError,
 }
 
@@ -298,7 +301,7 @@ fn terminal_completion_error_message_with_renderer(
 }
 
 #[cfg(test)]
-fn terminal_completion_error_message_in_english(
+pub(crate) fn terminal_completion_error_message_in_english(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
