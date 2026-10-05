@@ -224,6 +224,10 @@ pub enum ServiceCommands {
     RunDesktopDaemon {
         #[arg(long, hide = true)]
         port: u16,
+        /// Report readiness once the daemon serves its RPC endpoint, with the
+        /// endpoint in the readiness frame, instead of when it starts
+        #[arg(long, hide = true)]
+        rpc_readiness: bool,
     },
     /// Internal Windows task runner that owns bounded daemon output capture
     #[command(hide = true)]

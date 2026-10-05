@@ -8,7 +8,7 @@ pub async fn send_message(
     message: String,
 ) -> Result<serde_json::Value, String> {
     let s = state.read().await;
-    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref());
+    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref()).with_core(s.core.clone());
     drop(s);
     client
         .send_webhook_message(&message)

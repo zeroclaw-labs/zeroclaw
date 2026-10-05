@@ -14,6 +14,63 @@ use std::time::Instant;
 // in zeroclaw-runtime's service module.
 const READINESS_FRAME_MAX_BYTES: usize = 4096;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a supervisor gets to report `READY` when it reports readiness at
+/// daemon start (older kernels).
+const SPAWNED_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a supervisor gets to report `READY` when it waits for the daemon
+/// to serve its RPC endpoint, which includes the daemon's own startup.
+const RPC_READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// The kernel flag that asks the supervisor for RPC readiness.
+const RPC_READINESS_FLAG: &str = "--rpc-readiness";
+
+/// When the launched supervisor reports readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessMode {
+    /// `READY` once the daemon starts (kernels without RPC readiness).
+    Spawned,
+    /// `READY {"endpoint":…,"pid":…}` once the daemon serves its RPC endpoint.
+    Rpc,
+}
+
+/// What the supervisor reported when it became ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    /// An older kernel: the daemon has started; only HTTP health can tell more.
+    Spawned,
+    /// The daemon child serves its RPC endpoint at `endpoint`. `pid` is the
+    /// daemon child's process ID, a diagnostic only.
+    Rpc { endpoint: PathBuf, pid: Option<u32> },
+}
+
+/// A launched supervisor and what it reported.
+#[derive(Debug)]
+pub struct LaunchedDaemon {
+    pub child: Child,
+    pub readiness: Readiness,
+}
+
+/// A structured readiness failure from a supervisor using RPC readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessFailure {
+    /// `endpoint_held` or `daemon_exited`.
+    pub reason: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ReadinessFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReadinessFailure {}
+
+impl ReadinessFailure {
+    /// The structured failure carried by a launch error, if any.
+    pub fn from_launch_error(error: &std::io::Error) -> Option<&ReadinessFailure> {
+        error.get_ref()?.downcast_ref::<ReadinessFailure>()
+    }
+}
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -36,6 +93,15 @@ fn zeroclaw_exe_name() -> &'static str {
     } else {
         "zeroclaw"
     }
+}
+
+/// Whether `binary` is the kernel bundled beside this app's executable, the
+/// first place [`find_zeroclaw_binary`] looks. A bundled kernel comes from the
+/// same build as the app, so its version must match the app's exactly.
+pub fn is_bundled_kernel(binary: &Path) -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| exe.with_file_name(zeroclaw_exe_name()) == binary)
 }
 
 /// Find the `zeroclaw` binary. Checks, in order: the directory next to this
@@ -84,9 +150,9 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
 /// Spawn the bounded desktop daemon supervisor, detached so it outlives the app.
 /// The child handle is returned but intentionally not reaped because the
 /// supervisor owns the daemon's background lifecycle and log capture.
-pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
-    ensure_desktop_supervisor_capability(binary)?;
-    let mut cmd = desktop_daemon_command(binary, port);
+pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<LaunchedDaemon> {
+    let mode = negotiate_readiness(binary)?;
+    let mut cmd = desktop_daemon_command(binary, port, mode);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -123,7 +189,11 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
     std::thread::spawn(move || {
         let _ = sender.send(read_readiness_frame(stdout));
     });
-    let frame = match receiver.recv_timeout(Duration::from_secs(10)) {
+    let readiness_timeout = match mode {
+        ReadinessMode::Spawned => SPAWNED_READINESS_TIMEOUT,
+        ReadinessMode::Rpc => RPC_READINESS_TIMEOUT,
+    };
+    let frame = match receiver.recv_timeout(readiness_timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let startup_error = std::io::Error::new(
@@ -146,8 +216,14 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
             ));
         }
     };
-    match validate_readiness_frame(frame, || child.try_wait()) {
-        Ok(()) => Ok(child),
+    let readiness = match mode {
+        ReadinessMode::Spawned => {
+            validate_readiness_frame(frame, || child.try_wait()).map(|()| Readiness::Spawned)
+        }
+        ReadinessMode::Rpc => validate_frame(frame, || child.try_wait(), parse_rpc_readiness_line),
+    };
+    match readiness {
+        Ok(readiness) => Ok(LaunchedDaemon { child, readiness }),
         Err(startup_error) => Err(attach_cleanup_error(
             startup_error,
             terminate_supervisor_tree(&mut child),
@@ -155,10 +231,81 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
     }
 }
 
+/// Ask the kernel which readiness it can report: RPC readiness when it
+/// accepts the opt-in flag, otherwise the original `READY` line. A kernel
+/// that supports neither is refused.
+fn negotiate_readiness(binary: &Path) -> std::io::Result<ReadinessMode> {
+    match probe_desktop_supervisor(binary, &[RPC_READINESS_FLAG], CAPABILITY_PROBE_TIMEOUT) {
+        Ok(()) => Ok(ReadinessMode::Rpc),
+        // A kernel that predates the flag rejects it as an unknown argument.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            ensure_desktop_supervisor_capability(binary)?;
+            Ok(ReadinessMode::Spawned)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Parse an RPC-readiness frame: `READY {"endpoint":…,"pid":…}` or a
+/// structured `ERROR {"reason":…,"message":…}`. A plain `ERROR <message>`
+/// still reports a failure that happened before readiness could be checked.
+fn parse_rpc_readiness_line(line: &str) -> std::io::Result<Readiness> {
+    let line = line.trim_end();
+    if let Some(body) = line.strip_prefix("READY ") {
+        let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("desktop supervisor sent an unreadable readiness frame: {error}"),
+            )
+        })?;
+        let endpoint = value["endpoint"]
+            .as_str()
+            .filter(|endpoint| !endpoint.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "desktop supervisor did not report its RPC endpoint",
+                )
+            })?;
+        let pid = value["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok());
+        return Ok(Readiness::Rpc {
+            endpoint: PathBuf::from(endpoint),
+            pid,
+        });
+    }
+    if let Some(body) = line.strip_prefix("ERROR ")
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+        && let (Some(reason), Some(message)) = (value["reason"].as_str(), value["message"].as_str())
+    {
+        return Err(std::io::Error::other(ReadinessFailure {
+            reason: reason.to_string(),
+            message: message.to_string(),
+        }));
+    }
+    parse_readiness_line(line)
+        .and_then(|()| Err("desktop supervisor did not report its RPC endpoint".to_string()))
+        .map_err(std::io::Error::other)
+}
+
 fn validate_readiness_frame<F>(
     frame: std::io::Result<Option<String>>,
     status_probe: F,
 ) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<Option<std::process::ExitStatus>>,
+{
+    validate_frame(frame, status_probe, |line| {
+        parse_readiness_line(line).map_err(std::io::Error::other)
+    })
+}
+
+fn validate_frame<F, T>(
+    frame: std::io::Result<Option<String>>,
+    status_probe: F,
+    parse: impl FnOnce(&str) -> std::io::Result<T>,
+) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<Option<std::process::ExitStatus>>,
 {
@@ -183,7 +330,7 @@ where
         }
         Err(error) => return Err(error),
     };
-    parse_readiness_line(&line).map_err(std::io::Error::other)
+    parse(&line)
 }
 
 fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
@@ -194,9 +341,21 @@ fn ensure_desktop_supervisor_capability_with_timeout(
     binary: &Path,
     timeout: Duration,
 ) -> std::io::Result<()> {
+    probe_desktop_supervisor(binary, &[], timeout)
+}
+
+/// Run `service run-desktop-daemon <extra_args> --help`: it succeeds only
+/// when the kernel knows the supervisor command and every extra argument.
+fn probe_desktop_supervisor(
+    binary: &Path,
+    extra_args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<()> {
     let mut command = Command::new(binary);
     command
-        .args(["service", "run-desktop-daemon", "--help"])
+        .args(["service", "run-desktop-daemon"])
+        .args(extra_args)
+        .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -403,16 +562,27 @@ fn attach_cleanup_error(
     startup_error: std::io::Error,
     cleanup_result: std::io::Result<()>,
 ) -> std::io::Error {
-    match cleanup_result {
-        Ok(()) => startup_error,
-        Err(cleanup_error) => std::io::Error::new(
+    let Err(cleanup_error) = cleanup_result else {
+        return startup_error;
+    };
+    // Keep a structured readiness failure's reason through the cleanup note,
+    // so the splash can still name it.
+    match ReadinessFailure::from_launch_error(&startup_error).cloned() {
+        Some(failure) => std::io::Error::other(ReadinessFailure {
+            reason: failure.reason,
+            message: format!(
+                "{}; supervisor cleanup failed: {cleanup_error}",
+                failure.message
+            ),
+        }),
+        None => std::io::Error::new(
             startup_error.kind(),
             format!("{startup_error}; supervisor cleanup failed: {cleanup_error}"),
         ),
     }
 }
 
-fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
+pub(crate) fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
     let mut utility_errors = Vec::new();
     let mut forceful_termination_initiated = false;
 
@@ -631,12 +801,15 @@ fn parse_paircode_output(stdout: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "get-paircode returned no pairing code".to_string())
 }
 
-fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
+fn desktop_daemon_command(binary: &Path, port: u16, mode: ReadinessMode) -> Command {
     let mut cmd = Command::new(binary);
     cmd.arg("service")
         .arg("run-desktop-daemon")
         .arg("--port")
         .arg(port.to_string());
+    if mode == ReadinessMode::Rpc {
+        cmd.arg(RPC_READINESS_FLAG);
+    }
     cmd
 }
 
@@ -682,7 +855,8 @@ mod tests {
 
     #[test]
     fn desktop_command_targets_hidden_supervisor_and_port() {
-        let command = desktop_daemon_command(Path::new("/tmp/zeroclaw"), 42617);
+        let command =
+            desktop_daemon_command(Path::new("/tmp/zeroclaw"), 42617, ReadinessMode::Spawned);
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -866,6 +1040,7 @@ mod tests {
         fs::create_dir(&log_destination).expect("make log destination a directory");
         let fixture = format!(
             "#!/bin/sh\n\
+             if [ \"${{3:-}}\" = --rpc-readiness ]; then exit 2; fi\n\
              if [ \"${{1:-}}\" = service ] && [ \"${{2:-}}\" = run-desktop-daemon ] && [ \"${{3:-}}\" = --help ]; then exit 0; fi\n\
              sleep 30 &\n\
              child=$!\n\
@@ -941,6 +1116,7 @@ mod tests {
         let pid_file_literal = pid_file.to_string_lossy().replace('\'', "'\\''");
         let fixture = format!(
             "#!/bin/sh\n\
+             if [ \"${{3:-}}\" = --rpc-readiness ]; then exit 2; fi\n\
              if [ \"${{1:-}}\" = service ] && [ \"${{2:-}}\" = run-desktop-daemon ] && [ \"${{3:-}}\" = --help ]; then exit 0; fi\n\
              trap '' HUP TERM INT\n\
              sleep 30 &\n\
@@ -970,5 +1146,160 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("descendant process {descendant_pid} remained alive after cleanup");
+    }
+
+    #[test]
+    fn rpc_readiness_command_adds_the_opt_in_flag() {
+        let command = desktop_daemon_command(Path::new("/tmp/zeroclaw"), 42617, ReadinessMode::Rpc);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "service",
+                "run-desktop-daemon",
+                "--port",
+                "42617",
+                "--rpc-readiness"
+            ]
+        );
+    }
+
+    #[test]
+    fn rpc_readiness_frame_carries_the_endpoint_and_daemon_pid() {
+        assert_eq!(
+            parse_rpc_readiness_line("READY {\"endpoint\":\"/tmp/d.sock\",\"pid\":42}\n")
+                .expect("ready frame"),
+            Readiness::Rpc {
+                endpoint: PathBuf::from("/tmp/d.sock"),
+                pid: Some(42)
+            }
+        );
+    }
+
+    #[test]
+    fn rpc_readiness_failures_keep_their_reason() {
+        let error = parse_rpc_readiness_line(
+            "ERROR {\"reason\":\"endpoint_held\",\"message\":\"another process (pid 9) already serves it\"}\n",
+        )
+        .expect_err("structured failure");
+        let failure = ReadinessFailure::from_launch_error(&error).expect("typed failure");
+        assert_eq!(failure.reason, "endpoint_held");
+        assert!(failure.message.contains("pid 9"));
+
+        let plain = parse_rpc_readiness_line("ERROR could not open desktop log\n")
+            .expect_err("plain failure");
+        assert!(ReadinessFailure::from_launch_error(&plain).is_none());
+        assert!(plain.to_string().contains("could not open desktop log"));
+    }
+
+    #[test]
+    fn rpc_readiness_rejects_frames_without_an_endpoint() {
+        for frame in [
+            "READY\n",
+            "READY {\"pid\":1}\n",
+            "READY not-json\n",
+            "NOT_READY\n",
+        ] {
+            assert!(parse_rpc_readiness_line(frame).is_err(), "{frame:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn kernel_fixture(label: &str, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw-desktop-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create fixture directory");
+        let binary = dir.join("kernel");
+        fs::write(&binary, body.replace("{dir}", &dir.to_string_lossy()))
+            .expect("write kernel fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make kernel fixture executable");
+        (dir, binary)
+    }
+
+    /// A new kernel answers both probes, is launched with the opt-in flag,
+    /// and reports its endpoint.
+    #[cfg(unix)]
+    #[test]
+    fn a_kernel_with_rpc_readiness_is_launched_with_it() {
+        let (dir, binary) = kernel_fixture(
+            "rpc-ready",
+            "#!/bin/sh\n\
+             case \" $* \" in *\" --help \"*) exit 0;; esac\n\
+             printf '%s\\n' \"$*\" > '{dir}/args'\n\
+             printf '%s\\n' 'READY {\"endpoint\":\"/tmp/zc-test.sock\",\"pid\":4242}'\n\
+             exec sleep 30\n",
+        );
+        let mut launched = spawn_daemon(&binary, 0).expect("launch");
+        assert_eq!(
+            launched.readiness,
+            Readiness::Rpc {
+                endpoint: PathBuf::from("/tmp/zc-test.sock"),
+                pid: Some(4242)
+            }
+        );
+        let args = fs::read_to_string(dir.join("args")).expect("recorded args");
+        assert!(args.contains("--rpc-readiness"), "{args}");
+        terminate_supervisor_tree(&mut launched.child).expect("stop fixture");
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
+    }
+
+    /// A kernel that predates RPC readiness rejects the flag; the app falls
+    /// back to the original `READY` line and launches without the flag.
+    #[cfg(unix)]
+    #[test]
+    fn a_kernel_without_rpc_readiness_falls_back_to_the_ready_line() {
+        let (dir, binary) = kernel_fixture(
+            "legacy",
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do [ \"$arg\" = --rpc-readiness ] && exit 2; done\n\
+             case \" $* \" in *\" --help \"*) exit 0;; esac\n\
+             printf '%s\\n' \"$*\" > '{dir}/args'\n\
+             printf '%s\\n' READY\n\
+             exec sleep 30\n",
+        );
+        let mut launched = spawn_daemon(&binary, 0).expect("launch an older kernel");
+        assert_eq!(launched.readiness, Readiness::Spawned);
+        let args = fs::read_to_string(dir.join("args")).expect("recorded args");
+        assert!(!args.contains("--rpc-readiness"), "{args}");
+        terminate_supervisor_tree(&mut launched.child).expect("stop fixture");
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
+    }
+
+    /// The supervisor reports that another process holds the endpoint; the
+    /// launch fails with that reason so the splash can name it.
+    #[cfg(unix)]
+    #[test]
+    fn an_endpoint_held_by_another_process_fails_the_launch_with_its_reason() {
+        let (dir, binary) = kernel_fixture(
+            "held",
+            "#!/bin/sh\n\
+             case \" $* \" in *\" --help \"*) exit 0;; esac\n\
+             printf '%s\\n' 'ERROR {\"reason\":\"endpoint_held\",\"message\":\"another process (pid 7) already serves the daemon endpoint /tmp/x.sock\"}'\n\
+             exit 1\n",
+        );
+        let error = spawn_daemon(&binary, 0).expect_err("a held endpoint fails the launch");
+        let failure = ReadinessFailure::from_launch_error(&error).expect("typed failure");
+        assert_eq!(failure.reason, "endpoint_held");
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_kernel_supporting_neither_readiness_is_refused() {
+        let (dir, binary) = kernel_fixture("neither", "#!/bin/sh\nexit 2\n");
+        let error = spawn_daemon(&binary, 0).expect_err("unsupported kernel");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
     }
 }

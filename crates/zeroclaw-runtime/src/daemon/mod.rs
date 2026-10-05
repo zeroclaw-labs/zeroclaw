@@ -144,7 +144,12 @@ impl Drop for ChannelGenerationAttempt {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StartupReadiness {
     gateway_generation: u64,
+    /// What the current gateway generation's listener bound, while it
+    /// accepts connections.
     gateway_addr: Option<std::net::SocketAddr>,
+    /// That listener's possession key, published and cleared with the
+    /// address.
+    gateway_possession: Option<GatewayPossession>,
     socket_generation: u64,
     socket_ready: bool,
 }
@@ -223,16 +228,69 @@ fn fatal_socket_startup_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind
         })
 }
 
+/// How a gateway listener reports its lifetime to the process that owns it:
+/// the address it bound, once it accepts connections, and that it stopped
+/// accepting them. A listener the daemon owns also carries its generation's
+/// possession key, which it proves on `/health` challenges.
 #[derive(Clone)]
-pub struct GatewayReadinessReporter(std::sync::Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>);
+pub struct GatewayReadinessReporter {
+    ready: std::sync::Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>,
+    released: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Set by [`Self::report_released`]; a prover stops answering then.
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    possession: Option<GatewayPossession>,
+}
 
 impl GatewayReadinessReporter {
     pub fn new(report: impl Fn(std::net::SocketAddr) + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(report))
+        Self {
+            ready: std::sync::Arc::new(report),
+            released: None,
+            stopped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            possession: None,
+        }
+    }
+
+    /// Also run `release` when the listener stops accepting connections:
+    /// at the shutdown signal, before the listening socket is closed, or
+    /// when the gateway ends without one. It may run more than once.
+    #[must_use]
+    pub fn on_release(mut self, release: impl Fn() + Send + Sync + 'static) -> Self {
+        self.released = Some(std::sync::Arc::new(release));
+        self
+    }
+
+    /// The key the listener proves possession with.
+    #[must_use]
+    pub fn with_possession(mut self, possession: GatewayPossession) -> Self {
+        self.possession = Some(possession);
+        self
     }
 
     pub fn report_ready(&self, addr: std::net::SocketAddr) {
-        (self.0)(addr);
+        (self.ready)(addr);
+    }
+
+    /// The listener no longer accepts connections; its address may be
+    /// reused from now on.
+    pub fn report_released(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(released) = &self.released {
+            released();
+        }
+    }
+
+    pub fn possession(&self) -> Option<GatewayPossession> {
+        self.possession
+    }
+
+    /// What this listener answers `/health` challenges with, when it has a
+    /// possession key. It stops answering once the listener is released.
+    pub fn prover(&self) -> Option<possession::GatewayProver> {
+        self.possession.map(|possession| {
+            possession::GatewayProver::new(possession, std::sync::Arc::clone(&self.stopped))
+        })
     }
 }
 
@@ -271,7 +329,8 @@ pub fn gateway_start_hook_reporter(
         return inner;
     };
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Some(GatewayReadinessReporter::new(move |addr| {
+    let ready_inner = inner.clone();
+    let mut reporter = GatewayReadinessReporter::new(move |addr| {
         if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let hooks = std::sync::Arc::clone(&hooks);
             let host = host.clone();
@@ -279,10 +338,17 @@ pub fn gateway_start_hook_reporter(
                 hooks.fire_gateway_start(&host, addr.port()).await;
             });
         }
-        if let Some(inner) = &inner {
+        if let Some(inner) = &ready_inner {
             inner.report_ready(addr);
         }
-    }))
+    });
+    if let Some(inner) = inner {
+        if let Some(possession) = inner.possession() {
+            reporter = reporter.with_possession(possession);
+        }
+        reporter = reporter.on_release(move || inner.report_released());
+    }
+    Some(reporter)
 }
 
 #[derive(Clone)]
@@ -320,16 +386,34 @@ impl StartupReadinessAttempt {
                 readiness_tx.send_modify(|state| {
                     state.gateway_generation = state.gateway_generation.wrapping_add(1);
                     state.gateway_addr = None;
+                    state.gateway_possession = None;
                     generation = state.gateway_generation;
                 });
+                // A fresh key per generation: a proof made under an earlier
+                // generation's key never passes for this one.
+                let possession = GatewayPossession::generate();
                 let report_tx = readiness_tx.clone();
+                let release_tx = readiness_tx.clone();
                 let reporter = GatewayReadinessReporter::new(move |addr| {
                     report_tx.send_modify(|state| {
                         if state.gateway_generation == generation {
                             state.gateway_addr = Some(addr);
+                            state.gateway_possession = Some(possession);
                         }
                     });
-                });
+                })
+                // The address stops being published the moment the listener
+                // stops accepting, before the socket can be bound again, not
+                // when the gateway's drain finishes.
+                .on_release(move || {
+                    release_tx.send_modify(|state| {
+                        if state.gateway_generation == generation {
+                            state.gateway_addr = None;
+                            state.gateway_possession = None;
+                        }
+                    });
+                })
+                .with_possession(possession);
                 (
                     Some(Self {
                         readiness_tx,
@@ -376,12 +460,29 @@ impl StartupReadinessAttempt {
     }
 }
 
+/// The gateway listener the RPC surface reads: what the current gateway
+/// generation's listener bound, and its possession key, while it accepts
+/// connections. `None` before it binds and from the moment it stops.
+fn gateway_binding(
+    readiness_tx: &tokio::sync::watch::Sender<StartupReadiness>,
+) -> crate::rpc::context::GatewayBinding {
+    let readiness = readiness_tx.subscribe();
+    crate::rpc::context::GatewayBinding::new(move || {
+        let state = readiness.borrow();
+        Some(crate::rpc::context::BoundGateway {
+            addr: state.gateway_addr?,
+            possession: state.gateway_possession?,
+        })
+    })
+}
+
 impl Drop for StartupReadinessAttempt {
     fn drop(&mut self) {
         self.readiness_tx.send_modify(|state| match self.component {
             StartupComponent::Gateway if state.gateway_generation == self.generation => {
                 state.gateway_generation = state.gateway_generation.wrapping_add(1);
                 state.gateway_addr = None;
+                state.gateway_possession = None;
             }
             StartupComponent::Socket if state.socket_generation == self.generation => {
                 state.socket_generation = state.socket_generation.wrapping_add(1);
@@ -392,7 +493,9 @@ impl Drop for StartupReadinessAttempt {
     }
 }
 
+pub mod possession;
 mod registry;
+pub use possession::GatewayPossession;
 pub use registry::{DaemonInboundAuthority, DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
@@ -768,11 +871,12 @@ pub async fn run_with_authority(
         registry.take_channel_registry_clearer(),
     ));
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
-    let (startup_readiness_tx, startup_readiness_rx) = if startup_feedback_enabled {
+    // The readiness watch also backs the gateway address `health` reports
+    // over RPC, so it exists even without startup feedback; only the
+    // feedback wait reads this receiver.
+    let (startup_readiness_tx, startup_readiness_rx) = {
         let (tx, rx) = tokio::sync::watch::channel(StartupReadiness::default());
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
+        (Some(tx), startup_feedback_enabled.then_some(rx))
     };
     let (socket_startup_tracker, socket_startup_rx) = SocketStartupTracker::new();
     let mut gateway_required = false;
@@ -812,6 +916,11 @@ pub async fn run_with_authority(
         )?,
     );
 
+    // In-process RPC seam for the supervised gateway. Created before the
+    // gateway starts and bound once this generation's RPC context exists;
+    // the gateway's connect waits for that bind.
+    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
@@ -825,6 +934,7 @@ pub async fn run_with_authority(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            inproc: Some(inproc_connector.clone()),
             channel_generation_control: Some(channel_generation_control.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
@@ -1117,6 +1227,8 @@ pub async fn run_with_authority(
             },
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
+            gateway_binding: startup_readiness_tx.as_ref().map(gateway_binding),
+            external_gateways: std::sync::Arc::default(),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
@@ -1132,6 +1244,10 @@ pub async fn run_with_authority(
     } else {
         None
     };
+
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        inproc_connector.bind(std::sync::Arc::clone(ctx));
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
@@ -1403,7 +1519,23 @@ pub async fn run_with_authority(
     // that is refused below instead of handing over. Only this wait carries
     // the listeners' budget: the per-component grace below stays as it was, so
     // an unrelated pending component adds no reload latency.
-    let drain = await_rpc_connection_drain(&rpc_connection_count).await;
+    // The in-process seam's connections are the retiring generation's work
+    // too: the connector joins them (aborting stragglers at the same grace
+    // the socket listener uses) while the wait below counts their activity
+    // alongside the socket clients. They stay out of the ephemeral-exit count
+    // above on purpose; they are not external clients.
+    // Seal admission first, so a zero the wait below observes cannot be
+    // followed by a late in-process admission; the drain then joins what was
+    // admitted before the seal.
+    inproc_connector.close_admission();
+    let inproc_for_drain = inproc_connector.clone();
+    let (_aborted_inproc, drain) = tokio::join!(
+        inproc_connector.drain(),
+        await_rpc_connection_drain_with(|| {
+            rpc_connection_count.load(std::sync::atomic::Ordering::Relaxed)
+                + inproc_for_drain.connection_count()
+        })
+    );
     let exit_result = settle_exit_against_drain(exit_result, drain);
 
     // Channel teardown owns listener cleanup plus all accepted message work.
@@ -1632,26 +1764,28 @@ pub(crate) enum RpcDrain {
     Outstanding(usize),
 }
 
-/// Wait for the connections the RPC listeners accepted to finish draining.
+/// Wait for the connections the RPC listeners and the in-process connector
+/// accepted to finish draining.
 ///
-/// `count` is decremented when the last task started by a connection has
-/// ended: the connection task, each prompt it spawned, and the nested turn task
-/// each hold a clone of the connection's liveness token. A count of zero is
-/// therefore the daemon-visible proof that no old-generation work is still
-/// running, not merely that the connection task was aborted. The wait is
-/// bounded just past the listeners' own forced-abort deadline
-/// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
-/// ignored cancellation is aborted. Returns immediately when no connection was
-/// accepted, which is also the case when no RPC listener is running at all.
-pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
-    use std::sync::atomic::Ordering;
-
+/// `outstanding` reads the live activity: the daemon sums the socket
+/// listeners' client count with the in-process connector's count, so both
+/// kinds of accepted work gate the generation handover. Each count is
+/// decremented when the last task started by a connection has ended: the
+/// connection task, each prompt it spawned, and the nested turn task each hold
+/// a clone of the connection's liveness token. Zero is therefore the
+/// daemon-visible proof that no old-generation work is still running, not
+/// merely that the connection task was aborted. The wait is bounded just past
+/// the listeners' own forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`),
+/// the point at which a connection that ignored cancellation is aborted.
+/// Returns immediately when nothing was accepted, which is also the case when
+/// no RPC listener is running at all.
+pub(crate) async fn await_rpc_connection_drain_with(outstanding: impl Fn() -> usize) -> RpcDrain {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     let deadline = tokio::time::Instant::now()
         + crate::rpc::CONNECTION_DRAIN_GRACE.saturating_add(Duration::from_millis(500));
 
     loop {
-        let outstanding = count.load(Ordering::Relaxed);
+        let outstanding = outstanding();
         if outstanding == 0 {
             return RpcDrain::Complete;
         }
@@ -3109,6 +3243,34 @@ mod tests {
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Complete
+        );
+        release.await.unwrap();
+    }
+
     #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3139,6 +3301,184 @@ mod tests {
         assert!(
             control.begin_attempt(&daemon_cancel).is_none(),
             "retired generation must not admit a replacement attempt"
+        );
+    }
+
+    /// Drive the real daemon through a reload while an authenticated
+    /// in-process connection holds activity for `hold`: the connection is
+    /// initialized with a paired token over `reload_controls.inproc`, then a
+    /// prompt's activity token is held (a model turn needs a provider this
+    /// harness has none of; the token is what such a task holds). Returns the
+    /// daemon's exit and whether the token was released before it exited.
+    async fn reload_with_held_in_process_activity(hold: Duration) -> (DaemonExit, bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_daemon_inproc_token".to_string()];
+        // The in-process seam is served under the non-local session policy,
+        // whose `initialize` refuses every caller while TUI identity signing is
+        // off, so this daemon gets a signing key, as one with a `.secret_key` has.
+        std::fs::write(config.data_dir.join(".secret_key"), "42".repeat(32)).unwrap();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_gateway = released.clone();
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, _client_count, readiness| {
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _authority,
+                  _event_bus,
+                  reload_controls,
+                  _tui_reg,
+                  _auth,
+                  _ready| {
+                let released = released_for_gateway.clone();
+                Box::pin(async move {
+                    let controls = reload_controls
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let connector = controls
+                        .inproc
+                        .clone()
+                        .expect("daemon passes the connector");
+                    let client = connector.connect().await.expect("bound connector connects");
+                    let (read_half, mut write_half) = tokio::io::split(client);
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let init = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocol_version": 1, "auth_token": "zc_daemon_inproc_token"},
+                    });
+                    write_half
+                        .write_all(format!("{init}\n").as_bytes())
+                        .await
+                        .expect("write initialize");
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.expect("read initialize");
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame.get("result").is_some(),
+                        "paired token must be accepted over the in-process seam: {frame}"
+                    );
+                    // The prompt's activity, held past the reload request.
+                    let token = connector.activity_token();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    tokio::time::sleep(hold).await;
+                    drop(token);
+                    released.store(true, Ordering::SeqCst);
+                    // Keep the connection open like a real gateway would.
+                    let _keep = (reader, write_half);
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(25),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon finishes inside the drain budget plus component grace")
+        .expect("daemon run should succeed");
+        (exit, released.load(Ordering::SeqCst))
+    }
+
+    /// In-process activity released within the drain budget: the generation
+    /// proves itself retired and the reload hands over.
+    #[tokio::test]
+    async fn reload_hands_over_once_held_in_process_activity_is_released() {
+        let (exit, released) =
+            reload_with_held_in_process_activity(Duration::from_millis(1200)).await;
+        assert!(
+            released,
+            "the daemon must wait for the in-process activity to end"
+        );
+        assert_eq!(exit, DaemonExit::Reload);
+    }
+
+    /// In-process activity that outlives the drain budget: the generation
+    /// cannot prove it retired, so the reload is downgraded to a shutdown.
+    /// Fails if the daemon stops counting in-process activity in its drain
+    /// (the socket count alone is zero here).
+    #[tokio::test]
+    async fn reload_is_downgraded_when_in_process_activity_outlives_the_drain_budget() {
+        let budget = crate::rpc::CONNECTION_DRAIN_GRACE + Duration::from_secs(3);
+        let (exit, _released) = reload_with_held_in_process_activity(budget).await;
+        assert_eq!(
+            exit,
+            DaemonExit::Shutdown,
+            "a reload must not hand over while in-process work is still live"
+        );
+    }
+
+    /// An authenticated in-process connection is the retiring generation's
+    /// work: while its activity token is live the generation drain must not
+    /// complete, so a reload is downgraded to a shutdown; once the generation
+    /// is cancelled and the connector drained, the same reload is admissible.
+    #[tokio::test(start_paused = true)]
+    async fn reload_is_refused_while_an_in_process_connection_is_still_live() {
+        use crate::rpc::inproc::InprocConnector;
+        use crate::rpc::session::SessionStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(4, 10, 60),
+        );
+        let ctx = crate::rpc::context::RpcContext::minimal(
+            config,
+            std::sync::Arc::new(SessionStore::new(16, session_queue)),
+        );
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let socket_clients = AtomicUsize::new(0);
+
+        // Hold the connection open across the drain budget.
+        let held = connector.connect().await.expect("bound connector connects");
+        tokio::task::yield_now().await;
+        assert_eq!(connector.connection_count(), 1);
+        let outstanding = || socket_clients.load(Ordering::Relaxed) + connector.connection_count();
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(
+            drain,
+            RpcDrain::Outstanding(1),
+            "a live in-process connection must keep the generation undrained"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), drain).unwrap(),
+            DaemonExit::Shutdown,
+            "a reload must not hand over while in-process work is live"
+        );
+
+        // Retire the generation: cancel, join the connection tasks, and the
+        // count reaches zero, so the same reload is now admissible.
+        cancel.cancel();
+        let aborted = connector.drain().await;
+        assert_eq!(
+            aborted, 0,
+            "a cancelled in-process connection unwinds cooperatively"
+        );
+        drop(held);
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(drain, RpcDrain::Complete);
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), drain).unwrap(),
+            DaemonExit::Reload
         );
     }
 
@@ -7024,29 +7364,6 @@ mod tests {
         // and clearing the global hook for the next test.
     }
 
-    /// The reload drain must report the connections that were still unwinding
-    /// when its budget expired, not silently declare the generation retired.
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
-        let count = std::sync::atomic::AtomicUsize::new(2);
-        assert_eq!(
-            await_rpc_connection_drain(&count).await,
-            RpcDrain::Outstanding(2)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let releaser = std::sync::Arc::clone(&count);
-        let release = zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
-        });
-        assert_eq!(await_rpc_connection_drain(&count).await, RpcDrain::Complete);
-        release.await.unwrap();
-    }
-
     /// A reload hands the same durable sessions to a replacement generation, so
     /// it is admissible only on proof that the retiring generation is finished.
     #[test]
@@ -7299,6 +7616,89 @@ mod tests {
     }
 
     #[test]
+    fn gateway_binding_follows_the_current_gateway_generation() {
+        let (tx, _rx) = tokio::sync::watch::channel(StartupReadiness::default());
+        let binding = gateway_binding(&tx);
+        let addr: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        let (attempt, reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        let reporter = reporter.expect("a readiness reporter");
+        assert_eq!(binding.bound_addr(), None, "not bound yet");
+        reporter.report_ready(addr);
+        assert_eq!(binding.bound_addr(), Some(addr));
+
+        drop(attempt);
+        assert_eq!(binding.bound_addr(), None, "that generation ended");
+
+        let (_next, _next_reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        reporter.report_ready(addr);
+        assert_eq!(
+            binding.bound_addr(),
+            None,
+            "an earlier generation's bind is not the current one"
+        );
+    }
+
+    /// The listener is released at its shutdown signal, while its attempt
+    /// (the whole gateway future, drain included) is still alive. From that
+    /// moment the address and key are no longer published and the listener
+    /// answers no more challenges, so a port another program binds during
+    /// the drain is never vouched for.
+    #[test]
+    fn a_released_listener_is_unpublished_before_its_attempt_ends() {
+        let (tx, _rx) = tokio::sync::watch::channel(StartupReadiness::default());
+        let binding = gateway_binding(&tx);
+        let addr: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        let (attempt, reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        let reporter = reporter.expect("a readiness reporter");
+        let key = reporter.possession().expect("each generation has a key");
+        let prover = reporter.prover().expect("the listener can prove its key");
+        reporter.report_ready(addr);
+        assert_eq!(
+            binding.bound(),
+            Some(crate::rpc::context::BoundGateway {
+                addr,
+                possession: key
+            })
+        );
+        assert_eq!(prover.prove("n"), Some(key.proof("n")));
+
+        reporter.report_released();
+        assert_eq!(binding.bound(), None, "released, though the attempt lives");
+        assert_eq!(
+            prover.prove("n"),
+            None,
+            "a released listener proves nothing"
+        );
+        drop(attempt);
+
+        let (_next, next_reporter) = StartupReadinessAttempt::gateway(Some(tx.clone()));
+        let next_key = next_reporter.expect("a reporter").possession().unwrap();
+        assert_ne!(next_key, key, "every generation draws its own key");
+    }
+
+    /// A listener whose owner wraps its reporter (the start hook) still
+    /// releases through it and proves with the owner's key.
+    #[test]
+    fn the_start_hook_wrapper_forwards_release_and_key() {
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let key = GatewayPossession::generate();
+        let inner = {
+            let released = std::sync::Arc::clone(&released);
+            GatewayReadinessReporter::new(|_| {})
+                .on_release(move || released.store(true, std::sync::atomic::Ordering::SeqCst))
+                .with_possession(key)
+        };
+        let hooks = std::sync::Arc::new(crate::hooks::HookRunner::new());
+        let wrapped = gateway_start_hook_reporter(Some(hooks), "127.0.0.1".into(), Some(inner))
+            .expect("a wrapped reporter");
+        assert_eq!(wrapped.possession(), Some(key));
+        wrapped.report_released();
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn gateway_start_hook_reporter_is_a_passthrough_when_hooks_are_disabled() {
         assert!(gateway_start_hook_reporter(None, "127.0.0.1".to_string(), None).is_none());
         let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -7317,24 +7717,25 @@ mod tests {
         );
     }
 
-    /// The daemon wraps each gateway start's readiness reporter with the hook
-    /// when hooks are enabled. With startup feedback off there is no inner
-    /// reporter, so the gateway starter receives one only through that
-    /// wrapper; removing the daemon's wiring makes it arrive as `None`.
+    /// Every gateway start gets a readiness reporter carrying its
+    /// generation's possession key, whether or not hooks wrap it and with
+    /// startup feedback off: the reporter backs the address and key the RPC
+    /// surface vouches for. (The hook wrapper itself is covered by the
+    /// `gateway_start_hook_reporter` tests.)
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn daemon_hands_the_gateway_a_hook_reporter_when_hooks_are_enabled() {
+    async fn daemon_hands_every_gateway_start_a_reporter_with_its_key() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU8, Ordering};
         use tokio::time::{Duration, Instant, sleep};
 
         let _broadcast_guard = hold_broadcast_hooks().await;
-        for (hooks_enabled, expect_reporter) in [(true, true), (false, false)] {
+        for hooks_enabled in [true, false] {
             let tmp = TempDir::new().unwrap();
             let mut config = test_config(&tmp);
             config.hooks.enabled = hooks_enabled;
 
-            // 0 = not started, 1 = started without a reporter, 2 = with one.
+            // 0 = not started, 1 = started without a keyed reporter, 2 = with one.
             let received = Arc::new(AtomicU8::new(0));
             let mut registry = DaemonRegistry::new();
             {
@@ -7349,7 +7750,11 @@ mod tests {
                           _tui,
                           _pairing,
                           readiness| {
-                        received.store(if readiness.is_some() { 2 } else { 1 }, Ordering::SeqCst);
+                        let keyed = readiness
+                            .as_ref()
+                            .and_then(GatewayReadinessReporter::possession)
+                            .is_some();
+                        received.store(if keyed { 2 } else { 1 }, Ordering::SeqCst);
                         Box::pin(std::future::pending::<Result<()>>())
                     },
                 ));
@@ -7367,8 +7772,8 @@ mod tests {
                 }
             }
             assert_eq!(
-                received.load(Ordering::SeqCst) == 2,
-                expect_reporter,
+                received.load(Ordering::SeqCst),
+                2,
                 "hooks enabled = {hooks_enabled}: the gateway starter's readiness reporter"
             );
         }

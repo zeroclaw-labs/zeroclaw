@@ -102,64 +102,77 @@
         return fn(cmd, args);
       }
 
-      // The backend tells us when it's starting its own daemon, or when it
-      // can't (e.g. the `zeroclaw` binary is missing). Once a status arrives it
-      // owns the message, so the polling loop stops overwriting it.
-      let statusLocked = false;
-      window.__TAURI__?.event
-        ?.listen("zeroclaw://splash-status", (event) => {
-          const { kind, message } = event.payload ?? {};
-          if (!message) return;
-          statusLocked = true;
-          statusEl.textContent = message;
-          if (kind === "error" || kind === "missing") {
-            spinnerEl.style.display = "none";
-            statusEl.classList.add("error");
-            hintEl.classList.remove("show");
-          }
-        })
-        .catch(() => {});
-
+      // The backend owns startup. `get_startup` says whether the dashboard
+      // may open (`ready`), why it may not (`failed`), or what is happening
+      // (`pending`), and `open_dashboard` refuses unless startup is ready.
+      // This page only follows that state; it never decides readiness from
+      // the gateway's HTTP health, which any program on the port can answer.
+      let failed = false;
       let launching = false;
       let attempts = 0;
 
+      function showFailure(message) {
+        failed = true;
+        spinnerEl.style.display = "none";
+        statusEl.classList.add("error");
+        statusEl.textContent = message || "ZeroClaw couldn't start.";
+        hintEl.classList.remove("show");
+      }
+
       async function tick() {
-        if (launching) return;
+        if (launching || failed) return;
         attempts += 1;
 
-        let healthy = false;
+        let startup = null;
         try {
-          healthy = await invoke("get_health");
+          startup = await invoke("get_startup");
         } catch (err) {
           // IPC not ready yet — keep polling.
-          healthy = false;
+          startup = null;
         }
+        // A failure, or another check, may have landed while this one waited.
+        if (launching || failed) return;
 
-        if (healthy) {
-          launching = true;
-          statusLocked = true;
-          statusEl.classList.remove("error");
-          statusEl.textContent = "Opening your dashboard…";
-          hintEl.classList.remove("show");
-          spinnerEl.style.display = "";
-          try {
-            await invoke("open_dashboard");
-            // On success the backend closes this splash window.
-          } catch (err) {
-            launching = false;
-            spinnerEl.style.display = "none";
-            statusEl.classList.add("error");
-            statusEl.textContent =
-              "Couldn't open the dashboard: " + String(err?.message ?? err);
-          }
+        if (startup?.state === "failed") {
+          showFailure(startup.message);
+          return;
+        }
+        if (startup?.state !== "ready") {
+          if (startup?.message) statusEl.textContent = startup.message;
+          // After several seconds still starting, surface a fallback hint.
+          if (attempts >= 6) hintEl.classList.add("show");
           return;
         }
 
-        if (!statusLocked) statusEl.textContent = "Starting ZeroClaw…";
-        // After several seconds with no daemon, surface a fallback hint (in
-        // case the status event was missed).
-        if (attempts >= 6 && !statusLocked) hintEl.classList.add("show");
+        launching = true;
+        statusEl.classList.remove("error");
+        statusEl.textContent = "Opening your dashboard…";
+        hintEl.classList.remove("show");
+        spinnerEl.style.display = "";
+        try {
+          await invoke("open_dashboard");
+          // On success the backend closes this splash window.
+        } catch (err) {
+          launching = false;
+          spinnerEl.style.display = "none";
+          statusEl.classList.add("error");
+          statusEl.textContent =
+            "Couldn't open the dashboard: " + String(err?.message ?? err);
+        }
       }
+
+      // The backend announces each startup change; read the state again at
+      // once rather than waiting for the next poll. A missed event only costs
+      // one poll interval.
+      window.__TAURI__?.event
+        ?.listen("zeroclaw://startup", (event) => {
+          if (event.payload?.state === "failed") {
+            showFailure(event.payload.message);
+          } else {
+            tick();
+          }
+        })
+        .catch(() => {});
 
       tick();
       setInterval(tick, 1200);

@@ -6390,11 +6390,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
-        service_command: ServiceCommands::RunDesktopDaemon { port },
+        service_command:
+            ServiceCommands::RunDesktopDaemon {
+                port,
+                rpc_readiness,
+            },
         ..
     } = &cli.command
     {
-        return service::run_desktop_daemon(*port).await;
+        return service::run_desktop_daemon(*port, *rpc_readiness).await;
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -14746,9 +14750,29 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Service {
-                service_command: ServiceCommands::RunDesktopDaemon { port },
+                service_command: ServiceCommands::RunDesktopDaemon { port, rpc_readiness: false },
                 ..
             } if port == 42617
+        ));
+
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+            "--rpc-readiness",
+        ])
+        .expect("RPC readiness is an opt-in flag of the internal desktop daemon");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon {
+                    rpc_readiness: true,
+                    ..
+                },
+                ..
+            }
         ));
 
         let help = Cli::command().render_help().to_string();

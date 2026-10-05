@@ -5,7 +5,7 @@ use tauri::State;
 #[tauri::command]
 pub async fn initiate_pairing(state: State<'_, SharedState>) -> Result<serde_json::Value, String> {
     let s = state.read().await;
-    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref());
+    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref()).with_core(s.core.clone());
     drop(s);
     client.initiate_pairing().await.map_err(|e| e.to_string())
 }
@@ -13,7 +13,7 @@ pub async fn initiate_pairing(state: State<'_, SharedState>) -> Result<serde_jso
 #[tauri::command]
 pub async fn get_devices(state: State<'_, SharedState>) -> Result<serde_json::Value, String> {
     let s = state.read().await;
-    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref());
+    let client = GatewayClient::new(&s.gateway_url, s.token.as_deref()).with_core(s.core.clone());
     drop(s);
     client.get_devices().await.map_err(|e| e.to_string())
 }

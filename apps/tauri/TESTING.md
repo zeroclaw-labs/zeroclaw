@@ -9,8 +9,8 @@ straight to the gateway, and first-time setup happens in the web Quickstart.
 On launch:
 
 1. A small **splash** window (`apps/tauri/splash/index.html`) appears and polls
-   the gateway's `/health` (via the `get_health` IPC command) every ~1.2s.
-2. Once the gateway is healthy, the splash calls the `open_dashboard` command,
+   the app's startup state (via the `get_startup` IPC command) every ~1.2s.
+2. Once startup is ready, the splash calls the `open_dashboard` command,
    which pairs with the gateway (when pairing is required), creates the **main**
    window pointed at the gateway **root** (`http://127.0.0.1:42617/`), seeds the
    bearer token via an initialization script, and closes the splash.
@@ -26,6 +26,75 @@ On launch:
 > a standalone `gateway start` has no supervisor and returns
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
+
+### Readiness when the app starts its own daemon
+
+When the kernel supports it (the app checks with
+`zeroclaw service run-desktop-daemon --rpc-readiness --help`), the app launches
+the supervisor with `--rpc-readiness`. The supervisor then:
+
+1. resolves the daemon's RPC endpoint with the kernel's own resolver;
+2. passes it to the daemon as `ZEROCLAW_SOCKET`;
+3. reports `READY {"endpoint":…,"pid":…}` only once that endpoint accepts
+   connections served by the daemon it started.
+
+The app then dials that endpoint. On Unix it first checks that the endpoint is
+served by the app's own OS account. It completes the RPC handshake and checks
+the protocol version. For a kernel bundled beside the app, it also checks that
+the kernel's version equals the app's. Only then does it wait, up to 60
+seconds in all, for the dashboard's gateway. In this mode the supervisor pins
+the daemon's gateway to `127.0.0.1` (`--host 127.0.0.1`). Over its verified
+RPC connection, the app asks for a fresh possession challenge for the
+dashboard address (`127.0.0.1:42617`). The listener must answer that challenge
+on the HTTP connection the app opened there. A successful proof admits the
+core's own listener or a registered external listener, regardless of the
+core's own gateway diagnostics. RPC `health` still reports
+`components.gateway.bound_addr` for the core's own listener; that report only
+explains a failed proof. Process IDs reported over HTTP shape failure messages
+and never admit an address.
+
+The wait polls every second. Three consecutive answers without the proof
+(`PROOF_MISMATCHES_HELD = 3`) end startup as `port_held`, and the app stops the
+daemon it launched. A successful proof admits immediately; no own-gateway diagnostic
+overrides it.
+
+The app records the outcome as its startup state. The splash polls that state
+and opens the dashboard only once it is ready, and `open_dashboard` itself
+refuses, before and after pairing, unless it is. With a launched core, the
+pairing requirement comes from the listener's proven `/health` response;
+missing flags and failed proofs refuse opening. Every new dashboard window
+also requires a fresh proof, even when pairing hands over no token: the
+WebView may already hold credentials for that origin.
+
+On Unix, native credential requests carry their proof and credential on the
+same HTTP connection. The WebView opens its own connections from its first
+navigation onward, so those connections are outside this proof. Windows
+cannot yet verify the RPC pipe server's account. A process already trusted as
+a local administrator can register a chosen listener key; when several live,
+admitted registrations name one address, the most recent is vouched for.
+
+An app that finds a gateway already running when it starts reuses it, as
+before.
+
+Each way this can fail shows its own message on the splash, and the dashboard
+does not open:
+
+| Splash kind | Cause |
+|---|---|
+| `endpoint_held` | Another process already serves the endpoint, or serves it as another account. |
+| `incompatible` | The protocol differs, a bundled kernel's version differs from the app's, or the core predates the possession proof. |
+| `port_held` | A failed proof is explained by the core's bind/address error, or three consecutive answers lack the proof. |
+| `core_unavailable` | The core stopped answering before its gateway was ready. |
+| `timeout` | A deadline passed: the kernel's capability check, the supervisor's readiness report (60 seconds with `--rpc-readiness`, 10 without), or the dashboard's `/health` after it. |
+
+During initial readiness, the app stops the daemon it started on every
+failure except a gateway timeout, where the daemon may still finish starting;
+reopening the app then reuses it. A supervisor that never reports readiness is stopped.
+
+A kernel without `--rpc-readiness` rejects the flag in that check. The app then
+uses the original `READY` line and waits for `/health` with the same deadline.
+Older apps never pass the flag, so a newer kernel answers them with the exact
+`READY` line they expect.
 
 The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
 
