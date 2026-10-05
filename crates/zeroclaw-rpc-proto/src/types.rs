@@ -1,0 +1,2226 @@
+//! Wire-stable request, response and notification payload types for the
+//! daemon RPC.
+//!
+//! Every type here is plain data: serde derives, no runtime handles, no
+//! I/O. Types whose fields are owned by the runtime (cron jobs, doctor
+//! diagnostics, skill frontmatter, quickstart descriptors) stay in
+//! `zeroclaw_runtime::rpc::types`, which re-exports this module so
+//! `use zeroclaw_runtime::rpc::types::*` keeps resolving every name.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use zeroclaw_api::tool::OptionDomain;
+
+// ── Re-exports: foundation-crate types that appear on the wire ────────
+
+pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
+pub use zeroclaw_api::runtime_status::{
+    RuntimeConfigKind, RuntimeShellFamily, RuntimeShellProfile,
+};
+pub use zeroclaw_config::cost::types::CostSummary;
+pub use zeroclaw_config::presets::BuilderSubmission;
+pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
+
+// ── Derive helper ────────────────────────────────────────────────────
+
+macro_rules! rpc_type {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident { $($body:tt)* }
+    ) => {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        #[serde(rename_all = "snake_case")]
+        $(#[$meta])*
+        pub struct $name { $($body)* }
+    };
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident { $($body:tt)* }
+    ) => {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        #[serde(rename_all = "snake_case")]
+        $(#[$meta])*
+        pub enum $name { $($body)* }
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Core ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct InitializeParams {
+        #[serde(default = "default_protocol_version")]
+        pub protocol_version: u64,
+        /// TUI ID from a previous connection (reconnection).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tui_id: Option<String>,
+        /// HMAC signature proving ownership of the claimed TUI ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tui_sig: Option<String>,
+        /// Shell environment from the TUI process, used to forward the user's
+        /// real env (PATH, credentials, etc.) to subprocesses spawned by the
+        /// daemon on their behalf. Omitted by older clients; defaults to empty.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        pub env: std::collections::HashMap<String, String>,
+        #[serde(
+            default,
+            rename = "clientCapabilities",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub client_capabilities: Option<serde_json::Value>,
+        /// Explicit credential for authentication (a native pairing token
+        /// or an OIDC access token). Wins over the transport-intrinsic
+        /// peer credential when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Which configured provider verifies `auth_token` (e.g. `native`,
+        /// `oidc.corp`). Defaults to `native`. Selection is explicit and
+        /// final: the selected provider's denial never falls through to
+        /// another provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_provider: Option<String>,
+    }
+}
+
+fn default_protocol_version() -> u64 {
+    crate::RPC_PROTOCOL_VERSION
+}
+
+rpc_type! {
+    /// Command identity and accepted tokens advertised to an RPC client.
+    pub struct CommandDescriptor {
+        pub id: String,
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub aliases: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct InitializeResult {
+        pub protocol_version: u64,
+        pub server_version: String,
+        /// OS process ID of the daemon serving this connection.
+        pub server_pid: u32,
+        /// Assigned TUI session UID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tui_id: Option<String>,
+        /// HMAC signature for reconnection. Pass back in next initialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tui_sig: Option<String>,
+        /// Supported RPC method names (e.g. "session/prompt", "memory/list").
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+        /// Configured auth provider selection keys (e.g. `native`,
+        /// `peercred`, `oidc.corp`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
+        /// Canonical principal id this connection is bound to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub principal_id: Option<String>,
+        /// Shared command catalogue entries available on the TUI surface.
+        ///
+        /// Always serialized so a new daemon's authoritative empty catalogue
+        /// remains distinguishable from an older daemon that predates this
+        /// field.
+        #[serde(default)]
+        pub commands: Vec<CommandDescriptor>,
+    }
+}
+
+rpc_type! {
+    pub struct StatusResult {
+        pub server_version: String,
+        pub protocol_version: u64,
+        pub active_sessions: usize,
+        pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<RuntimeConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_profile: Option<RuntimeShellProfile>,
+    }
+}
+
+// Health: no params, result is `Value` from `health::snapshot_json()`.
+
+rpc_type! {
+    pub struct DoctorSummary {
+        pub ok: usize,
+        pub warnings: usize,
+        pub errors: usize,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── TUI ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct TuiListEntry {
+        pub tui_id: String,
+        /// RFC 3339 timestamp (for gateway API / web frontend).
+        pub connected_at: String,
+        /// Unix epoch seconds (for TUI client relative-time display
+        /// without requiring chrono).
+        pub connected_at_unix: i64,
+        pub peer_label: String,
+        /// Transport protocol: `"unix"` or `"wss"`.
+        pub transport: String,
+    }
+}
+
+rpc_type! {
+    pub struct TuiListResult {
+        pub tuis: Vec<TuiListEntry>,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Sessions ─────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Shared param for methods that only need a session ID:
+    /// `session/close`, `session/cancel`, `session/messages`,
+    /// `session/state`, `session/delete`.
+    pub struct SessionIdParams {
+        pub session_id: String,
+    }
+}
+
+rpc_type! {
+    #[derive(PartialEq, Eq)]
+    pub enum ChatMode {
+        Chat,
+        Acp,
+    }
+}
+
+rpc_type! {
+    pub struct SessionNewResult {
+        pub session_id: String,
+        pub agent_alias: String,
+        pub message_count: usize,
+        pub workspace_dir: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionCloseResult {
+        pub session_id: String,
+        pub closed: bool,
+    }
+}
+
+rpc_type! {
+    pub struct SessionKillParams {
+        pub session_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionKillResult {
+        pub session_id: String,
+        pub killed: bool,
+    }
+}
+
+rpc_type! {
+    pub struct SessionPromptParams {
+        pub session_id: String,
+        pub prompt: String,
+        /// Optional client-local turn identity echoed by `TurnComplete`.
+        /// Older clients omit this field and retain session-scoped behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_turn_generation: Option<u64>,
+        /// Inline file attachments. Processed identically to `file/attach`
+        /// entries — markers are appended to the prompt before the turn runs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attachments: Vec<FileEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionPromptResult {
+        pub session_id: String,
+        pub stop_reason: String,
+        pub content: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionConfigureParams {
+        pub session_id: String,
+        #[serde(default)]
+        pub overrides: SessionOverrides,
+    }
+}
+
+rpc_type! {
+    pub struct SessionConfigureResult {
+        pub session_id: String,
+        pub overrides: SessionOverrides,
+    }
+}
+
+rpc_type! {
+    pub struct SessionCancelResult {
+        pub session_id: String,
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    pub struct SessionGitBranchResult {
+        pub session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hash: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionListParams {
+        /// Full-text search query. When present, only sessions whose message
+        /// content matches (via FTS5) are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit: Option<usize>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionListResult {
+        pub sessions: Vec<SessionEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionEntry {
+        pub session_id: String,
+        pub session_key: String,
+        pub created_at: String,
+        pub last_activity: String,
+        pub message_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_alias: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionMessagesResult {
+        pub session_id: String,
+        pub messages: Vec<MessageEntry>,
+        /// Total projected entries for this session. Lets the TUI know how
+        /// many pages remain before it reaches the head.
+        #[serde(default)]
+        pub total: usize,
+        /// Index of the first entry in `messages` relative to the
+        /// full projected history. Pair with `total` to compute
+        /// "page N of M" / "load older" affordances.
+        #[serde(default)]
+        pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionMessagesParams {
+        pub session_id: String,
+        #[serde(default)]
+        pub limit: Option<usize>,
+        #[serde(default)]
+        pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+}
+
+rpc_type! {
+    pub struct MessageEntry {
+        pub role: String,
+        pub content: String,
+        #[serde(default)]
+        pub kind: MessageEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_output: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionStateResult {
+        pub session_id: String,
+        pub state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub turn_started_at: Option<String>,
+        /// Authoritative live-session TodoWrite plan. Older/persisted
+        /// sessions omit this field because they have no runtime plan owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan: Option<Vec<zeroclaw_api::plan::PlanEntry>>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionDeleteResult {
+        pub session_id: String,
+        pub deleted: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Memory ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `memory/list`. Consolidates gateway `MemoryQuery` (list mode).
+    pub struct MemoryListParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane: `"private"` (the caller's own; the default for every
+        /// authenticated principal) or `"shared"` (honoured only for callers
+        /// with the admin bypass, audited).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct MemoryListResult {
+        #[cfg_attr(feature = "schema-export", schemars(with = "Vec<serde_json::Value>"))]
+        pub entries: Vec<MemoryEntry>,
+        pub count: usize,
+    }
+}
+
+rpc_type! {
+    /// Params for `memory/search`. Consolidates gateway `MemoryQuery` (search mode).
+    pub struct MemorySearchParams {
+        pub query: String,
+        #[serde(default = "default_search_limit")]
+        pub limit: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub since: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub until: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
+    }
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+rpc_type! {
+    pub struct MemorySearchResult {
+        #[cfg_attr(feature = "schema-export", schemars(with = "Vec<serde_json::Value>"))]
+        pub entries: Vec<MemoryEntry>,
+        pub count: usize,
+    }
+}
+
+rpc_type! {
+    /// `memory/get` params — fetch one entry's full content by key.
+    pub struct MemoryGetParams {
+        pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// `memory/get` result. `entry` carries the full content
+    /// the Memory pane only renders inside the detail modal —
+    /// list rows store preview-only data.
+    pub struct MemoryGetResult {
+        #[cfg_attr(feature = "schema-export", schemars(with = "Option<serde_json::Value>"))]
+        pub entry: Option<MemoryEntry>,
+    }
+}
+
+rpc_type! {
+    /// Params for `memory/store`. Consolidates gateway `MemoryStoreBody`.
+    pub struct MemoryStoreParams {
+        pub key: String,
+        pub content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct MemoryStoreResult {
+        pub key: String,
+        pub stored: bool,
+    }
+}
+
+rpc_type! {
+    /// Params for `memory/delete`. Consolidates gateway `MemoryDeleteQuery`.
+    pub struct MemoryDeleteParams {
+        pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct MemoryDeleteResult {
+        pub key: String,
+        pub deleted: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Cron ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+rpc_type! {
+    pub struct CronIdParams {
+        pub id: String,
+    }
+}
+
+rpc_type! {
+    /// Params for `cron/patch`. Consolidates gateway `CronPatchBody`.
+    pub struct CronPatchParams {
+        pub id: String,
+        pub agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub schedule: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tz: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub clear_tz: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prompt: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct CronDeleteResult {
+        pub id: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    pub struct CronRunsParams {
+        pub id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit: Option<u32>,
+    }
+}
+
+rpc_type! {
+    pub struct CronTriggerResult {
+        pub id: String,
+        pub success: bool,
+        pub status: String,
+        pub output: String,
+        pub duration_ms: i64,
+        pub started_at: String,
+        pub finished_at: String,
+    }
+}
+
+rpc_type! {
+    /// Params for `cron/settings`. Without a `patch` key, or with no params
+    /// at all, the call reads the scheduler settings. The daemon treats any
+    /// `patch` key as a write request, which it does not implement yet.
+    pub struct CronSettingsParams {
+        /// A present `null` stays `Some(Value::Null)`: the key's presence,
+        /// not its value, is what asks for a write.
+        #[serde(
+            default,
+            deserialize_with = "present_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub patch: Option<Value>,
+    }
+}
+
+/// Deserialize a field that is present into `Some`, even when its value is
+/// `null`; an absent field falls back to `None` through `#[serde(default)]`.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Config ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct ConfigGetParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prop: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Returned when `config/get` is called with a specific `prop`.
+    pub struct ConfigGetPropResult {
+        pub prop: String,
+        pub value: String,
+    }
+}
+
+// Full config read returns `Value` (masked) — inherently untyped.
+
+rpc_type! {
+    /// Value is polymorphic: a JSON string passes through as-is (backward
+    /// compat); any other JSON type is coerced via `coerce_for_set_prop`.
+    pub struct ConfigSetParams {
+        pub prop: String,
+        pub value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetResult {
+        pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry and at most the
+    /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigValidateResult {
+        pub valid: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigReloadResult {
+        pub reloading: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigListParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prefix: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigListResult {
+        #[cfg_attr(feature = "schema-export", schemars(with = "Vec<serde_json::Value>"))]
+        pub entries: Vec<ConfigFieldEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigDeleteParams {
+        pub prop: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigDeleteResult {
+        pub prop: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeysParams {
+        pub path: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeysResult {
+        pub path: String,
+        pub keys: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceParams {
+        pub source: zeroclaw_config::traits::AliasSource,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceResult {
+        pub source: zeroclaw_config::traits::AliasSource,
+        pub values: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyCreateParams {
+        pub path: String,
+        pub key: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyCreateResult {
+        pub path: String,
+        pub key: String,
+        pub created: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyDeleteParams {
+        pub path: String,
+        pub key: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyDeleteResult {
+        pub path: String,
+        pub key: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyRenameParams {
+        pub path: String,
+        pub from: String,
+        pub to: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyRenameResult {
+        pub path: String,
+        pub from: String,
+        pub to: String,
+        pub renamed: bool,
+        #[serde(default)]
+        pub rewritten: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
+    }
+}
+
+rpc_type! {
+    /// Owned wire representation of a [`zeroclaw_config::traits::MapKeySection`].
+    /// The upstream type uses `&'static str` fields that can't round-trip
+    /// through `Deserialize`, so this owned copy serves as the wire format.
+    pub struct ConfigTemplateEntry {
+        pub path: String,
+        pub kind: zeroclaw_config::traits::MapKeyKind,
+        pub value_type: String,
+        pub description: String,
+    }
+}
+
+impl From<zeroclaw_config::traits::MapKeySection> for ConfigTemplateEntry {
+    fn from(s: zeroclaw_config::traits::MapKeySection) -> Self {
+        Self {
+            path: s.path.to_string(),
+            kind: s.kind,
+            value_type: s.value_type.to_string(),
+            description: s.description.to_string(),
+        }
+    }
+}
+
+rpc_type! {
+    pub struct ConfigTemplatesResult {
+        pub templates: Vec<ConfigTemplateEntry>,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Agents ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct AgentEntry {
+        pub alias: String,
+        pub enabled: bool,
+        pub channels: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentsListResult {
+        pub agents: Vec<AgentEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentStatusEntry {
+        pub alias: String,
+        pub enabled: bool,
+        #[serde(default)]
+        pub live_sessions: usize,
+        #[serde(default)]
+        pub persisted_sessions: usize,
+        #[serde(default)]
+        pub channels: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentsStatusResult {
+        pub agents: Vec<AgentStatusEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteParams {
+        pub alias: String,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeletePreviewResult {
+        pub alias: String,
+        pub allowed: bool,
+        pub blockers: Vec<String>,
+        pub scrubs: Vec<String>,
+        pub owned_state: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteResult {
+        pub alias: String,
+        pub deleted: bool,
+        pub scrubbed: usize,
+        pub warnings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Cost ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `cost/query`. Consolidates gateway `CostQuery`.
+    pub struct CostQueryParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub to: Option<String>,
+    }
+}
+
+// Result is `CostSummary` directly (already Serialize).
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Skills ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Wire representation of a skill bundle. Consolidates gateway `BundleEntry`.
+    pub struct SkillBundleEntry {
+        pub alias: String,
+        pub directory: String,
+        pub include: Vec<String>,
+        pub exclude: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsBundlesResult {
+        pub bundles: Vec<SkillBundleEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsListParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bundle: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillEntry {
+        pub name: String,
+        pub description: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plugin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bundle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
+        pub editable: bool,
+        /// Lower-precedence same-name skills this one shadows. Empty normally;
+        /// additive so old clients ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub shadowed: Vec<ShadowedSkillEntry>,
+    }
+}
+
+rpc_type! {
+    /// A lower-precedence same-name skill shadowed by a winning skill
+    pub struct ShadowedSkillEntry {
+        pub name: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+    }
+}
+
+rpc_type! {
+    /// A candidate skill the audited resolver dropped (security audit failed,
+    /// unauditable, or manifest parse error)
+    pub struct DroppedSkillEntry {
+        pub name: String,
+        pub origin: String,
+        /// `"audit_findings"` | `"audit_error"` | `"manifest_parse_error"`.
+        pub reason_kind: String,
+        /// Human-readable detail (the audit summary / error text).
+        pub reason: String,
+        /// True when the secure-default script policy is the blocker, so the
+        /// dashboard can surface the `skills.allow_scripts = true` remediation
+        /// without parsing `reason`. Additive; old clients ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub scripts_blocked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillsResult {
+        pub agent: String,
+        pub skills: Vec<AgentSkillEntry>,
+        /// Audit-dropped candidates the resolver skipped. Empty normally;
+        /// additive so old clients ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub dropped: Vec<DroppedSkillEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsReadParams {
+        pub bundle: String,
+        pub name: String,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsWriteResult {
+        pub bundle: String,
+        pub name: String,
+        pub written: bool,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsDeleteParams {
+        pub bundle: String,
+        pub name: String,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsDeleteResult {
+        pub bundle: String,
+        pub name: String,
+        pub deleted: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Personality ──────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct PersonalityListParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PersonalityIndexEntry`.
+    pub struct PersonalityFileEntry {
+        pub filename: String,
+        pub exists: bool,
+        #[serde(default)]
+        pub size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mtime_ms: Option<i64>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PersonalityIndex`.
+    pub struct PersonalityListResult {
+        pub files: Vec<PersonalityFileEntry>,
+        pub max_chars: usize,
+    }
+}
+
+rpc_type! {
+    pub struct PersonalityGetParams {
+        pub agent: String,
+        pub filename: String,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PersonalityFileResponse`.
+    pub struct PersonalityGetResult {
+        pub filename: String,
+        #[serde(default)]
+        pub content: Option<String>,
+        pub exists: bool,
+        #[serde(default)]
+        pub truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mtime_ms: Option<i64>,
+    }
+}
+
+rpc_type! {
+    pub struct PersonalityPutParams {
+        pub agent: String,
+        pub filename: String,
+        pub content: String,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PersonalityPutResponse`.
+    pub struct PersonalityPutResult {
+        pub bytes_written: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mtime_ms: Option<i64>,
+    }
+}
+
+rpc_type! {
+    pub struct PersonalityTemplatesParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `TemplateFile`.
+    pub struct TemplateFileEntry {
+        pub filename: String,
+        pub content: String,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `TemplateResponse`.
+    pub struct PersonalityTemplatesResult {
+        pub preset: String,
+        pub files: Vec<TemplateFileEntry>,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Config introspection (sections, catalog, status) ─────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Consolidates gateway `CatalogModelProvider`.
+    pub struct CatalogModelProvider {
+        pub name: String,
+        pub display_name: String,
+        pub local: bool,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `CatalogResponse`.
+    pub struct CatalogResponse {
+        pub model_providers: Vec<CatalogModelProvider>,
+    }
+}
+
+rpc_type! {
+    pub struct CatalogModelsParams {
+        /// Accepts `model_provider` or aliased `provider` (gateway compat).
+        #[serde(alias = "provider")]
+        pub model_provider: String,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `ModelsResponse`.
+    pub struct CatalogModelsResult {
+        pub model_provider: String,
+        pub models: Vec<String>,
+        /// Optional pricing data keyed by model id. Populated when the
+        /// provider's `/models` endpoint returns pricing (Kilo Gateway,
+        /// OpenRouter, etc.). Absent for catalog fallbacks without pricing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pricing: Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+        pub local: bool,
+        pub live: bool,
+    }
+}
+
+rpc_type! {
+    /// A config section entry for the dashboard sidebar / TUI section list.
+    pub struct ConfigSectionEntry {
+        pub key: String,
+        pub label: String,
+        pub help: String,
+        pub has_picker: bool,
+        pub completed: bool,
+        /// Whether the section currently has enough usable config for the
+        /// first-run path.
+        #[serde(default)]
+        pub ready: bool,
+        /// Display group for the dashboard sidebar.
+        #[serde(default)]
+        pub group: String,
+        /// Stable locale-independent group identifier.
+        #[serde(default)]
+        pub group_key: String,
+        /// `true` when this section is part of the canonical Quickstart list.
+        #[serde(default)]
+        pub is_quickstart: bool,
+        /// Editor shape (direct form / one-tier alias map / typed-family map /
+        /// backend picker).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
+    }
+}
+
+rpc_type! {
+    /// Response for `config/sections`.
+    pub struct ConfigSectionsResult {
+        pub sections: Vec<ConfigSectionEntry>,
+    }
+}
+
+rpc_type! {
+    /// Config readiness status for the dashboard/TUI.
+    pub struct ConfigStatusResult {
+        pub needs_quickstart: bool,
+        pub reason: String,
+        pub has_partial_state: bool,
+        pub missing: Vec<String>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PickerItem`.
+    pub struct PickerItem {
+        pub key: String,
+        pub label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub badge: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `PickerResponse`.
+    pub struct PickerResponse {
+        pub section: String,
+        pub items: Vec<PickerItem>,
+        pub help: String,
+    }
+}
+
+rpc_type! {
+    pub struct SectionSelectParams {
+        pub section: String,
+        pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub alias: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Consolidates gateway `SelectItemResponse`.
+    pub struct SelectItemResponse {
+        pub fields_prefix: String,
+        pub created: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── File attachments ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+/// Source hint for how the client obtained the file.
+pub enum FileSource {
+    Clipboard,
+    #[default]
+    File,
+}
+
+rpc_type! {
+    /// A single file entry in a `file/attach` request. Either `path` (daemon
+    /// reads from local disk — Unix socket only) or `data_b64` (client sends
+    /// base64-encoded bytes) must be present.
+    pub struct FileEntry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_b64: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+        /// Advisory only, retained for wire compatibility. The image/document
+        /// marker decision is made from the filename and payload bytes via the
+        /// canonical provider-loadable contract, never from this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mime_type: Option<String>,
+        #[serde(default)]
+        pub source: FileSource,
+    }
+}
+
+rpc_type! {
+    pub struct FileAttachParams {
+        pub session_id: String,
+        pub files: Vec<FileEntry>,
+    }
+}
+
+rpc_type! {
+    /// Result for a single file in a `file/attach` response.
+    pub struct FileEntryResult {
+        pub ref_id: String,
+        pub marker: String,
+        pub workspace_path: String,
+        pub size_bytes: u64,
+        pub deduplicated: bool,
+    }
+}
+
+rpc_type! {
+    pub struct FileAttachResult {
+        pub files: Vec<FileEntryResult>,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/begin`: announce one upload for a session.
+    pub struct FileUploadBeginParams {
+        pub session_id: String,
+        /// Display name, at most 255 bytes; storage is content-addressed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+        /// Exact decoded size of the whole payload.
+        pub size_bytes: u64,
+        /// Optional hex SHA-256 of the whole payload, verified at commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadBeginResult {
+        /// Identifies the upload on this connection only.
+        pub upload_id: String,
+        /// Largest decoded chunk `file/upload/chunk` accepts.
+        pub chunk_bytes: u64,
+        /// Largest payload an upload may declare.
+        pub max_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/chunk`. Chunks arrive in order: `offset`
+    /// must equal the bytes received so far. Resending an already-accepted
+    /// chunk with identical bytes is acknowledged without change.
+    pub struct FileUploadChunkParams {
+        pub upload_id: String,
+        pub offset: u64,
+        pub data_b64: String,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadChunkResult {
+        pub received_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/commit`. The result is the same
+    /// `FileEntryResult` that `file/attach` returns for one file.
+    pub struct FileUploadCommitParams {
+        pub upload_id: String,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Session approval ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct SessionApproveParams {
+        pub session_id: String,
+        pub request_id: String,
+        pub decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replacement: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionApproveResult {
+        pub session_id: String,
+        pub request_id: String,
+        pub acknowledged: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Logs ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Parameters shared by every `X/subscribe` method.
+    #[derive(Default)]
+    pub struct SubscribeParams {
+        /// Resume after this sequence number: frames from `since_seq + 1`
+        /// that are still buffered are replayed before live delivery. Omit
+        /// for live frames only.
+        #[serde(default)]
+        pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Every notification of the subscription carries `subscription_id` and
+    /// its `seq`. `seq` here is the newest sequence number at subscribe time.
+    pub struct LogsSubscribeResult {
+        pub subscribed: bool,
+        pub subscription_id: String,
+        pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelParams {
+        pub subscription_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelResult {
+        /// `false` when no subscription with that id is open on this
+        /// connection (already ended, or never existed).
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `subscription/lagged`: frames `from_seq` up to (not including)
+    /// `resume_seq` are gone; delivery continues at `resume_seq`.
+    pub struct SubscriptionLagged {
+        pub subscription_id: String,
+        pub from_seq: u64,
+        pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
+    }
+}
+
+rpc_type! {
+    pub struct LogsQueryParams {
+        #[serde(default)]
+        pub since_ts: Option<String>,
+        #[serde(default)]
+        pub until_ts: Option<String>,
+        #[serde(default)]
+        pub until_id: Option<String>,
+        /// Byte offset to resume reading from. Set from the previous
+        /// `LogsQueryResult::next_cursor_line_offset` for deterministic
+        /// pagination regardless of id ordering.
+        #[serde(default)]
+        pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
+        #[serde(default)]
+        pub severity_min: Option<u8>,
+        #[serde(default)]
+        pub q: Option<String>,
+        #[serde(default)]
+        pub category: Option<String>,
+        #[serde(default)]
+        pub action: Option<String>,
+        #[serde(default)]
+        pub outcome: Option<String>,
+        #[serde(default)]
+        pub trace_id: Option<String>,
+        /// Exact SOP run correlation. Uses the canonical persisted-log
+        /// attribution filter, including its compatibility bridge for older rows.
+        #[serde(default)]
+        pub sop_run_id: Option<String>,
+        #[serde(default)]
+        pub hide_internal: bool,
+        #[serde(default)]
+        pub limit: Option<usize>,
+    }
+}
+
+rpc_type! {
+    pub struct LogsQueryResult {
+        pub events: Vec<serde_json::Value>,
+        /// Resolved path of the active installed persistence writer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
+        /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
+        /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+        #[deprecated(
+            since = "0.8.0",
+            note = "tie-breaks by lexicographic id and can silently drop events; \
+                    use `next_cursor_line_offset` / `until_line_offset` instead. \
+                    Removal tracked in zeroclaw-labs/zeroclaw#8012."
+        )]
+        pub next_cursor: Option<(String, String)>,
+        /// Byte offset past the last event on this page. Callers should
+        /// pass this back as `until_line_offset` on the next request to
+        /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
+        pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
+        pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
+    }
+}
+
+rpc_type! {
+    /// `logs/get` params — fetch a single event by id.
+    pub struct LogsGetParams {
+        pub id: String,
+    }
+}
+
+rpc_type! {
+    /// `logs/get` result. `event` is the full `LogEvent` payload
+    /// (attributes, attribution map, span ids, …) that the Logs pane
+    /// only renders inside the detail modal — list rows store
+    /// preview-only data.
+    pub struct LogsGetResult {
+        pub event: serde_json::Value,
+    }
+}
+
+rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Session update notifications ─────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+/// Typed session update events pushed via `session/update` notifications.
+/// Replaces the hand-built `notification_for_turn_event` function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionUpdateEvent {
+    AgentMessageChunk {
+        session_id: String,
+        text: String,
+    },
+    AgentThoughtChunk {
+        session_id: String,
+        text: String,
+    },
+    ToolCall {
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+        raw_input: Value,
+    },
+    ToolResult {
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+        raw_output: String,
+    },
+    ApprovalRequest {
+        session_id: String,
+        request_id: String,
+        tool_name: String,
+        arguments_summary: String,
+        timeout_secs: u64,
+    },
+    /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
+    ContextUsage {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_context_window: Option<u64>,
+    },
+    /// Emitted when the TodoWrite tool produces a plan. The `entries` array
+    /// carries the normalized `PlanEntry` values (content, status, priority,
+    /// optional activeForm) so the client can render the live tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<zeroclaw_api::plan::PlanEntry>,
+    },
+    /// Terminal event for a turn. Replaces the response of `session/prompt`.
+    /// `outcome` distinguishes a clean finish from a user-initiated cancel.
+    TurnComplete {
+        session_id: String,
+        outcome: TurnCompletionOutcome,
+        /// Final assistant text (Completed) or partial accumulated text
+        /// at cancel point (Cancelled).
+        content: String,
+        /// Optional client-local turn identity, echoed from `session/prompt`.
+        /// Absent for legacy callers that do not send one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_turn_generation: Option<u64>,
+        /// Authoritative projected conversation-entry count after this turn.
+        /// Absent for legacy or missing-session terminal events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_count: Option<usize>,
+    },
+    /// Emitted whenever older whole turns were dropped from structured history
+    /// to fit a token budget or message cap. Surfaces a user-visible "context
+    /// was cut here" marker so trimming is never silent. `dropped_messages` is
+    /// the count of conversation messages removed; `dropped_turns` and
+    /// `kept_turns` describe the user-facing whole-turn accounting.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: usize,
+        dropped_turns: usize,
+        kept_turns: usize,
+        reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
+    },
+}
+
+/// Wire-stable subset of the runtime's `rpc::turn::TurnOutcome` for
+/// `TurnComplete`. `messages` is intentionally not on the wire — the TUI
+/// rebuilds from streamed chunks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCompletionOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Session overrides ────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+/// Per-session model and sampling overrides carried by `session/configure`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Quickstart (wire-stable subset) ──────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Mirrors `zeroclaw_gateway::api_quickstart::QuickstartState`.
+    pub struct QuickstartStateResult {
+        pub quickstart_completed: bool,
+        pub agents: Vec<String>,
+        pub risk_profiles: Vec<String>,
+        pub runtime_profiles: Vec<String>,
+        /// Canonical runtime fallback for providers without a recommendation.
+        #[serde(default)]
+        pub default_runtime_profile: Option<String>,
+        /// `<provider_type>.<alias>` refs.
+        pub model_providers: Vec<String>,
+        /// `<channel_type>.<alias>` refs.
+        pub channels: Vec<String>,
+        /// Subset of `channels` not yet bound to any agent — safe to
+        /// reuse without breaking the one-channel-one-agent invariant.
+        #[serde(default)]
+        pub unassigned_channels: Vec<String>,
+        /// `<storage_type>.<alias>` refs.
+        pub storage: Vec<String>,
+        /// Picker rows for "Create new model provider" — sourced from
+        /// the canonical `zeroclaw_providers::list_model_providers()`
+        /// registry by the runtime's `quickstart::snapshot_state`.
+        pub model_provider_types: Vec<QuickstartTypeOption>,
+        /// Picker rows for "Create new channel" — sourced from the
+        /// schema's `ChannelsConfig` by walking its serialised
+        /// top-level keys, so adding a channel family in the schema
+        /// surfaces here automatically.
+        pub channel_types: Vec<QuickstartTypeOption>,
+    }
+}
+
+rpc_type! {
+    /// One row in the Quickstart "Create new …" picker. The TUI and
+    /// web surfaces both render this list as-is — no hardcoded
+    /// option lists on either side.
+    pub struct QuickstartTypeOption {
+        /// Canonical kebab-case identifier written into config
+        /// (`anthropic`, `telegram`, `wecom-ws`, …).
+        pub kind: String,
+        /// Human-readable picker label.
+        pub display_name: String,
+        /// `true` when the entry runs locally and needs no remote
+        /// credential. Always `false` for channels.
+        pub local: bool,
+        /// Daemon-derived runtime preset to auto-select for this provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_runtime_profile: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartValidateParams {
+        pub submission: BuilderSubmission,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartApplyParams {
+        pub submission: BuilderSubmission,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartDismissResult {
+        pub recorded: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── SOP authoring ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `sops/validate`: an unsaved draft in the `sops/save` form
+    /// (`sop`, optionally with `original_name`), or a stored SOP selected by
+    /// `name`. A request carrying a `sop` key is always validated as a draft,
+    /// and its `name` is then ignored.
+    #[cfg_attr(
+        feature = "schema-export",
+        schemars(extend("anyOf" = [{ "required": ["sop"] }, { "required": ["name"] }]))
+    )]
+    pub struct SopValidateParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(
+            feature = "schema-export",
+            schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
+        )]
+        pub sop: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub original_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Params for `sops/graph-draft`: project an unsaved SOP (the `sops/save`
+    /// wire form) onto its graph without persisting it.
+    pub struct SopDraftParams {
+        #[cfg_attr(
+            feature = "schema-export",
+            schemars(schema_with = "zeroclaw_api::jsonrpc::sop_document_schema")
+        )]
+        pub sop: Value,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Tools ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `tools/param-options`: the option list for one tool
+    /// parameter domain.
+    pub struct ToolsParamOptionsParams {
+        pub domain: OptionDomain,
+        /// Agent whose configuration scopes the options. Blank or absent
+        /// selects the first configured agent.
+        #[serde(default)]
+        pub agent: Option<String>,
+        /// Domain-specific arguments, handed to the option resolver as-is.
+        #[serde(default)]
+        pub args: Value,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Certificates ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    /// Params for `cert/renew`, served only on the mutually authenticated WSS
+    /// plane. The certificate renewed is the calling connection's own.
+    pub struct CertRenewParams {
+        /// PEM-encoded certificate signing request for the replacement.
+        pub csr_pem: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn chat_mode_serializes_as_snake_case() {
+        assert_eq!(serde_json::to_value(ChatMode::Chat).unwrap(), json!("chat"));
+        assert_eq!(serde_json::to_value(ChatMode::Acp).unwrap(), json!("acp"));
+    }
+
+    #[test]
+    fn chat_mode_deserializes_from_snake_case() {
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("chat")).unwrap(),
+            ChatMode::Chat
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
+            ChatMode::Acp
+        );
+    }
+
+    #[test]
+    fn status_result_shell_profile_round_trips_and_defaults_absent() {
+        let legacy: StatusResult = serde_json::from_value(json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 0,
+            "session_ids": []
+        }))
+        .unwrap();
+
+        assert_eq!(legacy.shell_profile, None);
+        let legacy_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_wire.get("shell_profile").is_none());
+
+        let status = StatusResult {
+            server_version: "0.8.4".into(),
+            protocol_version: 1,
+            active_sessions: 0,
+            session_ids: vec![],
+            config_dir: None,
+            config_file: None,
+            config_kind: None,
+            local_ipc_endpoint: None,
+            shell_profile: Some(RuntimeShellProfile {
+                name: "pwsh".into(),
+                family: RuntimeShellFamily::PowerShell,
+            }),
+        };
+
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["shell_profile"],
+            json!({
+                "name": "pwsh",
+                "family": "powershell"
+            })
+        );
+
+        let round_trip: StatusResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.shell_profile, status.shell_profile);
+    }
+
+    #[test]
+    fn session_prompt_turn_generation_is_optional_and_wire_stable() {
+        let legacy: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+        }))
+        .unwrap();
+        assert_eq!(legacy.client_turn_generation, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("client_turn_generation")
+                .is_none()
+        );
+
+        let current: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+            "client_turn_generation": 9,
+        }))
+        .unwrap();
+        assert_eq!(current.client_turn_generation, Some(9));
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["client_turn_generation"],
+            json!(9)
+        );
+    }
+
+    #[test]
+    fn file_source_default_is_file() {
+        // `FileSource` does not derive `PartialEq`; assert via the wire
+        // spelling instead. Default is `File` per the `#[default]`
+        // attribute — drift here would change file-attach defaults for
+        // every caller.
+        assert_eq!(
+            serde_json::to_value(FileSource::default()).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::File).unwrap(),
+            json!("file")
+        );
+        assert_eq!(
+            serde_json::to_value(FileSource::Clipboard).unwrap(),
+            json!("clipboard")
+        );
+    }
+
+    #[test]
+    fn turn_completion_outcome_round_trips_each_variant() {
+        for variant in [
+            TurnCompletionOutcome::Completed,
+            TurnCompletionOutcome::Cancelled,
+            TurnCompletionOutcome::Failed,
+        ] {
+            let s = serde_json::to_value(variant).unwrap();
+            let back: TurnCompletionOutcome = serde_json::from_value(s.clone()).unwrap();
+            assert_eq!(back, variant, "round-trip failed for {s:?}");
+        }
+        // Lock the wire spelling — older clients string-match on these.
+        assert_eq!(
+            serde_json::to_value(TurnCompletionOutcome::Completed).unwrap(),
+            json!("completed")
+        );
+    }
+
+    #[test]
+    fn session_update_event_uses_snake_case_variants() {
+        // Variants stay PascalCase → wire is snake_case, including the
+        // multi-word ones that historically drifted when serde flattened
+        // them. The discriminant lives under `"type"` (adjacent tagging)
+        // — a change here would break every TUI that subscribes.
+        let evt = SessionUpdateEvent::AgentMessageChunk {
+            session_id: "s".into(),
+            text: "t".into(),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("agent_message_chunk"));
+        assert_eq!(v["session_id"], json!("s"));
+        assert_eq!(v["text"], json!("t"));
+
+        let evt = SessionUpdateEvent::ApprovalRequest {
+            session_id: "s".into(),
+            request_id: "r".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            timeout_secs: 30,
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("approval_request"));
+        assert!(v.get("tool_name").is_some(), "got: {v}");
+
+        let evt = SessionUpdateEvent::TurnComplete {
+            session_id: "s".into(),
+            outcome: TurnCompletionOutcome::Cancelled,
+            content: "cancelled".into(),
+            client_turn_generation: Some(9),
+            message_count: Some(4),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("turn_complete"));
+        assert_eq!(v["client_turn_generation"], json!(9));
+        assert_eq!(v["message_count"], json!(4));
+    }
+
+    #[test]
+    fn initialize_params_defaults_protocol_version_to_one() {
+        // Older clients omit `protocol_version`; the runtime must default
+        // to `1` so the handshake succeeds without an explicit version.
+        let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn logs_query_params_accepts_sop_run_filter() {
+        let params: LogsQueryParams = serde_json::from_value(json!({
+            "sop_run_id": "run-123-0001",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(params.sop_run_id.as_deref(), Some("run-123-0001"));
+        assert_eq!(params.limit, Some(25));
+    }
+
+    #[test]
+    fn config_section_group_key_is_additive_on_the_wire() {
+        let legacy: ConfigSectionEntry = serde_json::from_value(json!({
+            "key": "cron",
+            "label": "Cron",
+            "help": "Scheduled tasks",
+            "has_picker": true,
+            "completed": false,
+            "group": "Agent"
+        }))
+        .unwrap();
+        assert!(legacy.group_key.is_empty());
+
+        let current = ConfigSectionEntry {
+            key: "cron".into(),
+            label: "Cron".into(),
+            help: "Scheduled tasks".into(),
+            has_picker: true,
+            completed: false,
+            ready: false,
+            group: "Agent".into(),
+            group_key: "agent".into(),
+            is_quickstart: true,
+            shape: None,
+            cost_category: String::new(),
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["group"], json!("Agent"));
+        assert_eq!(value["group_key"], json!("agent"));
+    }
+
+    #[test]
+    fn initialize_params_accepts_snake_case_field_names() {
+        let p: InitializeParams = serde_json::from_value(json!({
+            "protocol_version": 2,
+            "tui_id": "abc",
+            "tui_sig": "sig",
+            "env": {"PATH": "/bin"}
+        }))
+        .unwrap();
+        assert_eq!(p.protocol_version, 2);
+        assert_eq!(p.tui_id.as_deref(), Some("abc"));
+        assert_eq!(p.env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn initialize_params_renames_client_capabilities_field() {
+        // The ACP elicitation RFD uses camelCase on the wire; the rename
+        // is a one-shot field-level override — losing it would silently
+        // break elicitation handshake for every TUI that speaks it.
+        let p: InitializeParams = serde_json::from_value(json!({
+            "clientCapabilities": {"elicitation": {"form": true}}
+        }))
+        .unwrap();
+        let caps = p.client_capabilities.expect("rename lost the field");
+        assert_eq!(caps["elicitation"]["form"], json!(true));
+    }
+
+    #[test]
+    fn file_entry_skips_none_optional_fields_in_output() {
+        // `skip_serializing_if = "Option::is_none"` is what keeps the
+        // wire format tight for older clients that don't understand the
+        // `data_b64` field. Symmetric with the deserialize side.
+        let entry = FileEntry {
+            path: Some("/tmp/x".into()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let v = serde_json::to_value(entry).unwrap();
+        assert_eq!(v["path"], json!("/tmp/x"));
+        assert_eq!(v["source"], json!("file"));
+        assert!(
+            v.as_object().unwrap().get("data_b64").is_none(),
+            "None data_b64 leaked into wire: {v}"
+        );
+        assert!(
+            v.as_object().unwrap().get("filename").is_none(),
+            "None filename leaked into wire: {v}"
+        );
+    }
+
+    #[test]
+    fn file_entry_deserializes_when_only_path_is_present() {
+        // The contract is "path OR data_b64"; the schema must accept
+        // path-only entries without forcing the caller to send nulls.
+        let entry: FileEntry = serde_json::from_value(json!({"path": "/tmp/a"})).unwrap();
+        assert_eq!(entry.path.as_deref(), Some("/tmp/a"));
+        assert!(entry.data_b64.is_none());
+        assert_eq!(serde_json::to_value(entry.source).unwrap(), json!("file"));
+    }
+
+    #[test]
+    fn tui_list_entry_round_trip_preserves_all_fields() {
+        let entry = TuiListEntry {
+            tui_id: "tui-1".into(),
+            connected_at: "2026-06-29T10:00:00Z".into(),
+            connected_at_unix: 1_750_000_000,
+            peer_label: "desktop".into(),
+            transport: "wss".into(),
+        };
+        let v: Value = serde_json::to_value(&entry).unwrap();
+        let back: TuiListEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.tui_id, entry.tui_id);
+        assert_eq!(back.connected_at_unix, entry.connected_at_unix);
+        assert_eq!(back.transport, entry.transport);
+    }
+
+    #[test]
+    fn quickstart_type_option_round_trip() {
+        let opt = QuickstartTypeOption {
+            kind: "anthropic".into(),
+            display_name: "Anthropic".into(),
+            local: false,
+            default_runtime_profile: Some("unbounded".into()),
+        };
+        let v = serde_json::to_value(&opt).unwrap();
+        assert_eq!(v["kind"], json!("anthropic"));
+        assert_eq!(v["local"], json!(false));
+        assert_eq!(v["default_runtime_profile"], json!("unbounded"));
+        let back: QuickstartTypeOption = serde_json::from_value(v).unwrap();
+        assert_eq!(back.kind, opt.kind);
+        assert_eq!(back.local, opt.local);
+        assert_eq!(back.default_runtime_profile, opt.default_runtime_profile);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn logs_query_result_exposes_active_log_path_when_present() {
+        let result = LogsQueryResult {
+            events: Vec::new(),
+            log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
+            next_cursor: None,
+            next_cursor_line_offset: None,
+            next_segment_cursor: None,
+            at_end: true,
+            incomplete: false,
+        };
+
+        let value = serde_json::to_value(result).expect("logs/query result");
+        assert_eq!(
+            value["log_path"],
+            json!("/var/lib/zeroclaw/runtime-trace.jsonl")
+        );
+    }
+
+    #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
+    }
+
+    #[test]
+    fn cron_settings_params_read_without_a_patch() {
+        let read: CronSettingsParams = serde_json::from_value(json!({})).unwrap();
+        assert!(read.patch.is_none());
+        assert_eq!(serde_json::to_value(&read).unwrap(), json!({}));
+        let write: CronSettingsParams =
+            serde_json::from_value(json!({ "patch": { "enabled": false } })).unwrap();
+        assert_eq!(write.patch, Some(json!({ "enabled": false })));
+        // A present null is still a write request and must round-trip.
+        let null_patch: CronSettingsParams =
+            serde_json::from_value(json!({ "patch": null })).unwrap();
+        assert_eq!(null_patch.patch, Some(Value::Null));
+        assert_eq!(
+            serde_json::to_value(&null_patch).unwrap(),
+            json!({ "patch": null })
+        );
+    }
+
+    #[test]
+    fn sop_validate_params_carry_either_request_form() {
+        let draft: SopValidateParams =
+            serde_json::from_value(json!({ "sop": { "name": "deploy" }, "original_name": "old" }))
+                .unwrap();
+        assert_eq!(draft.sop, Some(json!({ "name": "deploy" })));
+        assert_eq!(draft.original_name.as_deref(), Some("old"));
+        let stored: SopValidateParams =
+            serde_json::from_value(json!({ "name": "deploy" })).unwrap();
+        assert!(stored.sop.is_none());
+        assert_eq!(stored.name.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn tools_param_options_params_default_the_agent_and_args() {
+        let params: ToolsParamOptionsParams =
+            serde_json::from_value(json!({ "domain": "agent_aliases" })).unwrap();
+        assert_eq!(params.domain, OptionDomain::AgentAliases);
+        assert!(params.agent.is_none());
+        assert!(params.args.is_null());
+    }
+
+    #[test]
+    fn cert_renew_params_require_the_csr() {
+        assert!(serde_json::from_value::<CertRenewParams>(json!({})).is_err());
+        assert!(serde_json::from_value::<CertRenewParams>(json!({ "csr_pem": 7 })).is_err());
+        let params: CertRenewParams = serde_json::from_value(json!({ "csr_pem": "csr" })).unwrap();
+        assert_eq!(params.csr_pem, "csr");
+    }
+
+    #[test]
+    fn sop_draft_params_carry_the_draft_verbatim() {
+        let draft = json!({ "name": "deploy", "steps": [] });
+        let params: SopDraftParams = serde_json::from_value(json!({ "sop": draft })).unwrap();
+        assert_eq!(params.sop, draft);
+    }
+}

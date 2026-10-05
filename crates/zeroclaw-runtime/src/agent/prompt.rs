@@ -13,6 +13,7 @@ use zeroclaw_config::schema::IdentityConfig;
 /// selects host-owned descriptive semantics; it never carries prompt prose or
 /// capability claims from the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionSurface {
     ZerocodeCode,
