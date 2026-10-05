@@ -44,9 +44,14 @@ No HTTP framing, no length prefix. The framing is identical across platforms;
 named pipes carry the same byte stream as Unix sockets.
 
 ```
-{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
+{"jsonrpc":"2.0","method":"initialize","params":{"protocol_version":1},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocol_version":1,"server_version":"0.8.5","server_pid":4242},"id":1}\n
 ```
+
+The `initialize` result is shortened here. It also carries the connection's
+TUI identity, the supported method names, the bound principal and the command
+catalogue; `InitializeResult` in the [contract document](#contract-document)
+lists every field.
 
 ## Connection limits
 
@@ -66,18 +71,31 @@ line. See [Chunked uploads](#chunked-uploads).
 ## Handshake
 
 The first RPC call must be `initialize`. The daemon rejects all other methods
-until `initialize` succeeds. Protocol version mismatch produces a structured
-error with code `-32011`.
+until `initialize` succeeds.
 
 ```json
 {
   "jsonrpc": "2.0",
   "method": "initialize",
   "params": {
-    "protocolVersion": 1
+    "protocol_version": 1
   },
   "id": 1
 }
+```
+
+The field is `protocol_version`, like every other `initialize` field except
+`clientCapabilities`:
+
+- A request that omits it is treated as version `1`.
+- The camelCase spelling `protocolVersion` is read the same way, so an
+  unsupported version sent under either name is refused rather than ignored.
+- A request that sends both spellings is rejected with `-32602`.
+
+A version the daemon does not speak gets error `-32011`:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32011,"message":"Protocol version mismatch: server=1, client=2"},"id":1}
 ```
 
 The endpoint does not require a pairing token. Access control is handled by
@@ -291,23 +309,37 @@ socat READLINE UNIX-CONNECT:~/.zeroclaw/data/daemon.sock
 Paste lines one at a time:
 
 ```
-{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}
+{"jsonrpc":"2.0","method":"initialize","params":{"protocol_version":1},"id":1}
 {"jsonrpc":"2.0","method":"status","params":{},"id":2}
 ```
 
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
