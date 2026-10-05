@@ -73,7 +73,9 @@ pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
-pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
+pub(crate) use vision_route::{
+    VisionProviderSource, prepare_messages_for_iteration, resolve_vision_provider,
+};
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -393,6 +395,12 @@ pub struct ToolLoop<'a> {
     /// FAILS CLOSED (the step errors rather than running with the parent
     /// agent's broader context).
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
+    /// The capabilities and principal this turn was built from, when an entry
+    /// point supplied them. The loop resolves provider changes it makes on its
+    /// own, such as the vision route for an image, through this binding's
+    /// provider source. Independent of `sop_reassembly`: a loop can carry a
+    /// binding without being allowed to reassemble SOP steps.
+    pub capability_binding: Option<&'a crate::composition::BoundCapabilities>,
 }
 
 /// Project the token population of the NEXT provider request that would be
@@ -1067,7 +1075,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         served_route_sink,
         sop_reassembly,
+        capability_binding,
     } = p;
+    // A turn built from bound capabilities resolves its vision route through
+    // that binding's provider source, with its principal.
+    let turn_vision_source = capability_binding.map(|binding| {
+        VisionProviderSource::from_binding(binding, agent_alias.unwrap_or_default())
+    });
     let mut loop_local_image_cache = None;
     let mut image_cache = Some(match image_cache {
         Some(cache) => cache,
@@ -1362,6 +1376,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         &mut turn_state.crumb_present,
                         pending_reported_usage,
                         observer,
+                        turn_vision_source,
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -1419,6 +1434,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             dispatch_model,
             security,
+            turn_vision_source,
         )
         .await?;
 
@@ -2653,6 +2669,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 agent_alias,
                 parent_agent_alias,
                 sop_reassembly.clone(),
+                capability_binding,
                 &mut sop_exec_cache,
             ))
             .await?;
@@ -2706,6 +2723,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         &mut turn_state.crumb_present,
         pending_reported_usage,
         observer,
+        turn_vision_source,
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2821,6 +2839,12 @@ fn sop_step_excluded_tools(
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
     pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    /// The capabilities and principal the enclosing turn was built from. A
+    /// cross-agent step re-assembles its agent through them, so the step
+    /// stays on the turn's provider, memory and tool sources. `None` only on
+    /// a path that holds no bound capabilities, which re-assembles from
+    /// config-backed sources as before.
+    pub capabilities: Option<&'a crate::composition::BoundCapabilities>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2909,6 +2933,9 @@ impl OwnedAgentExecution {
 /// SOP so the nested step keeps its SOP tools bound to the same engine. This
 /// connects MCP servers, so the driver memoizes the result per alias across a
 /// drain and re-assembles only on an alias change.
+///
+/// Compatibility adapter for [`assemble_owned_execution_with_capabilities`]
+/// over the config-backed capabilities.
 #[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
@@ -2918,9 +2945,11 @@ pub(crate) async fn assemble_owned_execution(
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
 ) -> Result<OwnedAgentExecution> {
-    assemble_owned_execution_with_admission(
+    assemble_owned_execution_with_capabilities(
         config,
         live_config,
+        &crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+        None,
         alias,
         sop_engine,
         sop_audit,
@@ -2930,9 +2959,14 @@ pub(crate) async fn assemble_owned_execution(
     .await
 }
 
-pub(crate) async fn assemble_owned_execution_with_admission(
+/// [`assemble_owned_execution`] with the step agent's memory, provider and any
+/// source-supplied tools obtained from `capabilities`, and its provider
+/// resolved for `principal`, the enclosing turn's.
+pub(crate) async fn assemble_owned_execution_with_capabilities(
     config: &zeroclaw_config::schema::Config,
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    capabilities: &crate::composition::RuntimeCapabilities,
+    principal: Option<&zeroclaw_api::principal::PrincipalId>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -2972,8 +3006,7 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     let resolved_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    let memory =
-        zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
+    let memory = capabilities.agent_memory(config, alias).await?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -2992,13 +3025,14 @@ pub(crate) async fn assemble_owned_execution_with_admission(
         (None, None)
     };
 
-    let built = crate::tools::all_tools_with_runtime_and_execution_capability(
-        Arc::new(config.clone()),
+    let tool_config = Arc::new(config.clone());
+    let mut built = crate::tools::all_tools_with_runtime_and_execution_capability(
+        Arc::clone(&tool_config),
         &security,
         &risk_profile,
         alias,
         runtime.clone(),
-        memory,
+        Arc::clone(&memory),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -3017,6 +3051,17 @@ pub(crate) async fn assemble_owned_execution_with_admission(
         execution_admission
             .as_ref()
             .map(AgentExecutionAdmission::capability),
+    )?;
+    capabilities.bind_registry(
+        &mut built,
+        &crate::composition::ToolRequest {
+            config: &tool_config,
+            agent_alias: alias,
+            security: &security,
+            runtime: &runtime,
+            memory: &memory,
+        },
+        principal,
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -3067,7 +3112,14 @@ pub(crate) async fn assemble_owned_execution_with_admission(
             ))
         })?;
     let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
+        crate::agent::agent::build_session_model_provider_with_capabilities(
+            capabilities,
+            config,
+            alias,
+            &provider_ref,
+            None,
+            principal,
+        )?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
     let temperature = config
@@ -3213,6 +3265,11 @@ async fn drive_live_sop_actions(
     agent_alias: Option<&str>,
     parent_agent_alias: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+    // The capabilities and principal of the loop that queued these actions.
+    // A step's nested loop runs on them whether or not the step needed
+    // cross-agent reassembly: provider authority travels with the execution,
+    // not with the permission to reassemble another agent.
+    capability_binding: Option<&crate::composition::BoundCapabilities>,
     // Per-agent execution contexts re-assembled in flight for steps that
     // delegate to a different agent, memoized by alias. Owned by the caller
     // (the turn loop) so the memo spans every drain of a turn's queued steps:
@@ -3304,17 +3361,37 @@ async fn drive_live_sop_actions(
                                 owned.matches_admission(execution_admission.as_ref())
                             });
                             if !cache_matches {
-                                match assemble_owned_execution_with_admission(
-                                    execution_config.as_deref().unwrap_or(reassembly.config),
-                                    reassembly.live_config.clone(),
-                                    alias,
-                                    Arc::clone(&queued.engine),
-                                    queued.audit.clone(),
-                                    approval,
-                                    execution_admission.clone(),
-                                )
-                                .await
-                                {
+                                let assembled = match reassembly.capabilities {
+                                    Some(bound) => {
+                                        assemble_owned_execution_with_capabilities(
+                                            execution_config.as_deref().unwrap_or(reassembly.config),
+                                            reassembly.live_config.clone(),
+                                            &bound.capabilities,
+                                            bound.principal.as_ref(),
+                                            alias,
+                                            Arc::clone(&queued.engine),
+                                            queued.audit.clone(),
+                                            approval,
+                                            execution_admission.clone(),
+                                        )
+                                        .await
+                                    }
+                                    None => {
+                                        assemble_owned_execution_with_capabilities(
+                                            execution_config.as_deref().unwrap_or(reassembly.config),
+                                            reassembly.live_config.clone(),
+                                            &crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+                                            None,
+                                            alias,
+                                            Arc::clone(&queued.engine),
+                                            queued.audit.clone(),
+                                            approval,
+                                            execution_admission.clone(),
+                                        )
+                                        .await
+                                    }
+                                };
+                                match assembled {
                                     Ok(owned) => {
                                         exec_cache.insert(alias.to_string(), owned);
                                     }
@@ -3647,6 +3724,9 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
                                     sop_reassembly: sop_reassembly.clone(),
+                                    // The step runs on the queuing loop's
+                                    // binding, same-agent or cross-agent.
+                                    capability_binding,
                                     })),
                                 )
                             )
@@ -5579,6 +5659,7 @@ vision_model_provider = "custom.vision"
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
                     model_provider: &text_provider,
@@ -6467,6 +6548,7 @@ mod sop_step_reassembly_tests {
 
         run_tool_call_loop(ToolLoop {
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
                     model_provider: provider,
@@ -6949,9 +7031,52 @@ mod sop_step_reassembly_tests {
 
     /// Drive one queued action through `drive_live_sop_actions` with a
     /// plain-text PARENT provider, the given identity/handle/cache, and return
-    /// the engine for assertions.
+    /// the engine for assertions. The loop's binding is the reassembly's, as
+    /// on a top-level capability-taking turn.
     #[allow(clippy::too_many_arguments)]
     async fn drive_step(
+        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+        parent_provider: &dyn ModelProvider,
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &dyn crate::observability::Observer,
+        history: &mut Vec<ChatMessage>,
+        history_has_trim_breadcrumb: Option<&mut bool>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+        new_messages_out: Option<&mut Vec<ChatMessage>>,
+        agent_alias: Option<&str>,
+        sop_reassembly: Option<SopStepReassembly<'_>>,
+        model_switch_callback: Option<ModelSwitchCallback>,
+        exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
+    ) {
+        let capability_binding = sop_reassembly
+            .as_ref()
+            .and_then(|reassembly| reassembly.capabilities);
+        drive_step_full(
+            engine,
+            action,
+            parent_provider,
+            parent_tools,
+            observer,
+            history,
+            history_has_trim_breadcrumb,
+            event_tx,
+            new_messages_out,
+            agent_alias,
+            sop_reassembly,
+            model_switch_callback,
+            exec_cache,
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            capability_binding,
+        )
+        .await;
+    }
+
+    /// [`drive_step`] with the loop's config, multimodal settings and
+    /// capability binding supplied explicitly.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_step_full(
         engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         action: crate::sop::types::SopRunAction,
         parent_provider: &dyn ModelProvider,
@@ -6969,6 +7094,9 @@ mod sop_step_reassembly_tests {
         // nested step loop never touches it.
         model_switch_callback: Option<ModelSwitchCallback>,
         exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
+        config: Option<&zeroclaw_config::schema::Config>,
+        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+        capability_binding: Option<&crate::composition::BoundCapabilities>,
     ) {
         use crate::sop::executor::QueuedSopAction;
 
@@ -6995,8 +7123,8 @@ mod sop_step_reassembly_tests {
             None,
             // security: no policy on the test path
             None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            None,
+            multimodal_config,
+            config,
             5,
             None,
             &[],
@@ -7028,6 +7156,7 @@ mod sop_step_reassembly_tests {
             agent_alias,
             None,
             sop_reassembly,
+            capability_binding,
             exec_cache,
         )
         .await
@@ -7047,6 +7176,313 @@ mod sop_step_reassembly_tests {
             .find(|r| r.step_number == 1)
             .expect("step 1 result recorded")
             .clone()
+    }
+
+    // ── Cross-agent steps inside a turn built from supplied capabilities ──
+
+    /// A config with one step agent, `stepper`, whose configured provider
+    /// endpoint is unroutable: a step that fell back to config-backed sources
+    /// could not reach a provider.
+    fn stepper_config(root: &std::path::Path) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("stepper".to_string(), RiskProfileConfig::default());
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("step-model".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    timeout_secs: Some(1),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    async fn drive_cross_agent_step_with(
+        bound: &crate::composition::BoundCapabilities,
+    ) -> crate::sop::types::SopStepResult {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = stepper_config(tmp.path());
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+            capabilities: Some(bound),
+        };
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            None,
+            None,
+            Some("outer"),
+            Some(handle),
+            None,
+            &mut exec_cache,
+        )
+        .await;
+        step1_result(&engine, &run_id)
+    }
+
+    /// A single same-agent step (no step agent) whose body carries an image.
+    fn start_single_same_agent_step(
+        body: &str,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopTrigger,
+            SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        let sop = Sop {
+            name: "same-agent".to_string(),
+            description: "x".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "look".to_string(),
+                body: body.to_string(),
+                agent: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-07-16T00:00:00Z".to_string(),
+        };
+        let action = engine.start_run("same-agent", event).expect("run starts");
+        let run_id = match &action {
+            SopRunAction::ExecuteStep { run_id, step, .. } => {
+                assert_eq!(step.agent, None, "the step stays on the current agent");
+                run_id.clone()
+            }
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        };
+        (Arc::new(std::sync::Mutex::new(engine)), run_id, action)
+    }
+
+    /// A same-agent SOP step queued by a loop that carries a capability
+    /// binding but no SOP reassembly (the shape of an agentic delegate's loop)
+    /// runs its nested loop on that binding. The step's image resolves its
+    /// vision route through the binding's source, for its principal, and the
+    /// configured route is never contacted: the counting endpoint behind it
+    /// sees zero connections, whether the source refuses the route or serves
+    /// it.
+    #[tokio::test]
+    async fn a_same_agent_step_in_a_bound_loop_routes_vision_through_the_binding() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
+            capabilities_with_providers, counting_endpoint,
+        };
+
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-ss");
+        for refuse in [true, false] {
+            let endpoint = counting_endpoint().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = zeroclaw_config::schema::Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            config.providers.models.custom.insert(
+                "vision".to_string(),
+                zeroclaw_config::schema::CustomModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        uri: Some(endpoint.url.clone()),
+                        model: Some("vision-model".to_string()),
+                        api_key: Some("ambient-key".to_string()),
+                        ..zeroclaw_config::schema::ModelProviderConfig::default()
+                    },
+                },
+            );
+            config.multimodal.vision_model_provider = Some("custom.vision".to_string());
+            let providers = Arc::new(if refuse {
+                VisionRouteProviders::refusing()
+            } else {
+                VisionRouteProviders::default()
+            });
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: capabilities_with_providers(Arc::clone(&providers) as _),
+                principal: Some(principal.clone()),
+            };
+            let (engine, run_id, action) = start_single_same_agent_step(IMAGE_TURN);
+            let parent_tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let mut history = vec![ChatMessage::system("helper system prompt")];
+            let mut exec_cache = std::collections::HashMap::new();
+
+            drive_step_full(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("helper"),
+                // An agentic delegate's loop: no SOP reassembly...
+                None,
+                None,
+                &mut exec_cache,
+                Some(&config),
+                &config.multimodal,
+                // ...but a capability binding.
+                Some(&bound),
+            )
+            .await;
+
+            let result = step1_result(&engine, &run_id);
+            if refuse {
+                assert_eq!(
+                    result.status,
+                    crate::sop::types::SopStepStatus::Failed,
+                    "{result:?}"
+                );
+                assert!(
+                    result.output.contains(VISION_REFUSAL),
+                    "the source's refusal fails the step: {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result.status,
+                    crate::sop::types::SopStepStatus::Completed,
+                    "{result:?}"
+                );
+                assert!(result.output.contains(VISION_REPLY), "{result:?}");
+            }
+            let vision = providers.vision.lock();
+            assert!(
+                !vision.is_empty(),
+                "the vision route is asked of the binding's source"
+            );
+            for request in vision.iter() {
+                assert_eq!(request.provider_ref.as_deref(), Some("custom.vision"));
+                assert_eq!(request.principal.as_ref(), Some(&principal));
+            }
+            assert_eq!(
+                endpoint.connections(),
+                0,
+                "the configured vision route was contacted (refuse = {refuse})"
+            );
+        }
+    }
+
+    /// The step agent is re-assembled through the turn's supplied sources and
+    /// resolved for the turn's principal, not from config.
+    #[tokio::test]
+    async fn cross_agent_step_reassembles_through_the_turns_supplied_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-sop");
+        let bound = crate::composition::BoundCapabilities {
+            capabilities: recording_capabilities(
+                Arc::clone(&providers),
+                Arc::clone(&memory),
+                Arc::new(NoTools),
+            ),
+            principal: Some(principal.clone()),
+        };
+
+        let result = drive_cross_agent_step_with(&bound).await;
+
+        assert_eq!(
+            result.status,
+            crate::sop::types::SopStepStatus::Completed,
+            "{result:?}"
+        );
+        assert!(result.output.contains(STUB_REPLY), "{result:?}");
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].agent_alias, "stepper");
+        assert_eq!(seen[0].provider_ref.as_deref(), Some("ollama.p"));
+        assert_eq!(seen[0].principal, Some(principal));
+        assert!(memory.agents.lock().iter().any(|alias| alias == "stepper"));
+    }
+
+    /// A source that refuses the step agent fails the step with its refusal;
+    /// the configured provider is never tried in its place.
+    #[tokio::test]
+    async fn a_refusing_source_fails_the_cross_agent_step() {
+        use crate::composition::test_support::{
+            NoTools, REFUSAL, RecordingMemory, RecordingProviders, RefusingProviders,
+            recording_capabilities,
+        };
+        let bound = crate::composition::BoundCapabilities {
+            capabilities: crate::composition::RuntimeCapabilities {
+                providers: Arc::new(RefusingProviders),
+                ..recording_capabilities(
+                    Arc::new(RecordingProviders::default()),
+                    Arc::new(RecordingMemory::default()),
+                    Arc::new(NoTools),
+                )
+            },
+            principal: None,
+        };
+
+        let result = drive_cross_agent_step_with(&bound).await;
+
+        assert_eq!(
+            result.status,
+            crate::sop::types::SopStepStatus::Failed,
+            "{result:?}"
+        );
+        assert!(result.output.contains(REFUSAL), "{result:?}");
     }
 
     // ── Blocker regressions: the REAL nested loop with distinct providers ────
@@ -7120,6 +7556,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7222,6 +7659,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7320,6 +7758,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
@@ -7384,6 +7823,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let observer = IdentityCapture::default();
@@ -7440,6 +7880,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let parent_provider = TextProvider;
@@ -7504,6 +7945,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let observer = IdentityCapture::default();
@@ -7561,6 +8003,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
@@ -7764,6 +8207,7 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
+            capabilities: None,
         };
 
         let mut exec_cache = std::collections::HashMap::new();
@@ -8273,6 +8717,7 @@ mod tool_lifecycle_abandonment_tests {
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: provider,

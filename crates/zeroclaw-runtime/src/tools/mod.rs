@@ -583,6 +583,12 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The capability slots of the tools this factory registered that start
+    /// child operations (delegate, `spawn_subagent`, `send_message_to_peer`),
+    /// so the entry point that owns the registry can bind its capabilities
+    /// and principal (`RuntimeCapabilities::bind_registry`) and those
+    /// children run through them.
+    pub capability_slots: Vec<crate::composition::CapabilitySlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
     /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
@@ -617,6 +623,7 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            capability_slots: Vec::new(),
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -1327,6 +1334,25 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    // Tools that start child turns carry a capability slot the owning entry
+    // point binds, so their children inherit its sources and principal.
+    let spawn_subagent_tool = SpawnSubagentTool::new(
+        Arc::clone(&root_config_shared),
+        agent_alias,
+        security.clone(),
+    )
+    .with_subagent_caller(is_subagent_caller)
+    .with_execution_capability(execution_capability.clone());
+    let send_message_to_peer_tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+        Arc::clone(&root_config_shared),
+        agent_alias,
+        live_config.clone(),
+        execution_capability.clone(),
+    );
+    let mut capability_slots: Vec<crate::composition::CapabilitySlot> = vec![
+        spawn_subagent_tool.capabilities_slot(),
+        send_message_to_peer_tool.capabilities_slot(),
+    ];
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool
@@ -1409,21 +1435,8 @@ fn all_tools_with_runtime_on_thread(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(
-            SpawnSubagentTool::new(
-                Arc::clone(&root_config_shared),
-                agent_alias,
-                security.clone(),
-            )
-            .with_subagent_caller(is_subagent_caller)
-            .with_execution_capability(execution_capability.clone()),
-        ),
-        Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
-            Arc::clone(&root_config_shared),
-            agent_alias,
-            live_config.clone(),
-            execution_capability.clone(),
-        )),
+        Arc::new(spawn_subagent_tool),
+        Arc::new(send_message_to_peer_tool),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -2286,6 +2299,7 @@ fn all_tools_with_runtime_on_thread(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
+                    capability_slots,
                     #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
@@ -2410,6 +2424,7 @@ fn all_tools_with_runtime_on_thread(
         .with_live_config(live_config.clone())
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
+        capability_slots.push(delegate_tool.capabilities_slot());
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
         {
@@ -2504,6 +2519,7 @@ fn all_tools_with_runtime_on_thread(
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
+        capability_slots,
         ask_user_handle,
         channel_room_handle,
         reaction_handle,
