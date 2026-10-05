@@ -121,6 +121,92 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::InferredV3 => ta(
+            "cli-config-migration-inferred-v3",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => ta(
+            "cli-config-retired-key-removed",
+            &[("key", key), ("path", path), ("reason", reason)],
+            format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+        ),
+        MigrationNotice::ReferenceRemoved {
+            path: key,
+            reference,
+            reason,
+        } => ta(
+            "cli-config-retired-reference-removed",
+            &[
+                ("reference", reference),
+                ("key", key),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!("warning: removed `{reference}` from `{key}` in {path}: {reason}"),
+        ),
+        MigrationNotice::ReferenceKept {
+            path: key,
+            reference,
+            reason,
+        } => ta(
+            "cli-config-retired-reference-kept",
+            &[
+                ("reference", reference),
+                ("key", key),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!(
+                "warning: kept `{reference}` in `{key}` in {path} although its channel is retired: {reason}"
+            ),
+        ),
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => ta(
+            "cli-config-env-override-retired",
+            &[("variable", variable), ("reason", reason)],
+            format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+        ),
+        MigrationNotice::Renamed { from, to, reason } => ta(
+            "cli-config-retired-key-renamed",
+            &[
+                ("from", from),
+                ("to", to),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!("warning: moved retired config key `{from}` to `{to}` in {path}: {reason}"),
+        ),
+        MigrationNotice::RenameConflict { from, to, reason } => ta(
+            "cli-config-retired-key-rename-conflict",
+            &[
+                ("from", from),
+                ("to", to),
+                ("path", path),
+                ("reason", reason),
+            ],
+            format!(
+                "warning: dropped retired config key `{from}` from {path} without moving it, because `{to}` is already set: {reason}"
+            ),
+        ),
+    }
+}
+
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
@@ -6584,27 +6670,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         eprintln!("{warning}");
     }
-    for section in &config.retired_wati_config_sections {
-        let fallback = format!(
-            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-section-retired-wati",
-                &[("section", section)],
-                &fallback,
-            )
-        );
-    }
-    if config.retired_node_transport_config {
-        eprintln!(
-            "{}",
-            t(
-                "cli-config-section-retired-node-transport",
-                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
-            )
-        );
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
@@ -9762,6 +9857,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -9777,6 +9873,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {
@@ -18323,7 +18423,14 @@ type = "string"
     #[cfg(feature = "plugins-wasm")]
     fn config_in_dir(dir: &std::path::Path) -> crate::config::schema::Config {
         let path = dir.join("config.toml");
-        std::fs::write(&path, "schema_version = 0\n").expect("seed config file");
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {}\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("seed config file");
         let mut config = crate::config::schema::Config::default();
         config.config_path = path;
         config.secrets.encrypt = true;

@@ -15676,7 +15676,7 @@ mod tests {
         // by the mock endpoint.
         let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.text]
 model = "text-model"
 context_window = 200000
@@ -15975,7 +15975,7 @@ vision_model_provider = "custom.vision"
         // keyed on the ACCEPTED alias — rather than model-pin mechanics.
         let config: zeroclaw_config::schema::Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.primary]
 model = "primary-model"
 context_window = 200000
@@ -16235,7 +16235,7 @@ model_provider = "custom.primary"
         // same alias.
         let config: zeroclaw_config::schema::Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.only]
 model = "large-model"
 context_window = 200000

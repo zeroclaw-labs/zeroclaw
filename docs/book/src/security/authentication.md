@@ -578,14 +578,18 @@ means its memory tools refuse.
 
 The Nevis IAM integration was removed. It was never wired into any
 authentication path, so enabling it never authenticated anyone; retiring
-it changes no live behavior. Its config table is still accepted so an old
-`config.toml` keeps loading: the daemon discards every value in the table
-at load, logs one warning naming the replacement, and removes the table
-from `config.toml` on the next save, whether a full save or the
-incremental save the CLI, dashboard and RPC use for a single edit. The
-removal touches only that table; comments and other sections keep their
-bytes. Nothing is converted automatically: the replacement stack needs
-values (an audience, profile grants) the old table never held.
+it changes no live behavior. `[security.nevis]` is no longer a config key:
+schema V4 retires it. While a config still holds the table, every command
+prints a warning naming it, and none of its values are loaded. The table is
+removed from `config.toml` by `zeroclaw config migrate`, and by the next
+save that follows an edit, whether a full save or the incremental save the
+CLI, dashboard and RPC use for a single edit. An incremental save runs only
+when something was edited, so an untouched config keeps the table until one
+of those happens. The removal touches only that table; comments and other
+sections keep their bytes. `config migrate` keeps the original, including
+any `client_secret`, in its `.backup` copy. Nothing is converted
+automatically: the replacement stack needs values (an audience, profile
+grants) the old table never held.
 
 **Before you upgrade**, copy `config.toml` somewhere protected. Every save
 after the upgrade writes `config.toml.bak` next to the file for the

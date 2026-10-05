@@ -10,7 +10,7 @@ data:
   # workspace / data location is set via ZEROCLAW_DATA_DIR on the pod's
   # env, not inside config.toml — see deployment.yaml.
   config.toml: |
-    schema_version = 3
+    schema_version = 4
 
     [providers.models.anthropic.cloud]   # type = anthropic; alias = cloud
     model = "claude-sonnet-4-20250514"
