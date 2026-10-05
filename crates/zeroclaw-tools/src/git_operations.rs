@@ -1169,8 +1169,10 @@ impl GitOperationsTool {
     /// A diff prints file contents, so every file the pathspec selects has to
     /// clear the canonical read policy before Git runs. Git expands the
     /// pathspec itself (`--name-only -z` over the same arguments), so a glob
-    /// or directory that selects a denied file is caught. Fails closed when
-    /// the set cannot be listed.
+    /// or directory that selects a denied file is caught. `--no-renames` keeps
+    /// rename detection from collapsing a rename to its destination, so the
+    /// deleted source is read-checked too. Fails closed when the set cannot
+    /// be listed.
     async fn preflight_diff(
         &self,
         files: &str,
@@ -1183,6 +1185,7 @@ impl GitOperationsTool {
             "--name-only",
             "-z",
             "--no-relative",
+            "--no-renames",
             "--ignore-submodules=dirty",
             "--no-ext-diff",
             "--no-textconv",
@@ -1225,8 +1228,11 @@ impl GitOperationsTool {
 
     /// Reject a `checkout` before it runs if any file that differs between
     /// `HEAD` and the target would land on a `deny_write`-guarded path (for
-    /// example the `.env`/`.git/config` guardrails). Fails closed if the
-    /// difference cannot be listed (unknown ref, unborn `HEAD`).
+    /// example the `.env`/`.git/config` guardrails). `--no-renames` is
+    /// essential here: with rename detection a rename lists only its
+    /// destination, but checkout also deletes the source, which must be
+    /// checked. Fails closed if the difference cannot be listed (unknown ref,
+    /// unborn `HEAD`).
     async fn preflight_checkout(
         &self,
         branch_name: &str,
@@ -1239,6 +1245,7 @@ impl GitOperationsTool {
             "--name-only",
             "-z",
             "--no-relative",
+            "--no-renames",
             "--ignore-submodules=dirty",
             "--no-ext-diff",
             "--no-textconv",
@@ -1256,7 +1263,10 @@ impl GitOperationsTool {
     /// Check a stash action's mutation set against `deny_write`. `push`/`save`
     /// revert tracked modifications (and, with `include_untracked`, remove
     /// untracked files); `pop` writes the latest entry back, including the
-    /// untracked files it was created with (`git stash push -u`).
+    /// untracked files it was created with (`git stash push -u`). Both halves
+    /// list with `--no-renames`: a stashed rename restores (pop) or reverts
+    /// (push) the source path as well as the destination, and rename detection
+    /// would list only the destination.
     async fn preflight_stash(
         &self,
         action: &str,
@@ -1278,6 +1288,7 @@ impl GitOperationsTool {
                 "--include-untracked",
                 "-z",
                 "--no-relative",
+                "--no-renames",
                 "--no-ext-diff",
                 "--no-textconv",
             ];
@@ -1293,6 +1304,7 @@ impl GitOperationsTool {
             "--name-only",
             "-z",
             "--no-relative",
+            "--no-renames",
             "--ignore-submodules=dirty",
             "--no-ext-diff",
             "--no-textconv",
@@ -6785,6 +6797,169 @@ mod tests {
         assert!(
             !root.join(newline_name).exists(),
             "a blocked pop must not restore the protected file"
+        );
+    }
+
+    // ── Rename-source regressions ────────────────────────────────────────────
+    //
+    // Default rename detection lists a rename as only its destination. Every
+    // operation below also writes the rename's SOURCE — checkout and pop
+    // delete it, push recreates it, a diff reads it — so each preflight lists
+    // with `--no-renames` and must refuse when the source is denied.
+
+    #[tokio::test]
+    async fn checkout_of_a_rename_source_is_refused_before_git_runs() {
+        // `master` tracks a deny_write `.env`; branch `renamer` renames it to
+        // `config.env`. Under rename detection the HEAD..renamer listing shows
+        // only `config.env`, yet `git checkout renamer` DELETES `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "renamer"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "config.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "rename away"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(root.join(".env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "renamer"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when the branch deletes a deny_write rename source"
+        );
+        assert!(
+            root.join(".env").exists(),
+            "a blocked checkout must leave the rename source in place"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("'.env'"),
+            "the denial must name the rename source, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_push_of_a_rename_source_is_refused_before_git_runs() {
+        // With a staged `git mv .env moved.env`, `git stash push` resets index
+        // and worktree to HEAD, RECREATING `.env`. The tracked listing sees
+        // only `moved.env` under rename detection; it must also list `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!root.join(".env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when it would recreate a deny_write rename source"
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked stash push must not restore the rename source"
+        );
+        let stashes = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stashes.stdout).trim().is_empty(),
+            "a blocked stash push must not have created a stash entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_of_a_rename_source_is_refused_before_git_runs() {
+        // The entry stashes a staged rename of `.env` to `moved.env`; popping
+        // it deletes `.env`. `stash show --name-only` lists only `moved.env`
+        // under rename detection, so the restore half must list the source.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(root.join(".env").exists());
+        assert!(!root.join("moved.env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry deletes a deny_write rename source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "initial",
+            "a blocked pop must leave the rename source untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_a_rename_source_under_deny_read() {
+        // A staged rename away from a deny_read file: the cached-diff listing
+        // collapses the rename to `moved.env` under rename detection, but the
+        // diff reads the source's HEAD content to compute it, so the source
+        // must clear the read policy too.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".", "cached": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a cached diff must be refused when the rename source is deny_read"
         );
     }
 
