@@ -14,6 +14,10 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// The capabilities the owning entry point binds. A job run from a bound
+    /// tool executes on them, so a supplied-capability turn's `cron_run` child
+    /// does not fall back to config.
+    capabilities: crate::composition::CapabilitySlot,
     execution_capability: Option<AgentExecutionCapability>,
 }
 
@@ -92,8 +96,15 @@ impl CronRunTool {
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability,
         }
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     #[cfg(test)]
@@ -248,16 +259,33 @@ impl Tool for CronRunTool {
             self.agent_alias.clone(),
             lock_token,
         );
-        let result = cron::scheduler::run_manual_job_with_runtime_and_selection(
-            config,
-            &job,
-            cron::scheduler::CronDeliveryContext::ToolManual,
-            &None,
-            self.runtime.as_ref(),
-            approved,
-            selection,
-        )
-        .await;
+        let result = match self.capabilities.get() {
+            Some(bound) => {
+                cron::scheduler::run_manual_job_with_capabilities(
+                    config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                    &bound.capabilities,
+                    selection,
+                )
+                .await
+            }
+            None => {
+                cron::scheduler::run_manual_job_with_runtime_and_selection(
+                    config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                    selection,
+                )
+                .await
+            }
+        };
 
         claim.release();
 
@@ -418,6 +446,106 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+        assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+        cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    /// A `cron_run` bound to supplied capabilities keeps its selection witness:
+    /// with the generation open the child job asks the bound provider source
+    /// while the owning agent's turn lease is held, and once the generation
+    /// closes the job is refused before it executes, records a run, or asks
+    /// the source.
+    #[tokio::test]
+    async fn bound_cron_run_keeps_lifecycle_admission_on_supplied_capabilities() {
+        use crate::composition::test_support::{LeaseObservingProviders, STUB_REPLY};
+
+        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
+            .lock()
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config.scheduler.enabled = true;
+        if let Some(entry) = config.providers.models.openrouter.get_mut(TEST_AGENT) {
+            entry.base.model = Some("test-model".into());
+        }
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            Some("child".into()),
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        let cfg = Arc::new(config);
+        let authority = crate::LiveConfigAuthority::new((*cfg).clone());
+        let providers = Arc::new(LeaseObservingProviders::new(authority.agent_lifecycle()));
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::from(crate::platform::create_runtime(&cfg.runtime).unwrap());
+        let tool = CronRunTool::new_with_runtime_and_capability(
+            cfg.clone(),
+            test_security(&cfg),
+            TEST_AGENT,
+            runtime,
+            Some(authority.execution_capability()),
+        );
+        assert!(
+            tool.capabilities_slot()
+                .set(crate::composition::BoundCapabilities {
+                    capabilities: providers.capabilities(),
+                    principal: None,
+                })
+                .is_ok()
+        );
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains(STUB_REPLY), "{result:?}");
+        let served = providers.observed();
+        assert!(
+            !served.is_empty()
+                && served
+                    .iter()
+                    .all(|(alias, active)| alias == TEST_AGENT && *active >= 1),
+            "the bound child must ask the supplied source under the owner's lease: {served:?}"
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count(TEST_AGENT), 0);
+        assert_eq!(cron::list_runs(&cfg, &job.id, 10).unwrap().len(), 1);
+
+        authority.close_agent_lifecycle();
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(
+            !result.success,
+            "a closed generation must refuse: {result:?}"
+        );
+        assert!(
+            result.output.contains("lifecycle generation is closing"),
+            "{result:?}"
+        );
+        assert_eq!(
+            providers.observed().len(),
+            served.len(),
+            "a refused bound run must not ask the supplied source"
+        );
+        assert_eq!(
+            cron::list_runs(&cfg, &job.id, 10).unwrap().len(),
+            1,
+            "a refused bound run must not record history"
+        );
         assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
         cron::release_job(&cfg, &job.id).unwrap();
     }

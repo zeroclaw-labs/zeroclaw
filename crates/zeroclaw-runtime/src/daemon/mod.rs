@@ -678,8 +678,62 @@ async fn classify_gateway_bind_outcome(
     }
 }
 
+/// Run the daemon. The heartbeat and cron scheduler build their agents'
+/// capabilities from config for each turn, as they always have.
 pub async fn run(
+    config: Config,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    Box::pin(run_inner(
+        config,
+        None,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await
+}
+
+/// Run the daemon for one config generation with `capabilities`: the
+/// heartbeat worker and the cron scheduler take their agents' providers,
+/// memory and observer from this set instead of building them per turn.
+///
+/// The generation's observer is flushed when the daemon returns, so a reload
+/// or shutdown does not strand buffered telemetry from its non-interactive
+/// turns.
+pub async fn run_with_capabilities(
+    config: Config,
+    capabilities: crate::composition::RuntimeCapabilities,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    let observer = std::sync::Arc::clone(&capabilities.observer);
+    let exit = Box::pin(run_inner(
+        config,
+        Some(capabilities),
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await;
+    observer.flush();
+    exit
+}
+
+async fn run_inner(
     mut config: Config,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     host: String,
     port: u16,
     registry: DaemonRegistry,
@@ -691,8 +745,9 @@ pub async fn run(
         config.gateway.port = port;
     }
     let live_config_authority = crate::LiveConfigAuthority::new_owned(config.clone())?;
-    let (exit, ownership) = run_with_authority(
+    let (exit, ownership) = run_with_authority_inner(
         live_config_authority,
+        capabilities,
         host,
         port,
         registry,
@@ -715,6 +770,57 @@ pub async fn run(
 /// shutdown or error the guard is released here.
 pub async fn run_with_authority(
     live_config_authority: crate::LiveConfigAuthority,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<(
+    DaemonExit,
+    Option<crate::live_config_authority::ConfigOwnershipGuard>,
+)> {
+    Box::pin(run_with_authority_inner(
+        live_config_authority,
+        None,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await
+}
+
+pub async fn run_with_authority_and_capabilities(
+    live_config_authority: crate::LiveConfigAuthority,
+    capabilities: crate::composition::RuntimeCapabilities,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<(
+    DaemonExit,
+    Option<crate::live_config_authority::ConfigOwnershipGuard>,
+)> {
+    let observer = std::sync::Arc::clone(&capabilities.observer);
+    let exit = Box::pin(run_with_authority_inner(
+        live_config_authority,
+        Some(capabilities),
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await;
+    observer.flush();
+    exit
+}
+
+async fn run_with_authority_inner(
+    live_config_authority: crate::LiveConfigAuthority,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
@@ -1283,6 +1389,7 @@ pub async fn run_with_authority(
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_capabilities = capabilities.clone();
         let heartbeat_execution_capability = daemon_execution_capability.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
@@ -1291,8 +1398,16 @@ pub async fn run_with_authority(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
+                let capabilities = heartbeat_capabilities.clone();
                 let execution_capability = heartbeat_execution_capability.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg, execution_capability)).await }
+                async move {
+                    Box::pin(run_heartbeat_worker(
+                        cfg,
+                        capabilities,
+                        execution_capability,
+                    ))
+                    .await
+                }
             },
         ));
     }
@@ -1301,6 +1416,7 @@ pub async fn run_with_authority(
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
         let scheduler_cancel = channels_cancel.clone();
+        let scheduler_capabilities = capabilities.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
@@ -1310,14 +1426,18 @@ pub async fn run_with_authority(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
+                let capabilities = scheduler_capabilities.clone();
                 let execution_capability = daemon_execution_capability.clone();
                 async move {
-                    Box::pin(crate::cron::scheduler::run_with_capability(
-                        cfg,
-                        Some(tx),
-                        cancel,
-                        Some(execution_capability),
-                    ))
+                    Box::pin(
+                        crate::cron::scheduler::run_with_capabilities_and_capability(
+                            cfg,
+                            capabilities,
+                            Some(tx),
+                            cancel,
+                            Some(execution_capability),
+                        ),
+                    )
                     .await
                 }
             },
@@ -2323,8 +2443,128 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
+/// The store a heartbeat tick consolidates its output into.
+///
+/// With a generation's capabilities this is the heartbeat agent's memory from
+/// that generation's `MemorySource`; a refusal means the tick consolidates
+/// nothing, never that it falls back to a config-built store. Without them
+/// it is the config-built install memory, as it always was.
+async fn heartbeat_consolidation_memory(
+    config: &Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
+    agent_alias: &str,
+) -> Option<std::sync::Arc<dyn zeroclaw_memory::Memory>> {
+    match capabilities {
+        Some(capabilities) => match capabilities.agent_memory(config, agent_alias).await {
+            Ok(memory) => Some(memory),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": agent_alias,
+                            "error": format!("{error:#}"),
+                        })),
+                    "heartbeat: the memory source refused consolidation memory; not consolidating"
+                );
+                None
+            }
+        },
+        None => zeroclaw_memory::create_memory_from_config(
+            config,
+            config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|e| e.api_key.as_deref()),
+        )
+        .ok()
+        .map(std::sync::Arc::from),
+    }
+}
+
+/// Store a heartbeat task's output as a Daily memory for cross-session
+/// awareness, when `[memory] auto_save` is on and the output is substantial.
+async fn consolidate_heartbeat_output(
+    config: &Config,
+    memory: Option<&dyn zeroclaw_memory::Memory>,
+    task_text: &str,
+    output: &str,
+) {
+    let Some(memory) = memory else {
+        return;
+    };
+    if !config.memory.auto_save || output.chars().count() < 50 {
+        return;
+    }
+    let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
+    let summary = if output.len() > 500 {
+        // Find a valid UTF-8 char boundary at or before 500.
+        let mut end = 500;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        &output[..end]
+    } else {
+        output
+    };
+    let _ = memory
+        .store(
+            &key,
+            &format!("Heartbeat task '{task_text}': {summary}"),
+            zeroclaw_memory::MemoryCategory::Daily,
+            None,
+        )
+        .await;
+}
+
+/// One heartbeat turn: the generation's capabilities when the daemon has them,
+/// otherwise a config-backed set built for this turn, which is exactly what
+/// `agent::run` builds. `internal_principal` stamps the turn as the daemon's,
+/// naming the heartbeat phase.
+///
+/// Returns the turn as a boxed `dyn Future + Send`: the heartbeat worker is
+/// spawned, and proving the turn future `Send` from inside the worker's state
+/// machine exceeds the auto-trait recursion limit. Erasing the type here proves
+/// it once, at this shallow boundary.
+fn heartbeat_turn<'a>(
+    config: Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
+    agent_alias: &'a str,
+    prompt: String,
+    temperature: Option<f64>,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+    mcp_registry: Option<std::sync::Arc<crate::tools::McpRegistry>>,
+    internal_principal: zeroclaw_api::ingress::InternalPrincipal,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    let capabilities = capabilities
+        .cloned()
+        .unwrap_or_else(|| crate::composition::RuntimeCapabilities::config_backed(&config));
+    Box::pin(crate::agent::run_with_capabilities(
+        config,
+        capabilities,
+        None,
+        agent_alias,
+        Some(prompt),
+        None,
+        None,
+        temperature,
+        vec![],
+        false,
+        None,
+        None,
+        zeroclaw_api::ingress::TurnOrigin::Daemon,
+        crate::agent::loop_::AgentRunOverrides {
+            mcp_registry,
+            execution_capability,
+            internal_principal: Some(internal_principal),
+            ..crate::agent::loop_::AgentRunOverrides::default()
+        },
+    ))
+}
+
 async fn run_heartbeat_worker(
     config: Config,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     execution_capability: crate::live_config_authority::AgentExecutionCapability,
 ) -> Result<()> {
     use crate::heartbeat::engine::{
@@ -2348,8 +2588,12 @@ async fn run_heartbeat_worker(
     let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
         connect_heartbeat_mcp_registry(&config, &agent_alias, None).await?;
 
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+    // With a generation's capabilities the engine reports through that
+    // generation's observer; without them it builds its own, as before.
+    let observer: std::sync::Arc<dyn crate::observability::Observer> = match &capabilities {
+        Some(capabilities) => Arc::clone(&capabilities.observer),
+        None => std::sync::Arc::from(crate::observability::create_observer(&config.observability)),
+    };
     let engine = HeartbeatEngine::new(config.heartbeat.clone(), heartbeat_workspace_dir, observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
@@ -2474,27 +2718,18 @@ async fn run_heartbeat_worker(
                 "[Heartbeat Task | decision] {}",
                 HeartbeatEngine::build_decision_prompt(&tasks),
             );
-            let phase1_fut = Box::pin(crate::agent::run(
+            let phase1_fut = heartbeat_turn(
                 config.clone(),
+                capabilities.as_ref(),
                 &agent_alias,
-                Some(decision_prompt),
-                None,
-                None,
+                decision_prompt,
                 Some(0.0),
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    execution_capability: Some(execution_capability.clone()),
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:decision".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
+                Some(execution_capability.clone()),
+                shared_mcp_registry.as_ref().map(Arc::clone),
+                zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                    task: "heartbeat:decision".to_string(),
                 },
-            ));
+            );
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),
@@ -2574,14 +2809,8 @@ async fn run_heartbeat_worker(
             None
         };
 
-        let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory_from_config(
-                &config,
-                config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .ok();
+        let heartbeat_memory =
+            heartbeat_consolidation_memory(&config, capabilities.as_ref(), &agent_alias).await;
 
         let mut tick_had_error = false;
         for task in &tasks_to_run {
@@ -2599,30 +2828,21 @@ async fn run_heartbeat_worker(
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
                 .and_then(|e| e.temperature);
-            let phase2_fut = Box::pin(crate::agent::run(
+            let phase2_fut = heartbeat_turn(
                 config.clone(),
+                capabilities.as_ref(),
                 &agent_alias,
-                Some(prompt),
-                None,
-                None,
+                prompt,
                 temp,
-                vec![],
-                false,
-                None,
-                None,
-                zeroclaw_api::ingress::TurnOrigin::Daemon,
-                crate::agent::loop_::AgentRunOverrides {
-                    mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
-                    execution_capability: Some(execution_capability.clone()),
-                    // Heartbeat tasks have no runtime-owned id (their text is
-                    // model-maintained content, which never enters the
-                    // principal), so the stamp names the pipeline phase.
-                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
-                        task: "heartbeat:execute".to_string(),
-                    }),
-                    ..crate::agent::loop_::AgentRunOverrides::default()
+                Some(execution_capability.clone()),
+                shared_mcp_registry.as_ref().map(Arc::clone),
+                // Heartbeat tasks have no runtime-owned id (their text is
+                // model-maintained content, which never enters the
+                // principal), so the stamp names the pipeline phase.
+                zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                    task: "heartbeat:execute".to_string(),
                 },
-            ));
+            );
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
                     Duration::from_secs(config.heartbeat.task_timeout_secs),
@@ -2672,30 +2892,13 @@ async fn run_heartbeat_worker(
                         config.heartbeat.max_run_history,
                     );
                     // Consolidate heartbeat output to memory for cross-session awareness.
-                    if config.memory.auto_save
-                        && output.chars().count() >= 50
-                        && let Some(ref mem) = heartbeat_memory
-                    {
-                        let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
-                        let summary = if output.len() > 500 {
-                            // Find a valid UTF-8 char boundary at or before 500.
-                            let mut end = 500;
-                            while end > 0 && !output.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &output[..end]
-                        } else {
-                            &output
-                        };
-                        let _ = mem
-                            .store(
-                                &key,
-                                &format!("Heartbeat task '{}': {}", task.text, summary),
-                                zeroclaw_memory::MemoryCategory::Daily,
-                                None,
-                            )
-                            .await;
-                    }
+                    consolidate_heartbeat_output(
+                        &config,
+                        heartbeat_memory.as_deref(),
+                        &task.text,
+                        &output,
+                    )
+                    .await;
 
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
@@ -3104,6 +3307,200 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `MemorySource` that serves one fixed store, or refuses.
+    struct FixedMemorySource(Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>);
+
+    #[async_trait::async_trait]
+    impl crate::composition::MemorySource for FixedMemorySource {
+        async fn memory(
+            &self,
+            _request: &crate::composition::MemoryRequest<'_>,
+        ) -> anyhow::Result<std::sync::Arc<dyn zeroclaw_memory::Memory>> {
+            self.0
+                .clone()
+                .ok_or_else(|| anyhow::Error::msg("this memory source refuses"))
+        }
+    }
+
+    fn sqlite_memory_config(dir: &std::path::Path) -> Config {
+        let mut config = Config {
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "sqlite".to_string();
+        config.memory.auto_save = true;
+        config
+    }
+
+    fn capabilities_with_memory(
+        memory: Option<std::sync::Arc<dyn zeroclaw_memory::Memory>>,
+    ) -> crate::composition::RuntimeCapabilities {
+        use crate::composition::test_support::{NoChannels, NoTools, RecordingProviders};
+        crate::composition::RuntimeCapabilities {
+            providers: std::sync::Arc::new(RecordingProviders::default()),
+            memory: std::sync::Arc::new(FixedMemorySource(memory)),
+            tools: std::sync::Arc::new(NoTools),
+            channels: std::sync::Arc::new(NoChannels),
+            observer: std::sync::Arc::new(crate::observability::NoopObserver),
+        }
+    }
+
+    async fn daily_records(memory: &dyn zeroclaw_memory::Memory) -> Vec<String> {
+        memory
+            .list(Some(&zeroclaw_memory::MemoryCategory::Daily), None)
+            .await
+            .expect("list daily records")
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect()
+    }
+
+    /// With a generation's capabilities, heartbeat output consolidates into
+    /// the heartbeat agent's store from that generation's `MemorySource`, and
+    /// the config-built store is never written, not even after the source
+    /// refuses. Without capabilities the config-built store still receives it.
+    #[tokio::test]
+    async fn heartbeat_consolidates_into_the_generation_memory_source_not_config() {
+        let supplied_dir = tempfile::TempDir::new().unwrap();
+        let ambient_dir = tempfile::TempDir::new().unwrap();
+        let supplied_store: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::from(
+            zeroclaw_memory::create_memory_from_config(
+                &sqlite_memory_config(supplied_dir.path()),
+                None,
+            )
+            .expect("supplied store"),
+        );
+        let config = sqlite_memory_config(ambient_dir.path());
+        let ambient_store =
+            zeroclaw_memory::create_memory_from_config(&config, None).expect("ambient store");
+        let output = "Disk usage is at 42 percent; nothing needs attention right now.";
+        assert!(output.chars().count() >= 50);
+
+        // Supplied source: the record lands in the supplied store only.
+        let capabilities = capabilities_with_memory(Some(std::sync::Arc::clone(&supplied_store)));
+        let memory = heartbeat_consolidation_memory(&config, Some(&capabilities), "hb").await;
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        let supplied = daily_records(supplied_store.as_ref()).await;
+        assert_eq!(supplied.len(), 1, "{supplied:?}");
+        assert!(
+            supplied[0].contains("Heartbeat task 'check disk'"),
+            "{supplied:?}"
+        );
+        assert!(
+            daily_records(ambient_store.as_ref()).await.is_empty(),
+            "the config-built store must not receive supplied-generation output"
+        );
+
+        // A refusing source: nothing is written anywhere.
+        let refusing = capabilities_with_memory(None);
+        let memory = heartbeat_consolidation_memory(&config, Some(&refusing), "hb").await;
+        assert!(memory.is_none(), "a refusal yields no consolidation store");
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        assert!(daily_records(ambient_store.as_ref()).await.is_empty());
+        assert_eq!(daily_records(supplied_store.as_ref()).await.len(), 1);
+
+        // Unbound: the config-built store consolidates, as before.
+        let memory = heartbeat_consolidation_memory(&config, None, "hb").await;
+        consolidate_heartbeat_output(&config, memory.as_deref(), "check disk", output).await;
+        assert_eq!(daily_records(ambient_store.as_ref()).await.len(), 1);
+    }
+
+    /// A heartbeat turn on the generation's supplied capabilities still runs
+    /// under the daemon's lifecycle admission: while the generation is open the
+    /// supplied provider source is asked with the heartbeat agent's turn lease
+    /// held, and once the generation closes the turn is refused before the
+    /// source is asked at all.
+    #[tokio::test]
+    async fn heartbeat_turn_on_supplied_capabilities_runs_under_lifecycle_admission() {
+        use crate::composition::test_support::{LeaseObservingProviders, STUB_REPLY};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
+            .lock()
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.memory.backend = "none".to_string();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "hb".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "hb".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.hb".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let providers =
+            std::sync::Arc::new(LeaseObservingProviders::new(authority.agent_lifecycle()));
+        let capabilities = providers.capabilities();
+        let principal = || zeroclaw_api::ingress::InternalPrincipal::Daemon {
+            task: "heartbeat:execute".to_string(),
+        };
+
+        let reply = heartbeat_turn(
+            config.clone(),
+            Some(&capabilities),
+            "hb",
+            "check disk usage".to_string(),
+            None,
+            Some(authority.execution_capability()),
+            None,
+            principal(),
+        )
+        .await
+        .expect("an open generation runs the heartbeat turn");
+        assert!(reply.contains(STUB_REPLY), "{reply}");
+        let served = providers.observed();
+        assert!(
+            !served.is_empty()
+                && served
+                    .iter()
+                    .all(|(alias, active)| alias == "hb" && *active >= 1),
+            "the supplied source must be asked under the heartbeat turn's lease: {served:?}"
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("hb"), 0);
+
+        authority.close_agent_lifecycle();
+        let error = heartbeat_turn(
+            config.clone(),
+            Some(&capabilities),
+            "hb",
+            "check disk usage".to_string(),
+            None,
+            Some(authority.execution_capability()),
+            None,
+            principal(),
+        )
+        .await
+        .expect_err("a closed generation refuses the heartbeat turn");
+        assert!(
+            format!("{error:#}").contains("lifecycle generation is closing"),
+            "{error:#}"
+        );
+        assert_eq!(
+            providers.observed().len(),
+            served.len(),
+            "a refused heartbeat turn must not ask the supplied source"
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("hb"), 0);
+    }
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
 

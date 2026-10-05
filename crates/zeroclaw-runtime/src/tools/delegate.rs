@@ -335,6 +335,13 @@ pub struct DelegateTool {
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
     live_config: Option<Arc<RwLock<Config>>>,
+    /// Capabilities the delegate resolves a target's provider, memory and
+    /// supplied tools through. Bound once, by `with_capabilities` or by the
+    /// entry point that owns the registry this tool was built into; while
+    /// empty the tool uses the config-backed set, which is the construction
+    /// it performed before it took capabilities. Shared with the copies this
+    /// tool rebuilds for background and parallel delegation.
+    capabilities: crate::composition::CapabilitySlot,
     /// Authority capability used to admit every independent target execution.
     execution_capability: Option<AgentExecutionCapability>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
@@ -489,6 +496,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
             caller_alias: String::new(),
             originator_chain: Vec::new(),
@@ -545,6 +553,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             live_config: None,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability: None,
             caller_alias: String::new(),
             originator_chain: Vec::new(),
@@ -675,6 +684,45 @@ impl DelegateTool {
     pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
         self.live_config = live_config;
         self
+    }
+
+    /// Resolve delegate targets' providers, memory and supplied tools through
+    /// `capabilities` instead of the config-backed set, and ask the provider
+    /// source for them on behalf of `principal`, the requesting principal.
+    ///
+    /// The first binding wins, so a tool built with capabilities is not
+    /// rebound by a later registry binding.
+    pub fn with_capabilities(
+        self,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        let _ = self
+            .capabilities
+            .set(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            });
+        self
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
+    }
+
+    /// The capabilities and requesting principal delegated targets resolve
+    /// through: the owner's binding, or the config-backed set with no
+    /// principal when nothing bound this tool.
+    fn target_binding(&self) -> crate::composition::BoundCapabilities {
+        self.capabilities
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::composition::BoundCapabilities {
+                capabilities: crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+                principal: None,
+            })
     }
 
     pub fn with_execution_capability(
@@ -1181,17 +1229,40 @@ impl DelegateTool {
         })
     }
 
-    fn build_target_provider(
+    pub(crate) fn build_target_provider(
         &self,
         config: Option<&Config>,
+        agent_name: &str,
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = config.or(self.root_config.as_deref()) {
+            // The target is resolved for the principal that asked for the
+            // delegation, not anonymously: a source that scopes credentials
+            // or quotas by principal must see the same caller it saw for the
+            // parent.
+            let binding = self.target_binding();
             let (provider, provider_name, model_name, _resolver) =
-                crate::agent::agent::build_session_model_provider(config, model_provider, None)?;
+                crate::agent::agent::build_session_model_provider_with_capabilities(
+                    &binding.capabilities,
+                    config,
+                    agent_name,
+                    model_provider,
+                    None,
+                    binding.principal.as_ref(),
+                )?;
             return Ok((provider, provider_name, model_name));
+        }
+        // A delegate bound to supplied capabilities resolves targets only
+        // through them, and that needs the root config. Refuse rather than
+        // build the target from the concrete factory, which would ignore the
+        // binding's source and principal.
+        if self.capabilities.get().is_some() {
+            anyhow::bail!(
+                "delegate target {agent_name:?} cannot be resolved: this delegate is bound to \
+                 supplied capabilities but has no root config to resolve targets through them"
+            );
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
@@ -1211,10 +1282,9 @@ impl DelegateTool {
             return Ok(self.memory.clone());
         };
 
-        let api_key = config
-            .resolved_model_provider_for_agent(agent_name)
-            .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
-        zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
+        self.target_binding()
+            .capabilities
+            .agent_memory(config, agent_name)
             .await
             .map(Some)
     }
@@ -1290,13 +1360,14 @@ impl DelegateTool {
             .resolved_model_provider_for_agent(agent_name)
             .and_then(|(_, _, provider)| provider.api_key.as_deref());
 
-        let all_tools_result = crate::tools::all_tools_with_runtime_and_execution_capability(
-            Arc::new(config.clone()),
+        let tool_config = Arc::new(config.clone());
+        let mut all_tools_result = crate::tools::all_tools_with_runtime_and_execution_capability(
+            Arc::clone(&tool_config),
             &target_policy,
             &risk_profile,
             agent_name,
             runtime.clone(),
-            memory,
+            Arc::clone(&memory),
             composio_key,
             composio_entity_id,
             &config.browser,
@@ -1321,6 +1392,18 @@ impl DelegateTool {
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
             self.execution_capability.clone(),
+        )?;
+        let binding = self.target_binding();
+        binding.capabilities.bind_registry(
+            &mut all_tools_result,
+            &crate::composition::ToolRequest {
+                config: &tool_config,
+                agent_alias: agent_name,
+                security: &target_policy,
+                runtime: &runtime,
+                memory: &memory,
+            },
+            binding.principal.as_ref(),
         )?;
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -2805,6 +2888,7 @@ impl DelegateTool {
         // Create model_provider for this agent
         let (model_provider, provider_type, model) = match self.build_target_provider(
             authoritative_config,
+            agent_name,
             &agent_config.model_provider,
             legacy_provider_type,
             credential,
@@ -3227,6 +3311,7 @@ impl DelegateTool {
         // Carried, not dropped: the background task rebuilds a DelegateTool that
         // will construct its own nested registries.
         let live_config = self.live_config.clone();
+        let capabilities = self.capabilities.clone();
         let execution_capability = self.execution_capability.clone();
         let target_execution_admission = execution_admission;
         let caller_alias = self.caller_alias.clone();
@@ -3310,6 +3395,7 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     live_config,
+                    capabilities,
                     execution_capability,
                     caller_alias,
                     originator_chain,
@@ -3603,6 +3689,7 @@ impl DelegateTool {
             // Carried, not dropped: each fan-out task rebuilds a DelegateTool
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
+            let capabilities = self.capabilities.clone();
             let execution_capability = self.execution_capability.clone();
             let target_execution_admission = execution_admissions[index].clone();
             let caller_alias = self.caller_alias.clone();
@@ -3661,6 +3748,7 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         live_config,
+                        capabilities,
                         execution_capability,
                         caller_alias,
                         originator_chain,
@@ -4745,6 +4833,7 @@ impl DelegateTool {
                         skill_bundles: Arc::clone(&self.skill_bundles),
                         root_config: self.root_config.clone(),
                         live_config: self.live_config.clone(),
+                        capabilities: self.capabilities.clone(),
                         execution_capability: self.execution_capability.clone(),
                         caller_alias: agent_name.to_string(),
                         originator_chain: self.lineage(),
@@ -4918,7 +5007,14 @@ impl DelegateTool {
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 served_route_sink: None,
+                // No SOP reassembly: an agentic helper never re-assembles
+                // cross-agent SOP steps.
                 sop_reassembly: None,
+                // The helper's loop runs on the owner's binding, so a provider
+                // change it makes itself (the vision route for an image in the
+                // prompt or a tool result) still asks the owner's source, for
+                // the owner's principal. An unbound delegate keeps config.
+                capability_binding: self.capabilities.get(),
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -5135,6 +5231,53 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delegate bound to supplied capabilities never resolves a target
+    /// through the concrete provider factory. Without the root config it
+    /// cannot resolve targets through the binding, so it refuses; before this
+    /// guard it built the target from the factory, ignoring the binding's
+    /// source and principal.
+    #[test]
+    fn a_bound_delegate_without_root_config_refuses_instead_of_using_the_factory() {
+        use crate::composition::test_support::{VisionRouteProviders, capabilities_with_providers};
+
+        let providers = Arc::new(VisionRouteProviders::refusing());
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-d");
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_capabilities(
+                capabilities_with_providers(Arc::clone(&providers) as _),
+                Some(principal),
+            );
+
+        let error = match tool.build_target_provider(
+            None,
+            "helper",
+            "openai.fast",
+            "openai",
+            Some("test-key"),
+        ) {
+            Ok(_) => panic!("a bound, configless delegate must not build a target"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no root config"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            providers.seen.lock().is_empty(),
+            "no provider was built for the target"
+        );
+
+        // An unbound configless delegate keeps the legacy factory.
+        let unbound = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()));
+        assert!(
+            unbound
+                .build_target_provider(None, "helper", "openai.fast", "openai", Some("test-key"))
+                .is_ok(),
+            "an unbound delegate still builds its target from the factory"
+        );
+    }
     use crate::control_plane::{
         ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     };
@@ -7994,6 +8137,101 @@ mod tests {
             .await;
             assert_eq!(caller.remaining(), caller_limit);
             assert!(!fixture.tool.cancellation_token.is_cancelled());
+        }
+    }
+
+    /// An agentic delegate whose owner was built from supplied capabilities
+    /// resolves an image turn's vision route through the owner's source, for
+    /// the owner's principal, in both delegate modes. A refusal fails the
+    /// delegation instead of building the configured (unreachable) route from
+    /// config; a serving source answers the image turn.
+    #[tokio::test]
+    async fn an_agentic_delegate_asks_the_owners_source_for_the_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, StubProvider, VISION_REFUSAL, VISION_REPLY, VisionRouteProviders,
+            capabilities_with_providers,
+        };
+
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-dv");
+        for mode in [
+            DelegateExecutionMode::Bounded,
+            DelegateExecutionMode::Independent,
+        ] {
+            for refuse in [true, false] {
+                let mut fixture = delegate_memory_fixture(None).await;
+                let config = Arc::make_mut(fixture.tool.root_config.as_mut().unwrap());
+                config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+                    agent: "target".into(),
+                    mode,
+                }];
+                config.providers.models.custom.insert(
+                    "vision".to_string(),
+                    CustomModelProviderConfig {
+                        base: ModelProviderConfig {
+                            // Unreachable: a config-built route could only
+                            // fail to connect.
+                            uri: Some("http://127.0.0.1:9/v1".to_string()),
+                            model: Some("vision-model".to_string()),
+                            api_key: Some("delegate-test-key".to_string()),
+                            ..ModelProviderConfig::default()
+                        },
+                    },
+                );
+                config.multimodal.vision_model_provider = Some("custom.vision".to_string());
+                let multimodal = config.multimodal.clone();
+                let providers = Arc::new(if refuse {
+                    VisionRouteProviders::refusing()
+                } else {
+                    VisionRouteProviders::default()
+                });
+                let tool = fixture
+                    .tool
+                    .with_runtime(Arc::new(DelegateTestRuntime))
+                    .with_multimodal_config(multimodal)
+                    .with_capabilities(
+                        capabilities_with_providers(Arc::clone(&providers) as _),
+                        Some(principal.clone()),
+                    );
+
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &fixture.target_config,
+                        "custom",
+                        "delegate-test-model",
+                        &StubProvider,
+                        IMAGE_TURN,
+                        None,
+                    )
+                    .await;
+                let rendered = format!("{result:?}");
+                if refuse {
+                    assert!(
+                        rendered.contains(VISION_REFUSAL),
+                        "{mode:?}: the source's refusal fails the delegation: {rendered}"
+                    );
+                    assert!(
+                        !matches!(&result, Ok(outcome) if outcome.success),
+                        "{mode:?}: a refused vision route must not succeed: {rendered}"
+                    );
+                } else {
+                    let outcome = result.expect("the delegation runs");
+                    assert!(
+                        outcome.success && outcome.output.contains(VISION_REPLY),
+                        "{mode:?}: the source's vision route serves the image turn: {outcome:?}"
+                    );
+                }
+                let vision = providers.vision.lock();
+                assert!(
+                    !vision.is_empty(),
+                    "{mode:?}: the vision route is asked of the owner's source"
+                );
+                for request in vision.iter() {
+                    assert_eq!(request.provider_ref.as_deref(), Some("custom.vision"));
+                    assert_eq!(request.principal.as_ref(), Some(&principal), "{mode:?}");
+                }
+            }
         }
     }
 
