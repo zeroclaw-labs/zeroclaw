@@ -578,6 +578,18 @@ endpoint = "intl"                            # variants: cn, intl
 
 For MiniMax's Anthropic-compatible API, use `[providers.models.anthropic.minimax]` with `uri = "https://api.minimax.io/anthropic"` (Global) or `uri = "https://api.minimaxi.com/anthropic"` (China) instead.
 
+An alias configured with `MiniMax-M3` advertises image support. User image
+markers use the existing multimodal normalization and limits. System messages
+remain separate so literal media examples in the system prompt stay text.
+
+User messages can include `[VIDEO:https://example.com/clip.mp4]` or
+`[VIDEO:mm_file://file_id]`; these become video content parts that MiniMax can
+retrieve. Only HTTPS URLs without embedded credentials and MiniMax file IDs are
+accepted. Local video paths and embedded video data remain text; upload those
+videos separately and supply their MiniMax file reference. Video markers in
+system, assistant, and tool messages remain text. `MiniMax-M2.7` retains its
+text-only behavior.
+
 ### Z.AI: slot `zai`
 
 For Z.AI's Anthropic-compatible API, use `[providers.models.anthropic.zai]` with `uri = "https://api.z.ai/api/anthropic"` instead.
