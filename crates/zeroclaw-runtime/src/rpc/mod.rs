@@ -9,6 +9,8 @@ pub mod fs;
 pub mod git;
 pub mod local;
 pub mod locales;
+#[cfg(feature = "schema-export")]
+pub mod schema;
 pub mod session;
 pub mod subscription;
 pub mod transport;

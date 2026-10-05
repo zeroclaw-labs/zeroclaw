@@ -49,6 +49,7 @@ const MAX_INFLIGHT: usize = 16;
 /// through a relay. Delivered in the enrollment response so the client is
 /// zero-config on its next run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct RelayProfile {
     /// Relay address (`host:port`) to dial.
     pub relay_url: String,

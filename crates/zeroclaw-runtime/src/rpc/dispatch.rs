@@ -33,8 +33,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +52,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +88,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +103,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -499,7 +226,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -3743,10 +3470,9 @@ impl RpcDispatcher {
                 "certificate renewal requires the mutually authenticated WSS plane",
             )
         })?;
-        let csr_pem = params
-            .get("csr_pem")
-            .and_then(Value::as_str)
-            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+        let req: CertRenewParams =
+            parse_params(params).map_err(|_| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+        let csr_pem = req.csr_pem.as_str();
 
         let (data_dir, relay_cfg, static_client_pins_configured, crl_path) = {
             let cfg = self.ctx.config.read();
@@ -3884,13 +3610,13 @@ impl RpcDispatcher {
         // reaches the client without a second bootstrap (rotation push consumer).
         let relay_profile = crate::enroll::relay_profile(&data_dir, &relay_cfg);
 
-        let response = serde_json::json!({
-            "cert_pem": issued.cert_pem,
-            "ca_chain_pem": ca_cert_pem,
-            "device_id": device_id,
-            "not_after": issued.not_after,
-            "relay_profile": relay_profile,
-        });
+        let response = to_result(CertRenewResult {
+            ca_chain_pem: ca_cert_pem.clone(),
+            cert_pem: issued.cert_pem.clone(),
+            device_id: device_id.clone(),
+            not_after: issued.not_after,
+            relay_profile,
+        })?;
 
         // Delivery boundary for renewal - and an honest one about its limits.
         // This layer returns a value to the JSON-RPC framing; it never sees the
@@ -8394,12 +8120,17 @@ impl RpcDispatcher {
             let val = config
                 .get_prop(&prop)
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
-            to_result(ConfigGetPropResult { prop, value: val })
+            to_result(ConfigGetResult::Prop(ConfigGetPropResult {
+                prop,
+                value: val,
+            }))
         } else {
             // Return full config, masked.
             let mut masked = config;
             masked.mask_secrets();
-            Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
+            to_result(ConfigGetResult::Document(MaskedConfigDocument(
+                serde_json::to_value(&masked).unwrap_or(Value::Null),
+            )))
         }
     }
 
@@ -9934,9 +9665,9 @@ impl RpcDispatcher {
                         format!("org_cost.json is not valid JSON: {e}"),
                     )
                 })?;
-                Ok(value)
+                to_result(CostOrgResult(Some(value)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => to_result(CostOrgResult(None)),
             Err(e) => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("failed to read org_cost.json: {e}"),
@@ -11115,7 +10846,7 @@ impl RpcDispatcher {
 
     fn handle_sops_list(&self) -> RpcResult {
         let (dir, mode) = self.sops_dir_and_mode();
-        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        let sops: SopsListResult = crate::sop::load_sops_from_directory(&dir, mode);
         to_result(sops)
     }
 
@@ -11295,7 +11026,7 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
-        to_result(serde_json::json!({ "runs": runs }))
+        to_result(SopRunsResult { runs })
     }
 
     /// Full detail for one run: step results with status, timings, failure
@@ -11334,7 +11065,7 @@ impl RpcDispatcher {
             rpc_err(code, msg)
         })?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
-        to_result(serde_json::json!({ "run": detail }))
+        to_result(SopRunDetailResult { run: detail })
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
@@ -11513,6 +11244,8 @@ impl RpcDispatcher {
     }
 
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
+        // A present `sop` key selects the draft form, so a malformed draft
+        // reports its own error instead of falling back to `name`.
         let sop = if params.get("sop").is_some() {
             let req: SopSaveRequest = parse_params(params)?;
             Self::parse_sop(&req.sop)?
@@ -11523,11 +11256,11 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
         };
         let v = crate::sop::validate_sop_strict(&sop);
-        to_result(serde_json::json!({
-            "blocking": v.blocking,
-            "warnings": v.warnings,
-            "ok": v.is_ok(),
-        }))
+        to_result(SopValidateResult {
+            ok: v.is_ok(),
+            blocking: v.blocking,
+            warnings: v.warnings,
+        })
     }
 
     fn handle_sops_save(&self, params: &Value) -> RpcResult {
@@ -11563,7 +11296,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "saved": sop.name }))
+        to_result(SopSaveResult { saved: sop.name })
     }
 
     fn handle_sops_create(&self, params: &Value) -> RpcResult {
@@ -11578,7 +11311,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "created": sop.name }))
+        to_result(SopCreateResult { created: sop.name })
     }
 
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
@@ -11592,7 +11325,7 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "deleted": req.name }))
+        to_result(SopDeleteResult { deleted: req.name })
     }
 
     /// Move a SOP to a new name. Separate from `sops/save` on purpose: save
@@ -11625,7 +11358,10 @@ impl RpcDispatcher {
             };
             rpc_err(code, e.to_string())
         })?;
-        to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
+        to_result(SopRenameResult {
+            from: req.from,
+            renamed: req.to,
+        })
     }
 
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
@@ -11640,17 +11376,16 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
         crate::sop::apply_wire(&mut sop, &edit)
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-        to_result(serde_json::json!({
-            "sop": sop,
-            "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
-        }))
+        to_result(SopWireDraftResult {
+            graph: crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
+            sop,
+        })
     }
 
     fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
-        let sop_val = params
-            .get("sop")
-            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
-        let sop = Self::parse_sop(sop_val)?;
+        let req: SopDraftParams =
+            parse_params(params).map_err(|_| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(&req.sop)?;
         to_result(crate::sop::SopGraph::from_sop_with_specs(
             &sop,
             &self.sop_tool_specs(),
@@ -11677,15 +11412,7 @@ impl RpcDispatcher {
     /// agent-relative domains; `args` carries sibling arguments already
     /// chosen so cascading domains can narrow.
     fn handle_tools_param_options(&self, params: &Value) -> RpcResult {
-        #[derive(serde::Deserialize)]
-        struct ParamOptionsParams {
-            domain: zeroclaw_api::tool::OptionDomain,
-            #[serde(default)]
-            agent: Option<String>,
-            #[serde(default)]
-            args: Value,
-        }
-        let req: ParamOptionsParams = parse_params(params)?;
+        let req: ToolsParamOptionsParams = parse_params(params)?;
         let config = self.ctx.config.read();
         let agent_alias = req
             .agent
@@ -11720,7 +11447,7 @@ impl RpcDispatcher {
                 &[],
             )
         };
-        to_result(serde_json::json!({ "options": entries }))
+        to_result(ToolsParamOptionsResult { options: entries })
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
@@ -17806,6 +17533,264 @@ mod tests {
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    /// The params these handlers now declare as typed contracts must not
+    /// change what a caller gets back: the same errors for missing keys, the
+    /// transport check before params, and a null-params settings read.
+    #[tokio::test]
+    async fn typed_contract_params_keep_the_handlers_answers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let graph = rpc(&mut operator, &mut rx, 1, "sops/graph-draft", json!({})).await;
+        assert_eq!(graph["error"]["code"], json!(INVALID_PARAMS), "{graph}");
+        assert_eq!(graph["error"]["message"], json!("missing 'sop'"), "{graph}");
+
+        let wire = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "sops/wire-draft",
+            json!({"sop": {}}),
+        )
+        .await;
+        assert_eq!(wire["error"]["message"], json!("missing 'edit'"), "{wire}");
+
+        let stored = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "sops/validate",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert!(stored["result"]["ok"].is_boolean(), "{stored}");
+        let unknown = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "sops/validate",
+            json!({"name": "no-such-sop"}),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+        let draft = rpc(
+            &mut operator,
+            &mut rx,
+            5,
+            "sops/validate",
+            json!({"sop": 7}),
+        )
+        .await;
+        assert_eq!(draft["error"]["code"], json!(INVALID_PARAMS), "{draft}");
+        // A present `sop` selects the draft even when a valid `name` is
+        // also sent: the malformed draft is refused, not replaced by `name`.
+        let both = rpc(
+            &mut operator,
+            &mut rx,
+            15,
+            "sops/validate",
+            json!({"sop": 7, "name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(both["error"]["code"], json!(INVALID_PARAMS), "{both}");
+
+        let options = rpc(
+            &mut operator,
+            &mut rx,
+            6,
+            "tools/param-options",
+            json!({"domain": "agent_aliases"}),
+        )
+        .await;
+        assert!(options["result"]["options"].is_array(), "{options}");
+
+        // A request that omits `params` reaches the handler as `null`; the
+        // settings read must still answer it.
+        operator
+            .process_line(
+                &json!({"jsonrpc": "2.0", "id": 7, "method": "cron/settings"}).to_string(),
+            )
+            .await;
+        let settings = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(7)) {
+                break value;
+            }
+        };
+        assert!(settings["result"].is_object(), "{settings}");
+
+        let renew = rpc(&mut operator, &mut rx, 8, "cert/renew", json!({})).await;
+        assert_eq!(
+            renew["error"]["message"],
+            json!("certificate renewal requires the mutually authenticated WSS plane"),
+            "{renew}"
+        );
+    }
+
+    /// The results these handlers now build from declared types must be the
+    /// payloads they returned before.
+    #[tokio::test]
+    async fn typed_contract_results_keep_the_handlers_payloads() {
+        use std::collections::BTreeSet;
+        let keys = |v: &Value| -> BTreeSet<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let listed = rpc(&mut operator, &mut rx, 1, "sops/list", json!({})).await;
+        assert!(
+            listed["result"]
+                .as_array()
+                .is_some_and(|sops| sops.iter().any(|sop| sop["name"] == json!("alpha-sop"))),
+            "{listed}"
+        );
+
+        let draft = gated_sop("gamma-sop", "alpha");
+        let created = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "sops/create",
+            json!({"sop": draft}),
+        )
+        .await;
+        assert_eq!(
+            created["result"],
+            json!({"created": "gamma-sop"}),
+            "{created}"
+        );
+        let saved = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "sops/save",
+            json!({"sop": draft}),
+        )
+        .await;
+        assert_eq!(saved["result"], json!({"saved": "gamma-sop"}), "{saved}");
+        let renamed = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "sops/rename",
+            json!({"from": "gamma-sop", "to": "delta-sop"}),
+        )
+        .await;
+        assert_eq!(
+            renamed["result"],
+            json!({"renamed": "delta-sop", "from": "gamma-sop"}),
+            "{renamed}"
+        );
+        let deleted = rpc(
+            &mut operator,
+            &mut rx,
+            5,
+            "sops/delete",
+            json!({"name": "delta-sop"}),
+        )
+        .await;
+        assert_eq!(
+            deleted["result"],
+            json!({"deleted": "delta-sop"}),
+            "{deleted}"
+        );
+
+        let validated = rpc(
+            &mut operator,
+            &mut rx,
+            6,
+            "sops/validate",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(
+            keys(&validated["result"]),
+            BTreeSet::from(["blocking".into(), "ok".into(), "warnings".into()]),
+            "{validated}"
+        );
+
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let runs = rpc(&mut operator, &mut rx, 7, "sops/runs", json!({})).await;
+        assert_eq!(
+            keys(&runs["result"]),
+            BTreeSet::from(["runs".into()]),
+            "{runs}"
+        );
+        assert_eq!(runs["result"]["runs"][0]["run_id"], json!(run_id), "{runs}");
+        let detail = rpc(
+            &mut operator,
+            &mut rx,
+            8,
+            "sops/run-detail",
+            json!({"run_id": run_id}),
+        )
+        .await;
+        assert_eq!(
+            keys(&detail["result"]),
+            BTreeSet::from(["run".into()]),
+            "{detail}"
+        );
+        assert_eq!(detail["result"]["run"]["run_id"], json!(run_id), "{detail}");
+
+        let options = rpc(
+            &mut operator,
+            &mut rx,
+            9,
+            "tools/param-options",
+            json!({"domain": "agent_aliases"}),
+        )
+        .await;
+        assert_eq!(
+            keys(&options["result"]),
+            BTreeSet::from(["options".into()]),
+            "{options}"
+        );
+
+        let prop = rpc(
+            &mut operator,
+            &mut rx,
+            10,
+            "config/get",
+            json!({"prop": "users.alice.uid"}),
+        )
+        .await;
+        assert_eq!(
+            prop["result"],
+            json!({"prop": "users.alice.uid", "value": "4242"}),
+            "{prop}"
+        );
+        let whole = rpc(&mut operator, &mut rx, 11, "config/get", json!({})).await;
+        assert!(whole["result"]["agents"].is_object(), "{whole}");
+        assert!(whole["result"].get("prop").is_none(), "{whole}");
+
+        let absent = rpc(&mut operator, &mut rx, 12, "cost/org", json!({})).await;
+        assert_eq!(absent["result"], Value::Null, "{absent}");
+        let org_cost = json!({"teams": [{"name": "core", "usd": 12.5}]});
+        let data_dir = ctx.config.read().data_dir.clone();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("org_cost.json"), org_cost.to_string()).unwrap();
+        let present = rpc(&mut operator, &mut rx, 13, "cost/org", json!({})).await;
+        assert_eq!(present["result"], org_cost, "{present}");
+
+        let health = rpc(&mut operator, &mut rx, 14, "health", json!({})).await;
+        let declared = serde_json::to_value(HealthResult {
+            snapshot: crate::health::snapshot(),
+            process: crate::process_stats::sample(),
+        })
+        .unwrap();
+        assert_eq!(keys(&health["result"]), keys(&declared), "{health}");
     }
 
     #[tokio::test]

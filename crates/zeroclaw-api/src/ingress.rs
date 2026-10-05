@@ -62,6 +62,7 @@ pub enum TurnOrigin {
 /// consulted by peer-membership checks — identity and delivery permission
 /// are separate axes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum InternalPrincipal {
     /// A scheduled cron job. `job_id` is the stable store id; `job_name`
