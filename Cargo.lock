@@ -13849,6 +13849,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax 0.12.0",
+ "jsonschema",
  "pulldown-cmark",
  "reqwest 0.12.28",
  "schemars 1.2.2",
@@ -13864,6 +13865,7 @@ dependencies = [
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-providers",
+ "zeroclaw-rpc-proto",
  "zeroclaw-runtime",
  "zerocode",
 ]
@@ -14339,6 +14341,7 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-rpc-client",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14564,6 +14567,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-rpc-client"
+version = "0.8.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-rpc-proto",
+]
+
+[[package]]
+name = "zeroclaw-rpc-proto"
+version = "0.8.5"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-sop-graph",
+]
+
+[[package]]
 name = "zeroclaw-runtime"
 version = "0.8.5"
 dependencies = [
@@ -14650,6 +14676,7 @@ dependencies = [
  "zeroclaw-plugins",
  "zeroclaw-providers",
  "zeroclaw-relay-proto",
+ "zeroclaw-rpc-proto",
  "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tls",

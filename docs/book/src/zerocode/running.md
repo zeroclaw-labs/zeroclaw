@@ -14,9 +14,12 @@ zerocode
 
 </div>
 
-zerocode finds the daemon's local endpoint automatically: `<data_dir>/data/daemon.sock`
-on Unix, `\\.\pipe\zeroclaw-<hash>` on Windows. If the daemon isn't running,
-zerocode spawns an ephemeral one.
+zerocode finds the daemon's local endpoint automatically: `<config_dir>/data/daemon.sock`
+on Unix, `\\.\pipe\zeroclaw-daemon-<hash>` on Windows, resolved the same way the
+daemon resolves it (see [RPC socket](../architecture/rpc-socket.md)). If the daemon
+isn't running, zerocode spawns an ephemeral one. zerocode does not follow
+`ZEROCLAW_DATA_DIR`; if the daemon runs with it, set `ZEROCLAW_SOCKET` to the
+daemon's endpoint.
 
 ## Session working directories
 
