@@ -5,9 +5,12 @@
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
+use zeroclaw_eval::baseline::SuiteKind;
 use zeroclaw_eval::case::load_suite;
 use zeroclaw_eval::grader::evaluate_expects;
-use zeroclaw_eval::{LlmTrace, Mode, RecordedCall, RunRecord, run_case, run_suite};
+use zeroclaw_eval::record::ToolSurface;
+use zeroclaw_eval::runner::case_provenance;
+use zeroclaw_eval::{LlmTrace, RecordedCall, RunDeps, RunRecord, run_case, run_suite};
 
 /// Resolve the gated suite from the shipped config default rather than a second
 /// hardcoded literal, so the directory this gate certifies cannot drift away
@@ -19,7 +22,7 @@ fn regression_dir() -> PathBuf {
 
 #[tokio::test]
 async fn regression_suite_replays_green() {
-    let report = run_suite(&regression_dir(), Mode::Replay)
+    let report = run_suite(&regression_dir(), &RunDeps::replay())
         .await
         .expect("regression suite must load and run");
     assert!(
@@ -27,7 +30,7 @@ async fn regression_suite_replays_green() {
         "regression suite failed:\n{}",
         report.render_table()
     );
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.exit_code(SuiteKind::Regression, None), 0);
 }
 
 /// A case earns its place in a required suite only if it fails when the behavior
@@ -42,25 +45,25 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
     let path = regression_dir().join("missing_tool_argument_continues_loop.json");
     let trace = LlmTrace::from_file(&path).expect("the committed fixture must load");
 
-    let observed = run_case(&trace).await.expect("the fixture must replay");
+    let observed = run_case(&trace, &RunDeps::replay())
+        .await
+        .expect("the fixture must replay");
+    let observed = observed.record;
     let graded = evaluate_expects(&trace.expects, &observed);
     assert!(
         graded.iter().all(|grade| grade.passed),
         "the fixture must pass on the run it actually produces: {graded:?}"
     );
 
-    let repaired = RunRecord {
-        final_response: observed.final_response.clone(),
-        history: Vec::new(),
-        tool_calls: vec![RecordedCall {
-            name: "echo".to_string(),
-            arguments: r#"{"message":"hello"}"#.to_string(),
-            result: "hello".to_string(),
-            success: true,
-        }],
-        input_tokens: observed.input_tokens,
-        output_tokens: observed.output_tokens,
-    };
+    let mut repaired = observed.clone();
+    let completion = repaired.completion.as_mut().expect("fixture completed");
+    completion.history.clear();
+    completion.tool_calls = vec![RecordedCall {
+        name: "echo".to_string(),
+        arguments: r#"{"message":"hello"}"#.to_string(),
+        result: "hello".to_string(),
+        success: true,
+    }];
     let failures: Vec<String> = evaluate_expects(&trace.expects, &repaired)
         .into_iter()
         .filter(|grade| !grade.passed)
@@ -86,14 +89,13 @@ async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
     let suite = load_suite(&regression_dir()).expect("the gated suite must load");
     assert!(!suite.is_empty(), "the gated suite must not be empty");
 
+    let deps = RunDeps::replay();
     for (path, trace) in suite {
-        let idle = RunRecord {
-            final_response: String::new(),
-            history: Vec::new(),
-            tool_calls: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-        };
+        let provenance = case_provenance(&trace, &deps, ToolSurface::default())
+            .expect("a loaded fixture must yield provenance");
+        // A record with no completion grades exactly as "nothing happened": no
+        // response, no dispatched tool, no usage.
+        let idle = RunRecord::from_provenance(provenance);
         let grades = evaluate_expects(&trace.expects, &idle);
         assert!(
             grades.iter().any(|grade| !grade.passed),
