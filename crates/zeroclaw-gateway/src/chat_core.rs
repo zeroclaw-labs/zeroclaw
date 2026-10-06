@@ -961,6 +961,7 @@ impl TurnRelay {
                 return Relayed::Continue;
             }
             SessionUpdateEvent::BudgetWarning { .. } => return Relayed::Continue,
+            SessionUpdateEvent::PlanPersistence { .. } => return Relayed::Continue,
             SessionUpdateEvent::AgentMessageChunk { text, .. } => {
                 json!({ "type": "chunk", "content": text })
             }
@@ -1041,6 +1042,7 @@ fn event_session(event: &SessionUpdateEvent) -> &str {
         | SessionUpdateEvent::ApprovalRequest { session_id, .. }
         | SessionUpdateEvent::ContextUsage { session_id, .. }
         | SessionUpdateEvent::Plan { session_id, .. }
+        | SessionUpdateEvent::PlanPersistence { session_id, .. }
         | SessionUpdateEvent::TurnComplete { session_id, .. }
         | SessionUpdateEvent::BudgetWarning { session_id, .. }
         | SessionUpdateEvent::HistoryTrimmed { session_id, .. } => session_id,
