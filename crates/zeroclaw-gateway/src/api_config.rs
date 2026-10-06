@@ -291,12 +291,7 @@ fn error_response(err: ConfigApiError) -> Response {
 /// `ConfigApiError`. Path-not-found errors get the specific code; everything
 /// else falls through to ValidationFailed.
 fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
-    let msg = err.to_string();
-    if msg.starts_with("Unknown property") {
-        ConfigApiError::path_not_found(path)
-    } else {
-        ConfigApiError::from_validation(err).with_path(path)
-    }
+    ConfigApiError::for_prop(err, path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1369,13 +1364,7 @@ pub async fn handle_get_map_keys(
         Some(keys) => {
             axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
         }
-        None => error_response(
-            ConfigApiError::new(
-                ConfigApiCode::PathNotFound,
-                format!("no map-keyed section at `{}`", q.path),
-            )
-            .with_path(&q.path),
-        ),
+        None => error_response(ConfigApiError::no_map_section(&q.path)),
     }
 }
 
@@ -1708,20 +1697,7 @@ pub async fn handle_map_key(
     let created =
         match zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &path, &key) {
             Ok(b) => b,
-            Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
-                return error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::ValidationFailed,
-                        format!("alias `{a}` is reserved and cannot be created"),
-                    )
-                    .with_path(format!("{path}.{key}")),
-                );
-            }
-            Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
-                return error_response(
-                    ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
-                );
-            }
+            Err(e) => return error_response(e.api_error(&path, &key)),
         };
 
     if created {
@@ -1943,23 +1919,7 @@ fn rename_error_response(
     from: &str,
     err: zeroclaw_config::alias_refs::RenameError,
 ) -> Response {
-    use zeroclaw_config::alias_refs::RenameError;
-    let (code, msg) = match err {
-        RenameError::NotFound(p) => (
-            ConfigApiCode::PathNotFound,
-            format!("{p} is not configured"),
-        ),
-        RenameError::InvalidName(m) => (ConfigApiCode::ValidationFailed, m),
-        RenameError::Reserved(a) => (
-            ConfigApiCode::ValidationFailed,
-            format!("alias `{a}` is reserved and cannot be renamed"),
-        ),
-        RenameError::PostCondition(m) => (
-            ConfigApiCode::InternalError,
-            format!("rename cascade post-condition failed: {m}"),
-        ),
-    };
-    error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{from}")))
+    error_response(err.api_error(path, from))
 }
 
 /// Map a [`CascadeError`](zeroclaw_config::alias_refs::CascadeError) to the
