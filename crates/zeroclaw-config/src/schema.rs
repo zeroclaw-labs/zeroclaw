@@ -5148,6 +5148,19 @@ impl Config {
         {
             return custom.clone();
         }
+        self.default_agent_workspace_dir(agent_alias)
+    }
+
+    /// The alias-derived workspace location for `alias`,
+    /// `<install>/agents/<alias>/workspace/`, whatever
+    /// `[agents.<alias>.workspace.path]` says.
+    ///
+    /// This is where [`Self::agent_workspace_dir`] resolves when no custom
+    /// path is set. An agent lifecycle operation compares the two to tell a
+    /// workspace that follows the alias, and so moves on rename, from a
+    /// custom one that stays put.
+    #[must_use]
+    pub fn default_agent_workspace_dir(&self, agent_alias: &str) -> std::path::PathBuf {
         self.install_root_dir()
             .join("agents")
             .join(agent_alias)
@@ -22939,6 +22952,7 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
+            crate::agent_recovery_journal::warn_retired_configured_aliases(&config);
 
             // Validation must NOT prevent the daemon from booting. If
             // it did, a single broken agent reference would lock the
@@ -22986,6 +23000,7 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
+            crate::agent_recovery_journal::warn_retired_configured_aliases(&config);
 
             // Same boot-resilience as the load-existing branch above:
             // a fresh-init config can't realistically fail validation,
@@ -25794,12 +25809,15 @@ impl Config {
     /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
     /// the entry first.
     ///
-    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
-    /// set-prop surface should then surface a reserved-name error rather than the
-    /// generic "not configured" that the still-missing entry would otherwise
-    /// produce. Returns `false` in every other case (created, already existed, or
-    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
-    /// that do not distinguish the reserved case may ignore it.
+    /// Returns `true` iff it REFUSED to create the entry: the reserved `default`
+    /// agent, an agent alias an unfinished rename retired, or an agent alias
+    /// whose retirement could not be checked. A set-prop surface should then
+    /// surface that refusal rather than the generic "not configured" that the
+    /// still-missing entry would otherwise produce; use
+    /// [`Self::ensure_map_key_for_path_checked`] to learn which refusal it was.
+    /// Returns `false` in every other case (created, already existed, or the
+    /// path is not a map-keyed entry). The bool is advisory; statement-callers
+    /// that do not distinguish a refusal may ignore it.
     ///
     /// When it newly creates the alias, it also guarantees no phantom is left
     /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
@@ -25822,6 +25840,12 @@ impl Config {
     /// Rate rows are created explicitly through `POST /api/config/map-key`
     /// instead.
     pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
+        self.ensure_map_key_for_path_checked(path).is_err()
+    }
+
+    /// [`Self::ensure_map_key_for_path`], saying why a refused entry was
+    /// refused so a set-prop surface can return the matching error.
+    pub fn ensure_map_key_for_path_checked(&mut self, path: &str) -> Result<(), VivifyRefusal> {
         self.ensure_key_for_path(path, false)
     }
 
@@ -25845,10 +25869,23 @@ impl Config {
     /// The same guarantees apply: an existing entry is left alone, and a new
     /// entry whose trailing field does not resolve is rolled back.
     pub fn ensure_map_or_list_key_for_path(&mut self, path: &str) -> bool {
+        self.ensure_map_or_list_key_for_path_checked(path).is_err()
+    }
+
+    /// [`Self::ensure_map_or_list_key_for_path`], saying why a refused entry
+    /// was refused so the caller can return the matching error.
+    pub fn ensure_map_or_list_key_for_path_checked(
+        &mut self,
+        path: &str,
+    ) -> Result<(), VivifyRefusal> {
         self.ensure_key_for_path(path, true)
     }
 
-    fn ensure_key_for_path(&mut self, path: &str, include_lists: bool) -> bool {
+    fn ensure_key_for_path(
+        &mut self,
+        path: &str,
+        include_lists: bool,
+    ) -> Result<(), VivifyRefusal> {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -25868,17 +25905,17 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return false;
+            return Ok(());
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return false;
+            return Ok(());
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return false;
+            return Ok(());
         }
         // Never auto-vivify the reserved `default` agent from a set-prop path: a
         // prop write under a nonexistent `agents.default` must not materialize the
@@ -25902,7 +25939,51 @@ impl Config {
                     })),
                 "refused to auto-create the reserved `default` agent from a set-prop path"
             );
-            return true;
+            return Err(VivifyRefusal::Reserved);
+        }
+        // Never auto-vivify an agent alias an unfinished rename retired: the
+        // rename still owes state moves out of it, and an agent created under it
+        // now would inherit whatever has not moved yet. This is the set-prop
+        // analogue of the same guard in `create_map_key_checked`. A journal that
+        // cannot be read may hold such a rename, so that refuses too.
+        if section == "agents" {
+            match crate::agent_recovery_journal::retired_alias(self, alias) {
+                Ok(None) => {}
+                Ok(Some(record)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "config.retired_agent_vivify_refused",
+                                "alias": alias,
+                                "pending_to": record.to,
+                                "path": path,
+                            })),
+                        "refused to auto-create an agent alias retired by an unfinished rename from a set-prop path"
+                    );
+                    return Err(VivifyRefusal::Retired {
+                        alias: alias.to_string(),
+                        pending_to: record.to,
+                    });
+                }
+                Err(e) => {
+                    let detail = e.to_string();
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "config.recovery_journal_unreadable",
+                                "alias": alias,
+                                "path": path,
+                                "error": detail,
+                            })),
+                        "refused to auto-create an agent from a set-prop path: the agent lifecycle recovery journal could not be read"
+                    );
+                    return Err(VivifyRefusal::RecoveryUnreadable(detail));
+                }
+            }
         }
         // Roll back on the same `Ok(true)` == "newly created" signal the CLI
         // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
@@ -25919,7 +26000,7 @@ impl Config {
         {
             let _ = self.delete_map_key(section, alias);
         }
-        false
+        Ok(())
     }
 
     pub fn clear_dirty(&mut self) {
@@ -26251,6 +26332,40 @@ impl Config {
         Ok(())
     }
 }
+
+/// Why [`Config::ensure_map_key_for_path_checked`] refused to create the entry
+/// a set-prop path names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VivifyRefusal {
+    /// The entry is the reserved `default` agent.
+    Reserved,
+    /// An unfinished agent rename retired the alias: `alias` is its `from`
+    /// and `pending_to` its target. Display leaves `pending_to` out, since
+    /// surfaces render this error before they authorize the caller.
+    Retired { alias: String, pending_to: String },
+    /// The agent lifecycle recovery journal could not be read, so whether the
+    /// alias is retired is unknown and the create fails closed. Carries the
+    /// reason.
+    RecoveryUnreadable(String),
+}
+
+impl std::fmt::Display for VivifyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reserved => write!(f, "alias `default` is reserved and cannot be created"),
+            Self::Retired { alias, .. } => write!(
+                f,
+                "alias `{alias}` is retired by an unfinished agent rename and cannot be created yet"
+            ),
+            Self::RecoveryUnreadable(detail) => write!(
+                f,
+                "agent lifecycle recovery journal could not be read: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VivifyRefusal {}
 
 fn collect_onepassword_reference_snapshots(
     config: &Config,
@@ -37573,6 +37688,100 @@ shared_secret = "retired-node-transport-sentinel"
 
     #[test]
     #[allow(clippy::large_futures)]
+    async fn load_or_init_warns_about_configured_agent_aliases_a_rename_retired() {
+        use crate::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryOperation, RecoveryPhase, RecoveryRecord,
+        };
+
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let install = temp_home.join("profile");
+        fs::create_dir_all(&install).await.unwrap();
+        fs::write(
+            install.join("config.toml"),
+            r#"schema_version = 3
+
+[agents.scout]
+enabled = true
+
+[agents.ranger]
+enabled = true
+"#,
+        )
+        .await
+        .unwrap();
+        // `scout` was renamed to `scout2` and the rename has not converged, yet
+        // `scout` is configured again.
+        let data_dir = install.join("data");
+        let journal = AgentRecoveryJournal::for_data_dir(&data_dir);
+        {
+            let guard = journal.lock(std::time::Duration::ZERO).unwrap();
+            journal
+                .upsert(
+                    &guard,
+                    RecoveryRecord {
+                        operation: RecoveryOperation::Rename,
+                        from: "scout".to_string(),
+                        to: "scout2".to_string(),
+                        phase: RecoveryPhase::Committed,
+                        source_workspace: None,
+                        armed_at: "2026-01-01T00:00:00+00:00".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        let journal_path = journal.path().display().to_string();
+
+        let _home_guard = EnvValueGuard::set("HOME", &temp_home);
+        let _workspace_guard = EnvValueGuard::set("ZEROCLAW_WORKSPACE", &install);
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+
+        let mut rx = capture_log_events();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+        let logs = drain_captured(&mut rx);
+
+        assert_eq!(config.data_dir, data_dir);
+        let retired: Vec<&str> = logs
+            .lines()
+            .filter(|line| {
+                line.contains("config.retired_agent_alias_configured")
+                    && line.contains(&journal_path)
+            })
+            .collect();
+        assert!(
+            retired
+                .iter()
+                .any(|line| line.contains("\"alias\":\"scout\"")
+                    && line.contains("\"pending_to\":\"scout2\"")),
+            "missing retired-alias warning: {logs}"
+        );
+        assert!(
+            retired.iter().all(|line| !line.contains("ranger")),
+            "only the retired alias is reported: {logs}"
+        );
+
+        // An unreadable journal is reported, and the load still comes up.
+        std::fs::remove_file(journal.path()).unwrap();
+        std::fs::create_dir(journal.path()).unwrap();
+        let mut rx = capture_log_events();
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+        let logs = drain_captured(&mut rx);
+
+        assert!(config.agents.contains_key("scout"));
+        assert!(
+            logs.lines().any(|line| {
+                line.contains("config.recovery_journal_unreadable") && line.contains(&journal_path)
+            }),
+            "missing unreadable-journal warning: {logs}"
+        );
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
     async fn load_or_init_assigns_degraded_security_for_malformed_section() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -42843,6 +43052,33 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         workspace.set_prop("agent_workspace.path", "").unwrap();
         assert_eq!(workspace.path, None);
+    }
+
+    #[test]
+    async fn default_agent_workspace_dir_ignores_a_custom_workspace_path() {
+        let install = PathBuf::from("/srv/zeroclaw");
+        let mut config = Config {
+            config_path: install.join("config.toml"),
+            ..Config::default()
+        };
+        let derived = install.join("agents").join("scout").join("workspace");
+        assert_eq!(config.default_agent_workspace_dir("scout"), derived);
+        assert_eq!(
+            config.agent_workspace_dir("scout"),
+            derived,
+            "an unconfigured alias resolves to the derived location"
+        );
+
+        let custom = PathBuf::from("/mnt/disk/scout");
+        let mut agent = AliasedAgentConfig::default();
+        agent.workspace.path = Some(custom.clone());
+        config.agents.insert("scout".to_string(), agent);
+        assert_eq!(config.agent_workspace_dir("scout"), custom);
+        assert_eq!(
+            config.default_agent_workspace_dir("scout"),
+            derived,
+            "the derived location ignores the custom path"
+        );
     }
 
     #[cfg(feature = "schema-export")]

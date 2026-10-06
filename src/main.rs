@@ -3078,7 +3078,30 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
-        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => Err(alias_create_refusal(e)),
+    }
+}
+
+/// A refused alias creation as the operator reads it: an alias an unfinished
+/// agent rename retired names the rename that frees it, and every other
+/// refusal keeps the config crate's own text.
+#[cfg(any(feature = "agent-runtime", test))]
+fn alias_create_refusal(error: zeroclaw_config::alias_refs::CreateError) -> anyhow::Error {
+    use zeroclaw_config::alias_refs::CreateError;
+    match error {
+        CreateError::Retired { alias, pending_to } => anyhow::Error::msg(ta(
+            "cli-alias-create-retired",
+            &[("alias", &alias), ("to", &pending_to)],
+            format!(
+                "alias `{alias}` is retired by an unfinished rename to `{pending_to}`; run `zeroclaw agents rename {alias} {pending_to}` first"
+            ),
+        )),
+        CreateError::RecoveryUnreadable(detail) => anyhow::Error::msg(ta(
+            "cli-alias-recovery-unreadable",
+            &[("error", &detail)],
+            format!("agent lifecycle recovery journal could not be read: {detail}"),
+        )),
+        other => anyhow::Error::msg(other.to_string()),
     }
 }
 
@@ -3132,7 +3155,9 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
             Ok(created) => created,
             Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
-            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+            // A retired alias or an unreadable recovery journal is an error the
+            // operator must see, never the reserved case's silent no-op.
+            Err(e) => return Err(alias_create_refusal(e)),
         };
     if created {
         // The section matched and the alias was newly materialized, but the
@@ -9970,17 +9995,21 @@ Add pricing to the active provider profile or supply a catalog entry."
                         raw_path.to_string()
                     };
                     if matches!(op_name, "add" | "replace")
-                        && config.ensure_map_or_list_key_for_path(&path)
+                        && let Err(refusal) = config.ensure_map_or_list_key_for_path_checked(&path)
                     {
-                        let err = ConfigApiError::new(
-                            ConfigApiCode::ValidationFailed,
-                            "alias `default` is reserved and cannot be created",
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx);
-                        let human = format!(
-                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
-                        );
+                        let code = match refusal {
+                            zeroclaw_config::schema::VivifyRefusal::RecoveryUnreadable(_) => {
+                                ConfigApiCode::InternalError
+                            }
+                            zeroclaw_config::schema::VivifyRefusal::Reserved
+                            | zeroclaw_config::schema::VivifyRefusal::Retired { .. } => {
+                                ConfigApiCode::ValidationFailed
+                            }
+                        };
+                        let err = ConfigApiError::new(code, refusal.to_string())
+                            .with_path(&path)
+                            .with_op_index(idx);
+                        let human = format!("op[{idx}] `{op_name}` on `{path}`: {refusal}");
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
                     let comment = match object.get("comment") {
@@ -16366,6 +16395,48 @@ mod tests {
             config.agents.contains_key("researcher"),
             "researcher alias should have been created"
         );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_errors_on_an_agent_alias_a_rename_retired() {
+        use zeroclaw_config::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryOperation, RecoveryPhase, RecoveryRecord,
+        };
+
+        let data_dir = tempfile::tempdir().expect("temp data dir");
+        let journal = AgentRecoveryJournal::for_data_dir(data_dir.path());
+        let guard = journal
+            .lock(std::time::Duration::ZERO)
+            .expect("lock the journal");
+        journal
+            .upsert(
+                &guard,
+                RecoveryRecord {
+                    operation: RecoveryOperation::Rename,
+                    from: "researcher".to_string(),
+                    to: "analyst".to_string(),
+                    phase: RecoveryPhase::Committed,
+                    source_workspace: None,
+                    armed_at: "2026-01-01T00:00:00+00:00".to_string(),
+                },
+            )
+            .expect("arm the journal");
+        let mut config = Config {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        // Unlike the reserved `default` agent, a retired alias is an error the
+        // operator sees, not a silent no-op, and it names the rename that
+        // frees the alias.
+        let err = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect_err("a retired agent alias must not be materialized");
+        assert!(
+            err.to_string()
+                .contains("zeroclaw agents rename researcher analyst"),
+            "{err}"
+        );
+        assert!(!config.agents.contains_key("researcher"));
     }
 
     #[test]

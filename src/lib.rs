@@ -373,6 +373,9 @@ pub enum AgentsCommands {
         from: String,
         /// New alias
         to: String,
+        /// Drop an unfinished rename's recovery record without moving anything
+        #[arg(long)]
+        abandon: bool,
     },
     /// Delete an agent alias, scrubbing references and cascading owned state
     Delete {
