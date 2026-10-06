@@ -9,12 +9,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use zeroclaw_log::{
-    ATTRIBUTION_FIELDS, COMPOSITE_PREFIXES, LogFilter, LogPage, is_attribution_field,
-};
+use zeroclaw_log::{LogFilter, LogPage, is_attribution_field};
 
 use super::AppState;
 use super::api::require_auth;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::{INTERNAL_ERROR, METHOD_NOT_FOUND};
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::{LogsQueryParams, LogsQueryResult};
 
 const TOP_LEVEL_PARAMS: &[&str] = &[
     "since_ts",
@@ -73,16 +76,7 @@ pub struct LogsResponse {
 }
 
 fn attribution_keys_for_response() -> Vec<String> {
-    let mut keys: Vec<String> = ATTRIBUTION_FIELDS
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-    for prefix in COMPOSITE_PREFIXES {
-        keys.push((*prefix).to_string());
-        keys.push(format!("{prefix}_type"));
-        keys.push(format!("{prefix}_alias"));
-    }
-    keys
+    zeroclaw_log::attribution_keys()
 }
 
 /// Read one page from the canonical persisted log store. Gateway surfaces with
@@ -144,84 +138,26 @@ pub async fn handle_api_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
+    access: CoreAccess,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return api_logs_through_core(&core, &params)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let take = |key: &str| -> Option<String> {
-        params.get(key).map(String::from).filter(|s| !s.is_empty())
+    let request = match LogsRequest::parse(&params) {
+        Ok(request) => request,
+        Err(refused) => return refused,
     };
-
-    let severity_min = params
-        .get("severity_min")
-        .and_then(|raw| raw.parse::<u8>().ok());
-    let hide_internal = params
-        .get("hide_internal")
-        .map(|raw| matches!(raw.as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
-    let limit = params
-        .get("limit")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(200);
-    let until_line_offset = params
-        .get("until_line_offset")
-        .and_then(|raw| raw.parse::<u64>().ok());
-    let segment_cursor: Option<zeroclaw_log::SegmentCursor> = match params
-        .get("until_segment_cursor")
-        .map(|s| s.as_str())
-    {
-        None | Some("") => None,
-        Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
-            Some(c) => Some(c),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "invalid until_segment_cursor: value is not a valid segment cursor",
-                    })),
-                )
-                    .into_response();
-            }
-        },
-    };
-
-    let mut field_eq: BTreeMap<String, String> = BTreeMap::new();
-    for (key, value) in &params {
-        if TOP_LEVEL_PARAMS.contains(&key.as_str()) {
-            continue;
-        }
-        if !is_attribution_field(key) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("unknown query parameter: {key}"),
-                })),
-            )
-                .into_response();
-        }
-        if value.is_empty() {
-            continue;
-        }
-        field_eq.insert(key.clone(), value.clone());
-    }
-
-    let filter = LogFilter {
-        since_ts: take("since_ts"),
-        until_ts: take("until_ts"),
-        until_id: take("until_id"),
-        until_line_offset,
-        action: take("action"),
-        category: take("category"),
-        outcome: take("outcome"),
-        severity_min,
-        trace_id: take("trace_id"),
-        q: take("q"),
-        hide_internal,
-        field_eq,
-    };
-
-    match load_logs_response(&filter, limit, segment_cursor.as_ref()) {
+    match load_logs_response(
+        &request.filter,
+        request.limit,
+        request.segment_cursor.as_ref(),
+    ) {
         Ok(response) => Json(response).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -230,6 +166,178 @@ pub async fn handle_api_logs(
             })),
         )
             .into_response(),
+    }
+}
+
+/// `GET /api/logs` through the core, the body every router serves for it.
+/// The query is read and refused exactly as the in-process route reads it,
+/// then the core filters its own log.
+#[allow(deprecated)] // we still forward the legacy cursor for backwards compat
+pub(crate) async fn api_logs_through_core(
+    core: &CoreCall,
+    params: &HashMap<String, String>,
+) -> Result<Response, CoreError> {
+    let request = match LogsRequest::parse(params) {
+        Ok(request) => request,
+        Err(refused) => return Ok(refused),
+    };
+    let LogFilter {
+        since_ts,
+        until_ts,
+        until_id,
+        until_line_offset,
+        action,
+        category,
+        outcome,
+        severity_min,
+        trace_id,
+        q,
+        hide_internal,
+        field_eq,
+    } = request.filter;
+    let query = LogsQueryParams {
+        since_ts,
+        until_ts,
+        until_id,
+        until_line_offset,
+        until_segment_cursor: request.segment_cursor.map(|cursor| cursor.to_wire()),
+        severity_min,
+        q,
+        category,
+        action,
+        outcome,
+        trace_id,
+        sop_run_id: None,
+        hide_internal,
+        limit: Some(request.limit),
+        field_eq,
+        report_disabled: true,
+    };
+    crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_REPORT_DISABLED)?;
+    crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_QUERY_METADATA)?;
+    if !query.field_eq.is_empty() {
+        crate::api::require_core_feature(core, zeroclaw_rpc_proto::feature::LOGS_FIELD_EQ)?;
+    }
+    let params = serde_json::to_value(&query).map_err(|error| {
+        CoreError::Rpc(JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("unencodable logs/query params: {error}"),
+            data: None,
+        })
+    })?;
+    let page: LogsQueryResult = core.call(Method::LogsQuery, params).await?;
+    // A core that predates the attribution filters would ignore them and
+    // answer unfiltered; it also omits the start time it now always reports.
+    let Some(daemon_started_at) = page.daemon_started_at else {
+        return Err(CoreError::Rpc(JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: "the core did not return dashboard log metadata; install a core that \
+                      supports this route"
+                .into(),
+            data: None,
+        }));
+    };
+    Ok(Json(LogsResponse {
+        events: page.events,
+        next_cursor: page.next_cursor,
+        next_cursor_line_offset: page.next_cursor_line_offset,
+        next_segment_cursor: page.next_segment_cursor,
+        at_end: page.at_end,
+        incomplete: page.incomplete,
+        persistence_enabled: page.persistence_enabled,
+        daemon_started_at,
+        attribution_keys: page.attribution_keys,
+    })
+    .into_response())
+}
+
+/// One `GET /api/logs` query, read as the route reads it: an unparsable
+/// number is ignored, an unknown parameter or a malformed segment cursor is
+/// refused with `400`.
+struct LogsRequest {
+    filter: LogFilter,
+    limit: usize,
+    segment_cursor: Option<zeroclaw_log::SegmentCursor>,
+}
+
+impl LogsRequest {
+    #[allow(clippy::result_large_err)] // the refusal is the route's response
+    fn parse(params: &HashMap<String, String>) -> Result<Self, Response> {
+        let take = |key: &str| -> Option<String> {
+            params.get(key).map(String::from).filter(|s| !s.is_empty())
+        };
+
+        let severity_min = params
+            .get("severity_min")
+            .and_then(|raw| raw.parse::<u8>().ok());
+        let hide_internal = params
+            .get("hide_internal")
+            .map(|raw| matches!(raw.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+        let limit = params
+            .get("limit")
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(200);
+        let until_line_offset = params
+            .get("until_line_offset")
+            .and_then(|raw| raw.parse::<u64>().ok());
+        let segment_cursor: Option<zeroclaw_log::SegmentCursor> = match params
+            .get("until_segment_cursor")
+            .map(|s| s.as_str())
+        {
+            None | Some("") => None,
+            Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+                Some(c) => Some(c),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "invalid until_segment_cursor: value is not a valid segment cursor",
+                        })),
+                    )
+                        .into_response());
+                }
+            },
+        };
+
+        let mut field_eq: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in params {
+            if TOP_LEVEL_PARAMS.contains(&key.as_str()) {
+                continue;
+            }
+            if !is_attribution_field(key) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("unknown query parameter: {key}"),
+                    })),
+                )
+                    .into_response());
+            }
+            if value.is_empty() {
+                continue;
+            }
+            field_eq.insert(key.clone(), value.clone());
+        }
+
+        Ok(Self {
+            filter: LogFilter {
+                since_ts: take("since_ts"),
+                until_ts: take("until_ts"),
+                until_id: take("until_id"),
+                until_line_offset,
+                action: take("action"),
+                category: take("category"),
+                outcome: take("outcome"),
+                severity_min,
+                trace_id: take("trace_id"),
+                q: take("q"),
+                hide_internal,
+                field_eq,
+            },
+            limit,
+            segment_cursor,
+        })
     }
 }
 

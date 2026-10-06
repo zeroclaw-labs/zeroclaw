@@ -7,13 +7,17 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
 use std::convert::Infallible;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use zeroclaw_rpc_client::Method;
+
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError, CoreSubscription};
+use zeroclaw_rpc_proto::types::LogsSubscribeResult;
 
 pub use zeroclaw_runtime::observability::broadcast::{BroadcastObserver, EventBuffer};
 use zeroclaw_runtime::observability::broadcast::{history_events, is_public_event};
@@ -101,14 +105,107 @@ fn sse_frame_for_stream(
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
+///
+/// Through the core this is `events/history`, which returns the same
+/// `{"events": [...]}` body from the same buffer. A principal the core does
+/// not let read every principal's events is refused with `403`; the route
+/// never substitutes another connection's view.
 pub async fn handle_events_history(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return events_history_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
     Json(history_events_payload(&state.event_buffer)).into_response()
+}
+
+/// `GET /api/events/history` through the core, the body every router
+/// serves for it.
+pub(crate) async fn events_history_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let history = core
+        .request(Method::EventsHistory, serde_json::json!({}))
+        .await?;
+    Ok(Json(history).into_response())
+}
+
+/// `GET /api/events` through the core: the caller's own `logs/subscribe`
+/// stream, narrowed to the frames this route carries (no session-scoped
+/// frames). The core refuses the stream to a scoped principal, and it never
+/// sends pairing credentials to a gateway's connection, so the QR payloads
+/// and pair codes the in-process stream gives its authenticated subscribers
+/// for headless channel login are not on this one.
+///
+/// The stream ends when the core connection does; the browser's
+/// `EventSource` then reconnects. [`CoreCall::subscribe`] owns the
+/// subscription from the moment the request is sent: a client that leaves
+/// before the core replies, or closes the stream later, leaves nothing open.
+pub(crate) async fn events_stream_through_core(core: CoreCall) -> Result<Response, CoreError> {
+    let subscription = core
+        .subscribe::<LogsSubscribeResult>(Method::LogsSubscribe, serde_json::json!({}))
+        .await?;
+    let delivery = Delivery {
+        closed: Box::pin(subscription.closed()),
+        subscription,
+    };
+    let stream = futures_util::stream::unfold(delivery, |mut delivery| async move {
+        loop {
+            tokio::select! {
+                () = &mut delivery.closed => return None,
+                received = delivery.subscription.notifications.recv() => match received {
+                    Ok(note) => {
+                        if let Some(frame) = public_frame(&delivery.subscription, note) {
+                            let event = Event::default().data(frame.to_string());
+                            return Some((Ok::<_, Infallible>(event), delivery));
+                        }
+                    }
+                    // Lagged frames are skipped, as the in-process stream skips them.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                },
+            }
+        }
+    });
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+/// One open `/api/events` stream through the core. Dropping it drops the
+/// subscription, which cancels it.
+struct Delivery {
+    closed: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    subscription: CoreSubscription<LogsSubscribeResult>,
+}
+
+/// The frame `note` carries for `subscription`, as the in-process stream
+/// would deliver it, or `None` when it is another subscription's, not a log
+/// frame, or a frame this route does not carry.
+///
+/// The core drops pairing-credential frames before any RPC subscriber sees
+/// them; a frame that still carries the marker is withheld here as well.
+fn public_frame(
+    subscription: &CoreSubscription<LogsSubscribeResult>,
+    note: zeroclaw_rpc_client::Notification,
+) -> Option<serde_json::Value> {
+    if note.method != zeroclaw_rpc_proto::notification::LOGS_EVENT || !subscription.is_mine(&note) {
+        return None;
+    }
+    let mut frame = note.params;
+    let fields = frame.as_object_mut()?;
+    // The core adds these two to each frame it delivers.
+    fields.remove("subscription_id");
+    fields.remove("seq");
+    if fields.contains_key(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER) {
+        return None;
+    }
+    is_public_sse_event(&frame).then_some(frame)
 }
 
 fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {

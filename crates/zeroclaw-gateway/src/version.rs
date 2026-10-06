@@ -21,10 +21,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use zeroclaw_runtime::i18n::get_required_cli_string;
 
 /// How long a successful version check is reused before re-querying GitHub.
 const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -40,120 +39,9 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // ── Restart classification (advisory) ────────────────────────────
 
-/// How a post-upgrade restart is achieved in this environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum RestartMode {
-    /// The ZeroClaw Desktop supervisor relaunches us after the dedicated exit.
-    DesktopSupervised,
-    /// A supervisor (systemd/launchd) relaunches us after a clean exit.
-    Supervised,
-    /// No supervisor, but we can relaunch ourselves: after teardown the daemon
-    /// detached-spawns the new binary, then exits (bare unix process).
-    SelfRespawn,
-    /// We cannot safely auto-restart (container PID 1, or non-unix bare); the
-    /// operator must restart manually.
-    Manual,
-}
-
-impl RestartMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RestartMode::DesktopSupervised => "desktop_supervised",
-            RestartMode::Supervised => "supervised",
-            RestartMode::SelfRespawn => "self_respawn",
-            RestartMode::Manual => "manual",
-        }
-    }
-
-    /// Whether the dashboard may offer (and the backend honour) auto-restart.
-    pub fn auto_restartable(self) -> bool {
-        matches!(
-            self,
-            RestartMode::DesktopSupervised | RestartMode::Supervised | RestartMode::SelfRespawn
-        )
-    }
-}
-
-/// Detected restart mode plus the command to show the operator.
-#[derive(Clone)]
-pub struct RestartInfo {
-    pub mode: RestartMode,
-    pub hint: String,
-}
-
-fn env_present(name: &str) -> bool {
-    std::env::var_os(name).is_some_and(|v| !v.is_empty())
-}
-
-fn is_container() -> bool {
-    // Any positive signal wins: a false "not a container" is the dangerous
-    // case (exiting PID 1 with no restart policy tears the container down).
-    std::path::Path::new("/.dockerenv").exists()
-        || std::process::id() == 1
-        || std::fs::read_to_string("/proc/1/cgroup").is_ok_and(|s| {
-            s.contains("docker") || s.contains("containerd") || s.contains("kubepods")
-        })
-}
-
-/// Classify the runtime environment to pick exit-vs-manual and hint text.
-///
-/// This only chooses what to *show*; the gateway does not act on it in Phase 1.
-/// The classification is static for the process lifetime (env vars + cgroup), so
-/// it is computed once and cached — `/api/status` calls this on every poll.
-pub fn detect_restart() -> RestartInfo {
-    static CACHE: OnceLock<RestartInfo> = OnceLock::new();
-    CACHE.get_or_init(detect_restart_uncached).clone()
-}
-
-fn detect_restart_uncached() -> RestartInfo {
-    if zeroclaw_runtime::restart::is_desktop_supervised() {
-        return RestartInfo {
-            mode: RestartMode::DesktopSupervised,
-            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
-        };
-    }
-    // Container first — default to manual since we can't see a restart policy.
-    if is_container() {
-        let hint = if env_present("KUBERNETES_SERVICE_HOST") {
-            get_required_cli_string("cli-gateway-restart-hint-kubernetes")
-        } else {
-            get_required_cli_string("cli-gateway-restart-hint-container")
-        };
-        return RestartInfo {
-            mode: RestartMode::Manual,
-            hint,
-        };
-    }
-    // systemd: a clean exit is relaunched when the unit sets Restart=on-success.
-    if env_present("INVOCATION_ID") || env_present("JOURNAL_STREAM") {
-        return RestartInfo {
-            mode: RestartMode::Supervised,
-            hint: get_required_cli_string("cli-gateway-restart-hint-systemd"),
-        };
-    }
-    // launchd (macOS): KeepAlive relaunches on exit.
-    if cfg!(target_os = "macos") && env_present("XPC_SERVICE_NAME") {
-        return RestartInfo {
-            mode: RestartMode::Supervised,
-            hint: get_required_cli_string("cli-gateway-restart-hint-launchd"),
-        };
-    }
-    // Bare process. On unix/windows we can relaunch ourselves (detached respawn
-    // after teardown); elsewhere there's no safe self-relaunch, so stay manual.
-    if cfg!(unix) || cfg!(windows) {
-        RestartInfo {
-            mode: RestartMode::SelfRespawn,
-            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
-        }
-    } else {
-        RestartInfo {
-            mode: RestartMode::Manual,
-            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
-        }
-    }
-}
+// The classification reads the daemon process's environment, so it lives in
+// the runtime, where the core reports it to a gateway in another process.
+pub use zeroclaw_runtime::restart::{RestartInfo, RestartMode, detect_restart};
 
 // ── Version check ────────────────────────────────────────────────
 
@@ -810,6 +698,7 @@ fn trigger_graceful_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_runtime::i18n::get_required_cli_string;
 
     #[test]
     fn lock_recover_preserves_state_after_poisoning() {
