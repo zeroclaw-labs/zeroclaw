@@ -100,6 +100,9 @@ the operating system:
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
+| `plugin-webhook/dispatch` | client -> daemon | Deliver one plugin webhook request to the channel plugin that owns its path (local IPC only; see [Plugin webhook dispatch](#plugin-webhook-dispatch)) |
+| `plugin-webhook/cancel` | client -> daemon | Cancel an in-flight plugin webhook dispatch on the same connection (local IPC only) |
+| `plugin-webhook/routes` | client -> daemon | List the published plugin webhook routes and their owners (local IPC only) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
 
@@ -244,6 +247,121 @@ A repeat of an upload the session already indexed is checked against the file
 on disk. If the file was edited, deleted, or replaced by a link, the uploaded
 bytes are written back at the indexed path before it is returned.
 
+### Plugin webhook dispatch
+
+Each daemon generation runs one plugin webhook ingress. It owns route lookup,
+per-route queue admission, the request deadline, and message dedup for
+channel plugins. The gateway's `/plugin/{path}` route is one caller of it; the
+`plugin-webhook/*` methods let a local process deliver the same requests over
+this socket. In builds with plugin support, on Unix, the standalone
+`zeroclaw gateway` calls these methods over the local socket; the supervised gateway inside the daemon calls the same
+ingress in process.
+
+| Method | Grant | Purpose |
+|---|---|---|
+| `plugin-webhook/dispatch` | `channels:execute` | Deliver one webhook request to the channel plugin that owns its path and answer with the outcome |
+| `plugin-webhook/cancel` | `channels:execute` | Cancel one of this connection's in-flight dispatches |
+| `plugin-webhook/routes` | `channels:read` | List the published routes and their owners |
+
+All three are served only on the local IPC endpoint. A WSS connection,
+including one that arrives through the relay, and an in-process connection get
+`FORBIDDEN` whatever their grants. Grants are checked when a request is
+admitted. A dispatch ends within
+the ingress deadline, so it is not rechecked while it runs.
+
+Each grant reaches only the channel instances the caller's permission profile
+names in `allowed_channels`, written `<type>.<alias>` (for example
+`plugin.support`), or every instance with the explicit `"*"` entry; `admin`
+reaches all of them. Config can also close the path for a channel or an agent
+whatever grants exist. A dispatch that meets any of these refusals is answered
+`FORBIDDEN` with an audit record, and nothing is queued or reserved. The check
+runs at dispatch, on the route owner the request would be queued to, so a
+route that changes owner meanwhile cannot redirect it.
+
+| Refusal | Config |
+|---|---|
+| The caller's profile does not name the route's channel instance | `[permission_profiles.<name>] allowed_channels` |
+| The channel instance refuses injected webhooks | `[channels.plugin.<alias>] accept_injected_webhooks = false` |
+| An agent that handles the channel refuses them | `[agents.<alias>] accept_injected_webhooks = false` |
+
+Both `accept_injected_webhooks` fields default to `true`. They govern only
+webhooks delivered through `plugin-webhook/dispatch`, which a standalone
+gateway also uses; webhooks through the daemon's own gateway are not affected.
+
+```json
+{"jsonrpc":"2.0","method":"plugin-webhook/dispatch","params":{"request_id":"gw-1","path":"ops","method":"POST","query":"","headers":[{"name":"content-type","value":"application/json"}],"body_b64":"e30="},"id":3}
+{"jsonrpc":"2.0","result":{"outcome":"ack"},"id":3}
+```
+
+Every dispatch param is required. The request bounds are the
+`MAX_PLUGIN_WEBHOOK_*` constants in `zeroclaw_api::webhook`, which the gateway
+enforces too. The `request_id` format also applies to `plugin-webhook/cancel`;
+its uniqueness applies to dispatch alone:
+
+| Param | Rule |
+|---|---|
+| `request_id` | 1 to 128 bytes of printable ASCII without spaces, unique among the connection's in-flight dispatches |
+| `path` | The `{path}` of `/plugin/{path}`. An unknown path, or one that is not 1 to 64 ASCII letters, digits, `-` or `_`, is the `not_found` outcome |
+| `method` | `GET` or `POST` |
+| `query` | Raw query string without the leading `?`, at most 65,536 bytes |
+| `headers` | At most 512 `{name, value}` entries holding at most 524,288 bytes of names and values together. The core lowercases each name, which must then be 1 to 65,535 bytes, each an RFC 9110 token character or `"`: the lowercase names the `http` crate's `HeaderName` accepts. Values may hold only visible ASCII, space, and tab. Order and repeated names are kept |
+| `body_b64` | The exact body bytes in standard base64 with padding, at most 65,536 bytes once decoded |
+
+A dispatch that breaks any of these rules except the `path` rule, or reuses a
+`request_id` that is still in flight on the connection, is refused with
+`INVALID_PARAMS` and never reaches a plugin. The result's `outcome` reports
+everything else; JSON-RPC errors are kept for the caller's own faults.
+
+| Outcome | Meaning |
+|---|---|
+| `ack` | The plugin accepted the request |
+| `reply` | The plugin answered with `result.body`, at most 4096 UTF-8 bytes |
+| `not_found` | No live route owns the path |
+| `queue_full` | The route's queue (64 requests) or the connection's in-flight limit is full |
+| `unavailable` | The route or plugin could not take the request, or the daemon runs no plugin webhook ingress |
+| `unauthorized` | The plugin rejected the request's credentials |
+| `bad_request` | The plugin rejected the payload as malformed |
+| `invalid_response` | The plugin's response broke the host response rules |
+| `timeout` | No outcome within 10 seconds of the request entering the route's queue |
+| `cancelled` | A `plugin-webhook/cancel` for this `request_id` ended the dispatch |
+
+Outcomes carry no plugin diagnostic detail. The daemon logs that detail with
+the plugin and channel alias, and records the plugin's rejections with the
+route's path as well.
+
+Each dispatch runs in its own task, so the connection keeps answering other
+requests, including `plugin-webhook/cancel`, while the plugin works. A
+connection holds at most 1024 dispatches, each counted until its response is
+queued on the connection's bounded writer. Past that, a dispatch answers
+`queue_full` without reaching the ingress, so a caller that stops reading
+responses runs out of room instead of piling up work in the daemon.
+
+Cancellation:
+
+- `plugin-webhook/cancel` answers `{"cancelled":true}` when a dispatch with
+  that `request_id` is in flight on the same connection, and `false`
+  otherwise. The dispatch's own response stays authoritative: it reports
+  `cancelled`, or its real outcome if it finished first. A `request_id` that
+  breaks the rule above is refused with `INVALID_PARAMS`.
+- Closing the connection, or a daemon reload, cancels every dispatch in flight
+  on it. The plugin's copy of the request is cancelled and no response is
+  sent.
+- A `request_id` is released when its dispatch finishes. Reuse one only after
+  reading its response.
+- `plugin-webhook/cancel` sent as a notification cancels and sends nothing.
+
+A `plugin-webhook/dispatch` sent as a notification, with no `id`, is dropped
+and logged with `error_key` `plugin_webhook_dispatch_notification`, because
+its outcome would have nowhere to go.
+
+`plugin-webhook/routes` returns the routes of the channel instances the
+caller is granted, sorted by `path`, each with its `plugin` package and
+`channel_alias`, and a `generation` that counts the
+channel supervisor's route generations. `generation` starts over after a
+reload, so compare it only within one connection. The list is for
+diagnostics: a dispatch resolves its path when it arrives. When the daemon
+wires no ingress, dispatch answers `unavailable` and routes lists nothing.
+
 ## Ephemeral mode
 
 `zeroclaw daemon --ephemeral` tracks connected clients and self-terminates
@@ -254,6 +372,9 @@ at least one client has connected.
 Daemons started without `--ephemeral` ignore client count and run until
 explicitly stopped.
 
+In builds with plugin support, a standalone `zeroclaw gateway` on Unix holds a
+connection for as long as it runs, so it counts as a client and keeps an ephemeral daemon up.
+
 ## Security
 
 - Unix socket directory: `0o700` (owner only)
@@ -261,6 +382,28 @@ explicitly stopped.
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
+- The `plugin-webhook/*` methods are refused with `FORBIDDEN` on WSS,
+  including relayed connections, and on in-process connections, whatever the
+  caller's grants
+- A local caller holding `channels:execute` can dispatch to the routes of
+  the channel instances its profile names in `allowed_channels`, unless the
+  instance or an agent handling it refuses injected webhooks. The gateway's
+  per-client webhook rate limit does not apply. Plugins still verify each
+  request's platform signature, and the core enforces the request bounds
+- `channels:read` lists the paths of those routes. Some vendors treat an
+  unguessable webhook path as the shared secret, so grant it only to callers
+  that may know those paths
+- In builds with plugin support, the standalone `zeroclaw gateway` on Unix
+  forwards `/plugin/{path}` only to a
+  socket whose kernel-reported peer uid equals its own effective uid, checked
+  before it sends anything, so a socket another user serves never sees
+  webhook traffic. Under the default `security.trust_daemon_uid = true` it
+  then connects as the shared operator, which holds every grant (see
+  [Authentication](../security/authentication.md#local-connections)); only
+  its `/plugin/{path}` route uses that connection. A channel instance or
+  agent with `accept_injected_webhooks = false` still refuses what it
+  forwards. On Windows it does not forward at all, because nothing verifies
+  which process serves the daemon's named pipe yet
 
 ## Quick test
 
@@ -298,17 +441,33 @@ Paste lines one at a time:
 On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
 `nc` via WSL, or just run `zerocode`).
 
+## Contract document
+
+The method table, every wire type's JSON Schema, the notification names and
+the error codes are rendered into
+[`zeroclaw-rpc.openrpc.json`](zeroclaw-rpc.openrpc.json) by
+`cargo generate openrpc`. CI fails when that file drifts from
+`zeroclaw-rpc-proto`. OpenRPC describes what travels inside the JSON-RPC
+envelope; the NDJSON framing, handshake and transport rules on this page are
+the prose half of the contract.
+
 ## Internals
 
-The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
+The wire contract lives in `crates/zeroclaw-rpc-proto/` and the dispatch
+layer in `crates/zeroclaw-runtime/src/rpc/`:
 
 | File | Role |
 |---|---|
+| `zeroclaw-rpc-proto/src/method.rs` | `Method` enum, the single wire-name table, per-method params/result contract |
+| `zeroclaw-rpc-proto/src/types.rs` | wire-stable request, response and notification payload types |
+| `zeroclaw-rpc-proto/src/notification.rs` | server-to-client notification names |
+| `zeroclaw-rpc-client/src/client.rs` | `RpcClient`: dial, handshake, request/notification mux, reconnect backoff |
 | `transport.rs` | `RpcTransport` trait |
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
-| `dispatch.rs` | `RpcDispatcher` method routing |
+| `dispatch.rs` | `RpcDispatcher` method routing and `Method::authz` classification |
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
+| `inproc.rs` | `InprocTransport` + `InprocConnector`: in-memory duplex connections for the supervised gateway; their own transport class, no peer credential, and no anonymous compatibility path, so every in-process `initialize` needs an explicit credential |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |

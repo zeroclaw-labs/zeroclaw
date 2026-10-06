@@ -1,8 +1,11 @@
-//! HTTP admission and responses for channel-plugin webhooks.
+//! HTTP adapter for channel-plugin webhooks.
+//!
+//! Rate limiting and request bounds happen here; route admission, the
+//! deadline, and dedup belong to the core ingress, reached in process or, from
+//! the standalone gateway on Unix, over RPC.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::{
     Router,
@@ -12,41 +15,49 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
+use zeroclaw_api::webhook::{
+    MAX_PLUGIN_WEBHOOK_BODY_BYTES, PluginWebhookOutcome, PluginWebhookRequest, WebhookCancellation,
+};
+use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
 
-use crate::{AppState, IdempotencyStore, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
+use crate::{AppState, MAX_BODY_SIZE, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
 
-const PLUGIN_WEBHOOK_TIMEOUT_SECS: u64 = 10;
+#[cfg(unix)]
+mod forward;
 
-fn plugin_webhook_idempotency_key(path: &str, message_id: &str) -> String {
-    use sha2::{Digest, Sha256};
+// A body the gateway admits must never be one the ingress refuses: that would
+// turn a 413 into a 400.
+const _: () = assert!(MAX_BODY_SIZE <= MAX_PLUGIN_WEBHOOK_BODY_BYTES);
 
-    let mut digest = Sha256::new();
-    digest.update(b"zeroclaw-plugin-webhook\0");
-    digest.update(path.as_bytes());
-    digest.update(b"\0");
-    digest.update(message_id.as_bytes());
-    format!("plugin-webhook:{}", hex::encode(digest.finalize()))
+/// Where admitted requests are resolved. Chosen once at startup; a request
+/// never falls back from one to the other.
+#[derive(Clone)]
+pub(crate) enum PluginWebhookBackend {
+    /// This process's ingress: the supervised gateway inside the daemon.
+    InProcess(Arc<PluginWebhookIngress>),
+    /// The daemon's ingress over its local RPC socket: the standalone
+    /// gateway. This connection is the forwarder's own, never the one other
+    /// routes reach through the `CoreRpc` extension.
+    #[cfg(unix)]
+    Core(crate::core_rpc::CoreRpc),
 }
 
-fn plugin_webhook_idempotency(
-    store: Arc<IdempotencyStore>,
-    path: &str,
-) -> zeroclaw_api::webhook::WebhookIdempotency {
-    let begin_store = Arc::clone(&store);
-    let commit_store = Arc::clone(&store);
-    let path = path.to_string();
-    zeroclaw_api::webhook::WebhookIdempotency::new(
-        move |message_id| {
-            begin_store.begin_reservation(&plugin_webhook_idempotency_key(&path, message_id))
-        },
-        move |token| commit_store.commit_reservation(token),
-        move |token| store.rollback_reservation(token),
-    )
+impl PluginWebhookBackend {
+    /// The public response for an admitted request.
+    async fn respond(&self, request: PluginWebhookRequest) -> Response {
+        match self {
+            Self::InProcess(ingress) => {
+                let cancellation = WebhookCancellation::new();
+                let _cancel_on_exit = cancellation.clone().drop_guard();
+                outcome_response(ingress.dispatch(request, &cancellation).await)
+            }
+            #[cfg(unix)]
+            Self::Core(core) => forward::respond(core, request).await,
+        }
+    }
 }
 
-pub(super) fn routes(
-    registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
-) -> Router<AppState> {
+pub(super) fn routes(backend: PluginWebhookBackend) -> Router<AppState> {
     Router::new()
         .route(
             "/plugin/{path}",
@@ -55,7 +66,7 @@ pub(super) fn routes(
                 .head(unsupported_method)
                 .fallback(unsupported_method),
         )
-        .layer(axum::Extension(registry))
+        .layer(axum::Extension(backend))
 }
 
 async fn unsupported_method() -> impl IntoResponse {
@@ -70,17 +81,13 @@ async fn unsupported_method() -> impl IntoResponse {
 async fn handle_plugin_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    axum::Extension(backend): axum::Extension<PluginWebhookBackend>,
     Path(path): Path<String>,
     method: Method,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    use zeroclaw_api::webhook::{
-        MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookOutcome, WebhookReject,
-    };
-
     // Apply the same trusted-forwarded-aware client key and limiter as the
     // built-in webhook before route lookup or guest work.
     let rate_key =
@@ -106,98 +113,70 @@ async fn handle_plugin_webhook(
             .into_response();
     }
 
-    let Some(sink) = registry.get(&path) else {
-        return (StatusCode::NOT_FOUND, "webhook not found").into_response();
-    };
+    // Drop, rather than refuse the request over, a value outside visible
+    // ASCII, space, and tab: the ingress would reject the whole request.
     let headers = headers
         .iter()
         .filter_map(|(name, value)| {
             value
                 .to_str()
                 .ok()
-                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
         })
         .collect();
-    let cancellation = zeroclaw_api::webhook::WebhookCancellation::new();
-    let _cancel_on_exit = cancellation.clone().drop_guard();
-    let (reply, outcome) = tokio::sync::oneshot::channel();
-    let request = RawWebhook {
-        method: method.to_string(),
-        query: query.unwrap_or_default(),
+    let request = match PluginWebhookRequest::new(
+        path.as_str(),
+        method.as_str(),
+        query.unwrap_or_default(),
         headers,
-        body: body.to_vec(),
-        cancellation,
-        idempotency: Some(plugin_webhook_idempotency(
-            Arc::clone(&state.idempotency_store),
-            &path,
-        )),
-        reply,
+        body.to_vec(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path,
+                        "reason": error.reason(),
+                        "error_key": "plugin_webhook_request_invalid",
+                    })),
+                "Plugin webhook request exceeds the ingress bounds"
+            );
+            return (StatusCode::BAD_REQUEST, "invalid webhook").into_response();
+        }
     };
-    match sink.try_send(request) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            return (StatusCode::TOO_MANY_REQUESTS, "webhook queue full").into_response();
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response();
-        }
-    }
+    backend.respond(request).await
+}
 
-    match tokio::time::timeout(Duration::from_secs(PLUGIN_WEBHOOK_TIMEOUT_SECS), outcome).await {
-        Ok(Ok(Ok(WebhookOutcome::Ack))) => StatusCode::OK.into_response(),
-        Ok(Ok(Ok(WebhookOutcome::Body(body)))) => {
-            if body.len() > MAX_WEBHOOK_RESPONSE_BODY_BYTES {
-                (StatusCode::BAD_GATEWAY, "invalid webhook response").into_response()
-            } else {
-                body.into_response()
-            }
+/// The fixed public status and body for each ingress outcome. Guest and host
+/// detail never reaches this unauthenticated surface.
+fn outcome_response(outcome: PluginWebhookOutcome) -> Response {
+    match outcome {
+        PluginWebhookOutcome::Ack => StatusCode::OK.into_response(),
+        PluginWebhookOutcome::Reply(body) => body.into_response(),
+        PluginWebhookOutcome::NotFound => {
+            (StatusCode::NOT_FOUND, "webhook not found").into_response()
         }
-        Ok(Ok(Err(WebhookReject::InvalidResponse))) => {
+        PluginWebhookOutcome::QueueFull => {
+            (StatusCode::TOO_MANY_REQUESTS, "webhook queue full").into_response()
+        }
+        PluginWebhookOutcome::InvalidResponse => {
             (StatusCode::BAD_GATEWAY, "invalid webhook response").into_response()
         }
-        Ok(Ok(Err(WebhookReject::Unauthorized(_)))) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": path,
-                        "error_key": "plugin_webhook_unauthorized",
-                    })),
-                "Channel plugin rejected webhook authentication"
-            );
+        PluginWebhookOutcome::Unauthorized => {
             (StatusCode::UNAUTHORIZED, "unauthorized webhook").into_response()
         }
-        Ok(Ok(Err(WebhookReject::BadRequest(_)))) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": path,
-                        "error_key": "plugin_webhook_invalid",
-                    })),
-                "Channel plugin rejected malformed webhook"
-            );
+        PluginWebhookOutcome::BadRequest => {
             (StatusCode::BAD_REQUEST, "invalid webhook").into_response()
         }
-        Ok(Ok(Err(WebhookReject::Unavailable(_)))) => {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": path,
-                        "error_key": "plugin_webhook_unavailable",
-                    })),
-                "Channel plugin webhook processing unavailable"
-            );
+        PluginWebhookOutcome::Unavailable | PluginWebhookOutcome::Cancelled => {
             (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response()
         }
-        Ok(Ok(Err(WebhookReject::Timeout))) | Err(_) => {
+        PluginWebhookOutcome::Timeout => {
             (StatusCode::GATEWAY_TIMEOUT, "webhook processing timed out").into_response()
         }
-        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response(),
     }
 }
 

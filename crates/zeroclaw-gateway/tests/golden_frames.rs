@@ -21,6 +21,21 @@
 //!     --test golden_frames --run-ignored only
 //! ```
 //!
+//! The `/plugin/{path}` scenarios in the `plugin_webhook` module are the
+//! exception. The route only exists with the gateway's `plugins-wasm` feature,
+//! so the module is compiled only with it too, and its scenarios are not
+//! ignored: the plugin backend CI job runs them as required coverage. They
+//! start the gateway through `run_gateway_with_plugin_webhooks` with a
+//! test-owned plugin webhook ingress whose routes are served by scripted
+//! workers in place of channel plugins, and they also record what each worker
+//! received.
+//! To regenerate their fixtures:
+//!
+//! ```text
+//! ZEROCLAW_GOLDEN_RECORD=1 cargo test -p zeroclaw-gateway \
+//!     --features plugins-wasm --test golden_frames plugin_webhook
+//! ```
+//!
 //! Normalization keeps identity visible: each distinct UUID becomes
 //! `<uuid:N>` numbered by first appearance, so a transcript still shows
 //! whether two frames name the same session, turn, or tool call.
@@ -178,22 +193,7 @@ impl Gateway {
     async fn start(provider: &ScriptedProvider) -> Self {
         let root = tempfile::TempDir::new().expect("gateway temp root");
         let config = fixture_config(root.path(), &provider.base_url());
-
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe free port");
-        let port = probe.local_addr().expect("probe address").port();
-        drop(probe);
-
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        let (reload_tx, _) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
-            shutdown_tx.clone(),
-            reload_tx,
-        );
-        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
-        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
-            let _ = ready_tx.send(Some(addr));
-        });
-        let server = zeroclaw_spawn::spawn!(async move {
+        Self::launch(root, move |port, reload_controls, readiness| {
             zeroclaw_gateway::run_gateway(
                 "127.0.0.1",
                 port,
@@ -208,8 +208,37 @@ impl Gateway {
                 None,
                 Some(readiness),
             )
-            .await
+        })
+        .await
+    }
+
+    /// Spawns the gateway that `run` starts on a free loopback port and waits
+    /// until it reports its bind.
+    async fn launch<F, Fut>(root: tempfile::TempDir, run: F) -> Self
+    where
+        F: FnOnce(
+            u16,
+            zeroclaw_runtime::daemon::GatewayReloadControls,
+            zeroclaw_runtime::daemon::GatewayReadinessReporter,
+        ) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe free port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
         });
+        let gateway = run(port, reload_controls, readiness);
+        let server = zeroclaw_spawn::spawn!(gateway);
         let addr = tokio::time::timeout(STEP_TIMEOUT, async {
             ready_rx
                 .wait_for(Option::is_some)
@@ -515,12 +544,41 @@ fn line_diff(expected: &str, actual: &str) -> String {
 /// nextest already runs each test in its own process.
 static SCENARIO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs a scenario on a runtime with large worker stacks: building a
-/// runtime agent overflows the default test-thread stack on Linux.
+/// Runs a standalone-gateway scenario against its scripted provider.
 fn run_scenario<F, Fut>(scenario: &'static str, script: Vec<Reply>, body: F)
 where
     F: FnOnce(SocketAddr, Transcript) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Transcript>,
+{
+    on_scenario_runtime(scenario, move || async move {
+        let provider = ScriptedProvider::spawn(script).await;
+        let gateway = Gateway::start(&provider).await;
+        let transcript = tokio::time::timeout(
+            Duration::from_secs(60),
+            body(gateway.addr, Transcript::default()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("scenario `{scenario}` timed out"));
+        let mut normalizer = Normalizer::new(&gateway, &provider);
+        let frames = coalesce_chunks(transcript.frames)
+            .iter()
+            .map(|frame| normalizer.value(None, frame))
+            .collect();
+        let provider_requests = provider.requests.load(Ordering::SeqCst);
+        gateway.stop().await;
+        let mut frames: Vec<Value> = frames;
+        frames.push(json!({"dir": "meta", "channel": "provider",
+            "payload": {"requests": provider_requests}}));
+        check_fixture(scenario, frames);
+    });
+}
+
+/// Runs one scenario at a time on a runtime with large worker stacks:
+/// building a runtime agent overflows the default test-thread stack on Linux.
+fn on_scenario_runtime<F, Fut>(scenario: &'static str, run: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
 {
     let _serial = SCENARIO_LOCK
         .lock()
@@ -535,27 +593,7 @@ where
                 .enable_all()
                 .build()
                 .expect("scenario runtime");
-            runtime.block_on(async move {
-                let provider = ScriptedProvider::spawn(script).await;
-                let gateway = Gateway::start(&provider).await;
-                let transcript = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    body(gateway.addr, Transcript::default()),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("scenario `{scenario}` timed out"));
-                let mut normalizer = Normalizer::new(&gateway, &provider);
-                let frames = coalesce_chunks(transcript.frames)
-                    .iter()
-                    .map(|frame| normalizer.value(None, frame))
-                    .collect();
-                let provider_requests = provider.requests.load(Ordering::SeqCst);
-                gateway.stop().await;
-                let mut frames: Vec<Value> = frames;
-                frames.push(json!({"dir": "meta", "channel": "provider",
-                    "payload": {"requests": provider_requests}}));
-                check_fixture(scenario, frames);
-            });
+            runtime.block_on(run());
         })
         .expect("spawn scenario thread")
         .join()
@@ -602,25 +640,46 @@ async fn open_request(
     headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> tokio::net::TcpStream {
+    let payload = body.map(Value::to_string).unwrap_or_default();
+    let mut raw_headers: Vec<(&str, &[u8])> = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_bytes()))
+        .collect();
+    if body.is_some() {
+        raw_headers.push(("Content-Type", "application/json".as_bytes()));
+    }
+    let mut request = request_head(addr, method, path, &raw_headers, payload.len());
+    request.extend_from_slice(payload.as_bytes());
+    write_request(addr, &request).await
+}
+
+/// The request line and headers of a `Connection: close` request whose body
+/// is `content_length` bytes. Header values are raw bytes, so a request can
+/// carry values that are not UTF-8.
+fn request_head(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &[u8])],
+    content_length: usize,
+) -> Vec<u8> {
+    let mut head =
+        format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n").into_bytes();
+    for (name, value) in headers {
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value);
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(format!("Content-Length: {content_length}\r\n\r\n").as_bytes());
+    head
+}
+
+async fn write_request(addr: SocketAddr, request: &[u8]) -> tokio::net::TcpStream {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to gateway");
-    let payload = body.map(Value::to_string).unwrap_or_default();
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\r\n"));
-    }
-    if body.is_some() {
-        request.push_str("Content-Type: application/json\r\n");
-    }
-    request.push_str(&format!(
-        "Content-Length: {}\r\n\r\n{payload}",
-        payload.len()
-    ));
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("write request");
+    stream.write_all(request).await.expect("write request");
     stream
 }
 
@@ -1076,6 +1135,634 @@ fn headers_json(headers: &[(&str, &str)]) -> Value {
             .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
             .collect::<serde_json::Map<_, _>>(),
     )
+}
+
+// ── Plugin webhook scenarios ────────────────────────────────────────────
+
+/// `/plugin/{path}` scenarios. Each exchange records the request, then on the
+/// `plugin` channel what the route's worker received, then the response. An
+/// exchange the gateway answers on its own has no `plugin` frame, which pins
+/// that the request never reached a worker. Bodies and header values are
+/// recorded as text when they are UTF-8 and as hex otherwise, so a fixture
+/// pins the exact bytes a worker receives. The last frame lists every worker
+/// report no exchange claimed, collected once the routes are retired and every
+/// worker has stopped, so an extra or duplicate delivery is a fixture diff.
+#[cfg(feature = "plugins-wasm")]
+mod plugin_webhook {
+    use super::*;
+
+    use std::time::Instant;
+
+    use tokio::sync::mpsc;
+    use zeroclaw_api::webhook::{
+        MAX_WEBHOOK_RESPONSE_BODY_BYTES, PLUGIN_WEBHOOK_DEADLINE, PluginWebhookOwner,
+        PluginWebhookRegistry, PluginWebhookRegistryLease, PluginWebhookRoute, RawWebhook,
+        WebhookCancellation, WebhookOutcome, WebhookReject, WebhookReservation,
+    };
+    use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
+
+    /// Queue depth of the worker-backed routes; none of them fills up.
+    const WORKER_QUEUE: usize = 4;
+    /// A capacity-1 route whose queue is filled before the gateway starts and
+    /// never drained.
+    const FULL_ROUTE: &str = "queue-full";
+    /// A route whose receiver is dropped before the gateway starts.
+    const CLOSED_ROUTE: &str = "closed";
+    /// The header carrying the message ID the `dedup` worker reserves.
+    const MESSAGE_ID_HEADER: &str = "x-golden-message-id";
+
+    /// How the worker behind a route answers each request.
+    #[derive(Clone, Copy)]
+    enum Worker {
+        Ack,
+        EchoQuery,
+        /// Replies with the `challenge` field of a JSON body.
+        EchoChallenge,
+        EmptyReply,
+        /// Reserves the message ID through the request's idempotency bridge,
+        /// commits it when it owns the reservation, and acknowledges.
+        Dedup,
+        Unauthorized,
+        BadRequest,
+        InvalidResponse,
+        /// Replies one byte over the reply bound.
+        OversizedReply,
+        Unavailable,
+        TimeoutReject,
+        /// Drops the reply sender without answering.
+        DropReply,
+        /// Never answers, and reports when the gateway cancels the request.
+        Stall,
+    }
+
+    const ROUTES: [(&str, Worker); 13] = [
+        ("ack", Worker::Ack),
+        ("echo-query", Worker::EchoQuery),
+        ("echo-challenge", Worker::EchoChallenge),
+        ("empty-reply", Worker::EmptyReply),
+        ("dedup", Worker::Dedup),
+        ("unauthorized", Worker::Unauthorized),
+        ("bad-request", Worker::BadRequest),
+        ("invalid-response", Worker::InvalidResponse),
+        ("oversized-reply", Worker::OversizedReply),
+        ("unavailable", Worker::Unavailable),
+        ("timeout-reject", Worker::TimeoutReject),
+        ("dropped-reply", Worker::DropReply),
+        ("stalled", Worker::Stall),
+    ];
+
+    /// Serves one route. Every request is reported before it is answered, so
+    /// the report is queued by the time the gateway responds.
+    async fn serve(
+        route: &'static str,
+        worker: Worker,
+        mut requests: mpsc::Receiver<RawWebhook>,
+        reports: mpsc::UnboundedSender<Value>,
+    ) {
+        while let Some(request) = requests.recv().await {
+            let mut report = json!({
+                "route": route,
+                "method": request.method,
+                "query": request.query,
+                "headers": request.headers,
+                "body": text_or_hex(&request.body),
+            });
+            let answer = match worker {
+                Worker::Ack => Ok(WebhookOutcome::Ack),
+                Worker::EchoQuery => Ok(WebhookOutcome::Body(request.query.clone())),
+                Worker::EchoChallenge => Ok(WebhookOutcome::Body(challenge(&request.body))),
+                Worker::EmptyReply => Ok(WebhookOutcome::Body(String::new())),
+                Worker::Dedup => {
+                    report["reservation"] = json!(reserve(&request));
+                    Ok(WebhookOutcome::Ack)
+                }
+                Worker::Unauthorized => Err(WebhookReject::Unauthorized(
+                    "private signature detail".to_string(),
+                )),
+                Worker::BadRequest => Err(WebhookReject::BadRequest(
+                    "private parser detail".to_string(),
+                )),
+                Worker::InvalidResponse => Err(WebhookReject::InvalidResponse),
+                Worker::OversizedReply => Ok(WebhookOutcome::Body(
+                    "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1),
+                )),
+                Worker::Unavailable => Err(WebhookReject::Unavailable(
+                    "private host detail".to_string(),
+                )),
+                Worker::TimeoutReject => Err(WebhookReject::Timeout),
+                Worker::DropReply => {
+                    let _ = reports.send(report);
+                    continue;
+                }
+                Worker::Stall => {
+                    let _ = reports.send(report);
+                    request.cancellation.cancelled().await;
+                    let _ = reports.send(json!({"route": route, "cancelled": true}));
+                    continue;
+                }
+            };
+            let _ = reports.send(report);
+            let _ = request.reply.send(answer);
+        }
+    }
+
+    fn challenge(body: &[u8]) -> String {
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|body| body["challenge"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// Reserves the request's message ID the way a channel worker does once
+    /// it has delivered the message.
+    fn reserve(request: &RawWebhook) -> &'static str {
+        let Some(idempotency) = &request.idempotency else {
+            return "no idempotency bridge";
+        };
+        let message_id = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == MESSAGE_ID_HEADER)
+            .map_or("", |(_, value)| value.as_str());
+        match idempotency.begin(message_id) {
+            WebhookReservation::Owner(token) => {
+                if idempotency.commit(&token) {
+                    "owner, committed"
+                } else {
+                    "owner, commit refused"
+                }
+            }
+            WebhookReservation::Committed => "committed",
+            WebhookReservation::InFlight(_) => "in flight",
+            WebhookReservation::Unavailable => "unavailable",
+        }
+    }
+
+    /// The route generation a channel supervisor would publish, served by
+    /// scripted workers. The routes stay live while this value does.
+    struct ScriptedRoutes {
+        _lease: PluginWebhookRegistryLease,
+        _full_queue: mpsc::Receiver<RawWebhook>,
+    }
+
+    impl ScriptedRoutes {
+        fn publish(
+            registry: &PluginWebhookRegistry,
+            reports: &mpsc::UnboundedSender<Value>,
+        ) -> Self {
+            let route_for = |sink| {
+                PluginWebhookRoute::new(PluginWebhookOwner::new("golden-plugin", "golden"), sink)
+            };
+            let mut routes = HashMap::new();
+            for (route, worker) in ROUTES {
+                let (sink, requests) = mpsc::channel(WORKER_QUEUE);
+                routes.insert(route.to_string(), route_for(sink));
+                let task = serve(route, worker, requests, reports.clone());
+                zeroclaw_spawn::spawn!(task);
+            }
+
+            let (full_sink, full_queue) = mpsc::channel(1);
+            let (unanswered, _) = tokio::sync::oneshot::channel();
+            full_sink
+                .try_send(RawWebhook {
+                    method: "POST".to_string(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    cancellation: WebhookCancellation::new(),
+                    idempotency: None,
+                    reply: unanswered,
+                })
+                .expect("fill the full route's queue");
+            routes.insert(FULL_ROUTE.to_string(), route_for(full_sink));
+
+            let (closed_sink, closed_requests) = mpsc::channel(1);
+            drop(closed_requests);
+            routes.insert(CLOSED_ROUTE.to_string(), route_for(closed_sink));
+
+            let lease = registry.start_generation();
+            assert!(
+                lease.replace(routes),
+                "the scripted generation owns the registry"
+            );
+            Self {
+                _lease: lease,
+                _full_queue: full_queue,
+            }
+        }
+    }
+
+    /// Whether a request reaches a route's worker or the gateway answers it
+    /// on its own.
+    #[derive(Clone, Copy)]
+    enum Reaches {
+        Worker,
+        GatewayOnly,
+    }
+
+    struct Client {
+        addr: SocketAddr,
+        reports: mpsc::UnboundedReceiver<Value>,
+        transcript: Transcript,
+    }
+
+    impl Client {
+        async fn exchange(
+            &mut self,
+            method: &str,
+            path: &str,
+            headers: &[(&str, &[u8])],
+            body: &[u8],
+            reaches: Reaches,
+        ) {
+            self.transcript.send(
+                "http",
+                json!({
+                    "method": method,
+                    "path": path,
+                    "headers": raw_headers_json(headers),
+                    "body": text_or_hex(body),
+                }),
+            );
+            let mut request = request_head(self.addr, method, path, headers, body.len());
+            request.extend_from_slice(body);
+            self.complete(&request, reaches).await;
+        }
+
+        /// Declares a `body_len`-byte body and withholds it. The body limit
+        /// answers from the declared length; a body the server never reads
+        /// would make its close reset the connection and race the response.
+        async fn exchange_withholding_body(&mut self, method: &str, path: &str, body_len: usize) {
+            self.transcript.send(
+                "http",
+                json!({"method": method, "path": path, "declared_body_bytes": body_len}),
+            );
+            let request = request_head(self.addr, method, path, &[], body_len);
+            self.complete(&request, Reaches::GatewayOnly).await;
+        }
+
+        async fn complete(&mut self, request: &[u8], reaches: Reaches) {
+            let mut stream = write_request(self.addr, request).await;
+            let raw = read_response(&mut stream, Vec::new(), None).await;
+            match reaches {
+                Reaches::Worker => self.observe().await,
+                // Anything queued here reached a worker it should not have,
+                // and shows up as a fixture diff.
+                Reaches::GatewayOnly => {
+                    while let Ok(report) = self.reports.try_recv() {
+                        self.transcript.recv("plugin", report);
+                    }
+                }
+            }
+            let response = parse_http_response(&raw);
+            let mut payload = json!({
+                "status": response.status,
+                "content_type": response.content_type,
+                "body": response.body,
+            });
+            if let Some(allow) = response_header(&raw, "allow") {
+                payload["allow"] = Value::String(allow);
+            }
+            self.transcript.recv("http", payload);
+        }
+
+        /// Records the next worker report.
+        async fn observe(&mut self) {
+            let report = tokio::time::timeout(STEP_TIMEOUT, self.reports.recv())
+                .await
+                .expect("a worker should report")
+                .expect("workers outlive the scenario");
+            self.transcript.recv("plugin", report);
+        }
+    }
+
+    /// Header pairs in send order, each value as [`text_or_hex`] renders it.
+    fn raw_headers_json(headers: &[(&str, &[u8])]) -> Value {
+        headers
+            .iter()
+            .map(|(name, value)| json!([name, text_or_hex(value)]))
+            .collect()
+    }
+
+    /// `bytes` as text when they are UTF-8, and as `<bytes HEX>` otherwise:
+    /// a lossy decode would map different invalid bytes to the same text.
+    fn text_or_hex(bytes: &[u8]) -> String {
+        std::str::from_utf8(bytes).map_or_else(
+            |_| format!("<bytes {}>", hex::encode(bytes)),
+            str::to_string,
+        )
+    }
+
+    fn response_header(raw: &[u8], name: &str) -> Option<String> {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+        String::from_utf8_lossy(&raw[..end])
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+    }
+
+    /// Starts the gateway with an ingress built from the scenario's config,
+    /// as the daemon builds one per generation, and publishes the scripted
+    /// routes into it.
+    async fn start_gateway(
+        provider: &ScriptedProvider,
+        configure: fn(&mut Config),
+        reports: &mpsc::UnboundedSender<Value>,
+    ) -> (Gateway, ScriptedRoutes) {
+        let root = tempfile::TempDir::new().expect("gateway temp root");
+        let mut config = fixture_config(root.path(), &provider.base_url());
+        configure(&mut config);
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())
+            .expect("scenario config builds a live config authority");
+        let ingress = Arc::new(PluginWebhookIngress::new(
+            config.gateway.idempotency_ttl_secs,
+            config.gateway.idempotency_max_keys,
+        ));
+        let routes = ScriptedRoutes::publish(ingress.registry(), reports);
+        let gateway = Gateway::launch(root, move |port, reload_controls, readiness| {
+            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                zeroclaw_gateway::GatewaySupervision::new(
+                    Some(readiness),
+                    ingress,
+                    authority,
+                    None,
+                ),
+            ))
+        })
+        .await;
+        (gateway, routes)
+    }
+
+    /// Runs a scenario against a supervised gateway whose plugin webhook
+    /// routes are served by scripted workers. The agent config still names
+    /// the scripted provider; no plugin webhook reaches it.
+    fn run_plugin_scenario<F, Fut>(scenario: &'static str, configure: fn(&mut Config), body: F)
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Client>,
+    {
+        on_scenario_runtime(scenario, move || async move {
+            let provider = ScriptedProvider::spawn(vec![Reply::Text("unused")]).await;
+            let (report_tx, reports) = mpsc::unbounded_channel();
+            let (gateway, routes) = start_gateway(&provider, configure, &report_tx).await;
+            drop(report_tx);
+            let client = Client {
+                addr: gateway.addr,
+                reports,
+                transcript: Transcript::default(),
+            };
+            let Client {
+                reports,
+                transcript,
+                ..
+            } = tokio::time::timeout(Duration::from_secs(60), body(client))
+                .await
+                .unwrap_or_else(|_| panic!("scenario `{scenario}` timed out"));
+            let mut normalizer = Normalizer::new(&gateway, &provider);
+            let mut frames: Vec<Value> = transcript
+                .frames
+                .iter()
+                .map(|frame| normalizer.value(None, frame))
+                .collect();
+            gateway.stop().await;
+            drop(routes);
+            let unclaimed: Vec<Value> = unclaimed_reports(reports)
+                .await
+                .iter()
+                .map(|report| normalizer.value(None, report))
+                .collect();
+            frames.push(json!({"dir": "meta", "channel": "plugin",
+                "payload": {"unclaimed_reports": unclaimed}}));
+            check_fixture(scenario, frames);
+        });
+    }
+
+    /// Every report still queued once the workers have stopped. Retiring the
+    /// routes drops the last sink of each worker's queue, so each worker
+    /// serves what it already holds, exits, and drops its report sender; the
+    /// channel closes once every report is in. One worker reports in the order
+    /// it served, but two workers' reports interleave by scheduling, so they
+    /// are grouped by route with a stable sort.
+    async fn unclaimed_reports(mut reports: mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut unclaimed = Vec::new();
+        while let Some(report) = tokio::time::timeout(STEP_TIMEOUT, reports.recv())
+            .await
+            .expect("workers stop once their routes are retired")
+        {
+            unclaimed.push(report);
+        }
+        unclaimed.sort_by(|a, b| a["route"].as_str().cmp(&b["route"].as_str()));
+        unclaimed
+    }
+
+    #[test]
+    fn delivery() {
+        run_plugin_scenario(
+            "plugin_webhook_delivery",
+            |_| {},
+            |mut client| async move {
+                // Header names reach the worker lowercased, a repeated name
+                // keeps every value, and a value outside visible ASCII is
+                // dropped, whether raw non-UTF-8 bytes or non-ASCII UTF-8.
+                client
+                    .exchange(
+                        "POST",
+                        "/plugin/ack?source=golden&n=1",
+                        &[
+                            ("Content-Type", "text/plain; charset=utf-8".as_bytes()),
+                            ("X-Golden-Signature", "sha256=0f1e2d".as_bytes()),
+                            ("X-Golden-Multi", "one".as_bytes()),
+                            ("X-Golden-Multi", "two".as_bytes()),
+                            ("X-Golden-Opaque", b"\xff\xfe".as_slice()),
+                            ("X-Golden-Accent", "caf\u{e9}".as_bytes()),
+                        ],
+                        b"plain text body, not JSON",
+                        Reaches::Worker,
+                    )
+                    .await;
+                // The body reaches the worker byte for byte, including a NUL
+                // and bytes that are not UTF-8.
+                client
+                    .exchange(
+                        "POST",
+                        "/plugin/ack",
+                        &[("Content-Type", "application/octet-stream".as_bytes())],
+                        b"\x00\xff\xfe opaque \x80 bytes\r\n",
+                        Reaches::Worker,
+                    )
+                    .await;
+                client
+                    .exchange(
+                        "GET",
+                        "/plugin/echo-query?challenge=a%2Bb&part=one&part=two",
+                        &[],
+                        b"",
+                        Reaches::Worker,
+                    )
+                    .await;
+                client
+                    .exchange(
+                        "POST",
+                        "/plugin/echo-challenge",
+                        &[("Content-Type", "application/json".as_bytes())],
+                        br#"{"type":"url_verification","challenge":"golden-challenge"}"#,
+                        Reaches::Worker,
+                    )
+                    .await;
+                client
+                    .exchange("GET", "/plugin/empty-reply", &[], b"", Reaches::Worker)
+                    .await;
+                // The second delivery of one message ID finds it committed.
+                for _ in 0..2 {
+                    client
+                        .exchange(
+                            "POST",
+                            "/plugin/dedup",
+                            &[(MESSAGE_ID_HEADER, "golden-message-1".as_bytes())],
+                            b"{}",
+                            Reaches::Worker,
+                        )
+                        .await;
+                }
+                client
+            },
+        );
+    }
+
+    #[test]
+    fn rejections() {
+        run_plugin_scenario(
+            "plugin_webhook_rejections",
+            |_| {},
+            |mut client| async move {
+                for route in [
+                    "unauthorized",
+                    "bad-request",
+                    "invalid-response",
+                    "oversized-reply",
+                    "unavailable",
+                    "timeout-reject",
+                    "dropped-reply",
+                ] {
+                    client
+                        .exchange(
+                            "POST",
+                            &format!("/plugin/{route}"),
+                            &[],
+                            b"signed payload",
+                            Reaches::Worker,
+                        )
+                        .await;
+                }
+                client
+            },
+        );
+    }
+
+    #[test]
+    fn admission() {
+        run_plugin_scenario(
+            "plugin_webhook_admission",
+            |_| {},
+            |mut client| async move {
+                for route in ["missing", "not.a.route", FULL_ROUTE, CLOSED_ROUTE] {
+                    client
+                        .exchange(
+                            "POST",
+                            &format!("/plugin/{route}"),
+                            &[],
+                            b"body",
+                            Reaches::GatewayOnly,
+                        )
+                        .await;
+                }
+                // The method check comes before route lookup: an unknown path is
+                // refused the same way as a live one.
+                client
+                    .exchange("HEAD", "/plugin/ack", &[], b"", Reaches::GatewayOnly)
+                    .await;
+                client
+                    .exchange("PUT", "/plugin/missing", &[], b"", Reaches::GatewayOnly)
+                    .await;
+                client
+                    .exchange_withholding_body(
+                        "POST",
+                        "/plugin/ack",
+                        zeroclaw_gateway::MAX_BODY_SIZE + 1,
+                    )
+                    .await;
+                client
+            },
+        );
+    }
+
+    #[test]
+    fn rate_limit() {
+        run_plugin_scenario(
+            "plugin_webhook_rate_limit",
+            |config| config.gateway.webhook_rate_limit_per_minute = 1,
+            |mut client| async move {
+                client
+                    .exchange("POST", "/plugin/ack", &[], b"first", Reaches::Worker)
+                    .await;
+                client
+                    .exchange("POST", "/plugin/ack", &[], b"second", Reaches::GatewayOnly)
+                    .await;
+                // The limit applies before route lookup.
+                client
+                    .exchange(
+                        "POST",
+                        "/plugin/missing",
+                        &[],
+                        b"third",
+                        Reaches::GatewayOnly,
+                    )
+                    .await;
+                client
+            },
+        );
+    }
+
+    #[test]
+    fn timeout() {
+        run_plugin_scenario(
+            "plugin_webhook_timeout",
+            |_| {},
+            |mut client| async move {
+                let started = Instant::now();
+                client
+                    .exchange(
+                        "POST",
+                        "/plugin/stalled",
+                        &[],
+                        b"never answered",
+                        Reaches::Worker,
+                    )
+                    .await;
+                assert!(
+                    started.elapsed() >= PLUGIN_WEBHOOK_DEADLINE,
+                    "the gateway answered before its deadline"
+                );
+                // Giving up cancels the request the worker still holds.
+                client.observe().await;
+                client
+            },
+        );
+    }
 }
 
 // ── Harness self-tests (not ignored: no gateway, no network) ────────────

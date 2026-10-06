@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -12,18 +13,28 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::{
     GatewayRateLimiter, MAX_BODY_SIZE, SlidingWindowRateLimiter, tests::admin_paircode_state,
 };
-use zeroclaw_api::webhook::WebhookOutcome;
+use zeroclaw_api::webhook::{PluginWebhookOwner, PluginWebhookRoute, RawWebhook, WebhookOutcome};
 
-fn plugin_webhook_test_router(
-    state: AppState,
-    registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
-) -> Router {
-    routes(registry)
+fn test_ingress() -> Arc<PluginWebhookIngress> {
+    Arc::new(PluginWebhookIngress::new(300, 8))
+}
+
+fn fixture_route(sink: tokio::sync::mpsc::Sender<RawWebhook>) -> PluginWebhookRoute {
+    PluginWebhookRoute::new(PluginWebhookOwner::new("fixture-plugin", "fixture"), sink)
+}
+
+fn plugin_webhook_test_router(state: AppState, ingress: Arc<PluginWebhookIngress>) -> Router {
+    backend_test_router(state, PluginWebhookBackend::InProcess(ingress))
+}
+
+/// The plugin webhook route over `backend`, with the gateway's body limit.
+pub(super) fn backend_test_router(state: AppState, backend: PluginWebhookBackend) -> Router {
+    routes(backend)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
 }
 
-fn plugin_webhook_request(
+pub(super) fn plugin_webhook_request(
     path: &str,
     body: impl Into<Body>,
     peer: SocketAddr,
@@ -42,7 +53,7 @@ fn plugin_webhook_request(
     request
 }
 
-async fn response_text(response: Response) -> String {
+pub(super) async fn response_text(response: Response) -> String {
     let bytes = response
         .into_body()
         .collect()
@@ -54,14 +65,15 @@ async fn response_text(response: Response) -> String {
 
 #[tokio::test]
 async fn plugin_webhook_router_delivers_exact_request() {
-    use zeroclaw_api::webhook::PluginWebhookRegistry;
-
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let state = admin_paircode_state(&tmp, false, false);
-    let registry = Arc::new(PluginWebhookRegistry::new());
+    let ingress = test_ingress();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
-    let registry_lease = registry.start_generation();
-    assert!(registry_lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let registry_lease = ingress.registry().start_generation();
+    assert!(registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
     let (seen, observed) = tokio::sync::oneshot::channel();
     zeroclaw_spawn::spawn!(async move {
         let request = receiver.recv().await.expect("route forwards request");
@@ -74,7 +86,7 @@ async fn plugin_webhook_router_delivers_exact_request() {
     request
         .headers_mut()
         .insert("x-fixture-secret", HeaderValue::from_static("test-secret"));
-    let response = plugin_webhook_test_router(state, registry)
+    let response = plugin_webhook_test_router(state, ingress)
         .oneshot(request)
         .await
         .expect("plugin route is infallible");
@@ -90,14 +102,17 @@ async fn plugin_webhook_router_delivers_exact_request() {
 
 #[tokio::test]
 async fn plugin_webhook_router_keeps_all_diagnostics_private() {
-    use zeroclaw_api::webhook::{PluginWebhookRegistry, WebhookReject};
+    use zeroclaw_api::webhook::WebhookReject;
 
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let state = admin_paircode_state(&tmp, false, false);
-    let registry = Arc::new(PluginWebhookRegistry::new());
+    let ingress = test_ingress();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(3);
-    let registry_lease = registry.start_generation();
-    assert!(registry_lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let registry_lease = ingress.registry().start_generation();
+    assert!(registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
     zeroclaw_spawn::spawn!(async move {
         while let Some(request) = receiver.recv().await {
             let rejection = match request.body.as_slice() {
@@ -113,7 +128,7 @@ async fn plugin_webhook_router_keeps_all_diagnostics_private() {
             let _ = request.reply.send(Err(rejection));
         }
     });
-    let app = plugin_webhook_test_router(state, registry);
+    let app = plugin_webhook_test_router(state, ingress);
     let peer = SocketAddr::from(([203, 0, 113, 8], 30_301));
 
     for (body, status, public) in [
@@ -142,14 +157,15 @@ async fn plugin_webhook_router_keeps_all_diagnostics_private() {
 
 #[tokio::test(start_paused = true)]
 async fn plugin_webhook_router_timeout_cancels_the_worker_request() {
-    use zeroclaw_api::webhook::PluginWebhookRegistry;
-
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let state = admin_paircode_state(&tmp, false, false);
-    let registry = Arc::new(PluginWebhookRegistry::new());
+    let ingress = test_ingress();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
-    let registry_lease = registry.start_generation();
-    assert!(registry_lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let registry_lease = ingress.registry().start_generation();
+    assert!(registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
     let (cancelled, observed) = tokio::sync::oneshot::channel();
     zeroclaw_spawn::spawn!(async move {
         let request = receiver.recv().await.expect("route forwards request");
@@ -157,7 +173,7 @@ async fn plugin_webhook_router_timeout_cancels_the_worker_request() {
         let _ = cancelled.send(());
     });
 
-    let response = plugin_webhook_test_router(state, registry)
+    let response = plugin_webhook_test_router(state, ingress)
         .oneshot(plugin_webhook_request(
             "fixture",
             "slow",
@@ -178,20 +194,18 @@ async fn plugin_webhook_router_timeout_cancels_the_worker_request() {
 
 #[tokio::test]
 async fn plugin_webhook_router_bounds_queue_body_and_route_availability() {
-    use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook};
-
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let state = admin_paircode_state(&tmp, false, false);
     let peer = SocketAddr::from(([203, 0, 113, 10], 30_303));
 
-    let unknown_registry = Arc::new(PluginWebhookRegistry::new());
-    let unknown = plugin_webhook_test_router(state.clone(), unknown_registry)
+    let unknown_ingress = test_ingress();
+    let unknown = plugin_webhook_test_router(state.clone(), unknown_ingress)
         .oneshot(plugin_webhook_request("missing", "body", peer, None))
         .await
         .expect("plugin route is infallible");
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
-    let full_registry = Arc::new(PluginWebhookRegistry::new());
+    let full_ingress = test_ingress();
     let (full_sink, mut full_receiver) = tokio::sync::mpsc::channel(1);
     let (prefill_reply, _) = tokio::sync::oneshot::channel();
     full_sink
@@ -205,9 +219,12 @@ async fn plugin_webhook_router_bounds_queue_body_and_route_availability() {
             reply: prefill_reply,
         })
         .expect("prefill bounded queue");
-    let full_registry_lease = full_registry.start_generation();
-    assert!(full_registry_lease.replace(HashMap::from([("full".to_string(), full_sink)])));
-    let full = plugin_webhook_test_router(state.clone(), full_registry)
+    let full_registry_lease = full_ingress.registry().start_generation();
+    assert!(full_registry_lease.replace(HashMap::from([(
+        "full".to_string(),
+        fixture_route(full_sink)
+    )])));
+    let full = plugin_webhook_test_router(state.clone(), full_ingress)
         .oneshot(plugin_webhook_request("full", "body", peer, None))
         .await
         .expect("plugin route is infallible");
@@ -215,22 +232,28 @@ async fn plugin_webhook_router_bounds_queue_body_and_route_availability() {
     assert_eq!(response_text(full).await, "webhook queue full");
     let _ = full_receiver.recv().await;
 
-    let closed_registry = Arc::new(PluginWebhookRegistry::new());
+    let closed_ingress = test_ingress();
     let (closed_sink, closed_receiver) = tokio::sync::mpsc::channel(1);
     drop(closed_receiver);
-    let closed_registry_lease = closed_registry.start_generation();
-    assert!(closed_registry_lease.replace(HashMap::from([("closed".to_string(), closed_sink)])));
-    let closed = plugin_webhook_test_router(state.clone(), closed_registry)
+    let closed_registry_lease = closed_ingress.registry().start_generation();
+    assert!(closed_registry_lease.replace(HashMap::from([(
+        "closed".to_string(),
+        fixture_route(closed_sink)
+    )])));
+    let closed = plugin_webhook_test_router(state.clone(), closed_ingress)
         .oneshot(plugin_webhook_request("closed", "body", peer, None))
         .await
         .expect("plugin route is infallible");
     assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    let body_registry = Arc::new(PluginWebhookRegistry::new());
+    let body_ingress = test_ingress();
     let (body_sink, mut body_receiver) = tokio::sync::mpsc::channel(1);
-    let body_registry_lease = body_registry.start_generation();
-    assert!(body_registry_lease.replace(HashMap::from([("fixture".to_string(), body_sink)])));
-    let oversized = plugin_webhook_test_router(state, body_registry)
+    let body_registry_lease = body_ingress.registry().start_generation();
+    assert!(body_registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(body_sink)
+    )])));
+    let oversized = plugin_webhook_test_router(state, body_ingress)
         .oneshot(plugin_webhook_request(
             "fixture",
             vec![b'x'; MAX_BODY_SIZE + 1],
@@ -245,11 +268,7 @@ async fn plugin_webhook_router_bounds_queue_body_and_route_availability() {
 
 #[tokio::test]
 async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
-    use zeroclaw_api::webhook::PluginWebhookRegistry;
-
-    async fn acknowledge(
-        mut receiver: tokio::sync::mpsc::Receiver<zeroclaw_api::webhook::RawWebhook>,
-    ) {
+    async fn acknowledge(mut receiver: tokio::sync::mpsc::Receiver<RawWebhook>) {
         while let Some(request) = receiver.recv().await {
             let _ = request.reply.send(Ok(WebhookOutcome::Ack));
         }
@@ -266,12 +285,15 @@ async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
     let peer = SocketAddr::from(([203, 0, 113, 11], 30_304));
     let mut state = admin_paircode_state(&tmp, false, false);
     state.rate_limiter = limiter(1, Duration::from_millis(25));
-    let registry = Arc::new(PluginWebhookRegistry::new());
+    let ingress = test_ingress();
     let (sink, receiver) = tokio::sync::mpsc::channel(4);
-    let registry_lease = registry.start_generation();
-    assert!(registry_lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let registry_lease = ingress.registry().start_generation();
+    assert!(registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
     zeroclaw_spawn::spawn!(acknowledge(receiver));
-    let app = plugin_webhook_test_router(state, registry);
+    let app = plugin_webhook_test_router(state, ingress);
 
     let first = app
         .clone()
@@ -310,12 +332,15 @@ async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
     let mut trusted_state = admin_paircode_state(&tmp, false, false);
     trusted_state.trust_forwarded_headers = true;
     trusted_state.rate_limiter = limiter(1, Duration::from_secs(1));
-    let trusted_registry = Arc::new(PluginWebhookRegistry::new());
+    let trusted_ingress = test_ingress();
     let (trusted_sink, trusted_receiver) = tokio::sync::mpsc::channel(4);
-    let trusted_registry_lease = trusted_registry.start_generation();
-    assert!(trusted_registry_lease.replace(HashMap::from([("fixture".to_string(), trusted_sink)])));
+    let trusted_registry_lease = trusted_ingress.registry().start_generation();
+    assert!(trusted_registry_lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(trusted_sink)
+    )])));
     zeroclaw_spawn::spawn!(acknowledge(trusted_receiver));
-    let trusted = plugin_webhook_test_router(trusted_state, trusted_registry);
+    let trusted = plugin_webhook_test_router(trusted_state, trusted_ingress);
     for forwarded in ["198.51.100.1", "198.51.100.2"] {
         let response = trusted
             .clone()
@@ -343,14 +368,15 @@ async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
 
 #[tokio::test]
 async fn plugin_webhook_routes_preserve_authoritative_request_metadata() {
-    use zeroclaw_api::webhook::PluginWebhookRegistry;
-
     let tmp = tempfile::TempDir::new().expect("temp dir");
-    let registry = Arc::new(PluginWebhookRegistry::new());
-    let lease = registry.start_generation();
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(2);
-    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
-    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress);
     let worker = zeroclaw_spawn::spawn!(async move {
         for method in ["GET", "POST"] {
             let request = receiver
@@ -397,14 +423,15 @@ async fn plugin_webhook_routes_preserve_authoritative_request_metadata() {
 
 #[tokio::test]
 async fn plugin_webhook_unsupported_methods_never_reach_the_guest() {
-    use zeroclaw_api::webhook::PluginWebhookRegistry;
-
     let tmp = tempfile::TempDir::new().expect("temp dir");
-    let registry = Arc::new(PluginWebhookRegistry::new());
-    let lease = registry.start_generation();
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
-    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
-    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress);
     for method in [
         Method::HEAD,
         Method::PUT,
@@ -429,14 +456,17 @@ async fn plugin_webhook_unsupported_methods_never_reach_the_guest() {
 
 #[tokio::test]
 async fn plugin_webhook_response_limit_counts_utf8_bytes_at_the_gateway() {
-    use zeroclaw_api::webhook::{MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookRegistry};
+    use zeroclaw_api::webhook::MAX_WEBHOOK_RESPONSE_BODY_BYTES;
 
     let tmp = tempfile::TempDir::new().expect("temp dir");
-    let registry = Arc::new(PluginWebhookRegistry::new());
-    let lease = registry.start_generation();
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
     let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
-    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
-    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress);
     let bodies = [
         String::new(),
         "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2),
@@ -475,71 +505,303 @@ async fn plugin_webhook_response_limit_counts_utf8_bytes_at_the_gateway() {
 }
 
 #[tokio::test]
-async fn plugin_webhook_idempotency_waits_for_owner_outcome_and_fences_stale_tokens() {
-    use zeroclaw_api::webhook::{WebhookReservation, WebhookReservationStatus};
+async fn plugin_webhook_request_over_ingress_bounds_is_invalid_before_route_lookup() {
+    use zeroclaw_api::webhook::MAX_PLUGIN_WEBHOOK_HEADERS;
 
-    let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 8));
-    let idempotency = plugin_webhook_idempotency(Arc::clone(&store), "fixture");
-    let first = match idempotency.begin("stable-id") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("first request must own the reservation"),
-    };
-    let mut duplicate = match idempotency.begin("stable-id") {
-        WebhookReservation::InFlight(waiter) => waiter,
-        _ => panic!("duplicate must observe an in-flight owner"),
-    };
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress);
 
-    assert!(idempotency.rollback(&first));
-    assert_eq!(duplicate.wait().await, WebhookReservationStatus::RolledBack);
-    let replacement = match idempotency.begin("stable-id") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("duplicate must acquire after owner rollback"),
-    };
-    assert_ne!(first.generation(), replacement.generation());
-    assert!(!idempotency.rollback(&first));
+    for path in ["fixture", "missing"] {
+        let mut request = plugin_webhook_request(
+            path,
+            "body",
+            SocketAddr::from(([127, 0, 0, 1], 31000)),
+            None,
+        );
+        for index in 0..=MAX_PLUGIN_WEBHOOK_HEADERS {
+            request.headers_mut().insert(
+                axum::http::HeaderName::try_from(format!("x-h-{index}"))
+                    .expect("valid header name"),
+                HeaderValue::from_static("v"),
+            );
+        }
+        let response = app.clone().oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "path {path}");
+        assert_eq!(response_text(response).await, "invalid webhook");
+    }
+    assert!(receiver.try_recv().is_err());
+}
 
-    let mut committed_duplicate = match idempotency.begin("stable-id") {
-        WebhookReservation::InFlight(waiter) => waiter,
-        _ => panic!("later duplicate must wait for replacement owner"),
+#[tokio::test]
+async fn plugin_webhook_dedup_state_outlives_a_gateway_router() {
+    use zeroclaw_api::webhook::WebhookReservation;
+
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(2);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+    zeroclaw_spawn::spawn!(async move {
+        while let Some(request) = receiver.recv().await {
+            let report = match &request.idempotency {
+                Some(idempotency) => match idempotency.begin("stable-id") {
+                    WebhookReservation::Owner(token) if idempotency.commit(&token) => "owner",
+                    WebhookReservation::Committed => "committed",
+                    _ => "unexpected reservation",
+                },
+                None => "no idempotency bridge",
+            };
+            let _ = reports.send(report);
+            let _ = request.reply.send(Ok(WebhookOutcome::Ack));
+        }
+    });
+
+    // Each router, with its own app state, stands in for one gateway run of
+    // the same daemon generation.
+    for expected in ["owner", "committed"] {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let response = plugin_webhook_test_router(
+            admin_paircode_state(&tmp, false, false),
+            Arc::clone(&ingress),
+        )
+        .oneshot(plugin_webhook_request(
+            "fixture",
+            "{}",
+            SocketAddr::from(([127, 0, 0, 1], 31000)),
+            None,
+        ))
+        .await
+        .expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reported.recv().await, Some(expected));
+    }
+}
+
+/// Plugin deliveries and the generic `/webhook` and `/sop/*` routes keep
+/// separate committed-key budgets. With room for one key in each store, a
+/// plugin commit does not evict a generic key, and generic records do not
+/// evict a committed plugin delivery. The stores are the ones a gateway run
+/// uses: the core ingress's and the run's `IdempotencyStore`.
+#[tokio::test]
+async fn plugin_and_generic_webhook_keys_have_separate_budgets() {
+    use zeroclaw_api::webhook::WebhookReservation;
+
+    let ingress = Arc::new(PluginWebhookIngress::new(300, 1));
+    let lease = ingress.registry().start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(2);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+    zeroclaw_spawn::spawn!(async move {
+        while let Some(request) = receiver.recv().await {
+            let report = match &request.idempotency {
+                Some(idempotency) => match idempotency.begin("stable-id") {
+                    WebhookReservation::Owner(token) if idempotency.commit(&token) => "owner",
+                    WebhookReservation::Committed => "committed",
+                    _ => "unexpected reservation",
+                },
+                None => "no idempotency bridge",
+            };
+            let _ = reports.send(report);
+            let _ = request.reply.send(Ok(WebhookOutcome::Ack));
+        }
+    });
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let deliver = |ingress: Arc<PluginWebhookIngress>| {
+        plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress).oneshot(
+            plugin_webhook_request(
+                "fixture",
+                "{}",
+                SocketAddr::from(([127, 0, 0, 1], 31001)),
+                None,
+            ),
+        )
     };
-    assert!(idempotency.commit(&replacement));
-    assert_eq!(
-        committed_duplicate.wait().await,
-        WebhookReservationStatus::Committed
+    let generic = crate::IdempotencyStore::new(Duration::from_secs(300), 1);
+
+    assert!(generic.record_if_new("generic"));
+    let response = deliver(Arc::clone(&ingress)).await.expect("route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(reported.recv().await, Some("owner"));
+    assert!(
+        !generic.record_if_new("generic"),
+        "a plugin commit must not evict a generic key"
     );
-    assert!(matches!(
-        idempotency.begin("stable-id"),
-        WebhookReservation::Committed
-    ));
+
+    assert!(generic.record_if_new("generic-2"));
+    let response = deliver(Arc::clone(&ingress)).await.expect("route responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        reported.recv().await,
+        Some("committed"),
+        "generic records must not evict a committed plugin delivery"
+    );
+}
+
+/// The name the request constructor forwards for `name`, or `None` when it
+/// refuses the request.
+fn ingress_header_name(name: &str) -> Option<String> {
+    PluginWebhookRequest::new(
+        "fixture",
+        "POST",
+        "",
+        vec![(name.to_string(), "v".to_string())],
+        Vec::new(),
+    )
+    .ok()
+    .map(|request| request.headers()[0].0.clone())
+}
+
+/// The name a request can carry into the gateway for these bytes: hyper
+/// parses HTTP/1 names with `from_bytes`, and the HTTP/2 decoder uses
+/// `from_lowercase`, which also admits `"`.
+fn http_header_name(bytes: &[u8]) -> Option<String> {
+    axum::http::HeaderName::from_bytes(bytes)
+        .or_else(|_| axum::http::HeaderName::from_lowercase(bytes))
+        .ok()
+        .map(|name| name.as_str().to_owned())
 }
 
 #[test]
-fn plugin_webhook_pending_capacity_does_not_starve_existing_idempotency_callers() {
-    use zeroclaw_api::webhook::WebhookReservation;
+fn request_header_names_match_what_http_header_name_accepts() {
+    use zeroclaw_api::webhook::MAX_PLUGIN_WEBHOOK_HEADER_NAME_BYTES;
 
-    let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1));
-    let idempotency = plugin_webhook_idempotency(Arc::clone(&store), "fixture");
-    let owner = match idempotency.begin("first") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("first plugin delivery owns the pending slot"),
-    };
-    assert!(matches!(
-        idempotency.begin("second"),
-        WebhookReservation::Unavailable
-    ));
-    assert!(
-        store.record_if_new("native-webhook-key"),
-        "pending plugin work must not be misreported as a duplicate on the existing webhook path"
+    for byte in 0..=u8::MAX {
+        let name = char::from(byte).to_string();
+        assert_eq!(
+            ingress_header_name(&name),
+            http_header_name(name.as_bytes()),
+            "byte {byte:#04x}"
+        );
+        if !byte.is_ascii() {
+            // Only ASCII has a one-byte UTF-8 form, and http refuses the raw
+            // byte as well.
+            assert_eq!(http_header_name(&[byte]), None, "byte {byte:#04x}");
+        }
+    }
+
+    let longest = "n".repeat(MAX_PLUGIN_WEBHOOK_HEADER_NAME_BYTES);
+    assert_eq!(ingress_header_name(&longest), Some(longest.clone()));
+    assert_eq!(http_header_name(longest.as_bytes()), Some(longest.clone()));
+    let too_long = format!("{longest}n");
+    assert_eq!(ingress_header_name(&too_long), None);
+    assert_eq!(http_header_name(too_long.as_bytes()), None);
+}
+
+#[tokio::test]
+async fn plugin_webhook_forwards_a_quoted_header_name_that_http2_admits() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let ingress = test_ingress();
+    let lease = ingress.registry().start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
+    assert!(lease.replace(HashMap::from([(
+        "fixture".to_string(),
+        fixture_route(sink)
+    )])));
+    let (seen, observed) = tokio::sync::oneshot::channel();
+    zeroclaw_spawn::spawn!(async move {
+        let request = receiver.recv().await.expect("route forwards request");
+        let _ = seen.send(request.headers.clone());
+        let _ = request.reply.send(Ok(WebhookOutcome::Ack));
+    });
+
+    let mut request = plugin_webhook_request(
+        "fixture",
+        "body",
+        SocketAddr::from(([127, 0, 0, 1], 31000)),
+        None,
     );
-    assert!(idempotency.rollback(&owner));
+    // The HTTP/1 parser refuses this name; the HTTP/2 decoder builds it this
+    // way.
+    let quoted = axum::http::HeaderName::from_lowercase(b"x-\"quoted\"")
+        .expect("HTTP/2 admits a quote in a header name");
+    request
+        .headers_mut()
+        .insert(quoted, HeaderValue::from_static("v"));
+    let response = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), ingress)
+        .oneshot(request)
+        .await
+        .expect("plugin route is infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = observed.await.expect("worker records the request");
+    assert!(
+        headers.contains(&("x-\"quoted\"".to_string(), "v".to_string())),
+        "{headers:?}"
+    );
+}
 
-    let replacement = match idempotency.begin("second") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("rolling back frees the bounded pending slot"),
-    };
-    assert!(idempotency.commit(&replacement));
-    let entries = store.entries.lock();
-    assert_eq!(entries.pending.len(), 0);
-    assert_eq!(entries.committed.len(), 1);
-    assert!(entries.committed.contains_key(replacement.key()));
+#[tokio::test]
+async fn outcome_response_gives_every_outcome_its_fixed_response() {
+    const TEXT: &str = "text/plain; charset=utf-8";
+
+    for outcome in [
+        PluginWebhookOutcome::Ack,
+        PluginWebhookOutcome::Reply("challenge".to_string()),
+        PluginWebhookOutcome::NotFound,
+        PluginWebhookOutcome::QueueFull,
+        PluginWebhookOutcome::Unavailable,
+        PluginWebhookOutcome::Unauthorized,
+        PluginWebhookOutcome::BadRequest,
+        PluginWebhookOutcome::InvalidResponse,
+        PluginWebhookOutcome::Timeout,
+        PluginWebhookOutcome::Cancelled,
+    ] {
+        let (status, content_type, body) = match &outcome {
+            PluginWebhookOutcome::Ack => (StatusCode::OK, None, ""),
+            PluginWebhookOutcome::Reply(reply) => (StatusCode::OK, Some(TEXT), reply.as_str()),
+            PluginWebhookOutcome::NotFound => {
+                (StatusCode::NOT_FOUND, Some(TEXT), "webhook not found")
+            }
+            PluginWebhookOutcome::QueueFull => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(TEXT),
+                "webhook queue full",
+            ),
+            PluginWebhookOutcome::Unavailable | PluginWebhookOutcome::Cancelled => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(TEXT),
+                "webhook unavailable",
+            ),
+            PluginWebhookOutcome::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, Some(TEXT), "unauthorized webhook")
+            }
+            PluginWebhookOutcome::BadRequest => {
+                (StatusCode::BAD_REQUEST, Some(TEXT), "invalid webhook")
+            }
+            PluginWebhookOutcome::InvalidResponse => (
+                StatusCode::BAD_GATEWAY,
+                Some(TEXT),
+                "invalid webhook response",
+            ),
+            PluginWebhookOutcome::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Some(TEXT),
+                "webhook processing timed out",
+            ),
+        };
+        let shown = format!("{outcome:?}");
+        let response = outcome_response(outcome.clone());
+        assert_eq!(response.status(), status, "{shown}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.to_str().expect("ASCII content type")),
+            content_type,
+            "{shown}"
+        );
+        assert_eq!(response_text(response).await, body, "{shown}");
+    }
 }

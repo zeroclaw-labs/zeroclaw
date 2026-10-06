@@ -11,6 +11,9 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-rpc-client.workspace = true
+# Wire types of the plugin webhook forwarder (plugins-wasm).
+zeroclaw-rpc-proto = { workspace = true, optional = true }
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
@@ -105,7 +108,7 @@ default = ["schema-export", "a2a"]
 # [a2a.server] enabled = false. Pure-serde cards on the existing axum stack,
 # no a2a-rs/protobuf footprint.
 a2a = []
-plugins-wasm = ["dep:zeroclaw-plugins"]
+plugins-wasm = ["dep:zeroclaw-plugins", "dep:zeroclaw-rpc-proto"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
