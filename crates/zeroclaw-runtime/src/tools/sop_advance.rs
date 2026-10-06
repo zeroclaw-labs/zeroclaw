@@ -11,6 +11,9 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 pub struct SopAdvanceTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The session memory of the registry this tool was assembled into; once
+    /// that session is pinned, audit rows go to its owner's plane.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     collector: Option<Arc<SopMetricsCollector>>,
 }
 
@@ -19,6 +22,7 @@ impl SopAdvanceTool {
         Self {
             engine,
             audit: None,
+            session_memory: None,
             collector: None,
         }
     }
@@ -26,6 +30,22 @@ impl SopAdvanceTool {
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Share the session memory route of the registry this tool is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The audit logger this call writes through (see `session_audit`).
+    fn audit(&self) -> Option<Arc<SopAuditLogger>> {
+        crate::sop::audit::session_audit(self.audit.as_ref(), self.session_memory.as_ref())
     }
 
     pub fn with_collector(mut self, collector: Arc<SopMetricsCollector>) -> Self {
@@ -177,7 +197,8 @@ impl Tool for SopAdvanceTool {
         };
 
         // Audit logging (engine lock dropped, safe to await)
-        if let Some(ref audit) = self.audit {
+        let audit = self.audit();
+        if let Some(ref audit) = audit {
             if let Some(ref sr) = step_result_ok
                 && let Err(e) = audit.log_step_result(run_id, sr).await
             {
@@ -210,11 +231,7 @@ impl Tool for SopAdvanceTool {
         }
 
         if let Ok(ref action) = action {
-            crate::sop::executor::enqueue_live_action(
-                Arc::clone(&self.engine),
-                self.audit.clone(),
-                action,
-            );
+            crate::sop::executor::enqueue_live_action(Arc::clone(&self.engine), audit, action);
         }
 
         match action {

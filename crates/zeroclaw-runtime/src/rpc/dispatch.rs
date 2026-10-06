@@ -13499,6 +13499,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            memory_owner: None,
             decided_mode: None,
             decisions: std::collections::BTreeMap::new(),
         };

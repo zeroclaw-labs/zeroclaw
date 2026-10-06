@@ -843,6 +843,14 @@ pub struct SopRun {
     /// load.
     #[serde(default)]
     pub initiating_agent: Option<String>,
+    /// The owner whose private memory plane this run belongs to, for a run
+    /// started in a session pinned to its owner. Its audit rows and its
+    /// steps' memory stay on that owner's plane wherever the run is driven,
+    /// including after it parks at an approval and resumes on the headless
+    /// driver, possibly in a later daemon generation. `None` for an unowned
+    /// run; runs persisted before this field restore as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_owner: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -1628,10 +1636,11 @@ path = "/sop/test"
 
     #[test]
     fn sop_run_serde_roundtrip() {
-        let run = SopRun {
+        let mut run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1667,5 +1676,17 @@ path = "/sop/test"
         assert_eq!(parsed.status, SopRunStatus::Running);
         assert_eq!(parsed.step_results.len(), 1);
         assert_eq!(parsed.step_results[0].status, SopStepStatus::Completed);
+
+        // An unowned run is written without the owner key, the shape of a run
+        // persisted before runs recorded an owner, and it restores unowned.
+        assert!(!json.contains("memory_owner"), "{json}");
+        assert_eq!(parsed.memory_owner, None);
+        // An owned run keeps its owner through the store's serialization.
+        let owner = zeroclaw_api::memory_traits::PrincipalScope::new("user:alice")
+            .with_agent(Some("ops".to_string()));
+        run.memory_owner = Some(owner.clone());
+        let json = serde_json::to_string(&run).unwrap();
+        let parsed: SopRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.memory_owner, Some(owner));
     }
 }

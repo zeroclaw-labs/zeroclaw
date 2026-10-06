@@ -12,6 +12,9 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 pub struct SopApproveTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The session memory of the registry this tool was assembled into; once
+    /// that session is pinned, audit rows go to its owner's plane.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     agent_alias: String,
 }
 
@@ -20,6 +23,7 @@ impl SopApproveTool {
         Self {
             engine,
             audit: None,
+            session_memory: None,
             agent_alias: "agent".to_string(),
         }
     }
@@ -27,6 +31,22 @@ impl SopApproveTool {
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Share the session memory route of the registry this tool is
+    /// assembled into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The audit logger this call writes through (see `session_audit`).
+    fn audit(&self) -> Option<Arc<SopAuditLogger>> {
+        crate::sop::audit::session_audit(self.audit.as_ref(), self.session_memory.as_ref())
     }
 
     /// Set the agent alias recorded as the approval principal (default `"agent"`).
@@ -111,7 +131,7 @@ impl Tool for SopApproveTool {
             Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                 crate::sop::executor::enqueue_live_action(
                     Arc::clone(&self.engine),
-                    self.audit.clone(),
+                    self.audit(),
                     &action,
                 );
                 let output = match *action {
