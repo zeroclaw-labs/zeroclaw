@@ -254,6 +254,72 @@ mod tests {
             .to_vec()
     }
 
+    /// The dashboard's web manifest is served verbatim from `{prefix}/_app/`.
+    /// Unlike `index.html`, nothing rewrites it for `gateway.path_prefix`, so
+    /// its launch and scope URLs have to be relative to where it is served and
+    /// resolve to the dashboard root under every mount. An absolute `/` sends
+    /// an installed dashboard to the host root instead, fails Chrome's scope
+    /// check because the dashboard page sits outside `/`, and gives every
+    /// prefixed dashboard on one origin the same app identity.
+    #[test]
+    fn web_manifest_resolves_to_the_dashboard_root_under_any_prefix() {
+        let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/public/manifest.webmanifest");
+        let raw = std::fs::read_to_string(&manifest_path).expect("dashboard manifest is present");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&raw).expect("dashboard manifest is JSON");
+        let field = |name: &str| {
+            manifest[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("manifest `{name}` is a string"))
+                .to_string()
+        };
+
+        for prefix in ["", "/gw", "/team/zeroclaw"] {
+            let served_at = url::Url::parse(&format!(
+                "https://gateway.example{prefix}/_app/manifest.webmanifest"
+            ))
+            .unwrap();
+            let dashboard_root = format!("https://gateway.example{prefix}/");
+
+            let start = served_at.join(&field("start_url")).unwrap();
+            assert_eq!(
+                start.as_str(),
+                dashboard_root,
+                "start_url must launch the dashboard at {dashboard_root:?}"
+            );
+
+            let scope = served_at.join(&field("scope")).unwrap();
+            assert_eq!(scope.as_str(), dashboard_root);
+            let dashboard_page = format!("{dashboard_root}config");
+            assert!(
+                dashboard_page.starts_with(scope.as_str()),
+                "scope {scope} must contain the dashboard page {dashboard_page}"
+            );
+
+            // Absent `id` falls back to `start_url`, which is already
+            // per-prefix. A declared `id` resolves against `start_url`.
+            if let Some(id) = manifest.get("id").and_then(|v| v.as_str()) {
+                let identity = start.join(id).unwrap();
+                assert!(
+                    identity.as_str().starts_with(&dashboard_root),
+                    "id {identity} must stay inside {dashboard_root:?}"
+                );
+            }
+
+            for icon in manifest["icons"].as_array().expect("icons array") {
+                let src = served_at
+                    .join(icon["src"].as_str().expect("icon src"))
+                    .unwrap();
+                assert!(
+                    src.as_str()
+                        .starts_with(&format!("https://gateway.example{prefix}/_app/")),
+                    "icon {src} must resolve under the served asset path"
+                );
+            }
+        }
+    }
+
     #[test]
     fn static_route_rejects_malformed_path_syntax() {
         for path in [
