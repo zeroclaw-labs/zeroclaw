@@ -14386,6 +14386,7 @@ version = "0.8.5"
 dependencies = [
  "anyhow",
  "chrono",
+ "criterion",
  "parking_lot",
  "portable-atomic",
  "rusqlite",
