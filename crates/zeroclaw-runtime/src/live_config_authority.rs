@@ -297,6 +297,11 @@ impl AgentExecutionCapability {
         Arc::clone(&self.config)
     }
 
+    /// The same process-local coordinator used by this capability's admissions.
+    pub fn agent_lifecycle(&self) -> AgentLifecycleCoordinator {
+        self.agent_lifecycle.clone()
+    }
+
     pub fn agent_lifecycle_generation(&self, alias: &str) -> u64 {
         self.agent_lifecycle.alias_generation(alias)
     }
@@ -852,6 +857,46 @@ impl AgentLifecycleCoordinator {
             return Err(blocker);
         }
         let lifecycle = state.aliases.entry(alias.clone()).or_default();
+        lifecycle.deleting = true;
+        Ok(AgentDeleteLease {
+            coordinator: self.clone(),
+            alias,
+            active: true,
+            committed: false,
+        })
+    }
+
+    /// Reserve a change to an agent's context/authorization scope. Existing
+    /// idle connections may remain open, but no prepared admission or active
+    /// turn can cross the boundary. Commit advances the existing generation,
+    /// requiring pre-change producers to reconnect before dispatching again.
+    /// Retain this lease inside the uncancellable persistence job, then call
+    /// `commit_destructive_mutation` only after durable publication succeeds.
+    pub fn begin_policy_change(
+        &self,
+        alias: impl Into<String>,
+    ) -> Result<AgentDeleteLease, AgentDeleteBlocker> {
+        let alias = alias.into();
+        let mut state = self.state.lock();
+        if state.closing {
+            return Err(AgentDeleteBlocker::GenerationClosing);
+        }
+        let lifecycle = state.aliases.entry(alias.clone()).or_default();
+        if lifecycle.deleting {
+            return Err(AgentDeleteBlocker::Deleting { alias });
+        }
+        if lifecycle.reservations > 0 {
+            return Err(AgentDeleteBlocker::Reservations {
+                alias,
+                count: lifecycle.reservations,
+            });
+        }
+        if lifecycle.active_turns > 0 {
+            return Err(AgentDeleteBlocker::ActiveTurns {
+                alias,
+                count: lifecycle.active_turns,
+            });
+        }
         lifecycle.deleting = true;
         Ok(AgentDeleteLease {
             coordinator: self.clone(),
@@ -1497,6 +1542,49 @@ mod tests {
             })
         );
         assert!(lifecycle.reserve_turn("alpha").is_ok());
+    }
+
+    #[test]
+    fn policy_change_blocks_active_work_and_invalidates_idle_producers_after_commit() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let session = lifecycle
+            .reserve_admission("alpha")
+            .unwrap()
+            .publish()
+            .unwrap();
+        let generation = lifecycle.alias_generation("alpha");
+        let active = lifecycle.reserve_turn_at("alpha", generation).unwrap();
+        assert!(matches!(
+            lifecycle.begin_policy_change("alpha"),
+            Err(AgentDeleteBlocker::ActiveTurns { .. })
+        ));
+        drop(active);
+        let mut change = lifecycle.begin_policy_change("alpha").unwrap();
+        assert!(lifecycle.reserve_admission("alpha").is_err());
+        assert!(lifecycle.reserve_turn_at("alpha", generation).is_err());
+        change.commit_destructive_mutation();
+        drop(change);
+        assert!(matches!(
+            lifecycle.reserve_turn_at("alpha", generation),
+            Err(AgentAdmissionError::StaleGeneration { .. })
+        ));
+        assert!(lifecycle.reserve_turn("alpha").is_ok());
+        drop(session);
+    }
+
+    #[test]
+    fn failed_policy_change_preserves_existing_producer_generation() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let generation = lifecycle.alias_generation("alpha");
+        let prepared = lifecycle.reserve_admission("alpha").unwrap();
+        assert!(matches!(
+            lifecycle.begin_policy_change("alpha"),
+            Err(AgentDeleteBlocker::Reservations { .. })
+        ));
+        drop(prepared);
+        drop(lifecycle.begin_policy_change("alpha").unwrap());
+        assert_eq!(lifecycle.alias_generation("alpha"), generation);
+        assert!(lifecycle.reserve_turn_at("alpha", generation).is_ok());
     }
 
     #[test]

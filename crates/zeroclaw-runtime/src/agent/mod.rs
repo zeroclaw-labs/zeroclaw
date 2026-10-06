@@ -33,7 +33,8 @@ pub use turn::{
         degrade_media_in_message, degrade_media_in_messages, is_turn_opening_user_message,
     },
     redact::{is_credential_key, scrub_credentials_value},
-    semantic_empty_terminal_completion_message, terminal_completion_error_message,
+    scope_colony_config, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
 };
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {

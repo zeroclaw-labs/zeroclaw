@@ -24,9 +24,12 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { Link } from "react-router-dom";
+import { aliasRefSource } from "@/lib/configReferences";
+import { useConfigLocation } from "@/lib/configLocation";
 import {
   ExternalLink,
   Eye,
@@ -750,25 +753,6 @@ function leafSingleAliasKind(path: string): keyof AgentOptionsResponse | null {
 // kind but omits `alias_source` (older builds): the generic resolver still works
 // — covering provider refs (incl. tts/transcription/classifier) that have no
 // AgentOptionsResponse list, so they get a real dropdown, not a stuck spinner.
-const ALIAS_REF_TYPE_TO_SOURCE: Record<string, string> = {
-  ModelProviderRef: "model_providers",
-  TtsProviderRef: "tts_providers",
-  TranscriptionProviderRef: "transcription_providers",
-  RiskProfileRef: "risk_profiles",
-  RuntimeProfileRef: "runtime_profiles",
-  ChannelRef: "channels",
-};
-
-// The `resolve-alias-source` query value for an alias-ref entry: prefer the
-// daemon-declared `alias_source`; else derive it from the `<Type>Ref` type_hint.
-// Returns null for non-alias-ref entries or unmapped ref types.
-function aliasRefSource(entry: ListResponseEntry): string | null {
-  if (entry.kind !== "alias-ref") return null;
-  if (entry.alias_source) return entry.alias_source;
-  const m = entry.type_hint?.match(/(\w+Ref)\b/);
-  return (m && ALIAS_REF_TYPE_TO_SOURCE[m[1] ?? ""]) ?? null;
-}
-
 // Cross-section navigation map for agent alias-ref fields. Each entry
 // answers: "where does this field's source live in /config/?"
 // Used both by the empty-state hint and the per-item edit-jump links.
@@ -972,7 +956,26 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const [schema, setSchema] = useState<Record<string, unknown> | undefined>(
       undefined,
     );
+    const formRoot = useRef<HTMLDivElement>(null);
+    const location = useConfigLocation();
+    const fieldTarget = new URLSearchParams(location.search).get('field');
     const [filter, setFilter] = useState("");
+    useEffect(() => { setFilter(''); }, [fieldTarget]);
+    useEffect(() => {
+      if (loading || !fieldTarget || !entries.some((entry) => entry.path === fieldTarget)) return;
+      const frame = requestAnimationFrame(() => {
+        const root = formRoot.current;
+        if (!root) return;
+        const input = [...root.querySelectorAll<HTMLElement>('[id]')].find((node) => node.id === fieldTarget)
+          ?? [...root.querySelectorAll<HTMLElement>('[data-config-field]')].find((node) => node.dataset.configField === fieldTarget)
+          ?? [...root.querySelectorAll<HTMLElement>('[data-config-prefix]')].find((node) => fieldTarget.startsWith(`${node.dataset.configPrefix}.`));
+        const row = input?.closest('[data-config-field]') ?? input;
+        row?.scrollIntoView({ block: 'center', behavior: 'instant' });
+        const focus = input?.matches('input, select, textarea, button') ? input : input?.querySelector<HTMLElement>('input, select, textarea, button') ?? input;
+        focus?.focus({ preventScroll: true });
+      });
+      return () => cancelAnimationFrame(frame);
+    }, [fieldTarget, entries, loading]);
 
     // When this form edits a channel block (`channels.<type>.<alias>`), its
     // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
@@ -1398,7 +1401,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     }
 
     return (
-      <div
+      <div ref={formRoot}
         className={
           inlineSaveBar
             ? "flex flex-col"
@@ -1424,6 +1427,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <span />
             )}
             {enabledEntry && (
+              <div data-config-field={enabledEntry.path} tabIndex={-1}>
               <EntityEnabledToggle
                 prefix={prefix}
                 enabled={entryValue(enabledEntry) === "true"}
@@ -1437,6 +1441,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   );
                 }}
               />
+              </div>
             )}
           </div>
         )}
@@ -1537,6 +1542,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           return (
           <div
             key={g.parent}
+            data-config-prefix={g.parent}
+            tabIndex={-1}
             className="surface-panel p-4"
             style={{ borderColor: "var(--pc-border)" }}
           >
@@ -1915,7 +1922,7 @@ function FieldRow({
   }
 
   return (
-    <div className="px-4 py-3">
+    <div data-config-field={entry.path} className="px-4 py-3 focus-within:bg-pc-accent/5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label

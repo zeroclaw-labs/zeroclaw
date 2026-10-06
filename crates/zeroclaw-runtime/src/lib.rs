@@ -25,6 +25,7 @@ pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod enroll;
+pub mod execution_scope;
 pub mod health;
 pub mod heartbeat;
 pub mod hooks;

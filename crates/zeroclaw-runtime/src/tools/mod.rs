@@ -690,11 +690,184 @@ fn filter_agent_peer_groups(
     config: &Config,
     agent_alias: &str,
 ) -> HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig> {
-    config
+    let groups: HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig> = config
         .peer_groups
         .iter()
         .filter(|(_, pg)| pg.agents.iter().any(|a| a.as_str() == agent_alias))
         .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let Some((_, colony)) = config.colony_for_agent(agent_alias) else {
+        return groups;
+    };
+    let mut scoped = HashMap::new();
+    for binding in &colony.channels {
+        if !binding
+            .outbound_agents
+            .iter()
+            .any(|member| member == agent_alias)
+        {
+            continue;
+        }
+        // Preserve the matching group's presentation preferences and ignore
+        // list, but derive actual recipient authority from the graph binding.
+        let inherited = groups.values().find(|group| {
+            group.channel.as_str() == binding.channel
+                || (!group.channel.contains('.')
+                    && binding.channel.starts_with(&format!("{}.", group.channel)))
+        });
+        let mut selected = inherited.cloned().unwrap_or_default();
+        if selected.ignore.iter().any(|peer| {
+            peer.as_str()
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(binding.conversation.trim_start_matches('@'))
+        }) {
+            continue;
+        }
+        selected.channel = binding.channel.clone().into();
+        selected.external_peers = vec![binding.conversation.clone().into()];
+        selected.agents = vec![agent_alias.into()];
+        selected.admin_for_agent_scope = false;
+        scoped.insert(format!("colony:{}", binding.id), selected);
+    }
+    scoped
+}
+
+/// Existing communication tools must share the graph boundary rather than
+/// treating a populated transport handle as permission to contact anyone.
+/// Scope-less transports remain unavailable inside the Colony box; `send_via`
+/// is the supported explicitly scoped delivery path.
+struct ColonyToolBoundary {
+    inner: Arc<dyn Tool>,
+    agent_alias: String,
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+}
+
+impl zeroclaw_api::attribution::Attributable for ColonyToolBoundary {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+    fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ColonyToolBoundary {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.inner.requires_unrestricted_principal()
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+    fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+    ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+        let allowed = {
+            let live = self.live_config.as_ref().map(|config| config.read());
+            let config = live.as_deref().unwrap_or(self.config.as_ref());
+            if config.colony_for_agent(&self.agent_alias).is_none() {
+                true
+            } else if self.name() == "send_message_to_peer" {
+                crate::execution_scope::context_isolated()
+                    && crate::execution_scope::current_goal_id().is_some()
+            } else if self.name() == "poll" || self.name() == "reaction" {
+                let channel = args
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let recipient_key = if self.name() == "reaction" {
+                    "channel_id"
+                } else {
+                    "recipient"
+                };
+                let recipient = args
+                    .get(recipient_key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                !channel.is_empty()
+                    && !recipient.is_empty()
+                    && config.colony_allows_external(&self.agent_alias, channel, recipient, true)
+            } else {
+                false
+            }
+        };
+        if !allowed {
+            return Ok(zeroclaw_api::tool::ToolResult {
+                success: false,
+                output: zeroclaw_api::tool::ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-connection-required",
+                )),
+            });
+        }
+        self.inner.execute(args).await
+    }
+}
+
+fn needs_colony_tool_boundary(name: &str) -> bool {
+    matches!(
+        name,
+        "ask_user"
+            | "escalate_to_human"
+            | "reaction"
+            | "poll"
+            | "channel_room"
+            | "git_forge"
+            | "sessions_current"
+            | "sessions_list"
+            | "sessions_history"
+            | "sessions_send"
+            | "spawn_subagent"
+            | "schedule"
+            | "send_message_to_peer"
+    ) || name.starts_with("a2a_")
+        || name.starts_with("cron_")
+}
+
+fn apply_colony_tool_boundaries(
+    tools: Vec<Arc<dyn Tool>>,
+    config: &Arc<Config>,
+    live_config: &Option<Arc<RwLock<Config>>>,
+    agent_alias: &str,
+) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            if needs_colony_tool_boundary(tool.name()) {
+                Arc::new(ColonyToolBoundary {
+                    inner: tool,
+                    agent_alias: agent_alias.to_string(),
+                    config: Arc::clone(config),
+                    live_config: live_config.clone(),
+                }) as Arc<dyn Tool>
+            } else {
+                tool
+            }
+        })
         .collect()
 }
 
@@ -2282,6 +2455,8 @@ fn all_tools_with_runtime_on_thread(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
+                let tool_arcs =
+                    apply_colony_tool_boundaries(tool_arcs, &config, &live_config, agent_alias);
                 return AllToolsResult {
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
@@ -2500,6 +2675,7 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
+    let tool_arcs = apply_colony_tool_boundaries(tool_arcs, &config, &live_config, agent_alias);
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
@@ -2662,6 +2838,103 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
         MemoryConfig, SopApprovalConfig,
     };
+
+    fn colony_tool_config() -> Config {
+        use zeroclaw_config::colony::{ColonyChannel, ColonyConfig};
+        let mut config = Config::default();
+        config.agents.insert("queen".into(), Default::default());
+        config.colonies.insert(
+            "team".into(),
+            ColonyConfig {
+                name: "Team".into(),
+                queen: "queen".into(),
+                channels: vec![ColonyChannel {
+                    id: "updates".into(),
+                    channel: "telegram.work".into(),
+                    conversation: "room-42".into(),
+                    outbound_agents: vec!["queen".into()],
+                    inbound_agents: vec![],
+                }],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn colony_send_via_derives_scoped_recipient_without_legacy_bindings() {
+        let mut config = colony_tool_config();
+        assert!(config.agents["queen"].channels.is_empty());
+        assert!(config.peer_groups.is_empty());
+        let groups = filter_agent_peer_groups(&config, "queen");
+        assert_eq!(groups.len(), 1);
+        let group = &groups["colony:updates"];
+        assert_eq!(group.channel.as_str(), "telegram.work");
+        assert_eq!(group.external_peers[0].as_str(), "room-42");
+        config.colonies.get_mut("team").unwrap().channels[0]
+            .outbound_agents
+            .clear();
+        assert!(filter_agent_peer_groups(&config, "queen").is_empty());
+    }
+
+    struct ColonyToolProbe {
+        name: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    zeroclaw_api::mock_tool_attribution!(ColonyToolProbe);
+    #[async_trait::async_trait]
+    impl Tool for ColonyToolProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: "sent".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn colony_transport_guard_enforces_current_exact_scope_and_revocation() {
+        let config = Arc::new(colony_tool_config());
+        let live = Arc::new(RwLock::new((*config).clone()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = ColonyToolBoundary {
+            inner: Arc::new(ColonyToolProbe {
+                name: "poll",
+                calls: Arc::clone(&calls),
+            }),
+            agent_alias: "queen".into(),
+            config,
+            live_config: Some(Arc::clone(&live)),
+        };
+        assert!(
+            !guard
+                .execute(serde_json::json!({"channel":"telegram.work","recipient":"other-room"}))
+                .await
+                .unwrap()
+                .success
+        );
+        let request = serde_json::json!({"channel":"telegram.work","recipient":"room-42"});
+        assert!(guard.execute(request.clone()).await.unwrap().success);
+        live.write().colonies.get_mut("team").unwrap().channels[0]
+            .outbound_agents
+            .clear();
+        assert!(!guard.execute(request).await.unwrap().success);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {

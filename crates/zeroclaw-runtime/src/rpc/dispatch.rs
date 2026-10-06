@@ -7486,7 +7486,7 @@ impl RpcDispatcher {
 
         let scope = self.scoped_principal_id();
         let visible_ids = self.owner_visible_session_ids().await;
-        let sessions: Vec<SessionEntry> = summaries
+        let sessions: Vec<(SessionEntry, Option<String>)> = summaries
             .into_iter()
             .filter_map(|s| {
                 if scope
@@ -7498,24 +7498,47 @@ impl RpcDispatcher {
                 {
                     return None;
                 }
-                Some(SessionEntry {
-                    session_id: s.session_uuid.clone(),
-                    // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
-                    // prefix exists in this store, so session_id == session_key.
-                    session_key: s.session_uuid,
-                    created_at: s.created_at.to_rfc3339(),
-                    last_activity: s.last_activity.to_rfc3339(),
-                    message_count: s.message_count,
-                    agent_alias: Some(s.agent_alias),
-                    channel_id: None,
-                    // ACP sessions don't carry a user-set display name today; the
-                    // picker falls back to `session_id` when this is None.
-                    name: None,
-                })
+                Some((
+                    SessionEntry {
+                        session_id: s.session_uuid.clone(),
+                        // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
+                        // prefix exists in this store, so session_id == session_key.
+                        session_key: s.session_uuid,
+                        created_at: s.created_at.to_rfc3339(),
+                        last_activity: s.last_activity.to_rfc3339(),
+                        message_count: s.message_count,
+                        agent_alias: Some(s.agent_alias),
+                        channel_id: None,
+                        // ACP sessions don't carry a user-set display name today; the
+                        // picker falls back to `session_id` when this is None.
+                        name: None,
+                    },
+                    s.interaction_surface,
+                ))
             })
             .collect();
 
-        to_result(SessionListResult { sessions })
+        #[derive(Serialize)]
+        struct ActivityEntry {
+            #[serde(flatten)]
+            session: SessionEntry,
+            state: &'static str,
+            interaction_surface: Option<String>,
+        }
+        let mut activity = Vec::with_capacity(sessions.len());
+        for (session, interaction_surface) in sessions {
+            let running = self
+                .ctx
+                .sessions
+                .has_running_work(&session.session_id)
+                .await;
+            activity.push(ActivityEntry {
+                session,
+                interaction_surface,
+                state: if running { "running" } else { "idle" },
+            });
+        }
+        Ok(serde_json::json!({ "sessions": activity }))
     }
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
@@ -7762,23 +7785,12 @@ impl RpcDispatcher {
         if self.ctx.sessions.get_agent(&req.session_id).await.is_some() {
             let turn_generation = self.ctx.sessions.inflight_turn_generation(&req.session_id);
             let plan = self.ctx.sessions.get_plan(&req.session_id).await;
-            let queued = self
-                .ctx
-                .sessions
-                .session_queue
-                .queue_depth(&req.session_id)
-                .await
-                > 0;
+            let running = self.ctx.sessions.has_running_work(&req.session_id).await;
             self.ensure_session_incarnation(&req.session_id, expected_generation)
                 .await?;
             return to_result(SessionStateResult {
                 session_id: req.session_id,
-                state: if turn_generation.is_some() || queued {
-                    "running"
-                } else {
-                    "idle"
-                }
-                .to_string(),
+                state: if running { "running" } else { "idle" }.to_string(),
                 turn_id: turn_generation.map(|generation| generation.to_string()),
                 turn_started_at: None,
                 plan,

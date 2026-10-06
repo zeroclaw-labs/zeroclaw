@@ -812,6 +812,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -830,6 +831,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -10954,6 +10956,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -11132,6 +11135,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -11180,6 +11184,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -14175,6 +14180,7 @@ dependencies = [
  "whatsapp-rust-ureq-http-client",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-colony",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",
@@ -14184,6 +14190,32 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+]
+
+[[package]]
+name = "zeroclaw-colony"
+version = "0.8.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "parking_lot",
+ "rusqlite",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-infra",
+ "zeroclaw-log",
+ "zeroclaw-memory",
+ "zeroclaw-runtime",
+ "zeroclaw-spawn",
 ]
 
 [[package]]
@@ -14333,6 +14365,7 @@ dependencies = [
  "wiremock",
  "zeroclaw-api",
  "zeroclaw-channels",
+ "zeroclaw-colony",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",

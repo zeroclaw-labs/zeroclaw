@@ -195,6 +195,7 @@ fn step_timeout_stop(step_secs: u64) -> TurnStop {
 
 /// Budget enforcement — block if limit exceeded (no-op when not scoped).
 pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
+    crate::execution_scope::check_budget()?;
     if let Some(BudgetCheck::Exceeded {
         current_usd,
         limit_usd,

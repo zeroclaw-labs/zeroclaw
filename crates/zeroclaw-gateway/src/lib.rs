@@ -10,6 +10,7 @@ pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
+pub mod api_colony;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;
@@ -33,6 +34,7 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod code;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -696,6 +698,7 @@ pub struct AppState {
     /// landed yet, on disk too.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    pub colony_runtime: Arc<tokio::sync::OnceCell<Arc<zeroclaw_colony::ColonyRuntime>>>,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -850,6 +853,39 @@ impl GatewaySupervision {
 /// whatever its URL prefix.
 fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/colonies",
+            get(api_colony::snapshot).post(api_colony::create),
+        )
+        .route("/api/colonies/context", get(api_colony::context_sources))
+        .route(
+            "/api/colonies/{id}",
+            get(api_colony::get)
+                .put(api_colony::save)
+                .delete(api_colony::delete),
+        )
+        .route("/api/colonies/{id}/agents", post(api_colony::add_agent))
+        .route("/api/colonies/{id}/clarify", post(api_colony::clarify))
+        .route(
+            "/api/colonies/{id}/goals",
+            get(api_colony::goals).post(api_colony::create_goal),
+        )
+        .route(
+            "/api/colonies/{id}/goals/{goal}/control",
+            post(api_colony::control),
+        )
+        .route(
+            "/api/colonies/{id}/goals/{goal}/clarify",
+            post(api_colony::clarify_goal),
+        )
+        .route(
+            "/api/colonies/{id}/goals/{goal}/approvals/{approval}",
+            post(api_colony::approve),
+        )
+        .route(
+            "/api/colonies/{id}/messages",
+            get(api_colony::messages).post(api_colony::send_message),
+        )
         .route(
             "/api/config",
             get(api_config::handle_config_get)
@@ -2033,6 +2069,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         config: config_state,
         config_write_lock: authority.config_write_lock(),
         agent_lifecycle: authority.agent_lifecycle(),
+        colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
         model_provider,
         model,
         temperature,
@@ -2106,6 +2143,11 @@ pub async fn run_gateway_with_plugin_webhooks(
             None
         },
     };
+
+    let has_colonies = !state.config.read().colonies.is_empty();
+    if has_colonies {
+        api_colony::runtime(&state).await?.recover().await?;
+    }
 
     // Build router with middleware
     let inner = Router::new()
@@ -2289,6 +2331,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
+        .route("/api/workspace", get(api::handle_api_workspace))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -2372,6 +2415,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
         .route("/acp", get(acp::handle_ws_acp))
+        .route("/ws/code", get(code::handle_ws_code))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket SOP runs feed ──
@@ -5645,6 +5689,7 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6989,6 +7034,7 @@ path = "{trigger_path}"
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7077,6 +7123,7 @@ path = "{trigger_path}"
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7749,6 +7796,7 @@ path = "{trigger_path}"
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9335,6 +9383,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10256,6 +10305,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10379,6 +10429,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -10481,6 +10532,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10690,6 +10742,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10779,6 +10832,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10873,6 +10927,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10972,6 +11027,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11068,6 +11124,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11170,6 +11227,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11312,6 +11370,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -12208,6 +12267,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12295,6 +12355,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12909,6 +12970,7 @@ data: [DONE]\n\n";
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider,
             model: "test-model".into(),
             temperature: None,

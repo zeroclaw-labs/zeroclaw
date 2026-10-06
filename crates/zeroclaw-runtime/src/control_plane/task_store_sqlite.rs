@@ -12,8 +12,9 @@ use super::task_registry::{
 };
 
 mod goal;
+pub use goal::insert_goal_task_record;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -34,6 +35,29 @@ impl SqliteTaskStore {
     /// In-memory store for unit tests.
     pub fn new_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory().context("open in-memory control-plane DB")?)
+    }
+
+    /// Domain extension seam. The canonical task store retains connection and
+    /// transaction ownership; callers never open a second lifecycle database.
+    pub fn read_extension<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        read(&self.conn.lock())
+    }
+
+    pub fn extension_connection(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
+    pub fn extension_transaction<T>(
+        &self,
+        write: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("begin task extension transaction")?;
+        let result = write(&tx)?;
+        tx.commit().context("commit task extension transaction")?;
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -161,6 +185,16 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         )?;
         conn.execute_batch("PRAGMA user_version = 9;")
             .context("apply control-plane schema v9")?;
+    }
+    if version < 10 {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS task_execution_continuations (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+            owner_key TEXT NOT NULL,
+            execution_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_execution_owner ON task_execution_continuations(owner_key);
+        PRAGMA user_version = 10;")
+            .context("apply control-plane schema v10")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -556,7 +590,7 @@ fn log_unreadable_terminal_settlement_intent(error: rusqlite::Error) {
     );
 }
 
-fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+pub fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
     // status back to NULL/running (review finding— the documented idempotency).
@@ -597,7 +631,7 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     Ok(())
 }
 
-fn update_task_status_record(
+pub fn update_task_status_record(
     conn: &Connection,
     id: &str,
     status: TaskStatus,
@@ -914,6 +948,18 @@ impl TaskRegistry for SqliteTaskStore {
             .context("reconcile: load task")?
         };
         let Some(rec) = rec else { return Ok(false) };
+        // A domain continuation owner handles resumable goals. Generic Lost
+        // recovery must not destroy its persisted continuation eligibility.
+        let resumable = self.read_extension(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_execution_continuations WHERE task_id=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })?;
+        if rec.kind == TaskKind::Goal && resumable {
+            return Ok(false);
+        }
         // Never reclaim a terminal record, and never one a live owner still holds.
         if rec.status.is_terminal() || !is_authoritative(&rec) {
             return Ok(false);

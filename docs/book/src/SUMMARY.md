@@ -38,6 +38,7 @@
   - [Background work lifecycle](./architecture/background-work-lifecycle.md)
   - [Provider routing lifecycle](./architecture/provider-routing-lifecycle.md)
   - [Crates](./architecture/crates.md)
+  - [Colony](./architecture/colony.md)
   - [Architecture Decision Records](./architecture/decisions/index.md)
     - [ADR-001: Rust first](./architecture/decisions/ADR-001-rust-first.md)
     - [ADR-002: Trait-driven extensibility](./architecture/decisions/ADR-002-trait-driven-extensibility.md)

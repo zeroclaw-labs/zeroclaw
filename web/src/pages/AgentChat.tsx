@@ -1,6 +1,6 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
+import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2, Settings } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -20,6 +20,8 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import WorkspaceAttention from '@/components/layout/WorkspaceAttention';
+import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 
@@ -74,10 +76,11 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const [params] = useSearchParams();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
-  return <ChatWorkspace initialAlias={alias} />;
+  return <ChatWorkspace initialAlias={alias} initialSessionId={params.get('session') ?? undefined} />;
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */
@@ -103,6 +106,7 @@ export function AgentChatInner({
   agentAlias: string;
   onStatus?: (s: AgentChatStatus) => void;
 }) {
+  const openSettings = useWorkspaceSettings();
   const {
     messages,
     sendMessage,
@@ -557,10 +561,10 @@ export function AgentChatInner({
         </div>
       )}
       {/* Header with model selector */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="ml-10 flex min-w-0 items-center gap-2 md:ml-0">
           <Bot className="h-4 w-4 text-pc-accent" />
-          <span className="text-sm font-medium text-pc-text">{agentAlias}</span>
+          <span className="truncate text-sm font-medium text-pc-text">{agentAlias}</span>
           <Link
             to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
             className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
@@ -571,7 +575,8 @@ export function AgentChatInner({
           </Link>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <button type="button" onClick={() => openSettings(`/config/agents/${encodeURIComponent(agentAlias)}`)} aria-label={`${t('workspace.settings')}: ${agentAlias}`} className="rounded-md p-2 text-pc-text-muted hover:bg-pc-elevated"><Settings className="h-4 w-4" /></button>
           <SessionPicker agentAlias={agentAlias} />
 
           <div className="relative" ref={modelDropdownRef}>
@@ -724,7 +729,10 @@ export function AgentChatInner({
 
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
-        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        <>
+          <WorkspaceAttention to={`/agent/${encodeURIComponent(agentAlias)}?session=${encodeURIComponent(sessionId)}`} label={agentAlias} />
+          <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        </>
       )}
 
       {/* Input area */}

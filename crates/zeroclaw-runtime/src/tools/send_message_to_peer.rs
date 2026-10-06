@@ -102,7 +102,7 @@ impl Tool for SendMessageToPeerTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Channel ref to deliver on (e.g. 'telegram.prod'). Must be one of the agent's configured channels and a channel the target peer also listens on."
+                    "description": crate::i18n::get_required_cli_string("colony-peer-channel-description")
                 },
                 "target": {
                     "type": "string",
@@ -126,6 +126,44 @@ impl Tool for SendMessageToPeerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if crate::execution_scope::context_isolated() {
+            let target = args
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let message = args
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 64_000);
+            let (Some(target), Some(message)) = (target, message) else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "colony-peer-message-invalid",
+                    )),
+                });
+            };
+            let accepted =
+                crate::execution_scope::publish_peer_message(&self.sender_alias, target, message)?;
+            return Ok(match accepted {
+                Some(id) => ToolResult {
+                    success: true,
+                    output: ToolOutput::json(
+                        json!({"queued":true,"message_id":id,"target":target}),
+                    ),
+                    error: None,
+                },
+                None => ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "colony-connection-required",
+                    )),
+                },
+            });
+        }
         let channel = args
             .get("channel")
             .and_then(|v| v.as_str())
@@ -178,8 +216,13 @@ impl Tool for SendMessageToPeerTool {
             })?
             .to_string();
 
+        let config = self
+            .live_config
+            .as_ref()
+            .map(|live| Arc::new(live.read().clone()))
+            .unwrap_or_else(|| Arc::clone(&self.config));
         let fallback_channel_type = channel.split_once('.').map(|(t, _)| t);
-        let resolved = resolve_peer_set(&self.config, &self.sender_alias);
+        let resolved = resolve_peer_set(&config, &self.sender_alias);
 
         if !resolved.is_known_peer(&channel, &target)
             && !fallback_channel_type
@@ -199,8 +242,7 @@ impl Tool for SendMessageToPeerTool {
         // The agent must itself listen on the channel — the target may
         // be reachable on it via a peer group, but a sender can't
         // dispatch on a channel it isn't configured for.
-        let agent_listens_on_channel = self
-            .config
+        let agent_listens_on_channel = config
             .agents
             .get(&self.sender_alias)
             .map(|a| a.channels.iter().any(|c| c.as_str() == channel.as_str()))
@@ -218,8 +260,7 @@ impl Tool for SendMessageToPeerTool {
         }
 
         let target_norm = target.trim_start_matches('@').to_ascii_lowercase();
-        let target_is_agent = self
-            .config
+        let target_is_agent = config
             .agents
             .keys()
             .any(|alias| alias.to_ascii_lowercase() == target_norm);
@@ -229,14 +270,22 @@ impl Tool for SendMessageToPeerTool {
             // raw input ("@Beta" -> "beta"). Look up the canonical
             // alias once so the agent loop's `agent_alias` field
             // matches the [agents.<alias>] config key.
-            let canonical = self
-                .config
+            let canonical = config
                 .agents
                 .keys()
                 .find(|alias| alias.to_ascii_lowercase() == target_norm)
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
+            if !config.colony_allows_communication(&self.sender_alias, &canonical) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "colony-connection-required",
+                    )),
+                });
+            }
             let admission = self
                 .execution_capability
                 .as_ref()
@@ -245,7 +294,7 @@ impl Tool for SendMessageToPeerTool {
             let cfg = admission
                 .as_ref()
                 .map(AgentExecutionAdmission::config)
-                .unwrap_or_else(|| Arc::clone(&self.config));
+                .unwrap_or_else(|| Arc::clone(&config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let turn_recipient_alias = recipient_alias.clone();
@@ -380,7 +429,16 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        match deliver_announcement(&self.config, &channel, &target, None, &message).await {
+        if !config.colony_allows_external(&self.sender_alias, &channel, &target, true) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-connection-required",
+                )),
+            });
+        }
+        match deliver_announcement(&config, &channel, &target, None, &message).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("delivered to external peer {target:?} on {channel}").into(),
@@ -786,6 +844,68 @@ mod tests {
     use crate::control_plane::{SqliteTaskStore, TaskSnapshot};
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::schema::AliasedAgentConfig;
+
+    #[tokio::test]
+    async fn colony_peer_publication_uses_trusted_sender_and_defaults_closed() {
+        struct Collector {
+            messages: Mutex<Vec<(String, String, String)>>,
+        }
+        impl crate::execution_scope::ExecutionScopeObserver for Collector {
+            fn context_isolated(&self) -> bool {
+                true
+            }
+            fn goal_id(&self) -> Option<String> {
+                Some("owned-goal".into())
+            }
+            fn publish_peer_message(
+                &self,
+                sender: &str,
+                recipient: &str,
+                content: &str,
+            ) -> Result<Option<String>> {
+                self.messages
+                    .lock()
+                    .push((sender.into(), recipient.into(), content.into()));
+                Ok(Some("durable-message".into()))
+            }
+        }
+        struct Closed;
+        impl crate::execution_scope::ExecutionScopeObserver for Closed {
+            fn context_isolated(&self) -> bool {
+                true
+            }
+        }
+        let collector = Arc::new(Collector {
+            messages: Mutex::new(Vec::new()),
+        });
+        let tool = SendMessageToPeerTool::new(Arc::new(Config::default()), "bound-sender");
+        let accepted = crate::execution_scope::scope(
+            collector.clone(),
+            tool.execute(
+                json!({"target":"worker","message":"one-way task data","sender":"forged"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(accepted.success);
+        assert!(accepted.output.to_string().contains("durable-message"));
+        assert_eq!(
+            *collector.messages.lock(),
+            vec![(
+                "bound-sender".into(),
+                "worker".into(),
+                "one-way task data".into()
+            )]
+        );
+        let refused = crate::execution_scope::scope(
+            Arc::new(Closed),
+            tool.execute(json!({"target":"worker","message":"closed"})),
+        )
+        .await
+        .unwrap();
+        assert!(!refused.success);
+        assert_eq!(collector.messages.lock().len(), 1);
+    }
 
     struct MockRegistry {
         create_error: bool,

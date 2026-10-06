@@ -76,6 +76,7 @@
   --pc-accent-dim: rgba(34, 211, 238, 0.3);
   --pc-accent-glow: rgba(34, 211, 238, 0.1);
   --pc-accent-rgb: 34, 211, 238;
+  --pc-accent-foreground: #ffffff;
 
   /* Link text — derived from the per-theme accent so it tracks every palette. */
   --pc-text-link: var(--pc-accent-light);
@@ -412,15 +413,15 @@ code, kbd, pre {
 /* Primary action (pill) */
 .btn-primary {
   background: var(--pc-accent);
-  color: white;
-  border-radius: 1rem;
+  color: var(--pc-accent-foreground);
+  border-radius: 0.625rem;
   font-weight: 600;
   font-size: 0.875rem;
   padding: 0.5rem 1.25rem;
   border: none;
   cursor: pointer;
   transition: all 0.2s ease;
-  box-shadow: 0 4px 12px rgba(var(--pc-accent-rgb), 0.2);
+  box-shadow: var(--pc-shadow-sm);
 }
 
 .btn-primary:hover:not(:disabled) {

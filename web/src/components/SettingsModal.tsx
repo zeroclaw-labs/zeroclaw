@@ -320,12 +320,12 @@ export function SettingsModal({ open, onClose }: Props) {
                       <span
                         className="flex h-7 w-7 items-center justify-center rounded-full transition-all"
                         style={{
-                          backgroundColor: opt.color,
-                          border: accent === opt.value ? `2px solid ${opt.color}` : '2px solid transparent',
-                          boxShadow: accent === opt.value ? `0 0 8px ${opt.color}40` : 'none',
+                          backgroundColor: accent === opt.value ? 'var(--pc-accent)' : opt.color,
+                          border: accent === opt.value ? '2px solid var(--pc-accent)' : '2px solid transparent',
+                          boxShadow: accent === opt.value ? '0 0 0 3px var(--pc-accent-dim)' : 'none',
                         }}
                       >
-                        {accent === opt.value && <Check size={14} style={{ color: 'white' }} />}
+                        {accent === opt.value && <Check size={14} style={{ color: 'var(--pc-accent-foreground)' }} />}
                       </span>
                     </button>
                   ))}

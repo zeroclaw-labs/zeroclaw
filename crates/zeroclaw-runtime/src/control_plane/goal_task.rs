@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::task_registry::{TaskRecord, TaskStatus};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GoalTaskRecord {
     /// Foreign key to the canonical [`TaskRecord`].
     pub task_id: String,
@@ -111,6 +112,7 @@ impl TaskGoal {
 /// A pause reason is goal-specific explanation layered on top of
 /// [`TaskStatus::Paused`]. It must not be used as a second lifecycle enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPauseReason {
     /// An operator explicitly paused the goal through the control plane.
@@ -138,6 +140,7 @@ pub enum GoalPauseReason {
 /// Structured blocker packet attached to a paused goal.
 /// Free-form text is only explanatory. Policy branches on `kind` and payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GoalBlocker {
     /// Machine-readable blocker class used for policy and resume routing.
     pub kind: GoalBlockerKind,
@@ -151,6 +154,7 @@ pub struct GoalBlocker {
 /// This is intentionally separate from [`GoalPauseReason`]: a pause has one
 /// primary reason, while the blocker list can contain several actionable items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GoalBlockerKind {
     /// Waiting for an operator to resume an explicitly paused goal.
@@ -172,6 +176,7 @@ pub enum GoalBlockerKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GoalPauseState {
     /// Primary pause reason for controller policy.
     pub reason: GoalPauseReason,
@@ -184,6 +189,7 @@ pub struct GoalPauseState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TaskContinuationContext {
     /// Channel family that should receive the continuation turn.
     pub channel: String,
@@ -211,6 +217,7 @@ pub struct TaskContinuationContext {
 /// prompt. Kept local to the control plane so the store does not depend on
 /// channel transport structs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskContinuationConversationScope {
     /// Continue in the same sender-scoped history used by direct chats.

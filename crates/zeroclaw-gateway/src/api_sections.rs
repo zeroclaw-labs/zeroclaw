@@ -157,7 +157,7 @@ fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec
     missing
 }
 
-fn quickstart_agent_missing_requirements(
+pub(crate) fn quickstart_agent_missing_requirements(
     cfg: &zeroclaw_config::schema::Config,
     alias: &str,
     agent: &zeroclaw_config::schema::AliasedAgentConfig,
@@ -1557,6 +1557,7 @@ mod tests {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,

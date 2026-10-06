@@ -13,6 +13,7 @@ publish = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-colony.workspace = true
 zeroclaw-tls.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
@@ -120,5 +121,5 @@ gateway-voice-duplex = []
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
 # on; turning it off omits OPTIONS schema bodies (returns a small placeholder)
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
-schema-export = ["zeroclaw-config/schema-export", "zeroclaw-runtime/schema-export", "dep:schemars"]
+schema-export = ["zeroclaw-config/schema-export", "zeroclaw-runtime/schema-export", "zeroclaw-colony/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]

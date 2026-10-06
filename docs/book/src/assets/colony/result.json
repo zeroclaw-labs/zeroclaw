@@ -1,0 +1,37 @@
+{
+  "passed": true,
+  "actions": [
+    "start",
+    "pause",
+    "resume",
+    "confirm_plan",
+    "cancel",
+    "cancel"
+  ],
+  "creates": 1,
+  "saves": 4,
+  "chatSockets": 2,
+  "viewport": [
+    1440,
+    980
+  ],
+  "synthetic_http_and_models": true,
+  "compiled_renderer": true,
+  "browser_version": "154.0.8037.98",
+  "git_revision": "eada1bdc8b0c919310785f795165551f2cad0dab",
+  "source_sha256": {
+    "src/pages/ColonyWorkspace.tsx": "acdf058949119d14c9dd0a165a07e234cd5152f0f5c72a1aa9e5445dde1a342b",
+    "src/components/ColonyCanvas.tsx": "c5f905084bfc6ca54435c101189041c7f2da7656af80bd6be7d9939b97f4f51d",
+    "src/pages/ChatWorkspace.tsx": "24076e9e26ee85fd13b2a29e5b5fafb476c8f18dfe2df34cb8290bb7e625b9ca",
+    "src/pages/AgentLanding.tsx": "604a53395b4ff7b0259dd41e19cb9bd6dd7d60b65d90cb92e848b9f497ee741f",
+    "src/components/AgentSidebar.tsx": "a79c721f6aaac198ba8147e89046afa7e6dd5412a2297ed82c595ea8fcf1b1df",
+    "src/lib/colonies.ts": "2dfdb706b13829f0dc0785bf66cefe5aeb0739b2646fd18dba99275b47ffd535",
+    "src/lib/i18n.ts": "154ffabedfd723fab417bc310097ac76ac82166f109319bad625fe39a03b96d2"
+  },
+  "renderer_assets": [
+    "/_app/assets/index-BzbXQVxC.js",
+    "/_app/assets/api-ga9LX2MJ.js",
+    "/_app/assets/createLucideIcon-CNjVpYpV.js",
+    "/_app/assets/index-CHj3pUam.css"
+  ]
+}

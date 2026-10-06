@@ -720,6 +720,9 @@ impl DelegateTool {
         &self,
         target_alias: &str,
     ) -> anyhow::Result<Arc<SecurityPolicy>> {
+        if let Some(live) = self.live_config.as_ref() {
+            return self.policy_for_target_from_config(&live.read(), target_alias);
+        }
         let Some(config) = self.root_config.as_deref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -1337,7 +1340,7 @@ impl DelegateTool {
                 caller_allowed: None,
                 connect_mcp: true,
                 connect_peripherals: false,
-                exclude_memory: false,
+                exclude_memory: crate::execution_scope::context_isolated(),
                 acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
@@ -2244,6 +2247,9 @@ impl DelegateTool {
         if task.kind != crate::control_plane::TaskKind::Delegate {
             return false;
         }
+        if !self.colony_result_allowed(&task.agent) {
+            return false;
+        }
         if let Some(caller) = self.caller_identity()
             && (task.originator_route.as_deref() == Some(caller)
                 || task.originator_chain.iter().any(|alias| alias == caller))
@@ -2259,6 +2265,17 @@ impl DelegateTool {
     fn caller_identity(&self) -> Option<&str> {
         let alias = self.caller_alias.trim();
         (!alias.is_empty()).then_some(alias)
+    }
+
+    fn colony_result_allowed(&self, target: &str) -> bool {
+        if let Some(live) = self.live_config.as_ref() {
+            return live
+                .read()
+                .colony_allows_communication(target, &self.caller_alias);
+        }
+        self.root_config
+            .as_ref()
+            .is_none_or(|config| config.colony_allows_communication(target, &self.caller_alias))
     }
 
     /// Validate that a user-provided task_id is a valid UUID to prevent
@@ -2399,6 +2416,21 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if crate::execution_scope::context_isolated()
+            && (args
+                .get("background")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+                || args.get("parallel").is_some())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-detached-work-denied",
+                )),
+            });
+        }
         let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -2413,6 +2445,16 @@ impl Tool for DelegateTool {
                 )),
             });
         };
+
+        if crate::execution_scope::context_isolated() && action != DelegateAction::Delegate {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-detached-work-denied",
+                )),
+            });
+        }
 
         // Bounded sub-agents carry delegate-only instances: their identity is
         // transient, so the management surface stays with the ancestors, who
@@ -2524,19 +2566,38 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        if !self.colony_result_allowed(agent_name) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-reverse-connection-required",
+                )),
+            });
+        }
         let execution_admission = self
             .execution_capability
             .as_ref()
             .map(|capability| capability.admit(agent_name))
             .transpose()?;
-        self.execute_sync_with_target_admission(
-            agent_name,
-            prompt,
-            args,
-            admission,
-            execution_admission,
-        )
-        .await
+        let mut result = self
+            .execute_sync_with_target_admission(
+                agent_name,
+                prompt,
+                args,
+                admission,
+                execution_admission,
+            )
+            .await?;
+        // A graph edit while the child was running can revoke its reply.
+        if !self.colony_result_allowed(agent_name) {
+            result.success = false;
+            result.output = ToolOutput::default();
+            result.error = Some(crate::i18n::get_required_cli_string(
+                "colony-reverse-connection-required",
+            ));
+        }
+        Ok(result)
     }
 
     async fn execute_sync_with_target_admission(
@@ -2550,6 +2611,12 @@ impl DelegateTool {
         if let Some(execution_admission) = execution_admission.as_ref() {
             execution_admission.revalidate()?;
         }
+        // A child admission starts a new run. Capture its instructions here,
+        // rather than inheriting its caller's earlier next-run snapshot.
+        let colony_live_config = execution_admission
+            .as_ref()
+            .map(|admission| admission.capability().config_handle())
+            .or_else(|| self.live_config.clone());
         let fallback_agentic = execution_admission
             .as_ref()
             .map(|admission| {
@@ -2570,22 +2637,26 @@ impl DelegateTool {
         // The inner future owns the complete delegated agentic loop. Keep it
         // off the caller's bounded worker stack while the fallback scope and
         // lifecycle admission remain installed around it.
-        let (result, fallback) =
-            zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                let result = self
-                    .execute_sync_with_admission_inner(
-                        agent_name,
-                        prompt,
-                        args,
-                        admission,
-                        execution_admission,
-                    )
-                    .await;
-                let fallback =
-                    zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
-                (result, fallback)
-            }))
-            .await;
+        let (result, fallback) = crate::agent::scope_colony_config(
+            colony_live_config,
+            Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(
+                Box::pin(async {
+                    let result = self
+                        .execute_sync_with_admission_inner(
+                            agent_name,
+                            prompt,
+                            args,
+                            admission,
+                            execution_admission,
+                        )
+                        .await;
+                    let fallback =
+                        zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
+                    (result, fallback)
+                }),
+            )),
+        )
+        .await;
 
         let mut result = result?;
         if result.success
@@ -2856,7 +2927,7 @@ impl DelegateTool {
                 .unwrap_or_else(|| self.workspace_dir.clone())
         });
         let prompt_workspace = target_workspace.as_deref().unwrap_or(&self.workspace_dir);
-        let enriched_system_prompt = self.build_enriched_system_prompt_from_config(
+        let mut enriched_system_prompt = self.build_enriched_system_prompt_from_config(
             authoritative_config,
             agent_name,
             agent_config,
@@ -2867,6 +2938,17 @@ impl DelegateTool {
             None,
             None,
         );
+        // This single model call does not enter the turn engine; it still
+        // consumes its admitted instruction snapshot and live descriptors.
+        if let Some(config) = authoritative_config.or(self.root_config.as_deref()) {
+            let context =
+                crate::agent::turn::admitted_colony_instruction_context(Some(config), agent_name);
+            if !context.is_empty() {
+                enriched_system_prompt
+                    .get_or_insert_with(String::new)
+                    .push_str(&context);
+            }
+        }
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
@@ -2881,11 +2963,53 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
-        )
-        .await;
+        let result = if crate::execution_scope::context_isolated() {
+            crate::execution_scope::check_budget()?;
+            let mut messages = Vec::new();
+            if let Some(system) = system_prompt_ref {
+                messages.push(ChatMessage::system(system));
+            }
+            messages.push(ChatMessage::user(&full_prompt));
+            let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                scope.scope(zeroclaw_providers::dispatch::with_exact_dispatch_route(
+                    agent_config.model_provider.to_string(),
+                    model.clone(),
+                    dispatcher.chat(
+                        zeroclaw_providers::ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &model,
+                        temperature,
+                    ),
+                )),
+            )
+            .await;
+            let successful = matches!(&result, Ok(Ok(_)));
+            if successful {
+                scope.mark_logical_success();
+            }
+            let (attempts, _, _) = scope.take().into_attempts_and_parts();
+            if attempts.is_empty() {
+                crate::execution_scope::record_usage_error(&anyhow::Error::msg(
+                    "delegated provider usage is unavailable",
+                ));
+            }
+            crate::agent::cost::settle_provider_attempts(
+                &attempts,
+                successful.then(|| attempts.len().saturating_sub(1)),
+            );
+            result.map(|inner| inner.map(|response| response.text.unwrap_or_default()))
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            )
+            .await
+        };
 
         let result = match result {
             Ok(inner) => inner,
@@ -3884,6 +4008,13 @@ impl DelegateTool {
         let Some(status) = stored.legacy_status else {
             return Ok(None);
         };
+        if stored
+            .legacy_agent
+            .as_deref()
+            .is_some_and(|agent| !self.colony_result_allowed(agent))
+        {
+            return Ok(None);
+        }
         let state = BackgroundResultState::from_file_status(&status);
         Ok(Some((
             state,
@@ -4443,7 +4574,9 @@ impl DelegateTool {
         let target_workspace = config
             .map(|config| config.agent_workspace_dir(agent_alias))
             .or_else(|| self.agent_workspace(agent_alias));
-        if let Some(target_workspace) = target_workspace {
+        if let Some(target_workspace) = target_workspace
+            && !crate::execution_scope::context_isolated()
+        {
             let identity_files = [
                 "AGENTS.md",
                 "SOUL.md",
@@ -4683,6 +4816,12 @@ impl DelegateTool {
                     parent_tools
                         .iter()
                         .filter(|tool| tool.name() != Self::NAME)
+                        // Actor-bound room/transport handles carry the parent's
+                        // identity. A bounded child must never borrow those
+                        // grants; its controller admission supplies its own.
+                        .filter(|tool| !crate::execution_scope::context_isolated()
+                            || (!super::needs_colony_tool_boundary(tool.name())
+                                && !matches!(tool.name(), "colony_room" | "send_via")))
                         .filter(|tool| self.security.is_tool_allowed(tool.name()))
                         .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                         .cloned()
@@ -17295,6 +17434,62 @@ command = "rm independent-delegate-marker"
                 Some(alias),
             )
             .expect("seed spend recorded");
+    }
+
+    #[tokio::test]
+    async fn colony_non_agentic_delegate_records_goal_usage_and_denies_detached_direct_work() {
+        struct ColonyScope;
+        impl crate::execution_scope::ExecutionScopeObserver for ColonyScope {
+            fn context_isolated(&self) -> bool {
+                true
+            }
+            fn goal_id(&self) -> Option<String> {
+                Some("nested-colony-goal".into())
+            }
+        }
+        struct DirectScope;
+        impl crate::execution_scope::ExecutionScopeObserver for DirectScope {
+            fn context_isolated(&self) -> bool {
+                true
+            }
+        }
+        let (server, requests) = start_usage_chat_server(1).await;
+        let mut fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 0).await;
+        let mut config = (*fixture.config).clone();
+        config
+            .runtime_profiles
+            .get_mut("delegate_cost_runtime")
+            .unwrap()
+            .agentic = false;
+        fixture.tool.runtime_profiles = Arc::new(config.runtime_profiles.clone());
+        fixture.tool.root_config = Some(Arc::new(config));
+        let result = crate::execution_scope::scope(
+            Arc::new(ColonyScope),
+            fixture
+                .tool
+                .execute(json!({"agent":"target","prompt":"produce a status line"})),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{result:?}");
+        let tracker =
+            crate::cost::CostTracker::new(fixture.config.cost.clone(), &fixture.data_dir).unwrap();
+        let (tokens, cost, priced) = tracker
+            .get_usage_totals_for_task_with_pricing("nested-colony-goal")
+            .unwrap();
+        assert_eq!(tokens, 1200);
+        assert!(priced);
+        assert!((cost - 0.006).abs() < 1e-9);
+        let refused = crate::execution_scope::scope(
+            Arc::new(DirectScope),
+            fixture
+                .tool
+                .execute(json!({"agent":"target","prompt":"detached","background":true})),
+        )
+        .await
+        .unwrap();
+        assert!(!refused.success);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

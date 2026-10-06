@@ -509,6 +509,12 @@ pub struct Config {
     #[nested]
     pub agents: HashMap<String, AliasedAgentConfig>,
 
+    /// Saved exclusive teams and their directed communication graph.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    #[group = "Multi-agent"]
+    pub colonies: HashMap<String, crate::colony::ColonyConfig>,
+
     /// Named risk/autonomy profiles (`[risk_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -4143,6 +4149,11 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent"]
 pub struct AliasedAgentConfig {
+    /// Declared public purpose, consumed as an instruction and shared read-only
+    /// with explicitly connected colony agents. Identity files remain private.
+    #[tab(General)]
+    #[serde(default)]
+    pub core_command: String,
     /// Whether this agent is active. Set false to disable without removing the definition.
     #[tab(General)]
     #[serde(default = "default_true")]
@@ -4342,6 +4353,7 @@ pub struct AliasedAgentConfig {
 impl Default for AliasedAgentConfig {
     fn default() -> Self {
         Self {
+            core_command: String::new(),
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
@@ -4514,8 +4526,24 @@ impl Config {
             }
         }
 
+        // A colony wire is an explicit bounded communication grant. Existing
+        // independent delegate selections retain their narrower mode contract;
+        // the caller's risk profile still controls whether delegation may run.
+        if let Some((_, colony)) = self.colony_for_agent(caller_alias) {
+            for edge in &colony.connections {
+                if edge.from == caller_alias
+                    && self.agents.get(&edge.to).is_some_and(|agent| agent.enabled)
+                {
+                    targets
+                        .entry(edge.to.clone())
+                        .or_insert(DelegateExecutionMode::Bounded);
+                }
+            }
+        }
+
         targets
             .into_iter()
+            .filter(|(target, _)| self.colony_allows_communication(caller_alias, target))
             .map(|(agent, mode)| DelegateTargetConfig { agent, mode })
             .collect()
     }
@@ -21080,6 +21108,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
+            colonies: HashMap::new(),
             risk_profiles: HashMap::new(),
             decision_models: HashMap::new(),
             oidc: HashMap::new(),
@@ -23794,6 +23823,7 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.validate_colonies()?;
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
 
@@ -32851,6 +32881,7 @@ auto_save = true
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
+            colonies: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -34044,6 +34075,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
+            colonies: HashMap::new(),
             risk_profiles: HashMap::new(),
             decision_models: HashMap::new(),
             oidc: HashMap::new(),

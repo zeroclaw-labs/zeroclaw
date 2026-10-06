@@ -3263,10 +3263,17 @@ impl Agent {
     }
 
     fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
-        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
-            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
-            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
-        )))
+        Ok(Arc::new(
+            crate::agent::turn::ToolProtocolPrompts::new(
+                self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
+                self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
+            )
+            .with_colony_config(
+                self.provider_switch_config
+                    .as_ref()
+                    .and_then(|config| config.live_config.clone()),
+            ),
+        ))
     }
 
     fn build_system_prompt_with_dispatcher(

@@ -1313,6 +1313,14 @@ pub struct AgentRunOverrides {
     pub memory_free: bool,
     /// Per-run restriction applied after selecting an authoritative config.
     pub suppress_memory_auto_save: bool,
+    /// Unattended orchestration must preserve the owning agent's approval policy.
+    pub enforce_approvals: bool,
+    /// Optional caller-owned approval surface, never a policy override.
+    pub approval_channel: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
+    pub approval_reply_target: Option<String>,
+    /// Caller-owned scoped capabilities, admitted through the same profile
+    /// and per-run registry gates as built-in tools. They grant no bypass.
+    pub extra_tools: Vec<Box<dyn Tool>>,
     /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
     /// worker constructs this once at worker start and shares it across
     /// every tick so that stdio MCP children live for the daemon's
@@ -1502,6 +1510,9 @@ pub async fn run(
         runtime_profile = %agent.runtime_profile,
         memory_namespace = %memory_composite,
     );
+    let colony_live_config = execution_capability
+        .as_ref()
+        .map(AgentExecutionCapability::config_handle);
     let __zc_body = async move {
         let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
@@ -1614,7 +1625,7 @@ pub async fn run(
             (None, None)
         };
 
-        let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
+        let mut all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1640,6 +1651,7 @@ pub async fn run(
                 .map(AgentExecutionCapability::config_handle),
             execution_capability.clone(),
         )?;
+        all_tools_result.tools.append(&mut overrides.extra_tools);
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1996,15 +2008,24 @@ pub async fn run(
             eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
-            true,
+            !memory_free,
             config.channels.show_tool_calls,
             None,
             runtime.shell_profile().as_ref(),
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
-        let approval_manager =
-            run_approval_manager(interactive, sop_step_scope.is_some(), &risk_profile);
+        let approval_manager = if overrides.approval_channel.is_some() {
+            Some(ApprovalManager::for_non_interactive_backchannel(
+                &risk_profile,
+            ))
+        } else {
+            run_approval_manager(
+                interactive,
+                sop_step_scope.is_some() || overrides.enforce_approvals,
+                &risk_profile,
+            )
+        };
         let memory_session_id = session_state_file.as_deref().and_then(|path| {
             let raw = path.to_string_lossy().trim().to_string();
             if raw.is_empty() {
@@ -2097,7 +2118,7 @@ pub async fn run(
                 eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
-                true,
+                !memory_free,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
                 runtime.shell_profile().as_ref(),
@@ -2233,7 +2254,7 @@ pub async fn run(
                         eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
-                        true,
+                        !memory_free,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                         runtime.shell_profile().as_ref(),
@@ -2283,11 +2304,11 @@ pub async fn run(
                                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
                                 injected_memory_preamble: &mut None,
                                 channel_name,
-                                channel_reply_target: None,
+                                channel_reply_target: overrides.approval_reply_target.as_deref(),
                                 cancellation_token: None,
                                 on_delta: None,
                                 shared_budget: execution_tree_budget.clone(),
-                                channel: None,
+                                channel: overrides.approval_channel.as_deref(),
                                 collected_receipts: None,
                                 event_tx: None,
                                 steering: None,
@@ -2836,7 +2857,7 @@ pub async fn run(
                             eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
-                            true,
+                            !memory_free,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                             runtime.shell_profile().as_ref(),
@@ -3210,7 +3231,7 @@ pub async fn run(
 
         Ok(final_output)
     };
-    __zc_body
+    crate::agent::turn::scope_colony_config(colony_live_config, Box::pin(__zc_body))
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
@@ -3482,6 +3503,7 @@ async fn process_message_inner(
         runtime_profile = %agent.runtime_profile,
         memory_namespace = %memory_composite,
     );
+    let colony_live_config = live_config.clone();
     let __zc_body = async move {
         let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
@@ -4026,7 +4048,7 @@ async fn process_message_inner(
             )
             .await
     };
-    __zc_body
+    crate::agent::turn::scope_colony_config(colony_live_config, Box::pin(__zc_body))
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await

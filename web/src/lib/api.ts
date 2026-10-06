@@ -2130,6 +2130,14 @@ export function getCostForAgent(alias: string): Promise<CostSummary> {
 // Sessions
 // ---------------------------------------------------------------------------
 
+export type WorkspaceAvailability = components['schemas']['WorkspaceAvailability'];
+export function getWorkspaceAvailability(): Promise<WorkspaceAvailability> {
+  return apiFetch<WorkspaceAvailability>('/api/workspace');
+}
+export function getRunningSessions(): Promise<{ sessions: { session_id: string; last_activity: string }[] }> {
+  return apiFetch('/api/sessions/running');
+}
+
 export function getSessions(): Promise<Session[]> {
   return apiFetch<Session[] | { sessions: Session[] }>("/api/sessions").then(
     (data) => {

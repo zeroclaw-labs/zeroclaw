@@ -33,6 +33,7 @@ const {
   applySessionChange,
   loadPersisted,
   makeTab,
+  matchesChatRequest,
   reservationsByKey,
   tabForOpenRequest,
   withDistinctSessions,
@@ -46,6 +47,13 @@ function store(value: unknown): void {
 
 beforeEach(() => {
   storage.clear();
+});
+
+test('session deep links select the existing owner without opening a second socket', () => {
+  const tab = { key: 'owner', alias: 'builder', sessionId: 'session-one' };
+  assert.equal(matchesChatRequest(tab, 'stale-alias', 'session-one'), true);
+  assert.equal(matchesChatRequest(tab, 'builder', 'session-two'), false);
+  assert.equal(matchesChatRequest(tab, 'builder'), true);
 });
 
 // ── Restore ────────────────────────────────────────────────────────────────

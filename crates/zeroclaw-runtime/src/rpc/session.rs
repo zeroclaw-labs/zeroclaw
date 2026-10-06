@@ -1614,6 +1614,12 @@ impl SessionStore {
         sessions.get(session_id).map(|s| s.owner_tui_id.clone())
     }
 
+    /// Live activity includes admitted turns and queued work. Used by both
+    /// session recovery and activity listings; persistence is not a live lock.
+    pub async fn has_running_work(&self, id: &str) -> bool {
+        self.inflight_turn_generation(id).is_some() || self.session_queue.queue_depth(id).await > 0
+    }
+
     /// Read the owning-principal stamp from a LIVE session. Same tri-state
     /// contract as [`Self::session_owner_tui_id`].
     pub async fn session_owner_principal(&self, session_id: &str) -> Option<Option<String>> {

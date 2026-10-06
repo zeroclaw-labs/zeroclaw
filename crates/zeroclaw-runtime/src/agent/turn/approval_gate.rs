@@ -140,6 +140,9 @@ pub(crate) async fn gate_tool_approval(
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
+            if mgr.is_non_interactive() {
+                crate::execution_scope::record_approval_required(tool_name, tool_args);
+            }
             // This string is fed back to the MODEL, so it states the outcome and
             // stops there. It deliberately does not name the settings that would
             // permit the call: `auto_approve` bypasses operator approval for that

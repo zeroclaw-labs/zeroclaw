@@ -1455,6 +1455,45 @@ pub async fn handle_api_channel_relink(
     }
 }
 
+/// Materialized view of canonical config and runtime availability.
+#[derive(serde::Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct WorkspaceAvailability {
+    pub agents: Vec<String>,
+    pub session_persistence: bool,
+    pub workflows: bool,
+    pub code: bool,
+}
+
+/// GET /api/workspace — live availability for the work-focused dashboard.
+/// Config and runtime owners remain authoritative; no capability cache is kept.
+pub async fn handle_api_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    let mut agents: Vec<String> = config
+        .agents
+        .iter()
+        .filter(|(alias, agent)| {
+            super::api_sections::quickstart_agent_missing_requirements(&config, alias, agent)
+                .is_empty()
+        })
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    agents.sort_unstable();
+    Json(WorkspaceAvailability {
+        agents,
+        session_persistence: state.session_backend.is_some(),
+        workflows: state.sop_engine.is_some(),
+        code: super::code::available(&state).await,
+    })
+    .into_response()
+}
+
 /// GET /api/tuis — list connected TUI sessions
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
@@ -2423,6 +2462,7 @@ pub(crate) mod tests {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: Default::default(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,

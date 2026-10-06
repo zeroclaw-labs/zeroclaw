@@ -3,25 +3,9 @@ import { basePath } from '../../lib/basePath';
 import { findActiveNavPath } from './sidebarNav';
 import { railAsideStyle, railLinkClassName, railNavClassName } from './sidebarRail';
 import { SidebarNavLink } from './SidebarNavLink';
-import {
-  Activity,
-  ArrowDownToLine,
-  Blocks,
-  Bot,
-  Clock,
-  LayoutDashboard,
-  ListChecks,
-  MessageSquare,
-  Monitor,
-  Puzzle,
-  Settings,
-  Smartphone,
-  Sparkles,
-  Stethoscope,
-  Terminal,
-  Workflow,
-  Wrench,
-} from 'lucide-react';
+import { ArrowDownToLine, Ellipsis, X } from 'lucide-react';
+import { navGroups, type NavItem, type NavGroup } from '@/lib/navigation';
+import { useFocusTrap } from '@/hooks/useFocusTrap';
 import { t } from '@/lib/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -29,57 +13,6 @@ import { getStatus } from '@/lib/api';
 import { useVersionCheck } from '@/hooks/useVersionCheck';
 import { UpgradeDialog } from '@/components/UpgradeDialog';
 import type { StatusResponse } from '@/types/api';
-
-interface NavItem {
-  to: string;
-  icon: typeof LayoutDashboard;
-  labelKey: string;
-}
-
-interface NavGroup {
-  headingKey: string;
-  items: NavItem[];
-}
-
-// Grouped navigation. Every existing route/link is preserved — the flat list
-// is just organized under four clusters so the rail reads top-down by task:
-// Home → Chat → Configure → Operations. On the desktop rail the cluster
-// boundaries become thin divider rules (no text headings); the mobile drawer
-// still renders the headings as full labels.
-const navGroups: NavGroup[] = [
-  {
-    headingKey: 'nav.group.home',
-    items: [{ to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' }],
-  },
-  {
-    headingKey: 'nav.group.chat',
-    items: [{ to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' }],
-  },
-  {
-    headingKey: 'nav.group.configure',
-    items: [
-      { to: '/config', icon: Settings, labelKey: 'nav.config' },
-      { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
-      { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
-      { to: '/skills', icon: Sparkles, labelKey: 'nav.skills' },
-      { to: '/sops', icon: Workflow, labelKey: 'nav.sops' },
-      { to: '/runs', icon: ListChecks, labelKey: 'nav.runs' },
-      { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
-      { to: '/plugins', icon: Blocks, labelKey: 'nav.plugins' },
-      { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-    ],
-  },
-  {
-    headingKey: 'nav.group.operations',
-    items: [
-      { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
-      { to: '/pairing', icon: Smartphone, labelKey: 'nav.pairing' },
-      { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
-      { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
-      { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp' },
-    ],
-  },
-];
 
 // NavLink matches path prefixes by default. Resolve the longest registered
 // destination so a specific item can suppress its otherwise-active ancestors.
@@ -325,6 +258,19 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const drawerOpen = open || moreOpen;
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeDrawer = () => { setMoreOpen(false); onClose(); };
+  useFocusTrap(drawerRef, { enabled: drawerOpen, onClose: closeDrawer, preventDefaultOnEscape: true, filterVisible: true });
+  useEffect(() => {
+    if (drawerOpen) drawerRef.current?.querySelector<HTMLElement>('button, a')?.focus();
+  }, [drawerOpen]);
+  // Daily work stays visible. Every destination is still available from More
+  // and from keyboard search, without a screen-height wall of icons.
+  const railGroups = navGroups.map((group, index) => ({ ...group,
+    items: index === 0 ? group.items : group.items.filter((item) => item.to === '/config' || item.to === '/system'),
+  }));
   const { pathname } = useLocation();
   const activePath = findActiveNavPath(pathname, navPaths);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -344,11 +290,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
   return (
     <>
       {/* Backdrop — mobile only */}
-      {open && (
+      {drawerOpen && (
         <div
-          className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm transition-opacity"
-          onClick={onClose}
-          onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
+          className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm transition-opacity"
+          onClick={closeDrawer}
+          onKeyDown={(e) => { if (e.key === 'Escape') closeDrawer(); }}
           role="button"
           tabIndex={-1}
           aria-label={t('sidebar.close_menu')}
@@ -365,7 +311,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       >
         <RailLogo />
         <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
-          {navGroups.map((group, index) => (
+          {railGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
               {index > 0 && (
@@ -385,6 +331,9 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
               ))}
             </div>
           ))}
+          <button type="button" onClick={() => setMoreOpen(true)} className="mx-auto flex h-10 w-10 items-center justify-center rounded-lg text-pc-text-muted hover:bg-pc-elevated focus-visible:ring-2 focus-visible:ring-pc-accent" aria-label={t('nav.more')} title={t('nav.more')} aria-expanded={drawerOpen}>
+            <Ellipsis className="h-5 w-5" />
+          </button>
         </nav>
         <RailFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
@@ -392,13 +341,16 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
       <aside
         className={[
-          'md:hidden fixed top-0 left-0 h-screen w-60 flex flex-col border-r z-50 transition-transform duration-200 ease-out',
-          open ? 'translate-x-0' : '-translate-x-full',
+          'fixed top-0 left-0 md:left-14 h-screen w-60 flex-col border-r z-50',
+          drawerOpen ? 'flex' : 'hidden',
         ].join(' ')}
         style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
-        aria-label={t('sidebar.mobile_menu')}
+        ref={drawerRef}
+        role="dialog"
+        aria-modal={drawerOpen}
+        aria-label={t('nav.more')}
       >
-        <DrawerLogo />
+        <div className="relative"><DrawerLogo /><button type="button" onClick={closeDrawer} aria-label={t('sidebar.close_menu')} className="absolute right-2 top-4 text-pc-text-muted"><X className="h-5 w-5" /></button></div>
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <DrawerGroup
@@ -406,7 +358,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
               group={group}
               index={index}
               activePath={activePath}
-              onClick={onClose}
+              onClick={closeDrawer}
             />
           ))}
         </nav>

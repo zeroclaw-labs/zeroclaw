@@ -15,6 +15,8 @@ pub enum ConfigApiCode {
     /// On-disk config differs from in-memory state (an out-of-band file edit
     /// happened despite the daemon-running rule). Caller should reload.
     ConfigChangedExternally,
+    /// Active or prepared agent work prevents a policy/membership mutation.
+    WorkActive,
     /// The daemon-reload step after a successful save failed; on-disk config
     /// has been reverted to the pre-write snapshot to keep state consistent.
     ReloadFailed,
@@ -54,6 +56,7 @@ impl ConfigApiCode {
             Self::PathNotFound => "path_not_found",
             Self::ValidationFailed => "validation_failed",
             Self::ConfigChangedExternally => "config_changed_externally",
+            Self::WorkActive => "work_active",
             Self::ReloadFailed => "reload_failed",
             Self::OpNotSupported => "op_not_supported",
             Self::SecretTestForbidden => "secret_test_forbidden",
@@ -80,7 +83,7 @@ impl ConfigApiCode {
             | Self::InvalidFormat
             | Self::InvalidEnumVariant
             | Self::DanglingReference => 400,
-            Self::ConfigChangedExternally => 409,
+            Self::ConfigChangedExternally | Self::WorkActive => 409,
             Self::ReloadFailed | Self::InternalError => 500,
         }
     }

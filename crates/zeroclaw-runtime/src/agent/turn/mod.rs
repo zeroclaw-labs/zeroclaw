@@ -245,6 +245,7 @@ async fn streamed_prefix_relays_only_unforwarded_native_narration_suffix() {
 #[derive(Clone)]
 pub(crate) struct ToolProtocolPrompts {
     text_tools_section: String,
+    colony_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 impl ToolProtocolPrompts {
@@ -252,21 +253,153 @@ impl ToolProtocolPrompts {
         let text_tools_section = tool_section_bounds(&text)
             .map(|bounds| text[bounds].to_string())
             .unwrap_or_default();
-        Self { text_tools_section }
+        Self {
+            text_tools_section,
+            colony_config: None,
+        }
+    }
+
+    pub(crate) fn with_colony_config(
+        mut self,
+        config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    ) -> Self {
+        self.colony_config = config;
+        self
     }
 }
 
 tokio::task_local! {
     static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+    static COLONY_CONFIG: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>;
+    static COLONY_PROMPT_SNAPSHOTS: std::collections::HashMap<String, (u64, Vec<zeroclaw_config::colony::ColonyPrompt>)>;
+}
+
+pub async fn scope_colony_config<'a, T>(
+    config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>,
+) -> T {
+    match config {
+        Some(config) => {
+            let snapshots = config
+                .read()
+                .colonies
+                .iter()
+                .map(|(id, colony)| {
+                    (
+                        id.clone(),
+                        (colony.instruction_revision, colony.prompts.clone()),
+                    )
+                })
+                .collect();
+            COLONY_CONFIG
+                .scope(config, COLONY_PROMPT_SNAPSHOTS.scope(snapshots, future))
+                .await
+        }
+        None => future.await,
+    }
+}
+
+/// Instruction content is captured per admitted run; graph permissions and
+/// public connection descriptors remain live canonical policy. An explicit
+/// apply-now epoch replaces the captured ordered bindings at an iteration
+/// boundary, while next-run edits leave already-admitted work unchanged.
+#[derive(Default)]
+struct ColonyRunInstructions {
+    initialized: bool,
+    colony_id: Option<String>,
+    revision: u64,
+    prompts: Vec<zeroclaw_config::colony::ColonyPrompt>,
+}
+
+impl ColonyRunInstructions {
+    fn resolve(&mut self, config: &zeroclaw_config::schema::Config, alias: &str) -> String {
+        let current = config.colony_for_agent(alias);
+        let colony_id = current.map(|(id, _)| id.to_string());
+        let revision = current.map_or(0, |(_, colony)| colony.instruction_revision);
+        if !self.initialized
+            && let Some((id, _)) = current
+        {
+            let captured = COLONY_PROMPT_SNAPSHOTS
+                .try_with(|snapshots| snapshots.get(id).cloned())
+                .ok()
+                .flatten();
+            if let Some((captured_revision, prompts)) = captured {
+                self.initialized = true;
+                self.colony_id = Some(id.to_string());
+                self.revision = captured_revision;
+                self.prompts = prompts;
+            }
+        }
+        if !self.initialized || self.colony_id != colony_id || self.revision != revision {
+            self.initialized = true;
+            self.colony_id = colony_id;
+            self.revision = revision;
+            self.prompts = current.map_or_else(Vec::new, |(_, colony)| colony.prompts.clone());
+        }
+        config.colony_instruction_context(alias, &self.prompts)
+    }
+}
+
+fn resolve_colony_context(
+    instructions: &mut ColonyRunInstructions,
+    config: Option<&zeroclaw_config::schema::Config>,
+    alias: Option<&str>,
+) -> String {
+    let Some(alias) = alias else {
+        return String::new();
+    };
+    if let Ok(context) = COLONY_CONFIG.try_with(|live| instructions.resolve(&live.read(), alias)) {
+        return context;
+    }
+    if let Ok(Some(context)) = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        prompts
+            .colony_config
+            .as_ref()
+            .map(|live| instructions.resolve(&live.read(), alias))
+    }) {
+        return context;
+    }
+    config
+        .map(|config| instructions.resolve(config, alias))
+        .unwrap_or_default()
+}
+
+/// Single-call delegates use the same admitted instruction snapshot as the
+/// agentic loop while resolving connection policy from the current authority.
+pub(crate) fn admitted_colony_instruction_context(
+    config: Option<&zeroclaw_config::schema::Config>,
+    alias: &str,
+) -> String {
+    resolve_colony_context(&mut ColonyRunInstructions::default(), config, Some(alias))
+}
+
+/// Remove only bytes this loop inserted, then resolve the current canonical
+/// instruction revision at the safe boundary between provider iterations.
+fn refresh_colony_context(history: &mut [ChatMessage], previous: &mut String, context: String) {
+    let Some(system) = history.iter_mut().find(|message| message.role == "system") else {
+        return;
+    };
+    if !previous.is_empty() && system.content.ends_with(previous.as_str()) {
+        system
+            .content
+            .truncate(system.content.len() - previous.len());
+    }
+    system.content.push_str(&context);
+    *previous = context;
 }
 
 /// Scope complete prompt variants around an Agent turn. This remains transient
 /// request state: durable history keeps the caller-owned canonical prompt.
-pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future + Send>(
     prompts: Arc<ToolProtocolPrompts>,
     future: F,
 ) -> F::Output {
-    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+    let live_config = prompts.colony_config.clone();
+    scope_colony_config(
+        live_config,
+        Box::pin(TOOL_PROTOCOL_PROMPTS.scope(prompts, future)),
+    )
+    .await
 }
 
 fn refresh_scoped_tool_protocol_prompt(
@@ -1264,7 +1397,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
 
+    let mut colony_instructions = ColonyRunInstructions::default();
+    // Capture at admission, before provider hooks or awaited tool work.
+    let _ = resolve_colony_context(&mut colony_instructions, config, agent_alias);
     for iteration in 0..max_iterations {
+        // The injected block is request-only: canonical conversation history
+        // never snapshots live instructions or duplicates them on later runs.
+        let colony_context = resolve_colony_context(&mut colony_instructions, config, agent_alias);
+        let mut injected_colony_context = String::new();
         // Re-resolved every iteration, against the tools callable *right now*.
         //
         // A step's scope is resolved by name, so it can only narrow tools that
@@ -1575,6 +1715,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
+        refresh_colony_context(
+            &mut provider_request_messages,
+            &mut injected_colony_context,
+            colony_context.clone(),
+        );
 
         if context_token_budget > 0 {
             let system_floor =
@@ -1723,6 +1868,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_state.history,
                     &mut trimmed_post_hook,
                     use_native_tools,
+                );
+                refresh_colony_context(
+                    &mut trimmed_post_hook,
+                    &mut injected_colony_context,
+                    colony_context.clone(),
                 );
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
@@ -8773,5 +8923,127 @@ mod tool_lifecycle_abandonment_tests {
             retained.lock().unwrap().is_empty(),
             "the cooperative dispatch releases exactly the retained entry"
         );
+    }
+}
+
+#[cfg(test)]
+mod colony_instruction_tests {
+    use super::*;
+    use zeroclaw_config::colony::{ColonyConfig, ColonyPrompt};
+
+    fn config() -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert("queen".into(), Default::default());
+        config.colonies.insert(
+            "team".into(),
+            ColonyConfig {
+                name: "Team".into(),
+                queen: "queen".into(),
+                prompts: vec![ColonyPrompt {
+                    id: "preference".into(),
+                    text: "Original".into(),
+                    agents: vec!["queen".into()],
+                    revision: 1,
+                }],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn colony_prompt_snapshot_survives_next_run_edits_and_applies_now_at_safe_point() {
+        let live = Arc::new(parking_lot::RwLock::new(config()));
+        let inside = Arc::clone(&live);
+        scope_colony_config(
+            Some(live),
+            Box::pin(async move {
+                // This change occurs after admission but before the provider loop.
+                inside.write().colonies.get_mut("team").unwrap().prompts[0].text =
+                    "Next run".into();
+                let mut run = ColonyRunInstructions::default();
+                let first = resolve_colony_context(&mut run, None, Some("queen"));
+                assert!(first.contains("Original"));
+                assert!(!first.contains("Next run"));
+                {
+                    let mut config = inside.write();
+                    let colony = config.colonies.get_mut("team").unwrap();
+                    colony.instruction_revision += 1;
+                    colony.prompts[0].text = "Apply now".into();
+                    colony.prompts.push(ColonyPrompt {
+                        id: "new".into(),
+                        text: "New binding".into(),
+                        agents: vec!["queen".into()],
+                        revision: 1,
+                    });
+                }
+                let second = resolve_colony_context(&mut run, None, Some("queen"));
+                assert!(!second.contains("Original"));
+                assert!(second.contains("Apply now"));
+                assert!(second.contains("New binding"));
+                inside
+                    .write()
+                    .colonies
+                    .get_mut("team")
+                    .unwrap()
+                    .prompts
+                    .clear();
+                assert!(
+                    resolve_colony_context(&mut run, None, Some("queen")).contains("Apply now")
+                );
+                inside
+                    .write()
+                    .colonies
+                    .get_mut("team")
+                    .unwrap()
+                    .instruction_revision += 1;
+                assert!(
+                    !resolve_colony_context(&mut run, None, Some("queen")).contains("Apply now")
+                );
+            }),
+        )
+        .await;
+    }
+
+    #[test]
+    fn colony_prompt_request_refresh_replaces_prior_block_once() {
+        let mut messages = vec![ChatMessage::system("Canonical history")];
+        let canonical = messages.clone();
+        let mut previous = String::new();
+        refresh_colony_context(&mut messages, &mut previous, "\nFirst".into());
+        refresh_colony_context(&mut messages, &mut previous, "\nSecond".into());
+        refresh_colony_context(&mut messages, &mut previous, "\nSecond".into());
+        assert_eq!(messages[0].content, "Canonical history\nSecond");
+        assert_eq!(canonical[0].content, "Canonical history");
+    }
+
+    #[tokio::test]
+    async fn colony_child_admission_gets_next_run_prompt_without_changing_parent() {
+        let live = Arc::new(parking_lot::RwLock::new(config()));
+        let inside = Arc::clone(&live);
+        scope_colony_config(
+            Some(live),
+            Box::pin(async move {
+                let mut parent = ColonyRunInstructions::default();
+                assert!(
+                    resolve_colony_context(&mut parent, None, Some("queen")).contains("Original")
+                );
+                inside.write().colonies.get_mut("team").unwrap().prompts[0].text =
+                    "Next run".into();
+                scope_colony_config(
+                    Some(Arc::clone(&inside)),
+                    Box::pin(async {
+                        let child = admitted_colony_instruction_context(None, "queen");
+                        assert!(child.contains("Next run"));
+                        assert!(!child.contains("Original"));
+                    }),
+                )
+                .await;
+                let retained = resolve_colony_context(&mut parent, None, Some("queen"));
+                assert!(retained.contains("Original"));
+                assert!(!retained.contains("Next run"));
+            }),
+        )
+        .await;
     }
 }

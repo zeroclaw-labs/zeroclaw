@@ -17,6 +17,7 @@ zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-colony = { workspace = true, default-features = false }
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools = { workspace = true, optional = true }
 anyhow = "1.0"

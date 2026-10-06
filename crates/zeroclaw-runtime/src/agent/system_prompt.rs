@@ -82,6 +82,12 @@ fn append_project_context(
     bootstrap_max_chars: Option<usize>,
     inject_memory: bool,
 ) {
+    // Colony goal context is selected explicitly. Original persona files may
+    // contain prior task/user history; the public core command is injected by
+    // the turn engine without silently importing those private documents.
+    if crate::execution_scope::context_isolated() {
+        return;
+    }
     prompt.push_str("## Project Context\n\n");
 
     if let Some(config) = identity_config

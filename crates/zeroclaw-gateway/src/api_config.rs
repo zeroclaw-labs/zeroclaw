@@ -384,6 +384,17 @@ fn scoped_validate(
 }
 
 fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> serde_json::Value {
+    let colony_channels: std::collections::BTreeMap<_, _> = config
+        .colonies
+        .iter()
+        .filter(|(_, colony)| !colony.channels.is_empty())
+        .map(|(id, colony)| {
+            (
+                id,
+                serde_json::json!({"agents":colony.agent_aliases(),"channels":colony.channels}),
+            )
+        })
+        .collect();
     let agents: std::collections::BTreeMap<&str, serde_json::Value> = config
         .agents
         .iter()
@@ -401,6 +412,7 @@ fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> se
         "channels": &config.channels,
         "peer_groups": &config.peer_groups,
         "agents": agents,
+        "colony_channels": colony_channels,
     })
 }
 
@@ -420,6 +432,7 @@ pub(crate) struct RetainedConfigWrite {
     _guard: ConfigWriteGuard,
     _generation_lease: zeroclaw_runtime::live_config_authority::ConfigWriteLease,
     _agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
+    _policy_leases: Vec<zeroclaw_runtime::live_config_authority::AgentDeleteLease>,
 }
 
 fn reserve_config_write(
@@ -459,6 +472,53 @@ async fn persist_and_swap_retaining(
         state.config_write_lock.try_lock().is_err(),
         "persist_and_swap caller must hold state.config_write_lock"
     );
+    new_config.validate_colonies().map_err(|error| {
+        error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            error.to_string(),
+        ))
+    })?;
+    let previous = state.config.read().clone();
+    if !previous.colonies.is_empty() || !new_config.colonies.is_empty() {
+        let controller = crate::api_colony::runtime(state).await.map_err(|error| {
+            error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                error.to_string(),
+            ))
+        })?;
+        controller
+            .validate_config_change(&previous, &new_config)
+            .map_err(|error| {
+                error_response(ConfigApiError::new(
+                    ConfigApiCode::WorkActive,
+                    error.to_string(),
+                ))
+            })?;
+    }
+    // Membership changes retire prepared producers with stale context, and
+    // reserve admission through durable publication. Config owns membership;
+    // lifecycle leases own only the temporary mutation barrier.
+    let aliases: std::collections::BTreeSet<_> = previous
+        .agents
+        .keys()
+        .chain(new_config.agents.keys())
+        .cloned()
+        .collect();
+    let mut policy_leases = Vec::new();
+    for alias in aliases {
+        let old_colony = previous.colony_for_agent(&alias).map(|(id, _)| id);
+        let new_colony = new_config.colony_for_agent(&alias).map(|(id, _)| id);
+        if old_colony != new_colony {
+            policy_leases.push(state.agent_lifecycle.begin_policy_change(alias).map_err(
+                |error| {
+                    error_response(ConfigApiError::new(
+                        ConfigApiCode::WorkActive,
+                        error.to_string(),
+                    ))
+                },
+            )?);
+        }
+    }
     let generation_lease = reserve_config_write(state).map_err(error_response)?;
     let config = Arc::clone(&state.config);
     let pending_reload = Arc::clone(&state.pending_reload);
@@ -473,11 +533,15 @@ async fn persist_and_swap_retaining(
                 authorization,
             )
             .await?;
+            for lease in &mut policy_leases {
+                lease.commit_destructive_mutation();
+            }
             finish_prepared_channel_generation(prepared, pending_reload).await;
             Ok(RetainedConfigWrite {
                 _guard: guard,
                 _generation_lease: generation_lease,
                 _agent_reservations: agent_reservations,
+                _policy_leases: policy_leases,
             })
         }));
     task.await.map_err(|e| {
@@ -1388,6 +1452,19 @@ pub async fn handle_delete_map_key(
     principal: RequestPrincipal,
     Query(q): Query<MapKeyQuery>,
 ) -> Response {
+    if q.path == "agents" {
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default().with(format!("agents.{}", q.key), Verb::Delete),
+            &guard,
+        ) {
+            return denied.into_response();
+        }
+        if let Some(error) = colony_agent_alias_mutation_error(&state.config.read(), &q.key) {
+            return error;
+        }
+    }
     let agent_lifecycle_lease = if q.path == "agents" {
         match state.agent_lifecycle.begin_delete(q.key.clone()) {
             Ok(lease) => Some(lease),
@@ -1465,6 +1542,23 @@ pub async fn handle_delete_map_key(
     .into_response()
 }
 
+/// Colony references have no destructive alias cascade in this version.
+/// Resolve membership from canonical config rather than leaving a broken box.
+fn colony_agent_alias_mutation_error(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+) -> Option<Response> {
+    config.colony_for_agent(alias).map(|(id, _)| {
+        error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("agent `{alias}` belongs to Colony `{id}`; remove it from the Colony before deleting or renaming it"),
+            )
+            .with_path(format!("agents.{alias}")),
+        )
+    })
+}
+
 /// Agent-deletion cascade: refuse on HARD references (enabled `heartbeat.agent`
 /// or live ACP sessions), else scrub config refs + remove the entry via
 /// `delete_with_cascade`, archive the workspace, run the owned-state cascade
@@ -1487,6 +1581,11 @@ async fn delete_agent_cascade(
     .unwrap_or_else(|error| Err(format!("ACP preflight task failed: {error}")));
     let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
+    // Recheck under the final mutation guard: joining a Colony after the
+    // endpoint's early check must not race the prepared persistence path.
+    if let Some(error) = colony_agent_alias_mutation_error(&working, alias) {
+        return error;
+    }
     let preflight = zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
         &working, alias, live_acp,
     );
@@ -2003,6 +2102,24 @@ pub async fn handle_rename_map_key(
     principal: RequestPrincipal,
     axum::Json(body): axum::Json<RenameMapKeyBody>,
 ) -> Response {
+    if body.path == "agents" {
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        if let Err(denied) = authorize_config_write(
+            &principal,
+            ConfigWriteSet::default()
+                .with(format!("agents.{}", body.from), Verb::Delete)
+                .with(format!("agents.{}", body.to), Verb::Create),
+            &guard,
+        ) {
+            return denied.into_response();
+        }
+        let config = state.config.read();
+        for alias in [&body.from, &body.to] {
+            if let Some(error) = colony_agent_alias_mutation_error(&config, alias) {
+                return error;
+            }
+        }
+    }
     let agent_lifecycle_leases = if body.path == "agents" {
         let from = match state.agent_lifecycle.begin_delete(body.from.clone()) {
             Ok(lease) => lease,
@@ -2266,6 +2383,12 @@ async fn rename_agent_cascade(
         &guard,
     ) {
         return denied.into_response();
+    }
+
+    for alias in [from, to] {
+        if let Some(error) = colony_agent_alias_mutation_error(&working, alias) {
+            return error;
+        }
     }
 
     // Capture the OLD workspace path while the entry still lives under `from`
@@ -3261,6 +3384,326 @@ mod tests {
         state.agent_lifecycle.begin_delete(alias).unwrap()
     }
 
+    async fn colony_alias_http_surface(
+        tmp: &tempfile::TempDir,
+    ) -> (AppState, axum::Router, String, Vec<u8>) {
+        use zeroclaw_config::colony::{
+            ColonyChannel, ColonyConfig, ColonyConnection, ColonyContext, ColonyPrompt, ColonyRoom,
+        };
+        let mut config = config_with_telegram_alias(tmp, "alerts");
+        for alias in ["queen", "worker"] {
+            config.agents.insert(alias.into(), Default::default());
+            let workspace = config.agent_workspace_dir(alias);
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("retained.txt"), alias).unwrap();
+        }
+        config.colonies.insert(
+            "team".into(),
+            ColonyConfig {
+                name: "Team".into(),
+                queen: "queen".into(),
+                members: vec!["worker".into()],
+                connections: vec![ColonyConnection {
+                    from: "queen".into(),
+                    to: "worker".into(),
+                }],
+                prompts: vec![ColonyPrompt {
+                    id: "instructions".into(),
+                    text: "Scoped instructions".into(),
+                    agents: vec!["worker".into()],
+                    revision: 1,
+                }],
+                rooms: vec![ColonyRoom {
+                    id: "discussion".into(),
+                    name: "Discussion".into(),
+                    readers: vec!["queen".into()],
+                    publishers: vec!["worker".into()],
+                    ..Default::default()
+                }],
+                baseline_context: vec![ColonyContext {
+                    agent: "worker".into(),
+                    key: "selected-context".into(),
+                }],
+                channels: vec![ColonyChannel {
+                    id: "external".into(),
+                    channel: "telegram.alerts".into(),
+                    conversation: "scoped-conversation".into(),
+                    inbound_agents: vec!["queen".into()],
+                    outbound_agents: vec!["worker".into()],
+                }],
+                ..Default::default()
+            },
+        );
+        config.validate_colonies().unwrap();
+        config.save().await.unwrap();
+        let disk = tokio::fs::read(&config.config_path).await.unwrap();
+        let mut state = test_state(config.clone());
+        let token = "colony-alias-test-token".to_string();
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            std::slice::from_ref(&token),
+            Default::default(),
+        ));
+        let auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &config,
+                Arc::clone(&state.pairing),
+            )
+            .unwrap(),
+        );
+        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        (state, router, token, disk)
+    }
+
+    #[tokio::test]
+    async fn colony_alias_http_delete_and_rename_preserve_idle_queen_and_member() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, router, token, disk) = colony_alias_http_surface(&tmp).await;
+        let live = serde_json::to_value(state.config.read().clone()).unwrap();
+        for alias in ["queen", "worker"] {
+            let generation = state.agent_lifecycle.alias_generation(alias);
+            for rename in [false, true] {
+                let mut request = axum::http::Request::builder()
+                    .header("authorization", format!("Bearer {token}"));
+                let body = if rename {
+                    request = request
+                        .method("POST")
+                        .uri("/api/config/rename-map-key")
+                        .header("content-type", "application/json");
+                    axum::body::Body::from(serde_json::json!({"path":"agents","from":alias,"to":format!("renamed_{alias}")}).to_string())
+                } else {
+                    request = request
+                        .method("DELETE")
+                        .uri(format!("/api/config/map-key?path=agents&key={alias}"));
+                    axum::body::Body::empty()
+                };
+                let (status, error) = response_json(
+                    router
+                        .clone()
+                        .oneshot(request.body(body).unwrap())
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["code"], "validation_failed");
+                assert!(
+                    error["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("remove it from the Colony")
+                );
+                assert_eq!(
+                    serde_json::to_value(state.config.read().clone()).unwrap(),
+                    live
+                );
+                let config = state.config.read().clone();
+                assert_eq!(tokio::fs::read(&config.config_path).await.unwrap(), disk);
+                assert_eq!(
+                    tokio::fs::read_to_string(
+                        config.agent_workspace_dir(alias).join("retained.txt")
+                    )
+                    .await
+                    .unwrap(),
+                    alias
+                );
+                assert!(!config.data_dir.join("agents/_deleted").exists());
+                assert_eq!(state.agent_lifecycle.alias_generation(alias), generation);
+                drop(
+                    state
+                        .agent_lifecycle
+                        .reserve_turn_at(alias, generation)
+                        .unwrap(),
+                );
+                assert!(
+                    !state
+                        .pending_reload
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn colony_alias_http_channel_delete_and_rename_preserve_graph_and_transport() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, router, token, disk) = colony_alias_http_surface(&tmp).await;
+        let live = serde_json::to_value(state.config.read().clone()).unwrap();
+        for rename in [false, true] {
+            let mut request =
+                axum::http::Request::builder().header("authorization", format!("Bearer {token}"));
+            let body = if rename {
+                request = request
+                    .method("POST")
+                    .uri("/api/config/rename-map-key")
+                    .header("content-type", "application/json");
+                axum::body::Body::from(
+                    serde_json::json!({"path":"channels.telegram","from":"alerts","to":"renamed"})
+                        .to_string(),
+                )
+            } else {
+                request = request
+                    .method("DELETE")
+                    .uri("/api/config/map-key?path=channels.telegram&key=alerts");
+                axum::body::Body::empty()
+            };
+            let (status, error) = response_json(
+                router
+                    .clone()
+                    .oneshot(request.body(body).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["code"], "validation_failed");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("configured channel")
+            );
+            assert_eq!(
+                serde_json::to_value(state.config.read().clone()).unwrap(),
+                live
+            );
+            let path = state.config.read().config_path.clone();
+            assert_eq!(tokio::fs::read(path).await.unwrap(), disk);
+            assert!(
+                !state
+                    .pending_reload
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn colony_alias_http_pending_owner_delete_denies_concurrent_goal_without_stranding() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _, token, disk) = colony_alias_http_surface(&tmp).await;
+        // The production gateway and controller share the canonical writer.
+        // Legacy test AppState constructors can otherwise use independent locks.
+        state.config_write_lock = zeroclaw_config::write_lock::shared_config_write_lock();
+        assert!(Arc::ptr_eq(
+            &state.config_write_lock,
+            &zeroclaw_config::write_lock::shared_config_write_lock()
+        ));
+        let initial = state.config.read().clone();
+        let auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &initial,
+                Arc::clone(&state.pairing),
+            )
+            .unwrap(),
+        );
+        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        crate::api_colony::runtime(&state).await.unwrap();
+        let store =
+            zeroclaw_runtime::control_plane::SqliteTaskStore::new(&initial.data_dir).unwrap();
+        let assert_empty_goal_storage = || {
+            let conn = store.extension_connection();
+            for table in ["tasks", "goal_tasks", "task_execution_continuations"] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "no goal task or continuation may remain in {table}"
+                );
+            }
+        };
+        assert_empty_goal_storage();
+        let gate = test_pre_save_pause_gate::arm(initial.config_path.clone());
+        let delete_router = router.clone();
+        let delete_token = token.clone();
+        let delete = zeroclaw_spawn::spawn!(async move {
+            delete_router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("DELETE")
+                        .uri("/api/config/map-key?path=colonies&key=team")
+                        .header("authorization", format!("Bearer {delete_token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_paused())
+            .await
+            .expect("Colony owner deletion must reach the real pre-save boundary");
+        assert!(state.config.read().colonies.contains_key("team"));
+        assert_eq!(tokio::fs::read(&initial.config_path).await.unwrap(), disk);
+
+        let mut create = zeroclaw_spawn::spawn!(async move {
+            router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/colonies/team/goals")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({
+                                "objective": "Prepare a scoped plan",
+                                "proposal": {
+                                    "summary": "A reviewed Queen assignment",
+                                    "assignments": [{
+                                        "agent": "queen",
+                                        "instruction": "Prepare a scoped plan"
+                                    }]
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut create)
+                .await
+                .is_err(),
+            "reviewed goal creation must await the pending owner publication"
+        );
+        gate.release();
+        let (delete_status, _) = response_json(
+            tokio::time::timeout(Duration::from_secs(2), delete)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK);
+        let (create_status, error) = response_json(
+            tokio::time::timeout(Duration::from_secs(2), create)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CONFLICT);
+        assert_eq!(error["code"], "colony_goal_failed");
+        assert!(!state.config.read().colonies.contains_key("team"));
+        let persisted = tokio::fs::read_to_string(&initial.config_path)
+            .await
+            .unwrap();
+        let persisted = zeroclaw_config::migration::migrate_to_current(&persisted).unwrap();
+        assert!(!persisted.colonies.contains_key("team"));
+        assert_empty_goal_storage();
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
     // dirty_entry_for / CascadeReport::dirty_paths tests live in
     // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI
     // both consume the promoted helper).
@@ -3317,6 +3760,7 @@ mod tests {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
             agent_lifecycle: authority.agent_lifecycle(),
+            colony_runtime: Arc::new(tokio::sync::OnceCell::new()),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -3434,6 +3878,47 @@ mod tests {
             channel_generation_projection(&old),
             channel_generation_projection(&new),
             "peer authorization is captured by the running channel generation"
+        );
+    }
+
+    #[test]
+    fn colony_channel_routing_changes_generation_but_prompt_edits_do_not() {
+        use zeroclaw_config::colony::{ColonyChannel, ColonyConfig, ColonyPrompt};
+        let mut old = zeroclaw_config::schema::Config::default();
+        old.colonies.insert(
+            "team".into(),
+            ColonyConfig {
+                queen: "queen".into(),
+                members: vec!["worker".into()],
+                channels: vec![ColonyChannel {
+                    id: "inbox".into(),
+                    channel: "telegram.primary".into(),
+                    conversation: "synthetic-room".into(),
+                    inbound_agents: vec!["worker".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut new = old.clone();
+        new.colonies
+            .get_mut("team")
+            .unwrap()
+            .prompts
+            .push(ColonyPrompt {
+                id: "style".into(),
+                text: "Write clearly".into(),
+                agents: vec!["worker".into()],
+                revision: 1,
+            });
+        assert_eq!(
+            channel_generation_projection(&old),
+            channel_generation_projection(&new)
+        );
+        new.colonies.get_mut("team").unwrap().channels[0].conversation = "other-room".into();
+        assert_ne!(
+            channel_generation_projection(&old),
+            channel_generation_projection(&new)
         );
     }
 

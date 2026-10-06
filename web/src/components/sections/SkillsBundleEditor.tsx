@@ -12,7 +12,7 @@ import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { githubLight } from '@uiw/codemirror-theme-github';
 import CodeMirror from '@uiw/react-codemirror';
-import { useLocation } from 'react-router-dom';
+import { useConfigLocation } from '@/lib/configLocation';
 import { useTheme } from '@/hooks/useTheme';
 import {
   createSkill,
@@ -38,7 +38,7 @@ interface EditorBuffer {
 }
 
 export default function SkillsBundleEditor({ bundle }: Props) {
-  const location = useLocation();
+  const location = useConfigLocation();
   const requestedSkill = new URLSearchParams(location.search).get('skill');
   const appliedRequestedSkill = useRef<string | null>(null);
   const shouldFocusRequestedSkill = useRef(false);

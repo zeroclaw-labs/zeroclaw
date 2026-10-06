@@ -146,6 +146,9 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
+    // Provider usage has already been recorded before tool dispatch. A domain
+    // owner can stop effects when that usage is unknown or exhausts its cap.
+    crate::execution_scope::check_budget()?;
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -283,6 +286,9 @@ pub(crate) async fn execute_one_tool(
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
     let execute = async {
+        // Event delivery above can suspend; revalidate at the actual effect
+        // boundary rather than relying on the earlier dispatch check.
+        crate::execution_scope::check_budget()?;
         if let Some(token) = cancellation_token {
             tokio::select! {
                 () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
@@ -733,6 +739,49 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_exhausted_budget_blocks_activated_tool_effects() {
+        struct ExhaustedBudget;
+        impl crate::execution_scope::ExecutionScopeObserver for ExhaustedBudget {
+            fn check_budget(&self) -> anyhow::Result<()> {
+                anyhow::bail!("test budget exhausted")
+            }
+        }
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("extension", Arc::clone(&invocations)));
+        activated.lock().unwrap().activate("extension".into(), tool);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: Some("worker"),
+            turn_id: "budget-boundary",
+            channel_name: "test",
+        };
+        let result = crate::execution_scope::scope(
+            Arc::new(ExhaustedBudget),
+            execute_one_tool(
+                "extension",
+                serde_json::json!({}),
+                None,
+                ToolDispatchContext {
+                    tools_registry: &[],
+                    activated_tools: Some(&activated),
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

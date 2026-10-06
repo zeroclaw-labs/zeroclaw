@@ -779,6 +779,7 @@ impl ModelPickerDispatchOwnership {
 
 /// A turn waiting for its conversation lane.
 struct PendingTurn {
+    colony_capability: Option<zeroclaw_runtime::live_config_authority::AgentExecutionCapability>,
     ctx: Arc<ChannelRuntimeContext>,
     agent_generation: u64,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -1400,7 +1401,14 @@ fn send_conversation_busy(
             })),
         "message refused: channel dispatcher backlog is full"
     );
-    if msg.passive_context {
+    if msg.passive_context
+        || !ctx.live_config.read().colony_allows_external(
+            ctx.agent_alias.as_str(),
+            &channel_key_for_message(msg),
+            &msg.reply_target,
+            true,
+        )
+    {
         return;
     }
     // Do not enqueue a notification behind an earlier slow send.  The
@@ -8844,6 +8852,20 @@ async fn process_channel_message_body(
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
+    if !ctx.live_config.read().colony_allows_external(
+        ctx.agent_alias.as_str(),
+        &channel_composite,
+        &msg.reply_target,
+        false,
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "colony_channel_ingress_denied"
+        );
+        return;
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -8866,7 +8888,16 @@ async fn process_channel_message_body(
     // same final identity this path reads and writes.
     let mut msg = msg;
 
-    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg)
+        .cloned()
+        .filter(|_| {
+            ctx.live_config.read().colony_allows_external(
+                ctx.agent_alias.as_str(),
+                &channel_composite,
+                &msg.reply_target,
+                true,
+            )
+        });
 
     if let Some(channel) = target_channel.as_ref() {
         if channel.drop_self_messages(&msg) {
@@ -10174,7 +10205,12 @@ async fn process_channel_message_body(
         let safeguard = take_last_safeguard_fallback();
         (llm_result, fb, safeguard)
     }));
-    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
+    let (llm_result, fallback_info, safeguard_notice) =
+        zeroclaw_runtime::agent::scope_colony_config(
+            Some(Arc::clone(&ctx.live_config)),
+            Box::pin(scope_safeguard_fallback(scoped_turn)),
+        )
+        .await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
         && let Some(tx) = delta_tx.as_ref()
@@ -10547,7 +10583,18 @@ async fn process_channel_message_body(
                 )
             };
 
-            if let Some(channel) = delivery_channel.as_ref() {
+            let delivery_ref = turn_route
+                .as_ref()
+                .and_then(|route| route.channel.as_deref())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&channel_composite);
+            let outbound_allowed = ctx.live_config.read().colony_allows_external(
+                ctx.agent_alias.as_str(),
+                delivery_ref,
+                &delivery_recipient,
+                true,
+            );
+            if let Some(channel) = delivery_channel.as_ref().filter(|_| outbound_allowed) {
                 let is_redirect = turn_route
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
@@ -11100,9 +11147,26 @@ async fn run_conversation_turn(
         dispatch_ownership,
         registration,
         pending_work,
+        colony_capability,
         ..
     } = turn;
     let execution_permit = permit;
+    let colony_id = ctx
+        .live_config
+        .read()
+        .colony_for_agent(ctx.agent_alias.as_str())
+        .map(|(id, _)| id.to_string());
+    if let Some(colony_id) = colony_id {
+        let cancellation = registration
+            .as_ref()
+            .map(|slot| slot.cancellation.clone())
+            .unwrap_or(generation_cancel);
+        if !cancellation.is_cancelled() {
+            process_colony_channel_message(&ctx, &msg, &colony_id, colony_capability, cancellation)
+                .await;
+        }
+        return;
+    }
 
     let Some(registration) = registration else {
         process_channel_message_with_delivery_id(
@@ -11141,6 +11205,176 @@ async fn run_conversation_turn(
     drop(dispatch_ownership);
     drop(execution_permit);
     drop(pending_work);
+}
+
+/// External Colony traffic enters the same isolated conversation controller as
+/// the native UI. It never hydrates the agent's old channel session or memory.
+async fn process_colony_channel_message(
+    ctx: &Arc<ChannelRuntimeContext>,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    colony_id: &str,
+    capability: Option<zeroclaw_runtime::live_config_authority::AgentExecutionCapability>,
+    cancellation: CancellationToken,
+) {
+    if msg.passive_context {
+        return;
+    }
+    let key = channel_key_for_message(msg);
+    if !ctx.live_config.read().colony_allows_external(
+        ctx.agent_alias.as_str(),
+        &key,
+        &msg.reply_target,
+        false,
+    ) {
+        return;
+    }
+    let Some(capability) = capability else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject),
+            "colony channel requires canonical execution admission"
+        );
+        return;
+    };
+    let runtime =
+        match zeroclaw_colony::ColonyRuntime::open_shared(Arc::clone(&ctx.live_config), capability)
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "colony channel controller unavailable"
+                );
+                return;
+            }
+        };
+    let content = format!(
+        "External message via {key}, conversation {}, sender {}:\n{}",
+        msg.reply_target, msg.sender, msg.content
+    );
+    let messages = tokio::select! {
+        () = cancellation.cancelled() => return,
+        result = runtime.send_message(colony_id, ctx.agent_alias.as_str(), &content) => match result {
+            Ok(messages) => messages,
+            Err(error) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_attrs(serde_json::json!({"error":error.to_string(),"colony":colony_id})), "colony channel turn failed");
+                return;
+            }
+        },
+    };
+    let messages = if messages
+        .iter()
+        .any(|message| message.sender == ctx.agent_alias.as_str())
+    {
+        messages
+    } else if let Some(input) = messages
+        .iter()
+        .find(|message| message.sender == "user" && message.task_id.is_some())
+    {
+        let input_id = input.id.clone();
+        let goal_id = input.task_id.clone().unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+        // The existing channel queue owns this bounded wait. A daemon restart
+        // leaves the durable reply in Colony history; it never replays an
+        // external send whose delivery outcome cannot be proved.
+        loop {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let replies = match runtime
+                .messages(colony_id, Some(ctx.agent_alias.as_str()))
+                .await
+            {
+                Ok(replies) => replies
+                    .into_iter()
+                    .filter(|message| {
+                        message.in_reply_to.as_deref() == Some(input_id.as_str())
+                            && message.sender == ctx.agent_alias.as_str()
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_attrs(serde_json::json!({"error":error.to_string()})),
+                        "colony channel reply unavailable"
+                    );
+                    return;
+                }
+            };
+            let status = match runtime.goal(&goal_id).await {
+                Ok(goal) => goal.task.status,
+                Err(_) => return,
+            };
+            if status != zeroclaw_runtime::control_plane::TaskStatus::Running
+                && status != zeroclaw_runtime::control_plane::TaskStatus::Completed
+            {
+                return;
+            }
+            if !replies.is_empty() {
+                break replies;
+            }
+            if status.is_terminal() || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::select! { () = cancellation.cancelled() => return, () = tokio::time::sleep(Duration::from_millis(250)) => {} }
+        }
+    } else {
+        return;
+    };
+    let Some(channel) = find_channel_for_message(&ctx.channels_by_name, msg) else {
+        return;
+    };
+    for message in messages
+        .into_iter()
+        .filter(|message| message.sender == ctx.agent_alias.as_str())
+    {
+        if !ctx.live_config.read().colony_allows_external(
+            ctx.agent_alias.as_str(),
+            &key,
+            &msg.reply_target,
+            true,
+        ) {
+            return;
+        }
+        let leak_detection = ctx.live_config.read().security.leak_detection.clone();
+        let sanitized = sanitize_channel_response_for_format_with_leak_detection(
+            &message.content,
+            ctx.tools_registry.as_ref(),
+            &leak_detection,
+            outbound_content_format_for_channel(&msg.channel),
+        );
+        let Some(content) = apply_multi_message_narration_policy(
+            ctx.hooks.as_deref(),
+            &leak_detection,
+            &msg.channel,
+            &msg.reply_target,
+            "",
+            sanitized,
+        )
+        .await
+        else {
+            continue;
+        };
+        if !ctx.live_config.read().colony_allows_external(
+            ctx.agent_alias.as_str(),
+            &key,
+            &msg.reply_target,
+            true,
+        ) {
+            return;
+        }
+        if let Err(error) = channel.send(&SendMessage::reply_to(msg, content)).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(serde_json::json!({"error":error.to_string()})),
+                "colony channel delivery failed"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -11215,7 +11449,67 @@ impl AgentRouter {
         self
     }
 
+    /// Materialize exact conversation routes from the canonical graph. Graph
+    /// connections do not duplicate the agent's legacy channel assignments.
+    fn resolve_all(
+        &self,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Vec<Arc<ChannelRuntimeContext>> {
+        let live = self
+            .single_ctx
+            .as_ref()
+            .or_else(|| self.by_agent.values().next());
+        let key = channel_key_for_message(msg);
+        if let Some(live) = live {
+            let config = live.live_config.read();
+            let mut aliases: Vec<&str> = config
+                .colonies
+                .values()
+                .flat_map(|colony| colony.channels.iter())
+                .filter(|binding| {
+                    binding.channel == key && binding.conversation == msg.reply_target
+                })
+                .flat_map(|binding| binding.inbound_agents.iter().map(String::as_str))
+                .filter(|alias| config.agents.get(*alias).is_some_and(|agent| agent.enabled))
+                .collect();
+            aliases.sort_unstable();
+            aliases.dedup();
+            if !aliases.is_empty() {
+                return aliases
+                    .into_iter()
+                    .filter_map(|alias| {
+                        self.by_agent.get(alias).cloned().or_else(|| {
+                            self.single_ctx
+                                .as_ref()
+                                .filter(|ctx| ctx.agent_alias.as_str() == alias)
+                                .cloned()
+                        })
+                    })
+                    .collect();
+            }
+        }
+        self.resolve_legacy(msg)
+            .into_iter()
+            .filter(|ctx| {
+                ctx.live_config.read().colony_allows_external(
+                    ctx.agent_alias.as_str(),
+                    &key,
+                    &msg.reply_target,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn resolve(
+        &self,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Option<Arc<ChannelRuntimeContext>> {
+        self.resolve_all(msg).into_iter().next()
+    }
+
+    fn resolve_legacy(
         &self,
         msg: &zeroclaw_api::channel::ChannelMessage,
     ) -> Option<Arc<ChannelRuntimeContext>> {
@@ -11771,14 +12065,22 @@ async fn run_message_dispatch_loop_until_cancelled(
     // bucket another, still-live turn is waiting in.
     let mut debounce_bucket_owners: HashMap<String, u64> = HashMap::new();
 
+    // Fanout retains at most the current message and its explicitly bound
+    // recipients. Each recipient still passes the aggregate admission budget.
+    let mut routed_messages = std::collections::VecDeque::new();
     let cancelled = loop {
-        let msg = tokio::select! {
+        let (mut msg, selected_ctx) = if let Some(routed) = routed_messages.pop_front() {
+            routed
+        } else {
+            let msg = tokio::select! {
             biased;
             () = cancel.cancelled() => break true,
             msg = rx.recv() => match msg {
                 Some(msg) => msg,
                 None => break false,
             },
+            };
+            (msg, None)
         };
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
@@ -11799,7 +12101,8 @@ async fn run_message_dispatch_loop_until_cancelled(
             .as_ref()
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
-        if !msg.passive_context
+        if selected_ctx.is_none()
+            && !msg.passive_context
             && let Some(gate_ctx) = gate_ctx
         {
             let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
@@ -11835,10 +12138,47 @@ async fn run_message_dispatch_loop_until_cancelled(
             }
         }
 
-        let Some(ctx) = router.resolve(&msg) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
-            continue;
+        let ctx = match selected_ctx {
+            Some(ctx) => ctx,
+            None => {
+                let mut contexts = router.resolve_all(&msg).into_iter();
+                let Some(ctx) = contexts.next() else {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel or explicit Colony conversation");
+                    continue;
+                };
+                for recipient in contexts {
+                    routed_messages.push_back((msg.clone(), Some(recipient)));
+                }
+                ctx
+            }
         };
+        // Revalidate before commands, histories or notices, including queued
+        // recipients whose connection may have been revoked after fanout.
+        if !ctx.live_config.read().colony_allows_external(
+            ctx.agent_alias.as_str(),
+            &channel_key_for_message(&msg),
+            &msg.reply_target,
+            false,
+        ) {
+            continue;
+        }
+        if ctx
+            .live_config
+            .read()
+            .colony_for_agent(ctx.agent_alias.as_str())
+            .is_some()
+        {
+            // A channel node may fan out to several agents. Their personal
+            // interruption slots must not cancel one another's work.
+            let original = msg.interruption_scope_id.as_deref().unwrap_or("");
+            msg.interruption_scope_id = Some(format!(
+                "colony-agent:{}:{}:{}:{}",
+                ctx.agent_alias.len(),
+                ctx.agent_alias,
+                original.len(),
+                original
+            ));
+        }
 
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
@@ -11854,6 +12194,62 @@ async fn run_message_dispatch_loop_until_cancelled(
         // A passive observation carries no turn of its own and must not cancel
         // the sender's live turns or answer in the room.
         if msg.channel != "cli" && !msg.passive_context && is_stop_command(&msg.content) {
+            let colony_id = ctx
+                .live_config
+                .read()
+                .colony_for_agent(ctx.agent_alias.as_str())
+                .map(|(id, _)| id.to_string());
+            if let (Some(colony_id), Some(capability)) =
+                (colony_id, router.execution_capability.clone())
+            {
+                match zeroclaw_colony::ColonyRuntime::open_shared(
+                    Arc::clone(&ctx.live_config),
+                    capability,
+                ) {
+                    Ok(runtime) => match runtime.goals(&colony_id).await {
+                        Ok(goals) => {
+                            for goal in goals.into_iter().filter(|goal| {
+                                goal.task.status
+                                    == zeroclaw_runtime::control_plane::TaskStatus::Running
+                            }) {
+                                if let Err(error) = runtime.pause(&goal.task.id).await {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                                        "colony channel pause failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_attrs(serde_json::json!({"error":error.to_string()})),
+                                "colony channel pause unavailable"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error":error.to_string()})),
+                            "colony channel controller unavailable"
+                        );
+                    }
+                }
+            }
             let scope_key = interruption_scope_key(&msg);
             let states = {
                 let active = in_flight_by_sender
@@ -11947,7 +12343,16 @@ async fn run_message_dispatch_loop_until_cancelled(
             } else {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
-            let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+            let channel = find_channel_for_message(&ctx.channels_by_name, &msg)
+                .cloned()
+                .filter(|_| {
+                    ctx.live_config.read().colony_allows_external(
+                        ctx.agent_alias.as_str(),
+                        &channel_key_for_message(&msg),
+                        &msg.reply_target,
+                        true,
+                    )
+                });
             if let Some(channel) = channel {
                 // `/stop` bypasses every admission budget so cancellation
                 // stays reachable, but its acknowledgement must not: a
@@ -12115,6 +12520,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            colony_capability: router.execution_capability.clone(),
                             agent_generation: router
                                 .turn_generations
                                 .get(ctx.agent_alias.as_str())
@@ -12187,6 +12593,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    colony_capability: router.execution_capability.clone(),
                     agent_generation: router
                         .turn_generations
                         .get(ctx.agent_alias.as_str())
@@ -13740,17 +14147,41 @@ impl ActiveChannelAliases {
             .flat_map(resolve_route_channel_key)
             .collect();
 
+        let colony_bindings = || {
+            config
+                .colonies
+                .values()
+                .flat_map(|colony| colony.channels.iter().map(move |binding| (colony, binding)))
+        };
         Self {
             enabled_bindings: config
                 .agents
                 .values()
                 .filter(|a| a.enabled)
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .chain(
+                    colony_bindings()
+                        .filter(|(colony, binding)| {
+                            binding
+                                .inbound_agents
+                                .iter()
+                                .chain(&binding.outbound_agents)
+                                .any(|alias| {
+                                    colony.contains(alias)
+                                        && config
+                                            .agents
+                                            .get(alias)
+                                            .is_some_and(|agent| agent.enabled)
+                                })
+                        })
+                        .map(|(_, binding)| binding.channel.clone()),
+                )
                 .collect(),
             all_known_bindings: config
                 .agents
                 .values()
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .chain(colony_bindings().map(|(_, binding)| binding.channel.clone()))
                 .collect(),
             approval_route_bindings,
         }
@@ -21853,6 +22284,61 @@ temperature = 0.3
             !Arc::ptr_eq(&resolved_clamps, &resolved_glados),
             "ctxs distinct"
         );
+    }
+
+    #[test]
+    fn colony_channel_routes_exact_conversation_to_selected_agents_without_legacy_assignments() {
+        use zeroclaw_config::colony::{ColonyChannel, ColonyConfig};
+        let mut config = Config::default();
+        for alias in ["queen", "worker"] {
+            config.agents.insert(alias.into(), Default::default());
+        }
+        config.colonies.insert(
+            "team".into(),
+            ColonyConfig {
+                name: "Team".into(),
+                queen: "queen".into(),
+                members: vec!["worker".into()],
+                channels: vec![ColonyChannel {
+                    id: "inbox".into(),
+                    channel: "discord.inbox".into(),
+                    conversation: "room-42".into(),
+                    inbound_agents: vec!["queen".into(), "worker".into()],
+                    outbound_agents: vec![],
+                }],
+                ..Default::default()
+            },
+        );
+        let live = Arc::new(RwLock::new(config));
+        let mut contexts = HashMap::new();
+        for alias in ["queen", "worker"] {
+            contexts.insert(
+                alias.into(),
+                Arc::new(ChannelRuntimeContext {
+                    agent_alias: Arc::new(alias.into()),
+                    live_config: Arc::clone(&live),
+                    ..(*router_test_ctx()).clone()
+                }),
+            );
+        }
+        let router = AgentRouter::multi(contexts, HashMap::new(), None, None, None);
+        let mut msg = channel_message("discord", Some("inbox"));
+        msg.reply_target = "room-42".into();
+        let selected: Vec<String> = router
+            .resolve_all(&msg)
+            .iter()
+            .map(|ctx| ctx.agent_alias.as_ref().clone())
+            .collect();
+        assert_eq!(selected, vec!["queen", "worker"]);
+        assert!(ActiveChannelAliases::compute(&live.read()).contains("discord.inbox"));
+        msg.reply_target = "other-room".into();
+        assert!(router.resolve_all(&msg).is_empty());
+        msg.reply_target = "room-42".into();
+        live.write().colonies.get_mut("team").unwrap().channels[0]
+            .inbound_agents
+            .retain(|alias| alias == "worker");
+        assert_eq!(router.resolve_all(&msg).len(), 1);
+        assert_eq!(router.resolve_all(&msg)[0].agent_alias.as_str(), "worker");
     }
 
     #[test]
@@ -38582,6 +39068,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let msg = shared_topic_message("alice", "m1", "canceled during admission");
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
+            colony_capability: None,
             ctx,
             agent_generation: 0,
             msg,
@@ -38646,6 +39133,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack
         };
         let turn = Box::new(PendingTurn {
+            colony_capability: None,
             ctx: Arc::clone(&ctx),
             agent_generation: generation,
             msg,
@@ -42567,6 +43055,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let pending_work = Arc::clone(&pending_budget).acquire_owned().await.unwrap();
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
+            colony_capability: None,
             ctx: Arc::clone(&runtime_ctx),
             agent_generation: 0,
             msg: selection.clone(),

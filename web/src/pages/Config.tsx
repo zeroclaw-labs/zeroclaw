@@ -14,7 +14,8 @@
 // routing and filtering around those shared surfaces, not duplicate schema data.
 
 import { useEffect, useMemo, useState } from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link } from "react-router-dom";
+import { useConfigLocation, useConfigNavigate } from "@/lib/configLocation";
 import { ArrowLeft, Check, ChevronRight, MessageSquare, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import {
   ApiError,
@@ -82,19 +83,10 @@ const GROUP_ORDER = [
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
-export default function Config() {
-  // URL params drive the view. No internal mode state for picker/form —
-  // the address bar is the source of truth.
-  //   :section              → section overview
-  //   :section/:type        → alias list (providers/channels) or picker (others)
-  //   :section/:type/:alias → field form
-  const {
-    section: sectionParam,
-    type: typeParam,
-    alias: aliasParam,
-  } = useParams<{ section?: string; type?: string; alias?: string }>();
-  const location = useLocation();
-  const navigate = useNavigate();
+export default function Config({ compact = false }: { compact?: boolean }) {
+  const location = useConfigLocation();
+  const navigate = useConfigNavigate();
+  const [, sectionParam, typeParam, aliasParam] = location.pathname.split('/').filter(Boolean).map(decodeURIComponent);
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
@@ -227,6 +219,18 @@ export default function Config() {
         </div>
       </div>
     );
+  }
+
+  const focusedField = new URLSearchParams(location.search).get('field');
+  if (compact && focusedField) {
+    return <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
+      <div className="mb-4 flex items-center justify-between gap-3 text-xs text-pc-text-muted">
+        <span className="truncate">{[activeSection?.label, typeParam, aliasParam].filter(Boolean).join(" / ")}</span>
+        <button type="button" onClick={() => navigate(location.pathname)} className="shrink-0 hover:text-pc-text">{t('workspace.related_settings')}</button>
+      </div>
+      {['runtime_profiles', 'risk_profiles', 'providers'].includes(sectionParam ?? '') && <p className="mb-4 text-xs text-pc-text-muted">{t('workspace.shared_settings')}</p>}
+      <FieldForm key={`${reloadKey}-${focusedField}`} prefix={focusedField} onSaved={fetchDrift} drift={drifted} inlineSaveBar />
+    </div>;
   }
 
   // Determine what to render in the main pane based on URL params.
@@ -593,7 +597,7 @@ export default function Config() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {!lockedSection && (
+      {!lockedSection && (!compact || !hasSelection) && (
         // Master navigator: searchable section → entity tree. Selecting an
         // entity navigates to its existing form URL so the detail pane's
         // dispatch (unchanged) renders the right editor.
@@ -625,8 +629,8 @@ export default function Config() {
         />
       )}
 
-      <main
-        className={`flex-1 overflow-y-auto p-6 ${hasSelection ? "" : "hidden md:block"}`}
+      <div
+        className={`flex-1 min-w-0 overflow-y-auto p-6 ${hasSelection ? "" : "hidden md:block"}`}
       >
         {!hasSelection ? (
           // Empty state — no entity selected. Calm placeholder in the detail
@@ -652,7 +656,7 @@ export default function Config() {
             <Button
               variant="ghost"
               size="sm"
-              className="md:hidden self-start"
+              className={compact ? "self-start" : "md:hidden self-start"}
               onClick={() => navigate("/config")}
             >
               <ArrowLeft className="h-4 w-4" />
@@ -721,7 +725,7 @@ export default function Config() {
           </div>
           )
         )}
-      </main>
+      </div>
     </div>
   );
 }

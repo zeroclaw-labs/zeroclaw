@@ -80,7 +80,7 @@ pub fn build_spec() -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null)
     }
 
-    let components = serde_json::json!({
+    let mut components = serde_json::json!({
         "schemas": {
             "ConfigApiError":   schema_value::<ConfigApiError>(),
             "PropPutBody":      schema_value::<PropPutBody>(),
@@ -109,6 +109,7 @@ pub fn build_spec() -> serde_json::Value {
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
             "StatusResponse": response_schema_value::<StatusResponse>(),
+            "WorkspaceAvailability": response_schema_value::<crate::api::WorkspaceAvailability>(),
             "InstalledPluginPackage": schema_value::<crate::api_plugins::InstalledPluginPackage>(),
             "AvailablePluginPackage": schema_value::<crate::api_plugins::AvailablePluginPackage>(),
             "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
@@ -125,6 +126,68 @@ pub fn build_spec() -> serde_json::Value {
             }
         }
     });
+
+    for (name, schema) in [
+        (
+            "ColonySnapshot",
+            schema_value::<crate::api_colony::ColonySnapshot>(),
+        ),
+        (
+            "ColonyDetail",
+            schema_value::<crate::api_colony::ColonyDetail>(),
+        ),
+        (
+            "ColonyCreateRequest",
+            schema_value::<crate::api_colony::ColonyCreateRequest>(),
+        ),
+        (
+            "ColonySaveRequest",
+            schema_value::<crate::api_colony::ColonySaveRequest>(),
+        ),
+        (
+            "ColonyClarifyRequest",
+            schema_value::<crate::api_colony::ColonyClarifyRequest>(),
+        ),
+        (
+            "ColonyControlRequest",
+            schema_value::<crate::api_colony::ColonyControlRequest>(),
+        ),
+        (
+            "ColonyGoalClarifyRequest",
+            schema_value::<crate::api_colony::ColonyGoalClarifyRequest>(),
+        ),
+        (
+            "ColonyApprovalRequest",
+            schema_value::<crate::api_colony::ColonyApprovalRequest>(),
+        ),
+        (
+            "ColonyMessageRequest",
+            schema_value::<crate::api_colony::ColonyMessageRequest>(),
+        ),
+        (
+            "ColonyMessagesResponse",
+            schema_value::<crate::api_colony::ColonyMessagesResponse>(),
+        ),
+        (
+            "ColonyContextResponse",
+            schema_value::<crate::api_colony::ColonyContextResponse>(),
+        ),
+        (
+            "ColonyAgentCreateRequest",
+            schema_value::<crate::api_colony::ColonyAgentCreateRequest>(),
+        ),
+        (
+            "QueenProposal",
+            schema_value::<zeroclaw_colony::QueenProposal>(),
+        ),
+        (
+            "GoalRequest",
+            schema_value::<zeroclaw_colony::GoalRequest>(),
+        ),
+        ("GoalView", schema_value::<zeroclaw_colony::GoalView>()),
+    ] {
+        components["schemas"][name] = schema;
+    }
 
     let path_param = serde_json::json!({
         "name": "path",
@@ -226,6 +289,20 @@ pub fn build_spec() -> serde_json::Value {
     });
 
     let paths = serde_json::json!({
+        "/api/workspace": {
+            "get": {
+                "operationId": "workspaceAvailability",
+                "summary": "Read live workspace availability",
+                "security": [{ "bearerAuth": [] }],
+                "responses": {
+                    "200": {
+                        "description": "Dispatchable agents and connected capabilities",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceAvailability" } } }
+                    },
+                    "401": { "description": "Unauthorized" }
+                }
+            }
+        },
         "/api/status": {
             "get": {
                 "tags": ["status"],
@@ -464,8 +541,79 @@ pub fn build_spec() -> serde_json::Value {
         schema_value::<zeroclaw_api::a2a_wire::Task>(),
         schema_value::<zeroclaw_api::a2a_wire::Message>(),
     );
+    augment_spec_with_colonies(&mut spec);
     flatten_defs_into_components(&mut spec);
     spec
+}
+
+#[cfg(feature = "schema-export")]
+fn augment_spec_with_colonies(spec: &mut serde_json::Value) {
+    use serde_json::json;
+    fn operation(
+        request: Option<&str>,
+        response: &str,
+        created: bool,
+        parameters: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut operation = json!({
+            "tags": ["colony"], "security": [{"bearerAuth":[]}], "parameters":parameters,
+            "responses": {
+                "401":{"description":"Paired operator credential required"},"403":{"description":"Permission denied"},"409":{"description":"State changed or work is not eligible"}
+            }
+        });
+        let status = if created { "201" } else { "200" };
+        operation["responses"][status] = json!({"description":"Colony runtime response", "content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{response}")}}}});
+        if let Some(request) = request {
+            operation["requestBody"] = json!({"required":true,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{request}")}}}});
+        }
+        operation
+    }
+    let id = json!([{"name":"id","in":"path","required":true,"schema":{"type":"string"}}]);
+    let goal = json!([{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"goal","in":"path","required":true,"schema":{"type":"string"}}]);
+    let Some(paths) = spec["paths"].as_object_mut() else {
+        return;
+    };
+    paths.insert("/api/colonies".into(),json!({"get":operation(None,"ColonySnapshot",false,json!([])),"post":operation(Some("ColonyCreateRequest"),"ColonyDetail",true,json!([]))}));
+    paths.insert("/api/colonies/context".into(),json!({"get":operation(None,"ColonyContextResponse",false,json!([{"name":"agent","in":"query","required":true,"schema":{"type":"string"}}]))}));
+    paths.insert("/api/colonies/{id}".into(),json!({"get":operation(None,"ColonyDetail",false,id.clone()),"put":operation(Some("ColonySaveRequest"),"ColonyDetail",false,id.clone()),"delete":{"parameters":id.clone(),"responses":{"204":{"description":"Colony removed; agent definitions and histories retained"}}}}));
+    paths.insert(
+        "/api/colonies/{id}/agents".into(),
+        json!({"post":operation(Some("ColonyAgentCreateRequest"),"ColonyDetail",false,id.clone())}),
+    );
+    paths.insert(
+        "/api/colonies/{id}/clarify".into(),
+        json!({"post":operation(Some("ColonyClarifyRequest"),"QueenProposal",false,id.clone())}),
+    );
+    let mut list_goals = operation(None, "GoalView", false, id.clone());
+    list_goals["responses"]["200"]["content"]["application/json"]["schema"] =
+        json!({"type":"array","items":{"$ref":"#/components/schemas/GoalView"}});
+    paths.insert(
+        "/api/colonies/{id}/goals".into(),
+        json!({"get":list_goals,"post":operation(Some("GoalRequest"),"GoalView",true,id.clone())}),
+    );
+    paths.insert(
+        "/api/colonies/{id}/goals/{goal}/control".into(),
+        json!({"post":operation(Some("ColonyControlRequest"),"GoalView",false,goal.clone())}),
+    );
+    paths.insert(
+        "/api/colonies/{id}/goals/{goal}/clarify".into(),
+        json!({"post":operation(Some("ColonyGoalClarifyRequest"),"GoalView",false,goal)}),
+    );
+    paths.insert(
+        "/api/colonies/{id}/goals/{goal}/approvals/{approval}".into(),
+        json!({"post":operation(Some("ColonyApprovalRequest"),"GoalView",false,json!([
+            {"name":"id","in":"path","required":true,"schema":{"type":"string"}},
+            {"name":"goal","in":"path","required":true,"schema":{"type":"string"}},
+            {"name":"approval","in":"path","required":true,"schema":{"type":"string"}}
+        ]))}),
+    );
+    let mut message_parameters = id;
+    if let Some(parameters) = message_parameters.as_array_mut() {
+        parameters.push(
+            json!({"name":"recipient","in":"query","required":false,"schema":{"type":"string"}}),
+        );
+    }
+    paths.insert("/api/colonies/{id}/messages".into(),json!({"get":operation(None,"ColonyMessagesResponse",false,message_parameters.clone()),"post":operation(Some("ColonyMessageRequest"),"ColonyMessagesResponse",false,message_parameters)}));
 }
 
 /// Add the A2A task endpoint and its request/response schemas to the spec.
@@ -684,6 +832,40 @@ pub fn build_spec() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn colony_contract_keeps_goal_status_and_review_actions_distinct() {
+        let spec = build_spec();
+        for path in [
+            "/api/colonies",
+            "/api/colonies/context",
+            "/api/colonies/{id}/goals/{goal}/clarify",
+            "/api/colonies/{id}/goals/{goal}/approvals/{approval}",
+        ] {
+            assert!(spec["paths"].get(path).is_some(), "missing {path}");
+        }
+        let schemas = &spec["components"]["schemas"];
+        let status = &schemas["ControlPlaneTaskStatus"];
+        assert!(
+            status["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|variant| variant["const"] == "paused")
+        );
+        let goal = &schemas["GoalView"];
+        assert!(goal["properties"].get("turn_attached").is_some());
+        let actions = &schemas["ColonyControlAction"]["enum"];
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("confirm_plan"))
+        );
+        let encoded = serde_json::to_string(&spec).unwrap();
+        assert!(!encoded.contains("#/$defs/"));
+    }
 
     #[cfg(feature = "schema-export")]
     #[test]

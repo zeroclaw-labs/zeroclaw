@@ -487,6 +487,16 @@ pub(crate) fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
 ) {
+    if attempts.iter().any(|attempt| {
+        !matches!(
+            attempt.outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(_)
+        )
+    }) {
+        crate::execution_scope::record_usage_error(&anyhow::Error::msg(
+            "provider usage is incomplete; bounded goal consumption is unknown",
+        ));
+    }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -578,10 +588,11 @@ fn record_tool_loop_cost_usage_inner_with_live(
         && let Err(error) = tracker.record_usage_attributed(
             cost_usage.clone(),
             ctx.agent_alias.as_deref(),
-            None,
+            crate::execution_scope::current_goal_id(),
             conversation_id,
         )
     {
+        crate::execution_scope::record_usage_error(&error);
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 

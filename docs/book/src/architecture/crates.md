@@ -4,6 +4,12 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ## Layer: Core
 
+### `zeroclaw-colony`
+
+Queen-led reusable teams, clarification, goal coordination, scoped conversations
+and durable Colony checkpoints. Configuration and existing task/usage owners
+remain canonical; the controller consumes their live boundaries. See [Colony](./colony.md).
+
 ### `zeroclaw-runtime`
 
 The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.

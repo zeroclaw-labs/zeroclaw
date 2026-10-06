@@ -1434,7 +1434,32 @@ rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 
+colony-connection-required = This communication needs an explicit Colony connection in the requested direction.
+colony-reverse-connection-required = This result needs a reverse Colony connection from the responding agent to the caller.
+colony-detached-work-denied = Start detached work through the Queen so it remains attached to the Colony goal.
+colony-peer-message-invalid = A Colony message requires an agent target and nonempty text of at most 64,000 bytes.
+colony-peer-channel-description = Channel ref configured for both ordinary peers. During an active Colony goal, use colony to queue text for a connected agent's next admitted turn.
+
 # Atomic RPC configuration batches
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+colony-room-tool-description = Read or post in a Colony room with an explicit grant. Only the current goal's room messages are visible; private conversations and prior goals are excluded. Posting saves a message without automatically starting other agents.
+colony-room-tool-error-arguments = Choose read or post and a room ID. Posting also requires nonempty text of at most 64000 bytes.
+colony-room-tool-error-permission = This agent does not have the required room permission in the current Colony configuration.
+
+# Colony goal lifecycle
+colony-goal-review-start = Review the goal and choose Start
+colony-goal-awaiting-review = Awaiting the configured start review
+colony-goal-user-paused = Paused by the user
+colony-goal-restart-settled = Daemon restarted at a settled turn boundary
+colony-goal-restart-uncertain = Interrupted turn may have completed external actions; choose Retry or Skip after reviewing
+colony-goal-tool-approval = An agent requires explicit tool approval
+colony-goal-tool-not-executed = Tool was not executed. Review its approval policy before Retry.
+colony-goal-plan-review = The Queen proposes more work. Review the plan and confirm to continue
+colony-goal-plan-questions = The Queen needs grouped answers before proposing more work
+colony-goal-more-questions = The Queen needs more grouped answers
+colony-goal-revised-review = Review and confirm the revised Queen plan
+colony-goal-resume-review = Resume the pending plan review
+colony-goal-pending-review = Review the pending Queen plan

@@ -201,6 +201,7 @@ pub enum ToolKind {
     SopAdvance,
     SopStatus,
     SopHistory,
+    ColonyRoom,
     Wait,
     Plugin,
     /// A tool supplied by a WebAssembly plugin rather than the native registry.

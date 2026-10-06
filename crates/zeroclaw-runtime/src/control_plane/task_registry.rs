@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     /// Background delegation task.
@@ -18,7 +19,9 @@ pub enum TaskKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", schemars(rename = "ControlPlaneTaskStatus"))]
 pub enum TaskStatus {
     /// Task is currently eligible to execute or already executing.
     Running,
@@ -53,6 +56,7 @@ impl TaskStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TaskRecord {
     /// Stable task id. Producers validate it at registration boundaries.
     pub id: String,

@@ -239,6 +239,7 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "security",
     "risk_profiles",
+    "colonies",
     "peer_groups",
     "users",
     "oidc",

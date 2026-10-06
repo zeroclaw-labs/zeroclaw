@@ -272,7 +272,7 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
     })
 }
 
-fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
+pub fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
     let (effective_token_limit, effective_cost_limit_usd) =

@@ -23,10 +23,9 @@ const sizes: Record<ButtonSize, string> = {
 };
 
 const variants: Record<ButtonVariant, string> = {
-  // Accent fill with a fixed dark foreground that stays legible on the
-  // light-to-mid accents this design system ships (>= AA on the Operator accents).
+  // The theme derives contrasting text from the active accent fill.
   primary:
-    'bg-pc-accent border-transparent text-[#0b1220] hover:bg-pc-accent-light ' +
+    'bg-pc-accent border-transparent text-[color:var(--pc-accent-foreground)] hover:brightness-95 ' +
     'active:brightness-95',
   // Transparent until hovered — the calm default for secondary actions.
   // `--pc-hover` has no @theme utility, so the hover bg uses an arbitrary value.

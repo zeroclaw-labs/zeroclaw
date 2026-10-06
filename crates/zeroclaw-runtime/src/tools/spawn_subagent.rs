@@ -78,6 +78,7 @@ impl SpawnSubagentTool {
 /// child registry is narrowed by the same contract.
 fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
     AgentRunOverrides {
+        extra_tools: Vec::new(),
         security: Some(policy),
         memory: None,
         is_subagent: true,
@@ -88,6 +89,9 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         // the injected context preamble is suppressed above.
         memory_free: false,
         suppress_memory_auto_save: false,
+        enforce_approvals: false,
+        approval_channel: None,
+        approval_reply_target: None,
         // Subagent runs are short-lived; no cross-turn reuse contract,
         // so the per-call `connect_all` path inside `agent::run` is
         // the correct choice. The daemon heartbeat worker is the
@@ -139,6 +143,15 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        if crate::execution_scope::current_goal_id().is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "colony-detached-work-denied",
+                )),
+            });
+        }
         // Depth-1 cap: a SubAgent may not spawn its own subagents.
         // The caller-side flag is set at registry construction time
         // from `AgentRunOverrides.is_subagent`, so the refusal fires

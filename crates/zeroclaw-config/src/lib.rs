@@ -10,6 +10,7 @@ pub mod agent_bundle;
 pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
+pub mod colony;
 pub mod comment_writer;
 pub mod cost;
 pub mod domain_matcher;

@@ -73,7 +73,9 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
         let self_norm = agent_alias.trim_start_matches('@').to_ascii_lowercase();
         for member in &group.agents {
             let normalized = member.as_str().trim_start_matches('@').to_ascii_lowercase();
-            if normalized != self_norm {
+            if normalized != self_norm
+                && config.colony_allows_communication(agent_alias, member.as_str())
+            {
                 agent_set.insert(normalized);
             }
         }
@@ -83,7 +85,9 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
             // Match the lookup side (`is_known_peer` / `allows_inbound`):
             // channel-native usernames may be configured with or without a
             // leading `@`, and callers may pass either form.
-            ext_set.insert(ext.as_str().trim_start_matches('@').to_ascii_lowercase());
+            if config.colony_allows_external(agent_alias, &channel, ext.as_str(), true) {
+                ext_set.insert(ext.as_str().trim_start_matches('@').to_ascii_lowercase());
+            }
         }
 
         for ignored in &group.ignore {
