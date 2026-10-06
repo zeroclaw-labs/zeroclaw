@@ -20,7 +20,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 use zeroclaw_config::schema::Config;
+use zeroclaw_rpc_proto::error_reasons::{RefusalData, RefusalReason};
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -33,8 +35,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(
@@ -49,13 +54,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -92,287 +90,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -380,7 +105,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -499,7 +228,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -517,6 +246,29 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+/// [`rpc_err`] that also names why the call was refused, in `error.data`.
+/// The code stays the one the site always returned; the reason lets a client
+/// that answers over another protocol (the gateway's HTTP routes) tell
+/// outcomes apart that share a code, without reading the message.
+fn refused(code: i32, reason: RefusalReason, msg: impl Into<String>) -> JsonRpcError {
+    reason.error(code, msg)
+}
+
+/// A refused config operation: the code and message the method has always
+/// answered, carrying in `error.data` the structured config error the
+/// dashboard's config routes answer with, and the reason its code names.
+fn config_refused(code: i32, msg: impl Into<String>, error: ConfigApiError) -> JsonRpcError {
+    RefusalData::config_error(code, msg, error)
+}
+
+/// `error` re-worded as `msg`, keeping its code and its data.
+fn reworded(error: JsonRpcError, msg: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        message: msg.into(),
+        ..error
     }
 }
 
@@ -590,6 +342,35 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
     Some(grants.allowed_tools.clone())
 }
 
+/// The `clientCapabilities.client_kind` a connection declared, kept only for
+/// a kind the core knows. `tui/list` reports it so a listing can tell a
+/// gateway's connections from terminals; nothing authorizes on it.
+/// The additive extensions this core advertises on `initialize`, each
+/// listed only beside the behaviour it names and the test that proves it:
+///
+/// - `tui.client_kind`: `tui/list` reports the kind a connection declared
+///   (`tui_list_labels_only_a_declared_gateway_connection`).
+///
+/// The skills/personality extensions are backed by the dispatcher regressions
+/// for purge, canonical configured aliases, bounded reads, reader-restricted
+/// drift state, and editor template context.
+pub const ADVERTISED_FEATURES: &[&str] = &[
+    zeroclaw_rpc_proto::feature::TUI_CLIENT_KIND,
+    zeroclaw_rpc_proto::feature::SKILLS_DELETE_PURGE,
+    zeroclaw_rpc_proto::feature::PERSONALITY_CONFIGURED_AGENT,
+    zeroclaw_rpc_proto::feature::PERSONALITY_MAX_CHARS,
+    zeroclaw_rpc_proto::feature::PERSONALITY_EXPECTED_MTIME,
+    zeroclaw_rpc_proto::feature::PERSONALITY_EDITOR_TEMPLATES,
+];
+
+fn declared_client_kind(capabilities: Option<&Value>) -> Option<String> {
+    capabilities?
+        .get("client_kind")?
+        .as_str()
+        .filter(|kind| *kind == CLIENT_KIND_GATEWAY)
+        .map(str::to_owned)
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -618,22 +399,43 @@ fn personality_template_context(
     config: &zeroclaw_config::schema::Config,
     req: &PersonalityTemplatesParams,
 ) -> crate::agent::personality_templates::TemplateContext {
-    let agent_requested = req.agent.is_some();
-    let requested_agent = req
-        .agent
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let agent_alias = requested_agent.unwrap_or("default");
-    let configured_agent_exists = config.agent(agent_alias).is_some();
+    let defaults = crate::agent::personality_templates::TemplateContext::default();
+    let (agent, include_memory) = match req.defaults.unwrap_or_default() {
+        PersonalityTemplateDefaults::Quickstart => {
+            let agent_requested = req.agent.is_some();
+            let requested_agent = req
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let agent_alias = requested_agent.unwrap_or("default");
+            let configured_agent_exists = config.agent(agent_alias).is_some();
+            (
+                requested_agent
+                    .map(str::to_string)
+                    .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
+                    .unwrap_or_else(|| "ZeroClaw".to_string()),
+                configured_agent_exists || agent_requested,
+            )
+        }
+        PersonalityTemplateDefaults::Editor => (
+            req.agent
+                .as_deref()
+                .filter(|alias| config.agents.contains_key(*alias))
+                .map_or_else(|| defaults.agent.clone(), str::to_string),
+            config.memory.backend.as_str() != "none",
+        ),
+    };
 
     crate::agent::personality_templates::TemplateContext {
-        agent: requested_agent
-            .map(str::to_string)
-            .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
-            .unwrap_or_else(|| "ZeroClaw".to_string()),
-        include_memory: configured_agent_exists || agent_requested,
-        ..Default::default()
+        agent: req.agent_name.clone().unwrap_or(agent),
+        user: req.user_name.clone().unwrap_or(defaults.user),
+        timezone: req.timezone.clone().unwrap_or(defaults.timezone),
+        communication_style: req
+            .communication_style
+            .clone()
+            .unwrap_or(defaults.communication_style),
+        include_memory: req.include_memory.unwrap_or(include_memory),
     }
 }
 
@@ -877,7 +679,11 @@ fn rename_error_to_rpc(
         RenameError::PostCondition(_) => INTERNAL_ERROR,
         _ => INVALID_PARAMS,
     };
-    rpc_err(code, format!("{path}.{from}: {err}"))
+    config_refused(
+        code,
+        format!("{path}.{from}: {err}"),
+        err.api_error(path, from),
+    )
 }
 
 async fn move_renamed_agent_workspace(
@@ -1729,13 +1535,21 @@ impl RpcDispatcher {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let job = crate::cron::get_job(config, id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        // A job the principal may not see is refused exactly as a missing
+        // one, reason included, so neither reveals that the job exists.
+        let job = crate::cron::get_job(config, id).map_err(|e| {
+            refused(
+                INVALID_PARAMS,
+                RefusalReason::NotFound,
+                format!("Cron job not found: {e}"),
+            )
+        })?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
-        let denied = rpc_err(
+        let denied = refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("Cron job not found: {}", crate::cron::job_not_found(id)),
         );
         self.audit_auth_denial(
@@ -3431,7 +3245,7 @@ impl RpcDispatcher {
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
-                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                            Err(e) => handle.send_rpc_error(id_clone, e).await,
                         }
                     }
                 });
@@ -3572,7 +3386,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -3606,6 +3420,7 @@ impl RpcDispatcher {
             .and_then(|c| c.get("elicitation"));
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+        let client_kind = declared_client_kind(req.client_capabilities.as_ref());
 
         // Authenticate FIRST: bind a principal or reject, before any
         // registry mutation. The tui_id/tui_sig continuity below grants no
@@ -3665,6 +3480,7 @@ impl RpcDispatcher {
                     .to_string(),
                 peer_label: self.peer_label.clone(),
                 env,
+                client_kind,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -3726,6 +3542,10 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
+            features: ADVERTISED_FEATURES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         })
     }
 
@@ -4003,6 +3823,7 @@ impl RpcDispatcher {
                     connected_at_unix: e.connected_at.timestamp(),
                     peer_label: e.peer_label,
                     transport: e.transport,
+                    client_kind: e.client_kind,
                 })
                 .collect(),
         })
@@ -4278,7 +4099,7 @@ impl RpcDispatcher {
                     .session_queue
                     .acquire(&session_id)
                     .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                    .map_err(Self::session_busy)?;
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
                     self.selector_session_agent_with_grants(
@@ -4356,7 +4177,7 @@ impl RpcDispatcher {
                 .session_queue
                 .acquire(&session_id)
                 .await
-                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                .map_err(Self::session_busy)?
         };
 
         // A durable row can appear while admission is queued. Resolve its
@@ -5227,7 +5048,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         if current_identity != requested_identity {
             if current_identity.is_none() && requested_identity.is_some() {
@@ -5372,7 +5193,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(sid)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let admitted = match self
             .revalidate_admitted_session(sid, authorized.as_ref())
             .await
@@ -6128,7 +5949,7 @@ impl RpcDispatcher {
                 live_generation_at_entry,
                 cancel.clone(),
             ) => {
-                result.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+                result.map_err(Self::session_busy)?
             }
         };
         if self.connection_cancel.is_cancelled() {
@@ -7405,7 +7226,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         let req: SessionListParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let visible_ids = self.owner_visible_session_ids().await;
@@ -7541,7 +7362,7 @@ impl RpcDispatcher {
                     .session_queue
                     .acquire(&req.session_id)
                     .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+                    .map_err(Self::session_busy)?,
             )
         } else {
             None
@@ -7554,7 +7375,7 @@ impl RpcDispatcher {
                     .session_queue
                     .acquire(&req.session_id)
                     .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+                    .map_err(Self::session_busy)?,
             );
             live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         }
@@ -7679,21 +7500,23 @@ impl RpcDispatcher {
                         "cursor pagination requires an ACP session",
                     ));
                 }
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|row| MessageEntry {
+                        role: row.message.role,
+                        content: row.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: row.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -7705,7 +7528,7 @@ impl RpcDispatcher {
                     ));
                 }
                 if self.ctx.session_backend.is_none() && self.ctx.acp_session_store.is_none() {
-                    return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
+                    return Err(Self::session_persistence_disabled());
                 }
                 Vec::new()
             }
@@ -7793,7 +7616,7 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            .ok_or_else(Self::session_persistence_disabled)?;
         if let Some(DurableSession::Chat { key }) = record.and_then(|r| r.durable) {
             match backend.get_session_state(&key) {
                 Ok(Some(ss)) => {
@@ -7856,7 +7679,7 @@ impl RpcDispatcher {
             .session_queue
             .acquire(&req.session_id)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .map_err(Self::session_busy)?;
         let record = match self
             .revalidate_admitted_session(&req.session_id, authorized.as_ref())
             .await
@@ -7929,10 +7752,11 @@ impl RpcDispatcher {
                 })?
             }
             Some(DurableSession::Chat { key }) => {
-                let backend =
-                    self.ctx.session_backend.as_ref().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
-                    })?;
+                let backend = self
+                    .ctx
+                    .session_backend
+                    .as_ref()
+                    .ok_or_else(Self::session_persistence_disabled)?;
                 match expected_owner.as_deref() {
                     Some(owner) => backend.delete_session_owned(&key, owner),
                     None => backend.delete_session(&key),
@@ -8032,11 +7856,13 @@ impl RpcDispatcher {
         requested_agent: Option<&str>,
         private_plane: bool,
     ) -> Result<(Arc<dyn zeroclaw_api::memory_traits::Memory>, Option<String>), JsonRpcError> {
-        let memory = self
-            .ctx
-            .memory
-            .clone()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let memory = self.ctx.memory.clone().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Memory subsystem is not available",
+            )
+        })?;
         let Some(alias) = requested_agent
             .map(str::trim)
             .filter(|alias| !alias.is_empty())
@@ -8046,8 +7872,9 @@ impl RpcDispatcher {
         self.selector_agent(method, alias)?;
         let config = self.ctx.config.read().clone();
         if !config.agents.contains_key(alias) {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
             ));
         }
@@ -8153,8 +7980,9 @@ impl RpcDispatcher {
         };
         match entry {
             Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
-            None => Err(rpc_err(
+            None => Err(refused(
                 INTERNAL_ERROR,
+                RefusalReason::NotFound,
                 format!("Memory key `{}` not found", req.key),
             )),
         }
@@ -8391,9 +8219,10 @@ impl RpcDispatcher {
         let req: ConfigGetParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         if let Some(prop) = req.prop {
-            let val = config
-                .get_prop(&prop)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
+            let val = config.get_prop(&prop).map_err(|e| {
+                let msg = format!("Unknown prop: {e}");
+                config_refused(INVALID_PARAMS, msg, ConfigApiError::for_prop(e, &prop))
+            })?;
             to_result(ConfigGetPropResult { prop, value: val })
         } else {
             // Return full config, masked.
@@ -8576,17 +8405,15 @@ impl RpcDispatcher {
                 &config_write_guard,
             )
             .map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
+                let msg = crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &index.to_string()),
+                        ("prop", &entry.prop),
+                        ("reason", &e.message),
+                    ],
+                );
+                reworded(e, msg)
             })?;
         }
         // Boxed for the same stack-frame reason as in `handle_config_set`.
@@ -8600,17 +8427,15 @@ impl RpcDispatcher {
         let mut config = Box::new(old_config.clone());
         for (index, entry) in req.sets.iter().enumerate() {
             Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
+                let msg = crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &index.to_string()),
+                        ("prop", &entry.prop),
+                        ("reason", &e.message),
+                    ],
+                );
+                reworded(e, msg)
             })?;
         }
         // The request paths describe the affected live views; the candidate
@@ -8664,9 +8489,11 @@ impl RpcDispatcher {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
+            const RESERVED: &str = "alias `default` is reserved and cannot be created";
+            return Err(config_refused(
                 INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
+                RESERVED,
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, RESERVED).with_path(prop),
             ));
         }
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
@@ -8677,7 +8504,7 @@ impl RpcDispatcher {
                 other,
                 info.as_ref().map(|i| i.kind),
             )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+            .map_err(|e| config_refused(INVALID_PARAMS, e.message.clone(), e.with_path(prop)))?,
         };
         // Reject the masked sentinel for secrets — surfaces echo the
         // masked display value back when no real edit happened, and
@@ -8692,14 +8519,17 @@ impl RpcDispatcher {
                 || value_str == "****"
                 || value_str.is_empty())
         {
-            return Err(rpc_err(
+            let msg = format!("Refusing to overwrite secret `{prop}` with a masked or empty value");
+            return Err(config_refused(
                 INVALID_PARAMS,
-                format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
+                msg.clone(),
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(prop),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        config.set_prop_persistent(prop, &value_str).map_err(|e| {
+            let msg = format!("Config set failed: {e}");
+            config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, prop))
+        })
     }
 
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
@@ -9001,7 +8831,11 @@ impl RpcDispatcher {
 
     fn handle_config_reload(&self) -> RpcResult {
         if !self.schedule_daemon_reload("config") {
-            return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
+            return Err(refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Reload not available",
+            ));
         }
         to_result(ConfigReloadResult { reloading: true })
     }
@@ -9060,9 +8894,10 @@ impl RpcDispatcher {
             &old_config,
         )?;
         let mut working = old_config.clone();
-        working
-            .set_prop_persistent(&req.prop, "")
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        working.set_prop_persistent(&req.prop, "").map_err(|e| {
+            let msg = format!("Config delete failed: {e}");
+            config_refused(INTERNAL_ERROR, msg, ConfigApiError::for_prop(e, &req.prop))
+        })?;
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
@@ -9109,9 +8944,10 @@ impl RpcDispatcher {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let keys = config.get_map_keys(&req.path).ok_or_else(|| {
-            rpc_err(
+            config_refused(
                 INVALID_PARAMS,
                 format!("No map-keyed section at `{}`", req.path),
+                ConfigApiError::no_map_section(&req.path),
             )
         })?;
         to_result(ConfigMapKeysResult {
@@ -9140,7 +8976,13 @@ impl RpcDispatcher {
             // path cannot author an `agents.default` the rename guard then traps.
             let created =
                 zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    .map_err(|e| {
+                        config_refused(
+                            INVALID_PARAMS,
+                            e.to_string(),
+                            e.api_error(&req.path, &req.key),
+                        )
+                    })?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
@@ -9885,11 +9727,13 @@ impl RpcDispatcher {
         if let Some(agent) = req.agent.as_deref() {
             self.selector_agent(Method::CostQuery, agent)?;
         }
-        let tracker = self
-            .ctx
-            .cost_tracker
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
+        let tracker = self.ctx.cost_tracker.as_ref().ok_or_else(|| {
+            refused(
+                INTERNAL_ERROR,
+                RefusalReason::Disabled,
+                "Cost tracking is not available",
+            )
+        })?;
         // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
         // Reports view, or an external CLI report) pull day/month/quarter/YTD
         // scalars rather than only the daemon's today/this-month aggregates.
@@ -9946,13 +9790,33 @@ impl RpcDispatcher {
 
     // ── Skills handlers ──────────────────────────────────────────
 
+    /// A skills service failure. A kind the caller can act on names its
+    /// reason and keeps the service's own words, as the dashboard reports
+    /// it; an I/O failure is the core's own, prefixed with what failed.
+    fn skills_failed(what: &str, error: crate::skills::service::ServiceError) -> JsonRpcError {
+        use crate::skills::service::ServiceError;
+        let reason = match &error {
+            ServiceError::Ref(_) | ServiceError::Bundle(_) | ServiceError::Scaffold(_) => {
+                Some(RefusalReason::Invalid)
+            }
+            ServiceError::DocumentParse(_) => Some(RefusalReason::Malformed),
+            ServiceError::NotFound(_) => Some(RefusalReason::NotFound),
+            ServiceError::NotEditable { .. } => Some(RefusalReason::Forbidden),
+            ServiceError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(INTERNAL_ERROR, reason, error.to_string()),
+            None => rpc_err(INTERNAL_ERROR, format!("{what}: {error}")),
+        }
+    }
+
     fn handle_skills_bundles(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let bundles: Vec<SkillBundleEntry> = svc
             .list_bundles()
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills bundles failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills bundles failed", e))?
             .into_iter()
             .map(|b| SkillBundleEntry {
                 alias: b.alias,
@@ -9971,7 +9835,7 @@ impl RpcDispatcher {
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skills: Vec<SkillListEntry> = svc
             .list_skills(req.bundle.as_deref())
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills list failed: {e}")))?
+            .map_err(|e| Self::skills_failed("Skills list failed", e))?
             .into_iter()
             .map(|s| SkillListEntry {
                 bundle: s.r#ref.bundle().to_string(),
@@ -9991,7 +9855,7 @@ impl RpcDispatcher {
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = svc
             .read_skill(&skill_ref)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill read failed", e))?;
         to_result(SkillsReadResult {
             bundle: req.bundle,
             name: req.name,
@@ -10011,7 +9875,7 @@ impl RpcDispatcher {
             body: req.body,
         };
         svc.write_skill(&skill_ref, &doc)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill write failed: {e}")))?;
+            .map_err(|e| Self::skills_failed("Skill write failed", e))?;
         to_result(SkillsWriteResult {
             bundle: req.bundle,
             name: req.name,
@@ -10025,8 +9889,13 @@ impl RpcDispatcher {
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
         let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
-        svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
+        let mode = if req.purge {
+            crate::skills::service::RemoveMode::Purge
+        } else {
+            crate::skills::service::RemoveMode::Archive
+        };
+        svc.remove_skill(&skill_ref, mode)
+            .map_err(|e| Self::skills_failed("Skill delete failed", e))?;
         to_result(SkillsDeleteResult {
             bundle: req.bundle,
             name: req.name,
@@ -10042,6 +9911,9 @@ impl RpcDispatcher {
             self.selector_agent(Method::PersonalityList, agent)?;
         }
         let config = self.ctx.config.read().clone();
+        if req.require_configured_agent {
+            require_configured_agent(&config, req.agent.as_deref())?;
+        }
         let workspace = req.agent.as_deref().map(|a| config.agent_workspace_dir(a));
         let files: Vec<PersonalityFileEntry> =
             crate::agent::personality::EDITABLE_PERSONALITY_FILES
@@ -10097,6 +9969,9 @@ impl RpcDispatcher {
                 format!("Not an editable file: {}", req.filename),
             ));
         }
+        if req.require_configured_agent {
+            require_configured_agent(&config, Some(&req.agent))?;
+        }
         let workspace = config.agent_workspace_dir(&req.agent);
         // Read beneath a handle on the entitled agent's workspace, without
         // following a link out of it. Joining the pathname and reading it would
@@ -10104,7 +9979,16 @@ impl RpcDispatcher {
         // the workspace; the allowlist constrains the name, not its target.
         match read_personality_file(&workspace, &req.filename) {
             Ok((content, mtime_ms)) => {
-                let truncated = content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
+                // Bounded before it is serialized when the caller asks, so a
+                // file of any size answers within one frame.
+                let (content, truncated) = match req.max_chars {
+                    Some(max_chars) => bounded_to_chars(content, max_chars),
+                    None => {
+                        let truncated =
+                            content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
+                        (content, truncated)
+                    }
+                };
                 to_result(PersonalityGetResult {
                     filename: req.filename,
                     content: Some(content),
@@ -10144,7 +10028,48 @@ impl RpcDispatcher {
                 ),
             ));
         }
+        if req.require_configured_agent {
+            require_configured_agent(&config, Some(&req.agent))?;
+        }
         let workspace = config.agent_workspace_dir(&req.agent);
+        // Disk-drift guard, as on `PUT /api/personality/{filename}`: when the
+        // editor says which mtime it saw, refuse the write if the file has
+        // moved since, and hand back what is on disk now. Read through the
+        // same no-follow handle as every other personality read. This method
+        // needs only `personality:update`; what is on disk (content and mtime)
+        // is `personality:read` data, so it rides along only for a caller that
+        // holds that grant too.
+        if let Some(expected) = req.expected_mtime_ms {
+            let (current_content, current_mtime_ms) =
+                match read_personality_file(&workspace, &req.filename) {
+                    Ok((content, mtime)) => (content, mtime),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+                    Err(e) => return Err(rpc_err(INTERNAL_ERROR, format!("Read failed: {e}"))),
+                };
+            if current_mtime_ms != Some(expected) {
+                let mut err = rpc_err(
+                    PRECONDITION_FAILED,
+                    format!("{} changed on disk since it was read", req.filename),
+                );
+                let mut data = serde_json::json!({
+                    "reason": RefusalReason::Conflict.as_str(),
+                    "error": "personality_disk_drift",
+                    "filename": req.filename,
+                });
+                let may_read = self.auth.as_ref().is_some_and(|auth| {
+                    auth.grants.permits(
+                        zeroclaw_api::grants::Resource::Personality,
+                        zeroclaw_api::grants::Verb::Read,
+                    )
+                });
+                if may_read {
+                    data["current_content"] = Value::String(current_content);
+                    data["current_mtime_ms"] = serde_json::json!(current_mtime_ms);
+                }
+                err.data = Some(data);
+                return Err(err);
+            }
+        }
         // Write beneath a handle on the entitled agent's workspace, without
         // following a link out of it, for the same reason the read side does.
         let mtime_ms = write_personality_file(&workspace, &req.filename, &req.content)
@@ -10906,14 +10831,23 @@ impl RpcDispatcher {
     }
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
-        let resp = JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            result: None,
-            error: Some(JsonRpcError {
+        self.send_rpc_error(
+            id,
+            JsonRpcError {
                 code,
                 message: message.to_string(),
                 data: None,
-            }),
+            },
+        )
+        .await;
+    }
+
+    /// Send a handler's error as it stands, its `data` included.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
@@ -11113,6 +11047,79 @@ impl RpcDispatcher {
         serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
     }
 
+    /// A session whose queue refused this request. A full queue is a
+    /// `capacity` refusal; a wait that timed out keeps the bare code, since no
+    /// listed reason means "gave up waiting".
+    fn session_busy(error: zeroclaw_infra::session_queue::SessionQueueError) -> JsonRpcError {
+        use zeroclaw_infra::session_queue::SessionQueueError;
+        let msg = format!("Session busy: {error}");
+        match error {
+            SessionQueueError::QueueFull { .. } => {
+                refused(SESSION_BUSY, RefusalReason::Capacity, msg)
+            }
+            SessionQueueError::Timeout { .. } => rpc_err(SESSION_BUSY, msg),
+        }
+    }
+
+    /// The refusal a session method answers when session persistence is off.
+    fn session_persistence_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "Session persistence is disabled",
+        )
+    }
+
+    /// The refusal every SOP method answers while the subsystem is off.
+    fn sop_disabled() -> JsonRpcError {
+        refused(
+            INTERNAL_ERROR,
+            RefusalReason::Disabled,
+            "SOP subsystem not enabled",
+        )
+    }
+
+    /// The refusal for a procedure that does not load by `name`. Missing,
+    /// malformed and badly named all answer `not_found`, as the dashboard's
+    /// routes do: there is no procedure by that name to act on.
+    fn sop_not_loaded(name: &str, error: &anyhow::Error) -> JsonRpcError {
+        refused(
+            INVALID_PARAMS,
+            RefusalReason::NotFound,
+            format!("SOP '{name}': {error}"),
+        )
+    }
+
+    /// A SOP authoring failure, answered with the `code` the method gives its
+    /// kind. Unless the method counts it as the core's own failure
+    /// (`INTERNAL_ERROR`), it names the kind as a reason: a missing procedure,
+    /// a name already taken, or a definition the caller must fix.
+    fn sop_author_refused(code: i32, error: &crate::sop::SopAuthorError) -> JsonRpcError {
+        use crate::sop::SopAuthorError;
+        let reason = match error {
+            _ if code == INTERNAL_ERROR => None,
+            SopAuthorError::NotFound(_) => Some(RefusalReason::NotFound),
+            SopAuthorError::AlreadyExists(_) => Some(RefusalReason::Conflict),
+            SopAuthorError::Other(_) => Some(RefusalReason::Invalid),
+            SopAuthorError::Io(_) => None,
+        };
+        match reason {
+            Some(reason) => refused(code, reason, error.to_string()),
+            None => rpc_err(code, error.to_string()),
+        }
+    }
+
+    /// A run accessor's failure: a missing run is the caller's `not_found`;
+    /// anything else (a poisoned engine) is the core's own.
+    fn sop_run_lookup_failed(error: &anyhow::Error) -> JsonRpcError {
+        match error.downcast_ref::<crate::sop::RunLookupError>() {
+            Some(crate::sop::RunLookupError::NotFound(_)) => {
+                refused(INVALID_PARAMS, RefusalReason::NotFound, error.to_string())
+            }
+            _ => rpc_err(INTERNAL_ERROR, error.to_string()),
+        }
+    }
+
     fn handle_sops_list(&self) -> RpcResult {
         let (dir, mode) = self.sops_dir_and_mode();
         let sops = crate::sop::load_sops_from_directory(&dir, mode);
@@ -11123,7 +11130,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(sop)
     }
 
@@ -11131,7 +11138,7 @@ impl RpcDispatcher {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         to_result(crate::sop::SopGraph::from_sop_with_specs(
             &sop,
             &self.sop_tool_specs(),
@@ -11145,14 +11152,18 @@ impl RpcDispatcher {
             && !payload.trim().is_empty()
             && serde_json::from_str::<Value>(payload).is_err()
         {
-            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+            return Err(refused(
+                INVALID_PARAMS,
+                RefusalReason::Invalid,
+                "payload is not valid JSON",
+            ));
         }
 
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         // The run executes as the procedure's agents, so the principal must be
         // entitled to every one of them before anything is dispatched.
         if self.stamped_grants().is_some() {
@@ -11165,11 +11176,20 @@ impl RpcDispatcher {
                 self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
             }
         }
-        let audit = self
-            .ctx
-            .sop_audit
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self.ctx.sop_audit.as_ref().ok_or_else(Self::sop_disabled)?;
+        // A run started here has no agent turn behind it: the driver started
+        // below executes its steps, so a procedure with no owner for an
+        // execute step would start, take a run id and fail that step. Refuse
+        // it first, on the ownership rule the driver itself applies, at the
+        // point the dashboard's run route does.
+        let ownership_refusal = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_sop(&req.name)
+            .and_then(crate::sop::headless_ownership_refusal);
+        if let Some(refusal) = ownership_refusal {
+            return Err(refused(INVALID_PARAMS, RefusalReason::Unowned, refusal));
+        }
 
         let payload = req
             .payload
@@ -11184,8 +11204,9 @@ impl RpcDispatcher {
             .filter(|key| !key.is_empty());
         if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
         {
-            return Err(rpc_err(
+            return Err(refused(
                 INVALID_PARAMS,
+                RefusalReason::Invalid,
                 format!(
                     "dedup_key exceeds {} bytes",
                     crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
@@ -11262,12 +11283,26 @@ impl RpcDispatcher {
                         run_id: run_id.clone(),
                     });
                 }
-                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
-                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
+                        reason.clone(),
+                    ));
+                }
+                crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Blocked,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
-                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Deferred,
+                        reason.clone(),
+                    ));
                 }
                 crate::sop::dispatch::DispatchResult::Coalesced {
                     existing_run_id, ..
@@ -11280,8 +11315,9 @@ impl RpcDispatcher {
             }
         }
 
-        Err(rpc_err(
+        Err(refused(
             INVALID_PARAMS,
+            RefusalReason::NotFound,
             format!("SOP '{}' has no matching manual trigger", req.name),
         ))
     }
@@ -11292,7 +11328,7 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+            .ok_or_else(Self::sop_disabled)?;
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
@@ -11323,16 +11359,9 @@ impl RpcDispatcher {
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
         to_result(serde_json::json!({ "run": detail }))
     }
@@ -11341,21 +11370,14 @@ impl RpcDispatcher {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
-        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+            .ok_or_else(Self::sop_disabled)?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -11363,20 +11385,21 @@ impl RpcDispatcher {
         let req: SopDecideRequest = parse_params(params)?;
         let decision: crate::sop::approval::ApprovalDecision =
             serde_json::from_value(req.decision.clone()).map_err(|e| {
-                rpc_err(
+                refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!("decision is not a valid approval decision: {e}"),
                 )
             })?;
 
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+            .map_err(|e| Self::sop_not_loaded(&req.name, &e))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .ok_or_else(Self::sop_disabled)?
             .clone();
 
         let agent_alias = sop.agent.clone().unwrap_or_default();
@@ -11417,11 +11440,16 @@ impl RpcDispatcher {
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
                 .ok_or_else(|| {
-                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                    refused(
+                        INVALID_PARAMS,
+                        RefusalReason::NotFound,
+                        format!("run '{}' not found", req.run_id),
+                    )
                 })?;
             if run_sop_name != req.name {
-                return Err(rpc_err(
+                return Err(refused(
                     INVALID_PARAMS,
+                    RefusalReason::Invalid,
                     format!(
                         "run '{}' belongs to SOP '{}', not '{}'",
                         req.run_id, run_sop_name, req.name
@@ -11444,11 +11472,28 @@ impl RpcDispatcher {
                 )
                 | BrokerOutcome::PendingQuorum { .. } => {}
                 BrokerOutcome::Resolved(
-                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
-                )
-                | BrokerOutcome::NotWaiting => {
-                    return Err(rpc_err(
+                    outcome @ (ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity),
+                ) => {
+                    // Approved but over the concurrency caps, the gate stays
+                    // waiting: a retry can clear it once a slot frees.
+                    let reason = if matches!(outcome, ResolveOutcome::DeferredAtCapacity) {
+                        RefusalReason::Deferred
+                    } else {
+                        RefusalReason::Conflict
+                    };
+                    return Err(refused(
                         INVALID_PARAMS,
+                        reason,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::NotWaiting => {
+                    return Err(refused(
+                        INVALID_PARAMS,
+                        RefusalReason::Conflict,
                         crate::i18n::get_required_cli_string_with_args(
                             "sop-rpc-decision-invalid-state",
                             &[("run_id", req.run_id.as_str())],
@@ -11500,15 +11545,8 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
-            let msg = e.to_string();
-            let code = if msg.contains("not found") {
-                INVALID_PARAMS
-            } else {
-                INTERNAL_ERROR
-            };
-            rpc_err(code, msg)
-        })?;
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id)
+            .map_err(|e| Self::sop_run_lookup_failed(&e))?;
         to_result(overlay)
     }
 
@@ -11561,7 +11599,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
@@ -11576,7 +11614,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
                 _ => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "created": sop.name }))
     }
@@ -11590,7 +11628,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
                 _ => INTERNAL_ERROR,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "deleted": req.name }))
     }
@@ -11623,7 +11661,7 @@ impl RpcDispatcher {
                 crate::sop::SopAuthorError::Io(_) => INTERNAL_ERROR,
                 crate::sop::SopAuthorError::Other(_) => INVALID_PARAMS,
             };
-            rpc_err(code, e.to_string())
+            Self::sop_author_refused(code, &e)
         })?;
         to_result(serde_json::json!({ "renamed": req.to, "from": req.from }))
     }
@@ -11639,7 +11677,7 @@ impl RpcDispatcher {
         let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
         crate::sop::apply_wire(&mut sop, &edit)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))?;
         to_result(serde_json::json!({
             "sop": sop,
             "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
@@ -11850,6 +11888,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: None,
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -11863,6 +11902,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: None,
                     });
                 }
 
@@ -11883,6 +11923,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: None,
                     });
                 }
             }
@@ -11920,6 +11961,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: None,
                         });
                     }
                 }
@@ -12195,8 +12237,54 @@ fn resolve_skill_ref(
             format!("Invalid skill ref: {name:?} is not a single skill directory name"),
         ));
     }
+    // Worded as the service words it, which is how the dashboard reports it.
     svc.resolve_ref(name, Some(bundle))
-        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
+        .map_err(|e| refused(INVALID_PARAMS, RefusalReason::Invalid, e.to_string()))
+}
+
+/// `content` cut to its first `max_chars` characters, and whether it was
+/// longer.
+fn bounded_to_chars(content: String, max_chars: usize) -> (String, bool) {
+    match content.char_indices().nth(max_chars) {
+        Some((end, _)) => (content[..end].to_owned(), true),
+        None => (content, false),
+    }
+}
+
+/// Refuse, as invalid params, an agent `[agents]` does not configure, for a
+/// caller that asked (`require_configured_agent`), before anything is read
+/// or written for it: `not_found` for an unconfigured alias, `invalid` for a
+/// missing one or one not spelled exactly as configured.
+fn require_configured_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent: Option<&str>,
+) -> Result<(), JsonRpcError> {
+    let Some(alias) = agent.filter(|alias| !alias.trim().is_empty()) else {
+        return Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::Invalid,
+            "An agent is required",
+        ));
+    };
+    // The caller names the workspace with this same string, so it must be
+    // the configured spelling itself: a padded alias would pass a trimmed
+    // lookup and still name another directory.
+    if alias != alias.trim() {
+        return Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::Invalid,
+            format!("Agent {alias:?} must be named exactly as configured"),
+        ));
+    }
+    if config.agents.contains_key(alias) {
+        Ok(())
+    } else {
+        Err(refused(
+            INVALID_PARAMS,
+            RefusalReason::NotFound,
+            format!("Unknown agent {alias:?}"),
+        ))
+    }
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -18515,6 +18603,7 @@ mod tests {
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+                client_kind: None,
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
     }
@@ -18722,6 +18811,7 @@ mod tests {
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
         let response = rpc(
@@ -18795,6 +18885,7 @@ mod tests {
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                client_kind: None,
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
         for id in [1, 2] {
@@ -24257,10 +24348,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sops_run_withdraws_the_producer_key_when_its_driver_is_refused() {
         let sop_name = "refused";
+        // Owned, so `sops/run` starts it; the refused driver never runs it.
         let step = crate::sop::types::SopStep {
             number: 1,
             title: "Step one".to_string(),
             body: "Do the work".to_string(),
+            agent: Some("ops".to_string()),
             ..crate::sop::types::SopStep::default()
         };
         let handles = crate::sop::SopDriverHandles::default();
@@ -25965,6 +26058,7 @@ mod tests {
     fn personality_templates_use_requested_agent_name_before_config_exists() {
         let req = PersonalityTemplatesParams {
             agent: Some(" bob ".to_string()),
+            ..Default::default()
         };
         let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
 
@@ -25974,11 +26068,346 @@ mod tests {
 
     #[test]
     fn personality_templates_without_agent_stay_generic_and_memoryless() {
-        let req = PersonalityTemplatesParams { agent: None };
+        let req = PersonalityTemplatesParams::default();
         let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
 
         assert_eq!(ctx.agent, "ZeroClaw");
         assert!(!ctx.include_memory);
+    }
+
+    /// The editor's defaults: the agent's alias names it only when it is
+    /// configured, and memory follows the memory backend, not the request.
+    #[test]
+    fn personality_templates_editor_defaults_follow_the_dashboard_editor() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert("main".into(), Default::default());
+        let editor = |agent: Option<&str>| PersonalityTemplatesParams {
+            agent: agent.map(Into::into),
+            defaults: Some(PersonalityTemplateDefaults::Editor),
+            ..Default::default()
+        };
+
+        let configured = personality_template_context(&config, &editor(Some("main")));
+        assert_eq!(configured.agent, "main");
+        let unknown = personality_template_context(&config, &editor(Some("ghost")));
+        assert_eq!(unknown.agent, "ZeroClaw", "an unknown alias is not a name");
+        let backend_on = config.memory.backend.as_str() != "none";
+        assert_eq!(configured.include_memory, backend_on);
+
+        config.memory.backend = "none".into();
+        let no_memory = personality_template_context(&config, &editor(Some("main")));
+        assert!(!no_memory.include_memory);
+    }
+
+    #[test]
+    fn personality_templates_overrides_win_over_either_defaults() {
+        let config = zeroclaw_config::schema::Config::default();
+        for defaults in [
+            None,
+            Some(PersonalityTemplateDefaults::Quickstart),
+            Some(PersonalityTemplateDefaults::Editor),
+        ] {
+            let req = PersonalityTemplatesParams {
+                agent: Some("bob".into()),
+                agent_name: Some("Ada".into()),
+                user_name: Some("Lin".into()),
+                timezone: Some("Asia/Tokyo".into()),
+                communication_style: Some("terse".into()),
+                include_memory: Some(false),
+                defaults,
+                ..Default::default()
+            };
+            let ctx = personality_template_context(&config, &req);
+            assert_eq!(ctx.agent, "Ada", "{defaults:?}");
+            assert_eq!(ctx.user, "Lin", "{defaults:?}");
+            assert_eq!(ctx.timezone, "Asia/Tokyo", "{defaults:?}");
+            assert_eq!(ctx.communication_style, "terse", "{defaults:?}");
+            assert!(!ctx.include_memory, "{defaults:?}");
+        }
+    }
+
+    /// A roster for the personality methods: `ada` is an administrator,
+    /// `edith` may read and update personality files, `walt` may only update
+    /// them. One agent, `main`.
+    fn personality_roster(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.agents.insert("main".into(), Default::default());
+        for (profile, verbs) in [
+            ("editor", vec![Verb::Read, Verb::Update]),
+            ("writer", vec![Verb::Update]),
+        ] {
+            config.permission_profiles.insert(
+                profile.into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(Resource::Personality, verbs)]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        for (name, uid, profile) in [
+            ("ada", 5353u32, "admin"),
+            ("edith", 5151u32, "editor"),
+            ("walt", 5252u32, "writer"),
+        ] {
+            config.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec![profile.into()],
+                },
+            );
+        }
+        config
+    }
+
+    fn personality_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        RpcContext::for_live_test(config, sessions)
+    }
+
+    /// A connection authenticated as the roster user with `uid`, and the
+    /// frames it writes back.
+    async fn roster_connection(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid },
+            );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster principal authenticates");
+        (dispatcher, rx)
+    }
+
+    /// A stale write is refused with what is on disk now, in the error's
+    /// `data` as the client receives it, and that content goes only to a
+    /// caller allowed to read personality files.
+    #[tokio::test]
+    async fn a_stale_personality_write_carries_the_file_only_to_a_reader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let workspace = config.agent_workspace_dir("main");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        let ctx = personality_ctx(config);
+
+        for (uid, reader) in [(5151u32, true), (5252u32, false)] {
+            let (mut connection, mut frames) = roster_connection(&ctx, uid).await;
+            connection
+                .process_line_for_test(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "personality/put",
+                        "params": {
+                            "agent": "main",
+                            "filename": "SOUL.md",
+                            "content": "# Overwritten\n",
+                            "expected_mtime_ms": 1,
+                        },
+                    })
+                    .to_string(),
+                )
+                .await;
+            let frame: Value =
+                serde_json::from_str(&frames.recv().await.expect("a reply")).expect("a JSON frame");
+            let error = &frame["error"];
+            assert_eq!(error["code"], PRECONDITION_FAILED, "{frame}");
+            let data = &error["data"];
+            assert_eq!(data["reason"], "conflict", "{frame}");
+            assert_eq!(data["error"], "personality_disk_drift", "{frame}");
+            assert_eq!(data["filename"], "SOUL.md", "{frame}");
+            if reader {
+                assert_eq!(data["current_content"], "# Soul\n", "{frame}");
+                assert!(data["current_mtime_ms"].is_i64(), "{frame}");
+            } else {
+                assert!(data.get("current_content").is_none(), "{frame}");
+                assert!(data.get("current_mtime_ms").is_none(), "{frame}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("SOUL.md")).unwrap(),
+                "# Soul\n",
+                "the stale write changed nothing"
+            );
+        }
+    }
+
+    /// Asked for a bounded view, the core cuts the file before it is
+    /// serialized and says so; unasked, it returns the whole file.
+    #[tokio::test]
+    async fn a_personality_read_is_bounded_only_when_asked() {
+        use crate::agent::personality::MAX_FILE_CHARS;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let workspace = config.agent_workspace_dir("main");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Multi-byte characters, so a byte cut would land mid-character.
+        let long = "\u{e9}".repeat(MAX_FILE_CHARS + 10);
+        std::fs::write(workspace.join("IDENTITY.md"), &long).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "# Soul\n").unwrap();
+        let ctx = personality_ctx(config);
+        let (reader, _frames) = roster_connection(&ctx, 5151).await;
+        let read = |filename: &str, max_chars: Option<usize>| {
+            let mut params = json!({ "agent": "main", "filename": filename });
+            if let Some(max_chars) = max_chars {
+                params["max_chars"] = json!(max_chars);
+            }
+            reader
+                .handle_personality_get(&params)
+                .expect("an allowlisted file reads")
+        };
+
+        let whole = read("IDENTITY.md", None);
+        assert_eq!(whole["content"], long, "unasked, the whole file");
+        assert_eq!(whole["truncated"], true);
+
+        let bounded = read("IDENTITY.md", Some(MAX_FILE_CHARS));
+        assert_eq!(
+            bounded["content"],
+            "\u{e9}".repeat(MAX_FILE_CHARS),
+            "the first MAX_FILE_CHARS characters"
+        );
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["exists"], true);
+        assert_eq!(bounded["mtime_ms"], whole["mtime_ms"]);
+
+        let short = read("SOUL.md", Some(MAX_FILE_CHARS));
+        assert_eq!(short["content"], "# Soul\n");
+        assert_eq!(short["truncated"], false);
+    }
+
+    /// With `require_configured_agent`, an unknown agent is `not_found` and a
+    /// missing or padded alias is `invalid`, before any workspace is made. A
+    /// scoped principal is refused an unknown agent earlier, by the agent
+    /// selector, with no reason: that refusal does not tell it which agents
+    /// exist.
+    #[tokio::test]
+    async fn a_configured_agent_is_required_as_spelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = personality_roster(&tmp);
+        let probe = config.clone();
+        let ctx = personality_ctx(config);
+        let (admin, _frames) = roster_connection(&ctx, 5353).await;
+        for (agent, reason) in [
+            ("ghost", "not_found"),
+            (" main ", "invalid"),
+            ("", "invalid"),
+        ] {
+            let error = admin
+                .handle_personality_put(&json!({
+                    "agent": agent,
+                    "filename": "SOUL.md",
+                    "content": "x",
+                    "require_configured_agent": true,
+                }))
+                .expect_err("only a configured agent, as spelled, is written for");
+            assert_eq!(error.code, INVALID_PARAMS, "{agent:?}");
+            assert_eq!(
+                zeroclaw_rpc_proto::error_reasons::RefusalReason::of(&error)
+                    .map(|reason| reason.as_str()),
+                Some(reason),
+                "{agent:?}: {error:?}"
+            );
+            assert!(
+                !probe.agent_workspace_dir(agent).join("SOUL.md").exists(),
+                "{agent:?}: nothing was written"
+            );
+        }
+        admin
+            .handle_personality_put(&json!({
+                "agent": "main",
+                "filename": "SOUL.md",
+                "content": "x",
+                "require_configured_agent": true,
+            }))
+            .expect("the configured agent is written for");
+
+        let (scoped, _frames) = roster_connection(&ctx, 5151).await;
+        let error = scoped
+            .handle_personality_put(&json!({
+                "agent": "ghost",
+                "filename": "SOUL.md",
+                "content": "x",
+                "require_configured_agent": true,
+            }))
+            .expect_err("a scoped principal names no unconfigured agent");
+        assert_eq!(error.code, FORBIDDEN);
+        assert_eq!(
+            zeroclaw_rpc_proto::error_reasons::RefusalReason::of(&error),
+            None
+        );
+    }
+
+    /// `skills/delete {purge}` removes the skill; without it the skill is
+    /// archived, as before.
+    #[tokio::test]
+    async fn skills_delete_purges_only_when_asked() {
+        use crate::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = personality_roster(&tmp);
+        let bundles: zeroclaw_config::schema::Config =
+            toml::from_str("[skill_bundles.team]\n").expect("a skill bundle");
+        config.skill_bundles = bundles.skill_bundles;
+        let service = SkillsService::new(&config, config.install_root_dir());
+        for name in ["purged", "archived"] {
+            let target = service.resolve_ref(name, Some("team")).unwrap();
+            service
+                .scaffold_skill(
+                    &target,
+                    SkillFrontmatter {
+                        name: name.into(),
+                        description: "stub".into(),
+                        ..Default::default()
+                    },
+                    ScaffoldOptions::default(),
+                )
+                .unwrap();
+        }
+        let shared = config.install_root_dir().join("shared/skills");
+        let ctx = personality_ctx(config);
+        let (editor, _frames) = roster_connection(&ctx, 5151).await;
+        for (name, purge) in [("purged", true), ("archived", false)] {
+            editor
+                .handle_skills_delete(&json!({ "bundle": "team", "name": name, "purge": purge }))
+                .expect("the skill is deleted");
+            assert!(
+                !shared.join("team").join(name).exists(),
+                "{name} left the bundle"
+            );
+            let archived = std::fs::read_dir(shared.join("_deleted")).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().contains(name))
+            });
+            assert_eq!(archived, !purge, "{name}");
+        }
     }
 
     #[test]
@@ -27053,6 +27482,7 @@ mod tests {
             commands: vec![],
             auth_methods: Vec::new(),
             principal_id: None,
+            features: Vec::new(),
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -27247,6 +27677,59 @@ mod tests {
         assert!(!dispatcher.client_elicitation_caps.url);
     }
 
+    /// `tui/list` labels a connection that declared itself a gateway on
+    /// `initialize`, and only that kind: a terminal, or a kind the core does
+    /// not know, is listed without a label.
+    #[tokio::test]
+    async fn tui_list_labels_only_a_declared_gateway_connection() {
+        let (lister, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&lister.ctx);
+        let mut registered = std::collections::HashMap::new();
+        for (peer, capabilities) in [
+            (
+                "unix:gateway",
+                serde_json::json!({ "client_kind": CLIENT_KIND_GATEWAY }),
+            ),
+            (
+                "unix:terminal",
+                serde_json::json!({ "elicitation": { "form": {} } }),
+            ),
+            (
+                "unix:unknown",
+                serde_json::json!({ "client_kind": "relay" }),
+            ),
+        ] {
+            let (writer_tx, _writer_rx) = mpsc::channel(8);
+            let mut client = RpcDispatcher::new(Arc::clone(&ctx), writer_tx, peer.to_string());
+            client
+                .handle_initialize(&serde_json::json!({
+                    "protocol_version": RPC_PROTOCOL_VERSION,
+                    "clientCapabilities": capabilities,
+                }))
+                .await
+                .expect(peer);
+            let (id, _) = client.tui_registration().expect("registered");
+            registered.insert(id.to_string(), peer);
+        }
+
+        let listed: TuiListResult =
+            serde_json::from_value(lister.handle_tui_list().expect("tui/list")).unwrap();
+        let kinds: std::collections::HashMap<&str, Option<&str>> = listed
+            .tuis
+            .iter()
+            .map(|tui| (registered[&tui.tui_id], tui.client_kind.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashMap::from([
+                ("unix:gateway", Some(CLIENT_KIND_GATEWAY)),
+                ("unix:terminal", None),
+                ("unix:unknown", None),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn remote_initialize_fails_closed_without_identity_signing() {
         let (dispatcher, _sessions) =
@@ -27291,6 +27774,33 @@ mod tests {
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
                 {"id": "model", "name": "model"}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_every_feature_this_core_supports() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["features"], serde_json::json!(ADVERTISED_FEATURES));
+        for name in ADVERTISED_FEATURES {
+            assert!(
+                zeroclaw_rpc_proto::feature::KNOWN.contains(name),
+                "{name} is advertised but the protocol does not define it"
+            );
+        }
+        assert!(
+            result["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("tui.client_kind")),
+            "the core reports client_kind on tui/list: {result}"
         );
     }
 

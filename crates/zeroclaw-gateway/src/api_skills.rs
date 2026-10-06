@@ -18,6 +18,8 @@ use zeroclaw_runtime::skills::{
 
 use super::AppState;
 use super::api::require_auth;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
+use zeroclaw_rpc_client::Method;
 
 // ── HTTP-specific request shapes (not shared) ───────────────────────
 
@@ -77,7 +79,16 @@ pub async fn handle_slash_option_kinds(
 }
 
 /// `GET /api/skills/bundles`
-pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn handle_list_bundles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    access: CoreAccess,
+) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return list_bundles_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -106,8 +117,14 @@ pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderM
 pub async fn handle_list_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Path(alias): Path<String>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return list_skills_through_core(&core, &alias)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -249,8 +266,14 @@ pub async fn handle_create_skill(
 pub async fn handle_read_skill(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Path((alias, name)): Path<(String, String)>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return read_skill_through_core(&core, &alias, &name)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -278,9 +301,15 @@ pub async fn handle_read_skill(
 pub async fn handle_write_skill(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Path((alias, name)): Path<(String, String)>,
     Json(body): Json<SkillWriteBody>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return write_skill_through_core(&core, &alias, &name, &body)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -306,9 +335,15 @@ pub async fn handle_write_skill(
 pub async fn handle_delete_skill(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
     Path((alias, name)): Path<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<DeleteQuery>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return delete_skill_through_core(&core, &alias, &name, &q)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -329,6 +364,79 @@ pub async fn handle_delete_skill(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => service_error_response(e),
     }
+}
+
+// ── Through the core ────────────────────────────────────────────────
+//
+// Each route's body when the request reaches the core, shared by the
+// in-process handlers' `CoreAccess::Core` arm and the separate gateway. A
+// refusal keeps the gateway's generic mapping of the core's error code: the
+// core does not yet say which skills failure it was.
+
+/// `GET /api/skills/bundles` through the core.
+pub(crate) async fn list_bundles_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let bundles = core
+        .request(Method::SkillsBundles, serde_json::json!({}))
+        .await?;
+    Ok(Json(bundles).into_response())
+}
+
+/// `GET /api/skills/bundles/:alias/skills` through the core.
+pub(crate) async fn list_skills_through_core(
+    core: &CoreCall,
+    alias: &str,
+) -> Result<Response, CoreError> {
+    let skills = core
+        .request(Method::SkillsList, serde_json::json!({ "bundle": alias }))
+        .await?;
+    Ok(Json(skills).into_response())
+}
+
+/// `GET /api/skills/bundles/:alias/skills/:name` through the core.
+pub(crate) async fn read_skill_through_core(
+    core: &CoreCall,
+    alias: &str,
+    name: &str,
+) -> Result<Response, CoreError> {
+    let skill = core
+        .request(
+            Method::SkillsRead,
+            serde_json::json!({ "bundle": alias, "name": name }),
+        )
+        .await?;
+    Ok(Json(skill).into_response())
+}
+
+/// `PUT /api/skills/bundles/:alias/skills/:name` through the core.
+pub(crate) async fn write_skill_through_core(
+    core: &CoreCall,
+    alias: &str,
+    name: &str,
+    body: &SkillWriteBody,
+) -> Result<Response, CoreError> {
+    let params = serde_json::json!({
+        "bundle": alias,
+        "name": name,
+        "frontmatter": body.frontmatter,
+        "body": body.body,
+    });
+    core.request(Method::SkillsWrite, params).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `DELETE /api/skills/bundles/:alias/skills/:name` through the core.
+pub(crate) async fn delete_skill_through_core(
+    core: &CoreCall,
+    alias: &str,
+    name: &str,
+    q: &DeleteQuery,
+) -> Result<Response, CoreError> {
+    if q.purge {
+        core.require_feature(zeroclaw_rpc_proto::feature::SKILLS_DELETE_PURGE)?;
+    }
+    let params = serde_json::json!({ "bundle": alias, "name": name, "purge": q.purge });
+    core.request(Method::SkillsDelete, params).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ── Error mapping ───────────────────────────────────────────────────

@@ -832,19 +832,30 @@ fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Project the live run state for `run_id` onto `sop`'s graph. Errors if
-/// the run is unknown or the engine lock is poisoned.
+/// Why a run accessor below failed. It travels inside the `anyhow::Error`
+/// they return, so a caller tells a missing run from a poisoned engine with
+/// `downcast_ref` rather than by reading the message.
+#[derive(Debug, thiserror::Error)]
+pub enum RunLookupError {
+    /// The engine lock is poisoned.
+    #[error("SOP engine lock poisoned")]
+    Poisoned,
+    /// The engine holds no run with this id, active or retained.
+    #[error("run '{0}' not found")]
+    NotFound(String),
+}
+
+/// Project the live run state for `run_id` onto `sop`'s graph. Errors with a
+/// [`RunLookupError`] if the run is unknown or the engine lock is poisoned.
 pub fn run_overlay_for(
     sop: &Sop,
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
 ) -> Result<RunOverlay> {
-    let guard = engine
-        .lock()
-        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let guard = engine.lock().map_err(|_| RunLookupError::Poisoned)?;
     let run = guard
         .get_run(run_id)
-        .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))?;
+        .ok_or_else(|| RunLookupError::NotFound(run_id.to_owned()))?;
     let graph = SopGraph::from_sop(sop);
     Ok(RunOverlay::project(&graph, run))
 }
@@ -857,15 +868,13 @@ pub fn run_detail_for(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
 ) -> Result<(crate::sop::types::SopRun, bool)> {
-    let guard = engine
-        .lock()
-        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let guard = engine.lock().map_err(|_| RunLookupError::Poisoned)?;
     let active = guard.active_runs().contains_key(run_id);
-    guard
+    let run = guard
         .get_run(run_id)
         .cloned()
-        .map(|run| (run, active))
-        .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))
+        .ok_or_else(|| RunLookupError::NotFound(run_id.to_owned()))?;
+    Ok((run, active))
 }
 
 /// Enumerate every run the engine holds (active + retained terminal),
@@ -2177,6 +2186,13 @@ mod tests {
         let err =
             run_detail_for(&engine, "run-does-not-exist").expect_err("unknown id must not resolve");
         assert!(err.to_string().contains("not found"), "{err}");
+        assert!(
+            matches!(
+                err.downcast_ref::<RunLookupError>(),
+                Some(RunLookupError::NotFound(id)) if id == "run-does-not-exist"
+            ),
+            "a missing run is typed, not only worded: {err:?}"
+        );
     }
 
     use serde_json::json;
