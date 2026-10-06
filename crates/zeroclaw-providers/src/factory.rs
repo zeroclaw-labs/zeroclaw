@@ -572,14 +572,14 @@ use zeroclaw_config::schema::{
     MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
     NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
     NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OpperModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -654,6 +654,12 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for OpperModelProviderConfig {
+    const DISPLAY: &'static str = "Opper";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::OpperEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("opper");
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
     const DISPLAY: &'static str = "ZeroRouter";
@@ -2457,6 +2463,16 @@ mod tests {
         assert_eq!(
             get_default_url("atlascloud"),
             Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    fn opper_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, OpperEndpoint};
+        assert_eq!(
+            <OpperModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            OpperEndpoint::default().uri(),
+            "schema OpperEndpoint and factory DEFAULT_URL disagree"
         );
     }
 
