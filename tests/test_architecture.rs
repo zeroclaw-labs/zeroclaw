@@ -30,5 +30,8 @@ mod ci_runner_labels;
 #[path = "architecture/auth_boundary.rs"]
 mod auth_boundary;
 
+#[path = "architecture/pairing_state_load.rs"]
+mod pairing_state_load;
+
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;

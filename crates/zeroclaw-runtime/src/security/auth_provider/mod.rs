@@ -273,9 +273,13 @@ fn bind_provenance(provider: &dyn AuthProvider, outcome: AuthOutcome) -> AuthOut
         return outcome;
     };
     let method_ok = identity.method == provider.method();
+    // Native and peercred reach a roster subject only through explicit
+    // operator configuration: a pairing token bound when its code was
+    // minted, or a `[users.<name>].uid` entry.
     let subject_ok = matches!(
         (identity.method, &identity.subject),
         (AuthMethod::Native, IdentitySubject::SharedOperator)
+            | (AuthMethod::Native, IdentitySubject::Roster { .. })
             | (AuthMethod::Peercred, IdentitySubject::SharedOperator)
             | (AuthMethod::Peercred, IdentitySubject::Roster { .. })
             | (AuthMethod::Oidc, IdentitySubject::Oidc { .. })
@@ -557,6 +561,75 @@ mod tests {
                 reason: DenyReason::Misconfigured
             }
         ));
+    }
+
+    /// A native-method provider returning a fixed identity for any bearer,
+    /// to pin which subjects the registry lets the native method carry.
+    struct NativeReturning {
+        identity: AuthenticatedIdentity,
+    }
+
+    #[async_trait]
+    impl AuthProvider for NativeReturning {
+        fn name(&self) -> &str {
+            "native"
+        }
+        fn method(&self) -> AuthMethod {
+            AuthMethod::Native
+        }
+        fn accepts(&self, credential: &Credential) -> bool {
+            matches!(credential, Credential::Bearer(_))
+        }
+        async fn verify(&self, _credential: &Credential) -> AuthOutcome {
+            AuthOutcome::Verified(self.identity.clone())
+        }
+    }
+
+    async fn native_outcome(identity: AuthenticatedIdentity) -> AuthOutcome {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(NativeReturning { identity }))
+            .unwrap();
+        reg.resolve_named("native", &bearer("x")).await
+    }
+
+    #[tokio::test]
+    async fn provenance_accepts_a_roster_bound_native_identity() {
+        let out = native_outcome(AuthenticatedIdentity::new(
+            IdentitySubject::Roster {
+                principal_id: "alice".into(),
+            },
+            AuthMethod::Native,
+        ))
+        .await;
+        assert!(
+            out.is_allowed(),
+            "a roster-bound pairing token is a sanctioned native identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_an_oidc_subject_from_the_native_provider() {
+        for subject in [
+            IdentitySubject::Oidc {
+                issuer: "https://sso".into(),
+                subject: "s".into(),
+            },
+            IdentitySubject::Service {
+                issuer: "https://sso".into(),
+                client_id: "c".into(),
+            },
+        ] {
+            let out = native_outcome(AuthenticatedIdentity::new(subject, AuthMethod::Native)).await;
+            assert!(
+                matches!(
+                    out,
+                    AuthOutcome::Denied {
+                        reason: DenyReason::Misconfigured
+                    }
+                ),
+                "a native provider must never mint an OIDC or service identity"
+            );
+        }
     }
 
     fn bearer(token: &str) -> Credential {

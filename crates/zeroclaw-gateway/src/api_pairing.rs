@@ -401,8 +401,12 @@ pub async fn submit_pairing_enhanced(
             .into_response();
     }
 
-    match state.pairing.try_pair(code, &client_id).await {
-        Ok(Some(token)) => {
+    match state.pairing.reserve_pair(code, &client_id).await {
+        Ok(Some(reservation)) => {
+            // The subject comes from the code the operator minted; the
+            // client redeeming it cannot choose or drop it.
+            let principal_id = super::paired_principal_id(reservation.subject());
+            let token = reservation.commit();
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
@@ -472,6 +476,7 @@ pub async fn submit_pairing_enhanced(
                 "paired": true,
                 "persisted": true,
                 "token": token,
+                "principal_id": principal_id,
                 "message": "Pairing successful"
             }))
             .into_response()
@@ -672,7 +677,7 @@ pub async fn rotate_token(
         }
     };
 
-    state.pairing.revoke_token_hash(&token_hash);
+    let revoked = state.pairing.revoke_token_hash_subject(&token_hash);
 
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
@@ -691,22 +696,75 @@ pub async fn rotate_token(
             .into_response();
     }
 
+    // The replacement pairs as the revoked token did, or not at all: an
+    // unbound code would hand a roster user's device operator authority.
+    let replacement = super::rotation_replacement_subject(&state.config.read().users, revoked);
+    let subject = match replacement {
+        Ok(subject) => subject,
+        Err(withheld) => {
+            let outcome = match withheld {
+                super::ReplacementWithheld::TokenNotPaired => {
+                    "Device removed; its token was already revoked."
+                }
+                super::ReplacementWithheld::RosterEntryRemoved { .. } => "Old token revoked.",
+            };
+            return Json(serde_json::json!({
+                "device_id": device_id,
+                "pairing_code": null,
+                "message": format!("{outcome} {}", withheld.message()),
+            }))
+            .into_response();
+        }
+    };
+    let principal_id = super::paired_principal_id(&subject);
+
     // Issue the new pairing code atomically against the slot. If another
     // flow holds the slot, the revoke still stands — return 200 with
     // `pairing_code: null` and a message that tells the operator what
     // happened so they do not assume rotation failed.
-    match state.pairing.generate_pairing_code_if_vacant(crate::live_pairing_code_policy(&state)) {
+    match state.pairing.generate_pairing_code_if_vacant_as(
+        crate::live_pairing_code_policy(&state),
+        subject.clone(),
+    ) {
         Ok(code) => Json(serde_json::json!({
             "device_id": device_id,
             "pairing_code": code,
+            "principal_id": principal_id,
             "message": "Old token revoked. Use this code to re-pair the device.",
         }))
         .into_response(),
         Err(zeroclaw_config::pairing::GeneratePairingCodeError::Pending) => {
+            // Reusing the pending code is right only when it pairs as this
+            // device did; otherwise it would re-pair the device as someone
+            // else, possibly as the shared operator. Calling this route again
+            // cannot help either: the device row is already gone.
+            let pending = state
+                .pairing
+                .pending_pairing_code()
+                .map(|(_, pending)| pending);
+            let mint = super::mint_command_for(&state.config.read().users, &subject);
+            let message = match &pending {
+                Some(pending) if *pending == subject => format!(
+                    "Old token revoked. A pairing code that pairs as {principal_id} is already \
+                     pending; use it, or on the gateway host run `{mint}` for a fresh one."
+                ),
+                Some(pending) => format!(
+                    "Old token revoked. The pending pairing code pairs as {}, not as this \
+                     device's {principal_id}, so it cannot re-pair this device. On the gateway \
+                     host, run `{mint}` to replace it with one that does.",
+                    super::paired_principal_id(pending)
+                ),
+                None => format!(
+                    "Old token revoked. A pending pairing code has just cleared. On the gateway \
+                     host, run `{mint}` to mint a replacement."
+                ),
+            };
             Json(serde_json::json!({
                 "device_id": device_id,
                 "pairing_code": null,
-                "message": "Old token revoked. A pairing code is already pending; use it or call again after it clears.",
+                "principal_id": principal_id,
+                "pending_principal_id": pending.as_ref().map(super::paired_principal_id),
+                "message": message,
             }))
             .into_response()
         }

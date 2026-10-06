@@ -166,8 +166,8 @@ use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
-    GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, constant_time_eq,
-    gateway_admin_token_path, is_public_bind,
+    GATEWAY_ADMIN_TOKEN_HEADER, PairedTokenSubject, PairingCodePolicy, PairingGuard,
+    constant_time_eq, gateway_admin_token_path, is_public_bind,
 };
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -1713,13 +1713,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     // is resolved from config in exactly one guard: startup pairing,
     // `gateway get-paircode --new`, the dashboard pairing flow, and
     // rotate-device all issue through it.
-    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
-        PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            config.gateway.pairing_code,
-        )
-    }));
+    let pairing = Arc::new(
+        shared_pairing.unwrap_or_else(|| PairingGuard::from_gateway_config(&config.gateway)),
+    );
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -1881,7 +1877,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "gateway admin token could not be written; pairing-code admin routes will refuse all callers"
         );
     }
-    if let Some(code) = pairing.pairing_code() {
+    if let Some((code, subject)) = pairing.pending_pairing_code() {
         // The box is sized from the code, not from a literal: since the policy became config-driven,
         // the code length is operator-configurable (6..=128 chars).
         let rule = "─".repeat(code.chars().count() + 4);
@@ -1891,6 +1887,18 @@ pub async fn run_gateway_with_plugin_webhooks(
         println!("     │  {code}  │");
         println!("     └{rule}┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
+        // A code minted for a roster user outlives a supervised gateway
+        // restart on the daemon's guard; say whose it is.
+        if subject != PairedTokenSubject::SharedOperator {
+            let principal = paired_principal_id(&subject);
+            println!(
+                "   {}",
+                i18n::get_required_cli_string_with_args(
+                    "cli-pairing-bound-user",
+                    &[("principal", principal.as_str())]
+                )
+            );
+        }
     } else if pairing.require_pairing() {
         for line in already_paired_pairing_notice(host, actual_port, pfx, &admin_token_path) {
             println!("{line}");
@@ -1991,7 +1999,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
-        // set itself stays owned by `PairingGuard`/`gateway.paired_tokens`.
+        // set itself stays owned by `PairingGuard` and its persisted form,
+        // `gateway.paired_tokens` plus `gateway.paired_token_users`.
         match registry.reconcile_from_token_hashes(&pairing.tokens()) {
             Ok(0) => {}
             Ok(n) => ::zeroclaw_log::record!(
@@ -2777,11 +2786,16 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code, &rate_key).await {
-        Ok(Some(token)) => {
+    match state.pairing.reserve_pair(code, &rate_key).await {
+        Ok(Some(reservation)) => {
+            // The subject comes from the code the operator minted; the
+            // client redeeming it cannot choose or drop it.
+            let principal_id = paired_principal_id(reservation.subject());
+            let token = reservation.commit();
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "principal_id": principal_id })),
                 "new client paired successfully"
             );
             let token_hash = PairingGuard::token_hash(&token);
@@ -2843,6 +2857,7 @@ async fn handle_pair(
                 "paired": true,
                 "persisted": true,
                 "token": token,
+                "principal_id": principal_id,
                 "message": "Save this token — use it as Authorization: Bearer <token>"
             });
             (StatusCode::OK, Json(body))
@@ -2888,12 +2903,17 @@ pub(crate) async fn persist_pairing_tokens(
         config_write_lock.try_lock().is_err(),
         "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
     );
-    let paired_tokens = pairing.tokens();
+    let persisted = pairing.persisted_tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.read().clone() };
-    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg.gateway.paired_tokens = persisted.paired_tokens;
+    updated_cfg.gateway.paired_token_users = persisted.paired_token_users;
+    // Both fields, in one save, every time: roster-bound tokens live only in
+    // `paired_token_users`, so skipping it would leave a new bound token
+    // unsaved, or a revoked one still on disk to come back at restart.
     updated_cfg.mark_dirty("gateway.paired_tokens");
+    updated_cfg.mark_dirty("gateway.paired_token_users");
     updated_cfg
         .save_dirty()
         .await
@@ -4946,13 +4966,16 @@ async fn handle_admin_paircode(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
     require_gateway_admin_token(&state, &headers)?;
-    let code = state.pairing.pairing_code();
+    let pending = state.pairing.pending_pairing_code();
 
-    let body = if let Some(c) = code {
+    let body = if let Some((c, subject)) = pending {
+        // Name who the code pairs as, so a code bound to one roster user is
+        // not handed to someone else by mistake.
         serde_json::json!({
             "success": true,
             "pairing_required": state.pairing.require_pairing(),
             "pairing_code": c,
+            "principal_id": paired_principal_id(&subject),
             "message": "Use this one-time code to pair"
         })
     } else {
@@ -4982,10 +5005,114 @@ pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
     state.config.read().gateway.pairing_code
 }
 
+/// The canonical principal id a token paired under `subject` authenticates
+/// as (`shared-operator` or `user:<id>`), derived exactly as the native auth
+/// provider derives it, for pairing responses and logs.
+pub(crate) fn paired_principal_id(subject: &PairedTokenSubject) -> String {
+    zeroclaw_runtime::security::auth_provider::native::identity_for_subject(subject.clone())
+        .subject
+        .principal_id()
+        .as_str()
+        .to_owned()
+}
+
+/// Why a device rotation revoked the old token but issued no replacement
+/// code. A replacement carries the revoked token's own subject. Where that
+/// cannot be honoured, an unbound code would hand the device's roster user
+/// the shared operator's authority, so none is issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplacementWithheld {
+    /// The device's token was no longer paired, so its binding is unknown.
+    TokenNotPaired,
+    /// The token was bound to a roster principal the roster no longer has.
+    RosterEntryRemoved { principal_id: String },
+}
+
+impl ReplacementWithheld {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::TokenNotPaired => "The user its token was bound to, if any, is unknown, so \
+                no replacement code was issued. Mint one with `zeroclaw gateway get-paircode \
+                --new`, adding `--user <name>` for a roster user."
+                .to_string(),
+            Self::RosterEntryRemoved { principal_id } => format!(
+                "It was bound to {}, which no longer has a [users] entry, so no replacement \
+                 code was issued.",
+                paired_principal_id(&PairedTokenSubject::RosterUser {
+                    principal_id: principal_id.clone(),
+                })
+            ),
+        }
+    }
+}
+
+/// The gateway-host command that mints a code pairing as `subject`, for
+/// replies that cannot issue one themselves. A roster subject is named by its
+/// current `[users]` entry, or a placeholder when the roster has none.
+pub(crate) fn mint_command_for(
+    users: &HashMap<String, zeroclaw_config::schema::UserConfig>,
+    subject: &PairedTokenSubject,
+) -> String {
+    match subject.roster_principal_id() {
+        None => "zeroclaw gateway get-paircode --new".to_string(),
+        Some(principal_id) => {
+            let name = users
+                .iter()
+                .find(|(name, user)| user.effective_principal_id(name) == principal_id)
+                .map_or("<name>", |(name, _)| name.as_str());
+            format!("zeroclaw gateway get-paircode --new --user {name}")
+        }
+    }
+}
+
+/// The subject a device rotation's replacement code carries: the revoked
+/// token's own, so rotating a roster user's device never widens it.
+/// `revoked` is what the revocation removed, `None` when the token was
+/// already gone.
+pub(crate) fn rotation_replacement_subject(
+    users: &HashMap<String, zeroclaw_config::schema::UserConfig>,
+    revoked: Option<PairedTokenSubject>,
+) -> Result<PairedTokenSubject, ReplacementWithheld> {
+    match revoked {
+        None => Err(ReplacementWithheld::TokenNotPaired),
+        Some(PairedTokenSubject::SharedOperator) => Ok(PairedTokenSubject::SharedOperator),
+        Some(PairedTokenSubject::RosterUser { principal_id }) => {
+            if users
+                .iter()
+                .any(|(name, user)| user.effective_principal_id(name) == principal_id)
+            {
+                Ok(PairedTokenSubject::RosterUser { principal_id })
+            } else {
+                Err(ReplacementWithheld::RosterEntryRemoved { principal_id })
+            }
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
     pub rotate: Option<String>,
+    /// Bind the new code to this `[users.<name>]` entry: the device that
+    /// redeems it authenticates as that roster user, not the shared operator.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// A refused admin pairing-code request that changed nothing.
+fn admin_paircode_refusal(
+    status: StatusCode,
+    message: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "pairing_required": true,
+            "pairing_code": null,
+            "message": message,
+        })),
+    )
 }
 
 async fn handle_admin_paircode_new(
@@ -5013,7 +5140,43 @@ async fn handle_admin_paircode_new(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let revocation_message = match rotate {
+    // Resolve the requested binding before anything is revoked or minted, so
+    // a request that names no valid user changes nothing. A present but
+    // blank `user` is refused rather than read as "no user": the operator
+    // asked for a bound code and must not silently get an unbound one.
+    let user = params.user.as_deref().map(str::trim);
+    if user.is_some() && rotate.is_some() {
+        return Ok(admin_paircode_refusal(
+            StatusCode::BAD_REQUEST,
+            "`user` mints a new code for a roster user and cannot be combined with `rotate`."
+                .to_string(),
+        ));
+    }
+    let requested_subject = match user {
+        None => PairedTokenSubject::SharedOperator,
+        Some("") => {
+            return Ok(admin_paircode_refusal(
+                StatusCode::BAD_REQUEST,
+                "`user` must name a [users.<name>] entry.".to_string(),
+            ));
+        }
+        Some(name) => {
+            let subject = PairedTokenSubject::for_roster_entry(&state.config.read().users, name);
+            match subject {
+                Some(subject) => subject,
+                None => {
+                    return Ok(admin_paircode_refusal(
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "No [users.{name}] entry is configured; no pairing code was minted."
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+
+    let (revocation_message, subject) = match rotate {
         Some("all") => {
             let revoked = state.pairing.revoke_all_tokens();
             if let Some(registry) = state.device_registry.as_ref() {
@@ -5048,9 +5211,13 @@ async fn handle_admin_paircode_new(
                     .with_attrs(::serde_json::json!({"revoked": revoked})),
                 "all paired tokens revoked via admin endpoint"
             );
-            Some(format!(
-                "Revoked all {revoked} paired token(s) and cleared the device registry."
-            ))
+            // The operator's own reset: the replacement is unbound, as before.
+            (
+                Some(format!(
+                    "Revoked all {revoked} paired token(s) and cleared the device registry."
+                )),
+                PairedTokenSubject::SharedOperator,
+            )
         }
         Some(device_id) => {
             let Some(registry) = state.device_registry.as_ref() else {
@@ -5083,7 +5250,7 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             };
-            state.pairing.revoke_token_hash(&token_hash);
+            let revoked = state.pairing.revoke_token_hash_subject(&token_hash);
             if let Err(e) = persist_pairing_tokens(
                 state.config.clone(),
                 &state.pairing,
@@ -5104,38 +5271,70 @@ async fn handle_admin_paircode_new(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "single device token revoked via admin endpoint"
             );
-            Some(format!(
-                "Revoked the bearer token for device '{device_id}'."
-            ))
+            let revoked_message = if revoked.is_some() {
+                format!("Revoked the bearer token for device '{device_id}'.")
+            } else {
+                format!(
+                    "Removed device '{device_id}' from the registry; its bearer token was \
+                     already revoked."
+                )
+            };
+            // The replacement pairs as the revoked token did, or not at all.
+            let replacement = rotation_replacement_subject(&state.config.read().users, revoked);
+            match replacement {
+                Ok(subject) => (Some(revoked_message), subject),
+                Err(withheld) => {
+                    let body = serde_json::json!({
+                        "success": true,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("{revoked_message} {}", withheld.message()),
+                    });
+                    return Ok((StatusCode::OK, Json(body)));
+                }
+            }
         }
-        None => None,
+        None => (None, requested_subject),
     };
 
+    let principal_id = paired_principal_id(&subject);
+    let bound = subject != PairedTokenSubject::SharedOperator;
     let code = state
         .pairing
-        .generate_new_pairing_code(live_pairing_code_policy(&state))
+        .generate_new_pairing_code_as(live_pairing_code_policy(&state), subject)
         .expect("require_pairing checked above");
     if rotate.is_none() {
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "principal_id": principal_id })),
             "new pairing code generated via admin endpoint"
         );
     }
 
-    let message = match revocation_message {
-        Some(revoked) => {
-            format!("{revoked} Use this one-time code to re-pair.")
-        }
-        None => "New pairing code generated — use this one-time code to pair".to_string(),
+    let message = match (revocation_message, bound) {
+        (Some(revoked), false) => format!("{revoked} Use this one-time code to re-pair."),
+        (Some(revoked), true) => format!(
+            "{revoked} Use this one-time code to re-pair; the device again authenticates as \
+             {principal_id}."
+        ),
+        (None, false) => "New pairing code generated — use this one-time code to pair".to_string(),
+        (None, true) => format!(
+            "New pairing code generated for {principal_id} — the device that redeems it \
+             authenticates as that roster user"
+        ),
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "success": true,
         "pairing_required": true,
         "pairing_code": code,
+        "principal_id": principal_id,
         "message": message,
     });
+    if let Some(name) = user {
+        body["user"] = serde_json::Value::String(name.to_string());
+    }
     Ok((StatusCode::OK, Json(body)))
 }
 
@@ -6085,6 +6284,7 @@ path = "{trigger_path}"
                 admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
+                    user: None,
                 }),
             )
             .await,
@@ -6125,6 +6325,7 @@ path = "{trigger_path}"
                 admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
+                    user: None,
                 }),
             )
             .await,
@@ -6162,6 +6363,7 @@ path = "{trigger_path}"
                 admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
+                    user: None,
                 }),
             )
             .await,
@@ -6187,6 +6389,7 @@ path = "{trigger_path}"
                 admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
+                    user: None,
                 }),
             )
             .await,
@@ -6219,6 +6422,547 @@ path = "{trigger_path}"
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    // ── Roster-bound pairing tokens ─────────────────────────
+
+    /// `admin_paircode_state` with a `[users.alice]` roster entry holding a
+    /// Sessions:Read profile. The config file already exists on disk, as it
+    /// does for a running gateway, so every pairing persist takes the
+    /// incremental save path that only writes the fields it marks dirty.
+    fn roster_paircode_state(tmp: &tempfile::TempDir) -> AppState {
+        let state = admin_paircode_state(tmp, true, true);
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                "schema_version = {}\n",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("seed config file");
+        {
+            let mut config = state.config.write();
+            config.permission_profiles.insert(
+                "reader".into(),
+                zeroclaw_config::schema::PermissionProfileConfig {
+                    grants: HashMap::from([(
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    )]),
+                    ..zeroclaw_config::schema::PermissionProfileConfig::default()
+                },
+            );
+            config.users.insert(
+                "alice".into(),
+                zeroclaw_config::schema::UserConfig {
+                    principal_id: None,
+                    uid: Some(4242),
+                    permission_profiles: vec!["reader".into()],
+                },
+            );
+        }
+        state
+    }
+
+    fn alice() -> PairedTokenSubject {
+        PairedTokenSubject::RosterUser {
+            principal_id: "alice".into(),
+        }
+    }
+
+    fn user_query(name: &str) -> AdminPaircodeQuery {
+        AdminPaircodeQuery {
+            user: Some(name.into()),
+            ..AdminPaircodeQuery::default()
+        }
+    }
+
+    async fn mint_with(
+        state: &AppState,
+        query: AdminPaircodeQuery,
+    ) -> (StatusCode, serde_json::Value) {
+        admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(state),
+                Query(query),
+            )
+            .await,
+        )
+        .await
+    }
+
+    fn config_on_disk(tmp: &tempfile::TempDir) -> Config {
+        toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
+            .expect("persisted config parses")
+    }
+
+    /// Mint a code bound to `alice`, pair it, register the device the way
+    /// `pair_device` does, and persist the pairing state. Returns the
+    /// plaintext token.
+    async fn pair_bound_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code_as(live_pairing_code_policy(state), alice())
+            .expect("pairing enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .device_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                PairingGuard::token_hash(&token),
+                api_pairing::DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: chrono::Utc::now(),
+                    last_seen: chrono::Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
+        Box::pin(persist_pairing_tokens(
+            state.config.clone(),
+            &state.pairing,
+            state.config_write_lock.clone(),
+        ))
+        .await
+        .expect("persist the bound pairing");
+        token
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_binds_the_code_to_a_roster_user() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+
+        let (status, json) = mint_with(&state, user_query("alice")).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["user"], "alice");
+        assert_eq!(json["principal_id"], "user:alice");
+        let code = json["pairing_code"]
+            .as_str()
+            .expect("code issued")
+            .to_string();
+        assert_eq!(state.pairing.pending_pairing_code(), Some((code, alice())));
+
+        let (status, shown) = admin_paircode_response_json(
+            handle_admin_paircode(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            shown["principal_id"], "user:alice",
+            "showing a pending code names who it pairs as"
+        );
+    }
+
+    /// The `user` binding arrives through axum's query parsing exactly as the
+    /// CLI sends it (`POST /admin/paircode/new?user=<name>`), not only
+    /// through a hand-built `AdminPaircodeQuery`.
+    #[tokio::test]
+    async fn admin_paircode_route_binds_the_user_named_in_the_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let app = Router::new()
+            .route("/admin/paircode/new", post(handle_admin_paircode_new))
+            .with_state(state.clone())
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([127, 0, 0, 1], 40_000)),
+            ));
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/paircode/new?user=alice")
+            .body(Body::empty())
+            .unwrap();
+        request.headers_mut().extend(admin_headers(&state));
+
+        let (status, json) = json_of(app.oneshot(request).await.unwrap().into_response()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["user"], "alice");
+        assert_eq!(json["principal_id"], "user:alice");
+        assert_eq!(
+            state
+                .pairing
+                .pending_pairing_code()
+                .map(|(_, subject)| subject),
+            Some(alice())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_rejects_an_unknown_user_and_mints_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let before = state.pairing.pending_pairing_code();
+        assert!(before.is_some(), "a fresh guard holds its startup code");
+
+        let (status, json) = mint_with(&state, user_query("mallory")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["success"], false);
+        assert!(json["pairing_code"].is_null());
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            before,
+            "an unknown user must leave the pending code untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_refuses_user_with_rotate_or_blank_user() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, _) = mint_with(
+            &state,
+            AdminPaircodeQuery {
+                rotate: Some("all".into()),
+                user: Some("alice".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "a refused request must revoke nothing"
+        );
+
+        let (status, _) = mint_with(&state, user_query("  ")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a blank user must not silently mint an unbound code"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_a_bound_code_persists_token_and_binding_together() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let (_, minted) = mint_with(&state, user_query("alice")).await;
+        let code = minted["pairing_code"].as_str().unwrap().to_string();
+
+        let (status, json) = pair_with(&state, &code).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["principal_id"], "user:alice");
+        let token = json["token"].as_str().expect("token issued").to_string();
+        let hash = PairingGuard::token_hash(&token);
+
+        {
+            let config = state.config.read();
+            assert_eq!(
+                config
+                    .gateway
+                    .paired_token_users
+                    .get(&hash)
+                    .map(String::as_str),
+                Some("alice")
+            );
+            assert!(
+                !config.gateway.paired_tokens.contains(&hash),
+                "a bound token is never also stored as a shared-operator token"
+            );
+        }
+        let on_disk = config_on_disk(&tmp);
+        assert_eq!(
+            on_disk
+                .gateway
+                .paired_token_users
+                .get(&hash)
+                .map(String::as_str),
+            Some("alice"),
+            "the binding is on disk after the same save that persisted the token"
+        );
+
+        // A restart rebuilds the guard from what was saved.
+        let restarted = PairingGuard::from_gateway_config(&on_disk.gateway);
+        assert_eq!(restarted.subject_for_token(&token), Some(alice()));
+
+        assert!(
+            !state.pairing.is_authenticated(&token),
+            "operator-authority routes refuse the bound token"
+        );
+        for response in [
+            api_pairing::list_devices(State(state.clone()), bearer(&token))
+                .await
+                .into_response(),
+            api_pairing::initiate_pairing(State(state.clone()), bearer(&token))
+                .await
+                .into_response(),
+        ] {
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a bound token must not list devices or mint codes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enhanced_pairing_reports_and_persists_the_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let (_, minted) = mint_with(&state, user_query("alice")).await;
+        let code = minted["pairing_code"].as_str().unwrap().to_string();
+
+        let (status, json) = json_of(
+            api_pairing::submit_pairing_enhanced(
+                State(state.clone()),
+                test_connect_info(),
+                HeaderMap::new(),
+                Json(serde_json::json!({ "code": code, "device_name": "phone" })),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["principal_id"], "user:alice");
+        let hash = PairingGuard::token_hash(json["token"].as_str().unwrap());
+        assert_eq!(
+            state
+                .config
+                .read()
+                .gateway
+                .paired_token_users
+                .get(&hash)
+                .map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_persist_rolls_back_a_bound_token_and_its_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let (_, minted) = mint_with(&state, user_query("alice")).await;
+        let code = minted["pairing_code"].as_str().unwrap().to_string();
+        let blocker = tmp.path().join("bound-pair-blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        state.config.write().config_path = blocker.join("config.toml");
+
+        let (status, json) = pair_with(&state, &code).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert!(json.get("token").is_none());
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "the bound token must be rolled back"
+        );
+        assert_eq!(
+            state.pairing.persisted_tokens(),
+            zeroclaw_config::pairing::PersistedPairedTokens::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_a_bound_device_mints_a_code_for_the_same_user() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let old = pair_bound_device(&state, "phone").await;
+        assert_eq!(
+            config_on_disk(&tmp).gateway.paired_token_users.len(),
+            1,
+            "precondition: the binding is on disk"
+        );
+
+        let (status, json) = mint_with(
+            &state,
+            AdminPaircodeQuery {
+                rotate: Some("phone".into()),
+                ..AdminPaircodeQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["principal_id"], "user:alice");
+        let code = json["pairing_code"].as_str().expect("replacement issued");
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((code.to_string(), alice())),
+            "the replacement must pair as the rotated device did"
+        );
+        assert!(!state.pairing.token_is_paired(&old));
+        assert!(
+            state.config.read().gateway.paired_token_users.is_empty(),
+            "the old binding is gone from the persisted state"
+        );
+        assert!(
+            config_on_disk(&tmp).gateway.paired_token_users.is_empty(),
+            "the revocation is durable: a restart must not bring the old token back"
+        );
+    }
+
+    /// A device row whose token is already gone (a stale registry row) says
+    /// nothing about who the device paired as, so rotation revokes the row
+    /// and issues no code rather than guess an unbound one.
+    #[tokio::test]
+    async fn rotating_a_device_whose_token_is_gone_issues_no_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let old = pair_bound_device(&state, "phone").await;
+        assert!(state.pairing.revoke_token(&old));
+
+        let (status, json) = mint_with(
+            &state,
+            AdminPaircodeQuery {
+                rotate: Some("phone".into()),
+                ..AdminPaircodeQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(json["pairing_code"].is_null(), "{json}");
+        assert_eq!(state.pairing.pending_pairing_code(), None);
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            message.contains("already revoked") && !message.contains("Revoked the bearer token"),
+            "the reply must not claim a revocation that did not happen: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_a_device_of_a_removed_user_issues_no_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let old = pair_bound_device(&state, "phone").await;
+        state.config.write().users.clear();
+
+        let (status, json) = mint_with(
+            &state,
+            AdminPaircodeQuery {
+                rotate: Some("phone".into()),
+                ..AdminPaircodeQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            json["pairing_code"].is_null(),
+            "no unbound replacement may be handed out: {json}"
+        );
+        assert!(!state.pairing.token_is_paired(&old), "the revoke stands");
+        assert_eq!(state.pairing.pending_pairing_code(), None);
+    }
+
+    #[tokio::test]
+    async fn dashboard_rotation_keeps_the_binding_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let operator = pair_device(&state, "laptop").await;
+        let old = pair_bound_device(&state, "phone").await;
+
+        let (status, json) = json_of(
+            api_pairing::rotate_token(
+                State(state.clone()),
+                bearer(&operator),
+                axum::extract::Path("phone".to_string()),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["principal_id"], "user:alice");
+        let code = json["pairing_code"].as_str().expect("replacement issued");
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((code.to_string(), alice()))
+        );
+        assert!(!state.pairing.token_is_paired(&old));
+    }
+
+    /// When a code is already pending, dashboard rotation may point the
+    /// operator at it only if it pairs as the rotated device did. An unbound
+    /// pending code would re-pair a roster user's device as the operator.
+    #[tokio::test]
+    async fn dashboard_rotation_never_steers_a_device_to_a_differently_bound_pending_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = roster_paircode_state(&tmp);
+        let operator = pair_device(&state, "laptop").await;
+        let old = pair_bound_device(&state, "phone").await;
+        let unbound = state
+            .pairing
+            .generate_new_pairing_code(live_pairing_code_policy(&state))
+            .expect("pairing enabled");
+
+        let (status, json) = json_of(
+            api_pairing::rotate_token(
+                State(state.clone()),
+                bearer(&operator),
+                axum::extract::Path("phone".to_string()),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(json["pairing_code"].is_null());
+        assert_eq!(json["principal_id"], "user:alice");
+        assert_eq!(json["pending_principal_id"], "shared-operator");
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            !message.contains("use it"),
+            "an unbound pending code must not be offered for a bound device: {message}"
+        );
+        assert!(
+            message.contains("zeroclaw gateway get-paircode --new --user alice"),
+            "the reply names the remedy that works, since calling again finds no device: {message}"
+        );
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((unbound, PairedTokenSubject::SharedOperator)),
+            "the pending code is left as it was"
+        );
+        assert!(!state.pairing.token_is_paired(&old), "the revoke stands");
+
+        // A pending code that pairs as the same user is fine to reuse.
+        let second = pair_bound_device(&state, "tablet").await;
+        let bound_pending = state
+            .pairing
+            .generate_new_pairing_code_as(live_pairing_code_policy(&state), alice())
+            .expect("pairing enabled");
+        let (_, json) = json_of(
+            api_pairing::rotate_token(
+                State(state.clone()),
+                bearer(&operator),
+                axum::extract::Path("tablet".to_string()),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert!(
+            json["message"].as_str().unwrap().contains("use it"),
+            "{json}"
+        );
+        assert_eq!(
+            state.pairing.pending_pairing_code(),
+            Some((bound_pending, alice()))
+        );
+        assert!(!state.pairing.token_is_paired(&second));
     }
 
     /// Headers carrying this test gateway's admin secret, minted the way a

@@ -14091,6 +14091,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wss_bound_token_binds_its_roster_principal_and_revocation_bites_live() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = roster_config(4242);
+        config.gateway.paired_token_users.insert(
+            zeroclaw_config::pairing::PairingGuard::token_hash("zc_bound"),
+            "alice".into(),
+        );
+        let ctx = enforcement_ctx(config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        let result = dispatcher
+            .handle_initialize(&json!({"auth_token": "zc_bound"}))
+            .await
+            .expect("a bound pairing token authenticates over wss");
+        assert_eq!(result["principal_id"].as_str(), Some("user:alice"));
+        assert!(
+            dispatcher
+                .authorize(Method::SessionList, Resource::Sessions, Verb::Read)
+                .is_ok(),
+            "the roster user's profile grant applies"
+        );
+        let denied = dispatcher
+            .authorize(Method::ConfigSet, Resource::Config, Verb::Update)
+            .expect_err("a bound token carries only its roster user's grants");
+        assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+
+        assert!(ctx.auth.pairing().revoke_token("zc_bound"));
+        let denied = dispatcher
+            .authorize(Method::SessionList, Resource::Sessions, Verb::Read)
+            .expect_err("a revoked bound token invalidates the connection");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+    }
+
+    #[tokio::test]
     async fn selectors_gate_agents_config_paths_and_constrained_tools() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let mut config = roster_config(4242);

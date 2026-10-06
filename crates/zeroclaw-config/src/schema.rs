@@ -7812,6 +7812,14 @@ pub struct GatewayConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub paired_tokens: Vec<String>,
 
+    /// Paired bearer tokens bound to a `[users.<name>]` roster entry
+    /// (managed automatically, not user-edited): each token's SHA-256 hash
+    /// mapped to the entry's durable principal id. A token listed here
+    /// authenticates as that roster user and is never also listed in
+    /// `paired_tokens`. Written with `paired_tokens` in one save.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub paired_token_users: HashMap<String, String>,
+
     /// Max `/pair` requests per minute per client key.
     #[serde(default = "default_pair_rate_limit")]
     pub pair_rate_limit_per_minute: u32,
@@ -7987,6 +7995,7 @@ impl Default for GatewayConfig {
             allow_public_bind: false,
             allow_remote_admin: false,
             paired_tokens: Vec::new(),
+            paired_token_users: HashMap::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
             webhook_secret: None,
@@ -13878,7 +13887,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 /// aliases (which become the `oidc.<alias>` provider selection key) and
 /// roster entry names / durable principal ids. Conservative charset so the
 /// composed keys stay unambiguous in logs, TOML paths, and principal ids.
-fn is_valid_auth_section_name(name: &str) -> bool {
+pub(crate) fn is_valid_auth_section_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphanumeric() => {}
@@ -14354,7 +14363,8 @@ impl OidcConfig {
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
-/// providers (peer credentials today; SSH keys and passwords are
+/// providers: peer credentials, and gateway pairing tokens the operator
+/// bound to the entry when minting their code (SSH keys and passwords are
 /// separately tracked extensions).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -14370,8 +14380,9 @@ pub struct UserConfig {
     /// new principal.
     pub principal_id: Option<String>,
     /// Unix uid accepted for this user over the local socket (peer
-    /// credential). Required today: it is the only roster credential the
-    /// accepted provider set supports.
+    /// credential). Required today, also for a user who only connects
+    /// remotely with a bound pairing token: give such a user a uid no
+    /// account on the daemon host holds.
     pub uid: Option<u32>,
     /// The `[permission_profiles.<alias>]` entries granting this user's
     /// permissions, merged by deterministic union. Required; a user with
@@ -14407,9 +14418,9 @@ impl UserConfig {
         }
         if self.uid.is_none() {
             anyhow::bail!(
-                "users.{name}.uid is required: the peer-credential provider is the only \
-                 supported roster credential today, and an entry with no credential can \
-                 never authenticate"
+                "users.{name}.uid is required: every roster entry needs a local peer \
+                 credential today, even one that only connects remotely with a bound \
+                 pairing token (give that user a uid no account on the daemon host holds)"
             );
         }
         if self.permission_profiles.iter().all(|p| p.trim().is_empty()) {
@@ -24334,6 +24345,7 @@ impl Config {
         if self.wss.enabled
             && self.oidc.is_empty()
             && self.gateway.paired_tokens.is_empty()
+            && self.gateway.paired_token_users.is_empty()
             && !self.gateway.require_pairing
         {
             validation_bail!(
@@ -29724,6 +29736,44 @@ zeroclaw-operators = "operator"
         config
             .validate()
             .expect("an existing paired token is a path");
+
+        config.gateway.paired_tokens.clear();
+        config
+            .gateway
+            .paired_token_users
+            .insert("a".repeat(64), "alice".into());
+        config
+            .validate()
+            .expect("a roster-bound paired token is a path too");
+    }
+
+    /// The binding map is gateway-managed state: no property-path surface
+    /// (the gateway's config API, RPC `config/set`) may read or write it.
+    #[::core::prelude::v1::test]
+    fn paired_token_users_is_not_a_config_property() {
+        let mut config = Config::default();
+        config
+            .gateway
+            .paired_token_users
+            .insert("a".repeat(64), "alice".into());
+        assert!(
+            !config
+                .prop_fields()
+                .iter()
+                .any(|p| p.name.starts_with("gateway.paired_token_users")
+                    || p.name.starts_with("gateway.paired-token-users")),
+            "the binding map must not surface as a property"
+        );
+        for path in [
+            "gateway.paired_token_users",
+            "gateway.paired-token-users",
+            &format!("gateway.paired_token_users.{}", "b".repeat(64)),
+        ] {
+            assert!(
+                config.set_prop(path, "alice").is_err(),
+                "{path} must not be settable"
+            );
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -35681,6 +35731,7 @@ allowed_numbers = ["+1", "+2"]
             g.paired_tokens.is_empty(),
             "No pre-paired tokens by default"
         );
+        assert!(g.paired_token_users.is_empty());
         assert_eq!(g.pair_rate_limit_per_minute, 10);
         assert_eq!(g.webhook_rate_limit_per_minute, 60);
         assert!(!g.trust_forwarded_headers);
@@ -35713,6 +35764,7 @@ allowed_numbers = ["+1", "+2"]
             allow_public_bind: false,
             allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
+            paired_token_users: HashMap::from([("a".repeat(64), "alice".to_string())]),
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
             webhook_secret: None,
@@ -35740,6 +35792,7 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
+        assert_eq!(parsed.paired_token_users, g.paired_token_users);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert!(parsed.trust_forwarded_headers);
@@ -41474,6 +41527,70 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         config.loaded_from = Some(config_path.clone());
         config.config_path = config_path;
         config
+    }
+
+    /// Every pairing persist rewrites `gateway.paired_token_users` as a whole
+    /// next to `paired_tokens`: an incremental save must add new bindings and
+    /// drop revoked ones on disk, and drop the table once it is empty.
+    #[test]
+    async fn save_dirty_writes_and_prunes_paired_token_users() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+        let reload = |path: &std::path::Path| -> Config {
+            let written = std::fs::read_to_string(path).unwrap();
+            toml::from_str(&written)
+                .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"))
+        };
+
+        let shared = "c".repeat(64);
+        let alice = "a".repeat(64);
+        let bob = "b".repeat(64);
+        config.gateway.paired_tokens = vec![shared.clone()];
+        config.gateway.paired_token_users =
+            HashMap::from([(alice.clone(), "alice".into()), (bob.clone(), "bob".into())]);
+        config.mark_dirty("gateway.paired_tokens");
+        config.mark_dirty("gateway.paired_token_users");
+        config.save_dirty().await.expect("first save");
+        let on_disk = reload(&config_path);
+        assert_eq!(on_disk.gateway.paired_tokens, vec![shared.clone()]);
+        assert_eq!(
+            on_disk.gateway.paired_token_users,
+            config.gateway.paired_token_users
+        );
+
+        config.gateway.paired_token_users.remove(&alice);
+        config.mark_dirty("gateway.paired_tokens");
+        config.mark_dirty("gateway.paired_token_users");
+        config.save_dirty().await.expect("revocation save");
+        assert_eq!(
+            reload(&config_path).gateway.paired_token_users,
+            HashMap::from([(bob.clone(), "bob".to_string())]),
+            "a revoked binding must be gone from disk"
+        );
+
+        config.gateway.paired_token_users.clear();
+        config.mark_dirty("gateway.paired_tokens");
+        config.mark_dirty("gateway.paired_token_users");
+        config.save_dirty().await.expect("last revocation save");
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("paired_token_users"),
+            "an empty binding map leaves no table behind; got:\n{written}"
+        );
+        assert_eq!(reload(&config_path).gateway.paired_tokens, vec![shared]);
     }
 
     #[test]
