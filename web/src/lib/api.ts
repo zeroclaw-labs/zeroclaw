@@ -16,6 +16,7 @@ import type {
 } from "../types/api";
 import type { components } from "./api-generated";
 import { clearToken, getToken, setToken } from "./auth";
+import type { PublicHealth } from "./authBootstrap";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -359,18 +360,35 @@ export async function generatePairCode(): Promise<{
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
 
-export async function getPublicHealth(): Promise<{
-  require_pairing: boolean;
-  paired: boolean;
-}> {
+export async function getPublicHealth(): Promise<PublicHealth> {
   const response = await fetch(`${basePath}/health`);
-  if (!response.ok) {
+  const body = (await response.json().catch(() => null)) as PublicHealth | null;
+  // A gateway that is up but cannot reach its core still describes itself
+  // (`code`, `error`, `hint`): keep that body so the sign-in screen can show
+  // it rather than guess.
+  if (!response.ok && !(body && typeof body.code === "string")) {
     throw new Error(`Health check failed (${response.status})`);
   }
-  return response.json() as Promise<{
-    require_pairing: boolean;
-    paired: boolean;
-  }>;
+  if (!body) {
+    throw new Error("Health check returned no JSON");
+  }
+  return body;
+}
+
+/**
+ * Check an existing bearer token against `path` (a same-origin path the
+ * gateway's health names) without storing it. Bypasses the global 401
+ * handling: a rejected token here is an answer, not a session ending.
+ */
+export async function checkBearerToken(
+  path: string,
+  token: string,
+): Promise<{ status: number; body: unknown }> {
+  const response = await fetch(`${basePath}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const body = await response.json().catch(() => null);
+  return { status: response.status, body };
 }
 
 // ---------------------------------------------------------------------------
