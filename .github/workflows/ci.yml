@@ -963,6 +963,15 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The preview `zeroclaw-gw` binary and its two-process test exist only
+      # behind the gateway's non-default `gw-bin` feature, which the workspace
+      # run above never enables. This builds the binary and runs it against a
+      # real core listener, so neither can rot unseen.
+      - name: Run gateway preview binary tests
+        run: cargo nextest run --locked --no-fail-fast -p zeroclaw-gateway --features gw-bin --test gw_preview
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # Informational until the gateway starts calling the core over RPC: the
       # golden-frame replay compares the gateway's WebSocket, SSE, webhook and
       # ACP output with recorded fixtures and reports drift without failing
@@ -1430,6 +1439,8 @@ jobs:
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
         run: cargo generate sop-syntax --check
+      - name: Check the OpenRPC contract matches zeroclaw-rpc-proto
+        run: cargo generate openrpc --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |
