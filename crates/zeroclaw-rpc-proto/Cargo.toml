@@ -1,0 +1,30 @@
+[package]
+name = "zeroclaw-rpc-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Wire contract for the ZeroClaw daemon RPC: method name table, request and response types, notification payloads and error codes, shared by the daemon and every RPC client without linking the runtime."
+publish = true
+
+# Pure protocol crate. It must never depend on `zeroclaw-runtime` or on any
+# crate that does async I/O: the whole point is that a client (zerocode, the
+# gateway process, a bridge) can link it without linking the daemon.
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+schemars = { version = "1.2", optional = true }
+zeroclaw-api = { workspace = true }
+zeroclaw-config = { workspace = true }
+zeroclaw-sop-graph = { workspace = true }
+
+[features]
+default = []
+# JSON Schema derives for every wire type, consumed by `cargo generate openrpc`.
+schema-export = [
+    "dep:schemars",
+    "zeroclaw-api/schema-export",
+    "zeroclaw-config/schema-export",
+    "zeroclaw-sop-graph/schema-export",
+]
