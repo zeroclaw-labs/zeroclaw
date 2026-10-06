@@ -119,6 +119,8 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionCompactContext,
+    SessionRestoreContext,
 
     // Memory
     MemoryList,
@@ -253,6 +255,8 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionCompactContext, "session/compact-context"),
+        (Method::SessionRestoreContext, "session/restore-context"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -396,7 +400,10 @@ impl Method {
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
             M::SessionPrompt => (Resource::Sessions, Verb::Execute),
-            M::SessionConfigure | M::SessionApprove => (Resource::Sessions, Verb::Update),
+            M::SessionConfigure
+            | M::SessionApprove
+            | M::SessionCompactContext
+            | M::SessionRestoreContext => (Resource::Sessions, Verb::Update),
             M::SessionList
             | M::SessionListAcp
             | M::SessionMessages
@@ -510,7 +517,7 @@ type RpcResult = Result<Value, JsonRpcError>;
 
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
-fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
+pub(crate) fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
         code,
         message: msg.into(),
@@ -3477,6 +3484,12 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(params).await,
             Method::SessionApprove => self.handle_session_approve(params).await,
             Method::SessionKill => self.handle_session_kill(params).await,
+            Method::SessionCompactContext => {
+                Box::pin(self.handle_session_compact_context(params)).await
+            }
+            Method::SessionRestoreContext => {
+                Box::pin(self.handle_session_restore_context(params)).await
+            }
 
             // Memory
             Method::MemoryList => self.handle_memory_list(params).await,
@@ -5549,6 +5562,144 @@ impl RpcDispatcher {
             session_id: req.session_id,
             killed,
         })
+    }
+
+    async fn admit_context_operation(
+        &self,
+        session_id: &str,
+        method: Method,
+        authorized: Option<super::session::SessionRecord>,
+    ) -> Result<super::compaction::AdmittedCompactionSession, JsonRpcError> {
+        let Some(record) = authorized.as_ref() else {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        };
+        if record.durable != Some(DurableSession::Acp) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Context compaction is only available for native Code (ACP) sessions",
+            ));
+        }
+        let generation = record.live_generation.ok_or_else(|| {
+            rpc_err(
+                SESSION_NOT_FOUND,
+                "Session has no live agent; reopen it before changing its context",
+            )
+        })?;
+        if self
+            .ctx
+            .sessions
+            .interaction_surface(session_id)
+            .await
+            .flatten()
+            != Some(crate::agent::prompt::InteractionSurface::ZerocodeCode)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Context compaction is only available for the native ZeroCode Code surface",
+            ));
+        }
+
+        let cancellation = CancellationToken::new();
+        let admission = Arc::clone(&self.ctx.sessions)
+            .acquire_idle_operation(session_id, Some(generation), cancellation.clone())
+            .await
+            .ok_or_else(|| {
+                rpc_err(
+                    SESSION_BUSY,
+                    "Session is busy with a running or queued turn; retry when it is idle",
+                )
+            })?;
+
+        self.recheck_authority_after_admission(method)?;
+        let current = self
+            .revalidate_admitted_session(session_id, authorized.as_ref())
+            .await?;
+        if current.as_ref().and_then(|record| record.live_generation) != Some(generation)
+            || current.as_ref().and_then(|record| record.durable.as_ref())
+                != Some(&DurableSession::Acp)
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session changed while context-operation admission was acquired",
+            ));
+        }
+        if self
+            .ctx
+            .sessions
+            .interaction_surface(session_id)
+            .await
+            .flatten()
+            != Some(crate::agent::prompt::InteractionSurface::ZerocodeCode)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Context compaction is only available for the native ZeroCode Code surface",
+            ));
+        }
+        let agent = self
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .ok_or_else(|| {
+                rpc_err(
+                    SESSION_NOT_FOUND,
+                    "Session has no live agent; reopen it before changing its context",
+                )
+            })?;
+        Ok(super::compaction::AdmittedCompactionSession {
+            generation,
+            principal_id: record.owner.clone(),
+            agent,
+            admission,
+            cancellation,
+        })
+    }
+
+    async fn handle_session_compact_context(&self, params: &Value) -> RpcResult {
+        let params: SessionCompactContextParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&params.session_id, Method::SessionCompactContext)
+            .await?;
+        let admitted = self
+            .admit_context_operation(
+                &params.session_id,
+                Method::SessionCompactContext,
+                authorized,
+            )
+            .await?;
+        to_result(
+            super::compaction::compact_context(
+                Arc::clone(&self.ctx),
+                admitted,
+                self.connection_cancel.clone(),
+                params,
+            )
+            .await?,
+        )
+    }
+
+    async fn handle_session_restore_context(&self, params: &Value) -> RpcResult {
+        let params: SessionRestoreContextParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&params.session_id, Method::SessionRestoreContext)
+            .await?;
+        let admitted = self
+            .admit_context_operation(
+                &params.session_id,
+                Method::SessionRestoreContext,
+                authorized,
+            )
+            .await?;
+        to_result(
+            super::compaction::restore_context(
+                Arc::clone(&self.ctx),
+                admitted,
+                self.connection_cancel.clone(),
+                params,
+            )
+            .await?,
+        )
     }
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh

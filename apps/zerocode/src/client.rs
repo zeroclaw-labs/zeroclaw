@@ -121,6 +121,8 @@ pub mod method {
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
+    pub const SESSION_COMPACT_CONTEXT: &str = "session/compact-context";
+    pub const SESSION_RESTORE_CONTEXT: &str = "session/restore-context";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -2789,6 +2791,38 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_compact_context(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<SessionCompactContextResult> {
+        self.call_with_timeout(
+            method::SESSION_COMPACT_CONTEXT,
+            serde_json::json!({
+                "session_id": session_id,
+                "operation_id": operation_id,
+            }),
+            Duration::from_secs(240),
+        )
+        .await
+    }
+
+    pub async fn session_restore_context(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<SessionRestoreContextResult> {
+        self.call_with_timeout(
+            method::SESSION_RESTORE_CONTEXT,
+            serde_json::json!({
+                "session_id": session_id,
+                "operation_id": operation_id,
+            }),
+            Duration::from_secs(60),
+        )
+        .await
+    }
+
     pub async fn session_state(&self, session_id: &str) -> Result<SessionStateResult> {
         self.call(
             method::SESSION_STATE,
@@ -4373,6 +4407,43 @@ pub struct SessionNewResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactionUsageResult {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionCompactContextResult {
+    pub status: String,
+    #[serde(default)]
+    pub covered_turns: usize,
+    #[serde(default)]
+    pub covered_message_rows: usize,
+    #[serde(default)]
+    pub estimated_tokens_before: u64,
+    #[serde(default)]
+    pub estimated_tokens_after: u64,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub usage: Option<CompactionUsageResult>,
+    #[serde(default)]
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionRestoreContextResult {
+    pub status: String,
+    #[serde(default)]
+    pub covered_turns: Option<usize>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

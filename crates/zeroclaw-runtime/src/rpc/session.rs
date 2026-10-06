@@ -382,6 +382,34 @@ impl Drop for CancelTokenRegistration<'_> {
     }
 }
 
+/// Owned admission and cancellation registration for a non-turn operation.
+/// Holding this value keeps the session admitted until durable settlement and
+/// removes only the token generation registered by this operation.
+pub(crate) struct IdleOperationAdmission {
+    _guard: zeroclaw_infra::session_queue::SessionGuard,
+    store: Arc<SessionStore>,
+    session_id: String,
+    cancel_generation: Option<u64>,
+}
+
+impl IdleOperationAdmission {
+    pub(crate) fn finish(mut self) -> Option<CancelCause> {
+        let cause = self.store.take_cancel_cause(&self.session_id);
+        if let Some(generation) = self.cancel_generation.take() {
+            self.store.remove_cancel_token(&self.session_id, generation);
+        }
+        cause
+    }
+}
+
+impl Drop for IdleOperationAdmission {
+    fn drop(&mut self) {
+        if let Some(generation) = self.cancel_generation.take() {
+            self.store.remove_cancel_token(&self.session_id, generation);
+        }
+    }
+}
+
 impl SessionStore {
     pub fn new(max_sessions: usize, session_queue: Arc<SessionActorQueue>) -> Self {
         Self {
@@ -1634,6 +1662,17 @@ impl SessionStore {
             .map(|session| (session.generation, session.owner_tui_id.clone()))
     }
 
+    /// Read the live session's host-validated interaction surface.
+    pub async fn interaction_surface(
+        &self,
+        session_id: &str,
+    ) -> Option<Option<crate::agent::prompt::InteractionSurface>> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|session| session.interaction_surface)
+    }
+
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
     }
@@ -1735,6 +1774,31 @@ impl SessionStore {
             )))
         })
         .await
+    }
+
+    /// Atomically acquire fail-fast idle admission and publish this
+    /// operation's cancellation token before any caller-visible await can
+    /// observe the admitted state.
+    pub(crate) async fn acquire_idle_operation(
+        self: &Arc<Self>,
+        id: &str,
+        session_generation: Option<u64>,
+        token: tokio_util::sync::CancellationToken,
+    ) -> Option<IdleOperationAdmission> {
+        let guard = self.session_queue.try_acquire_idle(id).await?;
+        let mut tokens = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cancel_generation =
+            self.register_cancel_token_locked(&mut tokens, id, session_generation, token);
+        drop(tokens);
+        Some(IdleOperationAdmission {
+            _guard: guard,
+            store: Arc::clone(self),
+            session_id: id.to_string(),
+            cancel_generation: Some(cancel_generation),
+        })
     }
 
     #[cfg(test)]

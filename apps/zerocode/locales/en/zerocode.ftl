@@ -687,6 +687,21 @@ zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
 
+## Manual context compaction (native Code pane only).
+zc-compaction-wrong-pane = Context compaction is only available in the Code pane.
+zc-compaction-busy-local = A turn is in flight; try again when the session is idle.
+zc-compact-context-started = Compacting older context… The original transcript is kept.
+zc-restore-context-started = Restoring context from retained originals…
+zc-compact-context-done = Context compacted: covered { $turns } turns ({ $rows } messages), ~{ $before } → ~{ $after } estimated tokens.
+zc-compact-context-already = This compaction is already committed; the current projection is unchanged.
+zc-compact-context-uninstalled = Committed durably. The live view will be rebuilt from the checkpoint on the next prompt.
+zc-compact-context-usage = Summarization usage: { $input } in / { $output } out (as reported).
+zc-compact-context-usage-input = Summarization input usage: { $input } (as reported).
+zc-compact-context-summary-heading = Continuity summary (lossy historical record of lower trust):
+zc-restore-context-done = Context restored from retained originals ({ $turns } turns were covered). Later turns are kept; files and tool effects are not undone.
+zc-restore-context-none = No active context compaction to restore.
+zc-compaction-failed = Context operation failed: { $error }
+
 zc-oidc-enroll-visit = To sign in, visit { $uri } and enter code { $code }
 zc-oidc-enroll-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
 zc-oidc-enroll-missing-url = auth_provider { $provider } is set with no auth_token. Set [connection.wss] enroll_url to the gateway's HTTP origin to sign in interactively, or export ZEROCLAW_AUTH_TOKEN (see: zeroclaw oidc login).

@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use zeroclaw_api::agent::RetainedContextSnapshot;
 use zeroclaw_api::model_provider::{
     ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, projected_entry_count,
 };
@@ -61,10 +63,245 @@ fn open_calls_after(events: impl IntoIterator<Item = ToolEventKind>) -> usize {
 /// Keep in sync with the runtime constant.
 const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str = "[earlier turns omitted to fit the context window]";
 const SYNTHETIC_INTERRUPTION_ROLE: &str = "__zeroclaw_turn_stream_interrupted__";
+const PROMPT_TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RetainedContextRecord {
     messages: Vec<ConversationMessage>,
+}
+
+/// One active, derived provider-history projection. The canonical retained
+/// context and the user-visible transcript remain summary-free.
+#[derive(Debug, Clone)]
+pub struct AcpActiveCheckpointRecord {
+    pub format_version: i64,
+    pub operation_id: String,
+    pub source_context_sha256: String,
+    pub covered_prefix_sha256: String,
+    pub source_message_count: usize,
+    pub covered_message_count: usize,
+    pub covered_turn_count: usize,
+    pub summary: String,
+    pub summary_message: ConversationMessage,
+    pub summary_model_provider: String,
+    pub summary_model: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Consistent durable input for one manual compaction operation.
+#[derive(Debug, Clone)]
+pub struct AcpCompactionSnapshot {
+    pub session_row_id: i64,
+    pub interaction_surface: Option<String>,
+    pub killed: bool,
+    pub trim_breadcrumb: bool,
+    pub canonical_context: Vec<ConversationMessage>,
+    pub canonical_context_sha256: String,
+    pub active_checkpoint: Option<AcpActiveCheckpointRecord>,
+    pub inflight_turn_id: Option<String>,
+}
+
+impl AcpCompactionSnapshot {
+    /// Rebuild the active provider projection only after the store-owned
+    /// canonical prefix identity has been validated.
+    pub fn active_projection(&self) -> Result<Option<RetainedContextSnapshot>> {
+        let Some(checkpoint) = self.active_checkpoint.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(RetainedContextSnapshot {
+            retained_messages: AcpSessionStore::project_compacted_context(
+                &self.canonical_context,
+                self.trim_breadcrumb,
+                checkpoint,
+            )?,
+            breadcrumb: self.trim_breadcrumb,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSourceSelection {
+    pub covered_message_count: usize,
+    pub covered_turn_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionSourceError {
+    NoOpeningUserMessage,
+    NewestTurnMustBeRetained,
+    AmbiguousToolPairing,
+}
+
+impl std::fmt::Display for CompactionSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOpeningUserMessage => {
+                write!(
+                    formatter,
+                    "the retained context has no opening user message"
+                )
+            }
+            Self::NewestTurnMustBeRetained => {
+                write!(formatter, "the newest user turn must remain uncompacted")
+            }
+            Self::AmbiguousToolPairing => write!(
+                formatter,
+                "the covered context contains an ambiguous or unpaired tool exchange"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompactionSourceError {}
+
+pub struct CompactionActivationRequest<'a> {
+    pub session_uuid: &'a str,
+    pub principal_id: Option<&'a str>,
+    pub expected_session_row_id: i64,
+    pub expected_source_context_sha256: &'a str,
+    pub expected_active_operation: Option<&'a str>,
+    pub format_version: i64,
+    pub operation_id: &'a str,
+    pub covered_message_count: usize,
+    pub covered_turn_count: usize,
+    pub summary: &'a str,
+    pub summary_message: &'a ConversationMessage,
+    pub summary_model_provider: &'a str,
+    pub summary_model: &'a str,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionActivationOutcome {
+    Activated,
+    AlreadyActive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionActivationError {
+    SessionMissing,
+    IncarnationMismatch {
+        found_session_row_id: i64,
+    },
+    SessionKilled,
+    InflightTurn,
+    SourceMismatch,
+    StaleActiveCheckpoint {
+        active_operation: Option<String>,
+        expected_operation: Option<String>,
+    },
+    Storage(String),
+}
+
+impl std::fmt::Display for CompactionActivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMissing => write!(formatter, "session no longer exists"),
+            Self::IncarnationMismatch {
+                found_session_row_id,
+            } => write!(
+                formatter,
+                "session was recreated as durable row {found_session_row_id}"
+            ),
+            Self::SessionKilled => write!(formatter, "session is killed"),
+            Self::InflightTurn => write!(formatter, "a durable turn is still in flight"),
+            Self::SourceMismatch => write!(formatter, "the canonical retained context changed"),
+            Self::StaleActiveCheckpoint {
+                active_operation,
+                expected_operation,
+            } => write!(
+                formatter,
+                "the active checkpoint changed (active {:?}, expected {:?})",
+                active_operation, expected_operation
+            ),
+            Self::Storage(detail) => write!(formatter, "compaction storage failure: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionActivationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionDeactivationOutcome {
+    Deactivated,
+    NoActiveCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionDeactivationError {
+    SessionMissing,
+    IncarnationMismatch { found_session_row_id: i64 },
+    SessionKilled,
+    InflightTurn,
+    StaleActiveCheckpoint { active_operation: String },
+    Storage(String),
+}
+
+impl std::fmt::Display for CompactionDeactivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMissing => write!(formatter, "session no longer exists"),
+            Self::IncarnationMismatch {
+                found_session_row_id,
+            } => write!(
+                formatter,
+                "session was recreated as durable row {found_session_row_id}"
+            ),
+            Self::SessionKilled => write!(formatter, "session is killed"),
+            Self::InflightTurn => write!(formatter, "a durable turn is still in flight"),
+            Self::StaleActiveCheckpoint { active_operation } => write!(
+                formatter,
+                "the active checkpoint changed to operation {active_operation}"
+            ),
+            Self::Storage(detail) => write!(formatter, "compaction storage failure: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionDeactivationError {}
+
+/// Select every complete retained user turn except the newest one. The input
+/// is already the finalization/recovery-owned provider context, so no generic
+/// transcript append is allowed to certify additional coverage.
+pub fn select_compaction_source(
+    canonical_body: &[ConversationMessage],
+) -> std::result::Result<CompactionSourceSelection, CompactionSourceError> {
+    let user_starts = canonical_body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(
+                message,
+                ConversationMessage::Chat(chat)
+                    if chat.role == "user"
+                        && !chat.content.starts_with(PROMPT_TOOL_RESULTS_PREFIX)
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(&opening) = user_starts.first() else {
+        return Err(CompactionSourceError::NoOpeningUserMessage);
+    };
+    if opening != 0 {
+        return Err(CompactionSourceError::NoOpeningUserMessage);
+    }
+    if user_starts.len() < 2 {
+        return Err(CompactionSourceError::NewestTurnMustBeRetained);
+    }
+    let covered_message_count = *user_starts.last().expect("two user starts exist");
+    let covered = &canonical_body[..covered_message_count];
+    let safe = AcpSessionStore::provider_safe_history(covered);
+    let exact = serde_json::to_vec(covered).ok() == serde_json::to_vec(&safe).ok();
+    if !exact {
+        return Err(CompactionSourceError::AmbiguousToolPairing);
+    }
+    Ok(CompactionSourceSelection {
+        covered_message_count,
+        covered_turn_count: user_starts.len() - 1,
+    })
 }
 
 pub struct AcpSessionStore {
@@ -268,9 +505,31 @@ impl AcpSessionStore {
                  payload    TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acp_turn_checkpoint_events_session
-                 ON acp_turn_checkpoint_events(session_id, id);",
+                 ON acp_turn_checkpoint_events(session_id, id);
+
+             CREATE TABLE IF NOT EXISTS acp_compaction_checkpoints (
+                 session_id                INTEGER PRIMARY KEY
+                                           REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 format_version            INTEGER NOT NULL,
+                 operation_id              TEXT NOT NULL,
+                 source_context_sha256     TEXT NOT NULL,
+                 covered_prefix_sha256     TEXT NOT NULL,
+                 source_message_count      INTEGER NOT NULL,
+                 covered_message_count     INTEGER NOT NULL,
+                 covered_turn_count        INTEGER NOT NULL,
+                 summary                   TEXT NOT NULL,
+                 summary_message_json      TEXT NOT NULL,
+                 summary_model_provider    TEXT NOT NULL,
+                 summary_model             TEXT NOT NULL,
+                 input_tokens              INTEGER,
+                 output_tokens             INTEGER,
+                 created_at                TEXT NOT NULL
+             );",
         )
         .context("Failed to create ACP session schema")?;
+
+        Self::ensure_compaction_checkpoint_schema(&conn)
+            .context("Failed to migrate ACP compaction checkpoint schema")?;
 
         Self::ensure_killed_at_column(&conn)
             .context("Failed to migrate ACP session killed marker")?;
@@ -608,6 +867,62 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    /// Compaction checkpoints are derived and recoverable from the canonical
+    /// transcript/context. Pre-merge dogfood builds used an incompatible
+    /// shape, so replace only this derived table when its contract differs.
+    fn ensure_compaction_checkpoint_schema(conn: &Connection) -> Result<()> {
+        let expected = [
+            "session_id",
+            "format_version",
+            "operation_id",
+            "source_context_sha256",
+            "covered_prefix_sha256",
+            "source_message_count",
+            "covered_message_count",
+            "covered_turn_count",
+            "summary",
+            "summary_message_json",
+            "summary_model_provider",
+            "summary_model",
+            "input_tokens",
+            "output_tokens",
+            "created_at",
+        ];
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_compaction_checkpoints)")
+            .context("Failed to inspect ACP compaction checkpoint schema")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read ACP compaction checkpoint schema")?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if columns == expected {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS acp_compaction_checkpoints;
+             CREATE TABLE acp_compaction_checkpoints (
+                 session_id                INTEGER PRIMARY KEY
+                                           REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 format_version            INTEGER NOT NULL,
+                 operation_id              TEXT NOT NULL,
+                 source_context_sha256     TEXT NOT NULL,
+                 covered_prefix_sha256     TEXT NOT NULL,
+                 source_message_count      INTEGER NOT NULL,
+                 covered_message_count     INTEGER NOT NULL,
+                 covered_turn_count        INTEGER NOT NULL,
+                 summary                   TEXT NOT NULL,
+                 summary_message_json      TEXT NOT NULL,
+                 summary_model_provider    TEXT NOT NULL,
+                 summary_model             TEXT NOT NULL,
+                 input_tokens              INTEGER,
+                 output_tokens             INTEGER,
+                 created_at                TEXT NOT NULL
+             );",
+        )
+        .context("Failed to replace incompatible ACP compaction checkpoint schema")
+    }
+
     /// One-time legacy migration for rows written before the
     /// `trim_breadcrumb` column existed (`NULL`): infer provenance from
     /// whether the first non-system message is exactly the canonical
@@ -821,7 +1136,6 @@ impl AcpSessionStore {
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
         let messages = Self::load_messages(&conn, session_id)?;
-        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -829,6 +1143,17 @@ impl AcpSessionStore {
                 Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
                 inferred
             }
+        };
+        let retained_record = Self::load_retained_context_record(&conn, session_id)?;
+        let active_checkpoint = Self::active_compaction_checkpoint(&conn, session_id)?;
+        let retained_context = match (retained_record, active_checkpoint) {
+            (Some(record), _) => Some(Self::provider_safe_history(&record.messages)),
+            (None, Some(_)) => {
+                return Err(anyhow::Error::msg(
+                    "active ACP compaction checkpoint has no canonical retained context",
+                ));
+            }
+            (None, None) => None,
         };
 
         Ok(Some(AcpSessionData {
@@ -1075,7 +1400,6 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
-        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -1083,6 +1407,17 @@ impl AcpSessionStore {
                 Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
                 inferred
             }
+        };
+        let retained_record = Self::load_retained_context_record(&conn, session_id)?;
+        let active_checkpoint = Self::active_compaction_checkpoint(&conn, session_id)?;
+        let retained_context = match (retained_record, active_checkpoint) {
+            (Some(record), _) => Some(Self::provider_safe_history(&record.messages)),
+            (None, Some(_)) => {
+                return Err(anyhow::Error::msg(
+                    "active ACP compaction checkpoint has no canonical retained context",
+                ));
+            }
+            (None, None) => None,
         };
 
         Ok(Some(AcpSessionData {
@@ -1152,6 +1487,276 @@ impl AcpSessionStore {
             .context("Failed to read ACP session keys")
     }
 
+    /// Read one exact-owner, finalization-certified source snapshot.
+    pub fn read_compaction_snapshot_for_owner(
+        &self,
+        session_uuid: &str,
+        principal_id: Option<&str>,
+    ) -> Result<Option<AcpCompactionSnapshot>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP compaction snapshot transaction")?;
+        let row = tx
+            .query_row(
+                "SELECT id, interaction_surface, killed_at, trim_breadcrumb,
+                        retained_context_json
+                   FROM acp_sessions
+                  WHERE session_uuid = ?1 AND principal_id IS ?2",
+                params![session_uuid, principal_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to read ACP compaction session")?;
+        let Some((
+            session_row_id,
+            interaction_surface,
+            killed_at,
+            trim_breadcrumb,
+            retained_payload,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let retained_payload = retained_payload
+            .context("manual compaction requires finalization-certified retained context")?;
+        let record: RetainedContextRecord = serde_json::from_str(&retained_payload)
+            .context("Failed to deserialize ACP compaction source context")?;
+        let active_checkpoint = Self::active_compaction_checkpoint(&tx, session_row_id)?;
+        let inflight_turn_id = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_row_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("Failed to read ACP compaction in-flight turn")?;
+        let canonical_context_sha256 = Self::context_sha256(&record.messages)?;
+        tx.commit()
+            .context("Failed to finish ACP compaction snapshot transaction")?;
+        Ok(Some(AcpCompactionSnapshot {
+            session_row_id,
+            interaction_surface,
+            killed: killed_at.is_some(),
+            trim_breadcrumb: trim_breadcrumb.is_some_and(|value| value != 0),
+            canonical_context: record.messages,
+            canonical_context_sha256,
+            active_checkpoint,
+            inflight_turn_id,
+        }))
+    }
+
+    pub fn activate_compaction_checkpoint_for_owner(
+        &self,
+        request: &CompactionActivationRequest<'_>,
+    ) -> std::result::Result<CompactionActivationOutcome, CompactionActivationError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        let row = tx
+            .query_row(
+                "SELECT id, killed_at, trim_breadcrumb, retained_context_json
+                   FROM acp_sessions
+                  WHERE session_uuid = ?1 AND principal_id IS ?2",
+                params![request.session_uuid, request.principal_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?
+            .ok_or(CompactionActivationError::SessionMissing)?;
+        let (session_row_id, killed_at, trim_breadcrumb, retained_payload) = row;
+        if session_row_id != request.expected_session_row_id {
+            return Err(CompactionActivationError::IncarnationMismatch {
+                found_session_row_id: session_row_id,
+            });
+        }
+        if killed_at.is_some() {
+            return Err(CompactionActivationError::SessionKilled);
+        }
+        let inflight = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM acp_turn_checkpoints WHERE session_id = ?1)",
+                params![session_row_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        if inflight {
+            return Err(CompactionActivationError::InflightTurn);
+        }
+        let active = Self::active_compaction_checkpoint(&tx, session_row_id)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        if active
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.operation_id == request.operation_id)
+        {
+            return Ok(CompactionActivationOutcome::AlreadyActive);
+        }
+        let active_operation = active
+            .as_ref()
+            .map(|checkpoint| checkpoint.operation_id.as_str());
+        if active_operation != request.expected_active_operation {
+            return Err(CompactionActivationError::StaleActiveCheckpoint {
+                active_operation: active_operation.map(str::to_string),
+                expected_operation: request.expected_active_operation.map(str::to_string),
+            });
+        }
+        let retained_payload = retained_payload.ok_or(CompactionActivationError::SourceMismatch)?;
+        let record: RetainedContextRecord = serde_json::from_str(&retained_payload)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        if Self::context_sha256(&record.messages)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?
+            != request.expected_source_context_sha256
+        {
+            return Err(CompactionActivationError::SourceMismatch);
+        }
+        let (_, body) = Self::split_breadcrumb(
+            &record.messages,
+            trim_breadcrumb.is_some_and(|value| value != 0),
+        );
+        if request.covered_message_count > body.len() {
+            return Err(CompactionActivationError::SourceMismatch);
+        }
+        let covered_prefix_sha256 = Self::context_sha256(&body[..request.covered_message_count])
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let summary_message_json = serde_json::to_string(request.summary_message)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        let input_tokens = request
+            .input_tokens
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        let output_tokens = request
+            .output_tokens
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO acp_compaction_checkpoints
+                (session_id, format_version, operation_id,
+                 source_context_sha256, covered_prefix_sha256,
+                 source_message_count, covered_message_count,
+                 covered_turn_count, summary, summary_message_json,
+                 summary_model_provider, summary_model, input_tokens,
+                 output_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 format_version = excluded.format_version,
+                 operation_id = excluded.operation_id,
+                 source_context_sha256 = excluded.source_context_sha256,
+                 covered_prefix_sha256 = excluded.covered_prefix_sha256,
+                 source_message_count = excluded.source_message_count,
+                 covered_message_count = excluded.covered_message_count,
+                 covered_turn_count = excluded.covered_turn_count,
+                 summary = excluded.summary,
+                 summary_message_json = excluded.summary_message_json,
+                 summary_model_provider = excluded.summary_model_provider,
+                 summary_model = excluded.summary_model,
+                 input_tokens = excluded.input_tokens,
+                 output_tokens = excluded.output_tokens,
+                 created_at = excluded.created_at",
+            params![
+                session_row_id,
+                request.format_version,
+                request.operation_id,
+                request.expected_source_context_sha256,
+                covered_prefix_sha256,
+                i64::try_from(body.len())
+                    .map_err(|error| { CompactionActivationError::Storage(error.to_string()) })?,
+                i64::try_from(request.covered_message_count)
+                    .map_err(|error| { CompactionActivationError::Storage(error.to_string()) })?,
+                i64::try_from(request.covered_turn_count)
+                    .map_err(|error| { CompactionActivationError::Storage(error.to_string()) })?,
+                request.summary,
+                summary_message_json,
+                request.summary_model_provider,
+                request.summary_model,
+                input_tokens,
+                output_tokens,
+                now,
+            ],
+        )
+        .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        Ok(CompactionActivationOutcome::Activated)
+    }
+
+    pub fn deactivate_compaction_checkpoint_for_owner(
+        &self,
+        session_uuid: &str,
+        principal_id: Option<&str>,
+        expected_session_row_id: i64,
+        expected_operation_id: &str,
+    ) -> std::result::Result<CompactionDeactivationOutcome, CompactionDeactivationError> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        let row = tx
+            .query_row(
+                "SELECT id, killed_at FROM acp_sessions
+                  WHERE session_uuid = ?1 AND principal_id IS ?2",
+                params![session_uuid, principal_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?
+            .ok_or(CompactionDeactivationError::SessionMissing)?;
+        if row.0 != expected_session_row_id {
+            return Err(CompactionDeactivationError::IncarnationMismatch {
+                found_session_row_id: row.0,
+            });
+        }
+        if row.1.is_some() {
+            return Err(CompactionDeactivationError::SessionKilled);
+        }
+        let inflight = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM acp_turn_checkpoints WHERE session_id = ?1)",
+                params![row.0],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        if inflight {
+            return Err(CompactionDeactivationError::InflightTurn);
+        }
+        let active = Self::active_compaction_checkpoint(&tx, row.0)
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        let Some(active) = active else {
+            return Ok(CompactionDeactivationOutcome::NoActiveCheckpoint);
+        };
+        if active.operation_id != expected_operation_id {
+            return Err(CompactionDeactivationError::StaleActiveCheckpoint {
+                active_operation: active.operation_id,
+            });
+        }
+        tx.execute(
+            "DELETE FROM acp_compaction_checkpoints WHERE session_id = ?1",
+            params![row.0],
+        )
+        .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        Ok(CompactionDeactivationOutcome::Deactivated)
+    }
+
     /// Load only durable ACP rows that are allowed to become live sessions.
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
@@ -1202,7 +1807,6 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
-        let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
@@ -1210,6 +1814,22 @@ impl AcpSessionStore {
                 Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
                 inferred
             }
+        };
+        let retained_record = Self::load_retained_context_record(&conn, session_id)?;
+        let active_checkpoint = Self::active_compaction_checkpoint(&conn, session_id)?;
+        let retained_context = match (retained_record, active_checkpoint.as_ref()) {
+            (Some(record), Some(checkpoint)) => Some(Self::project_compacted_context(
+                &record.messages,
+                trim_breadcrumb,
+                checkpoint,
+            )?),
+            (Some(record), None) => Some(Self::provider_safe_history(&record.messages)),
+            (None, Some(_)) => {
+                return Err(anyhow::Error::msg(
+                    "active ACP compaction checkpoint has no canonical retained context",
+                ));
+            }
+            (None, None) => None,
         };
 
         Ok(AcpSessionRestore::Restorable(Box::new(AcpSessionData {
@@ -1572,10 +2192,10 @@ impl AcpSessionStore {
         Ok(())
     }
 
-    fn load_retained_context(
+    fn load_retained_context_record(
         conn: &Connection,
         session_id: i64,
-    ) -> Result<Option<Vec<ConversationMessage>>> {
+    ) -> Result<Option<RetainedContextRecord>> {
         let payload: Option<String> = conn
             .query_row(
                 "SELECT retained_context_json FROM acp_sessions WHERE id = ?1",
@@ -1590,7 +2210,192 @@ impl AcpSessionStore {
         };
         let record = serde_json::from_str::<RetainedContextRecord>(&payload)
             .context("Failed to deserialize ACP retained context")?;
-        Ok(Some(Self::provider_safe_history(&record.messages)))
+        Ok(Some(record))
+    }
+
+    fn context_sha256(messages: &[ConversationMessage]) -> Result<String> {
+        let payload =
+            serde_json::to_vec(messages).context("Failed to serialize ACP context for digest")?;
+        Ok(format!("{:x}", Sha256::digest(payload)))
+    }
+
+    fn active_compaction_checkpoint(
+        conn: &Connection,
+        session_id: i64,
+    ) -> Result<Option<AcpActiveCheckpointRecord>> {
+        let row = conn
+            .query_row(
+                "SELECT format_version, operation_id, source_context_sha256,
+                        covered_prefix_sha256, source_message_count,
+                        covered_message_count, covered_turn_count, summary,
+                        summary_message_json, summary_model_provider,
+                        summary_model, input_tokens, output_tokens, created_at
+                   FROM acp_compaction_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<i64>>(12)?,
+                        row.get::<_, String>(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to read ACP compaction checkpoint")?;
+        let Some((
+            format_version,
+            operation_id,
+            source_context_sha256,
+            covered_prefix_sha256,
+            source_message_count,
+            covered_message_count,
+            covered_turn_count,
+            summary,
+            summary_message_json,
+            summary_model_provider,
+            summary_model,
+            input_tokens,
+            output_tokens,
+            created_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let to_usize = |value: i64, field: &str| {
+            usize::try_from(value).with_context(|| format!("invalid {field} in ACP checkpoint"))
+        };
+        let to_u64 = |value: Option<i64>, field: &str| {
+            value
+                .map(|value| {
+                    u64::try_from(value)
+                        .with_context(|| format!("invalid {field} in ACP checkpoint"))
+                })
+                .transpose()
+        };
+        Ok(Some(AcpActiveCheckpointRecord {
+            format_version,
+            operation_id,
+            source_context_sha256,
+            covered_prefix_sha256,
+            source_message_count: to_usize(source_message_count, "source_message_count")?,
+            covered_message_count: to_usize(covered_message_count, "covered_message_count")?,
+            covered_turn_count: to_usize(covered_turn_count, "covered_turn_count")?,
+            summary,
+            summary_message: serde_json::from_str(&summary_message_json)
+                .context("Failed to deserialize ACP compaction summary message")?,
+            summary_model_provider,
+            summary_model,
+            input_tokens: to_u64(input_tokens, "input_tokens")?,
+            output_tokens: to_u64(output_tokens, "output_tokens")?,
+            created_at: parse_ts(&created_at, "created_at", "compaction checkpoint"),
+        }))
+    }
+
+    fn split_breadcrumb(
+        messages: &[ConversationMessage],
+        breadcrumb: bool,
+    ) -> (Option<&ConversationMessage>, &[ConversationMessage]) {
+        if breadcrumb && !messages.is_empty() {
+            (messages.first(), &messages[1..])
+        } else {
+            (None, messages)
+        }
+    }
+
+    fn project_compacted_context(
+        canonical: &[ConversationMessage],
+        breadcrumb: bool,
+        checkpoint: &AcpActiveCheckpointRecord,
+    ) -> Result<Vec<ConversationMessage>> {
+        let (crumb, body) = Self::split_breadcrumb(canonical, breadcrumb);
+        anyhow::ensure!(
+            checkpoint.covered_message_count <= body.len(),
+            "ACP compaction checkpoint covers beyond canonical context"
+        );
+        anyhow::ensure!(
+            Self::context_sha256(&body[..checkpoint.covered_message_count])?
+                == checkpoint.covered_prefix_sha256,
+            "ACP compaction checkpoint prefix no longer matches canonical context"
+        );
+        let opening_user = body[..checkpoint.covered_message_count]
+            .iter()
+            .find(
+                |message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user"),
+            )
+            .cloned()
+            .context("ACP compaction checkpoint has no opening user anchor")?;
+        let mut projected = Vec::with_capacity(
+            usize::from(crumb.is_some()) + 2 + body.len() - checkpoint.covered_message_count,
+        );
+        if let Some(crumb) = crumb {
+            projected.push(crumb.clone());
+        }
+        projected.push(opening_user);
+        projected.push(checkpoint.summary_message.clone());
+        projected.extend_from_slice(&body[checkpoint.covered_message_count..]);
+        Ok(Self::provider_safe_history(&projected))
+    }
+
+    fn messages_equal(left: &ConversationMessage, right: &ConversationMessage) -> bool {
+        serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
+    }
+
+    /// Convert a live projected snapshot back to summary-free canonical
+    /// context. If the summary turn has aged out, retire the checkpoint and
+    /// keep the supplied snapshot as the new ordinary canonical context.
+    fn canonicalize_projected_snapshot(
+        current_canonical: &[ConversationMessage],
+        current_breadcrumb: bool,
+        projected: &[ConversationMessage],
+        projected_breadcrumb: bool,
+        checkpoint: &AcpActiveCheckpointRecord,
+    ) -> Result<(Vec<ConversationMessage>, bool)> {
+        let (_, current_body) = Self::split_breadcrumb(current_canonical, current_breadcrumb);
+        anyhow::ensure!(
+            checkpoint.covered_message_count <= current_body.len(),
+            "ACP compaction checkpoint covers beyond canonical context"
+        );
+        anyhow::ensure!(
+            Self::context_sha256(&current_body[..checkpoint.covered_message_count])?
+                == checkpoint.covered_prefix_sha256,
+            "ACP compaction checkpoint prefix no longer matches canonical context"
+        );
+        let opening_user = current_body[..checkpoint.covered_message_count]
+            .iter()
+            .find(
+                |message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user"),
+            )
+            .context("ACP compaction checkpoint has no opening user anchor")?;
+        let (projected_crumb, projected_body) =
+            Self::split_breadcrumb(projected, projected_breadcrumb);
+        let summary_retained = projected_body.len() >= 2
+            && Self::messages_equal(&projected_body[0], opening_user)
+            && Self::messages_equal(&projected_body[1], &checkpoint.summary_message);
+        if !summary_retained {
+            return Ok((Self::provider_safe_history(projected), false));
+        }
+        let mut canonical = Vec::with_capacity(
+            usize::from(projected_crumb.is_some())
+                + checkpoint.covered_message_count
+                + projected_body.len().saturating_sub(2),
+        );
+        if let Some(crumb) = projected_crumb {
+            canonical.push(crumb.clone());
+        }
+        canonical.extend_from_slice(&current_body[..checkpoint.covered_message_count]);
+        canonical.extend_from_slice(&projected_body[2..]);
+        Ok((Self::provider_safe_history(&canonical), true))
     }
 
     /// Insert messages into the durable, user-visible transcript. This path
@@ -1987,6 +2792,11 @@ impl AcpSessionStore {
             ],
         )
         .context("Failed to update last_activity, trim_breadcrumb and projected_message_count")?;
+        tx.execute(
+            "DELETE FROM acp_compaction_checkpoints WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to invalidate ACP compaction checkpoint")?;
         tx.commit()
             .context("Failed to commit replace_messages_and_breadcrumb")?;
         Ok(())
@@ -2110,11 +2920,38 @@ impl AcpSessionStore {
             .context("Failed to begin retained context transaction")?;
         Self::ensure_active_checkpoint(&tx, session_id, turn_id)?;
         let retained = Self::bounded_transcript_messages(retained_messages);
-        // This is the complete owner-selected projection, including partial
-        // typed calls awaiting later results. Filtering belongs after recovery
-        // composes the snapshot with uncovered journal events.
-        let record = RetainedContextRecord {
-            messages: Self::without_hidden_reasoning(&retained),
+        let active = Self::active_compaction_checkpoint(&tx, session_id)?;
+        let record = if let Some(checkpoint) = active {
+            let current = Self::load_retained_context_record(&tx, session_id)?
+                .context("active ACP compaction has no canonical retained context")?;
+            let current_breadcrumb = tx.query_row(
+                "SELECT COALESCE(trim_breadcrumb, 0) FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            let (messages, checkpoint_retained) = Self::canonicalize_projected_snapshot(
+                &current.messages,
+                current_breadcrumb,
+                &retained,
+                breadcrumb,
+                &checkpoint,
+            )?;
+            if !checkpoint_retained {
+                tx.execute(
+                    "DELETE FROM acp_compaction_checkpoints WHERE session_id = ?1",
+                    params![session_id],
+                )?;
+            }
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&messages),
+            }
+        } else {
+            // This is the complete owner-selected projection, including partial
+            // typed calls awaiting later results. Filtering belongs after recovery
+            // composes the snapshot with uncovered journal events.
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&retained),
+            }
         };
         let payload =
             serde_json::to_string(&record).context("Failed to serialize retained ACP context")?;
@@ -2154,8 +2991,35 @@ impl AcpSessionStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin retained seed context transaction")?;
         let retained = Self::bounded_transcript_messages(retained_messages);
-        let record = RetainedContextRecord {
-            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+        let active = Self::active_compaction_checkpoint(&tx, session_id)?;
+        let record = if let Some(checkpoint) = active {
+            let current = Self::load_retained_context_record(&tx, session_id)?
+                .context("active ACP compaction has no canonical retained context")?;
+            let current_breadcrumb = tx.query_row(
+                "SELECT COALESCE(trim_breadcrumb, 0) FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            let (messages, checkpoint_retained) = Self::canonicalize_projected_snapshot(
+                &current.messages,
+                current_breadcrumb,
+                &retained,
+                breadcrumb,
+                &checkpoint,
+            )?;
+            if !checkpoint_retained {
+                tx.execute(
+                    "DELETE FROM acp_compaction_checkpoints WHERE session_id = ?1",
+                    params![session_id],
+                )?;
+            }
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&messages),
+            }
+        } else {
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+            }
         };
         let payload =
             serde_json::to_string(&record).context("Failed to serialize retained seed context")?;
@@ -2281,7 +3145,7 @@ impl AcpSessionStore {
         let session_id: i64 = tx
             .query_row(
                 "SELECT id FROM acp_sessions
-                 WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
+                 WHERE session_uuid = ?1 AND principal_id IS ?2",
                 params![session_uuid, owner_principal_id],
                 |row| row.get(0),
             )
@@ -2316,8 +3180,35 @@ impl AcpSessionStore {
         };
         Self::append_checkpoint_visible_messages(&tx, session_uuid, session_id, &visible, &now)?;
         let retained = Self::bounded_transcript_messages(retained_messages);
-        let record = RetainedContextRecord {
-            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+        let active = Self::active_compaction_checkpoint(&tx, session_id)?;
+        let record = if let Some(checkpoint) = active {
+            let current = Self::load_retained_context_record(&tx, session_id)?
+                .context("active ACP compaction has no canonical retained context")?;
+            let current_breadcrumb = tx.query_row(
+                "SELECT COALESCE(trim_breadcrumb, 0) FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            let (messages, checkpoint_retained) = Self::canonicalize_projected_snapshot(
+                &current.messages,
+                current_breadcrumb,
+                &retained,
+                breadcrumb,
+                &checkpoint,
+            )?;
+            if !checkpoint_retained {
+                tx.execute(
+                    "DELETE FROM acp_compaction_checkpoints WHERE session_id = ?1",
+                    params![session_id],
+                )?;
+            }
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&messages),
+            }
+        } else {
+            RetainedContextRecord {
+                messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+            }
         };
         let payload = serde_json::to_string(&record)
             .context("Failed to serialize final retained ACP context")?;
@@ -2416,7 +3307,7 @@ impl AcpSessionStore {
         let session_id = tx
             .query_row(
                 "SELECT id FROM acp_sessions
-                 WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
+                 WHERE session_uuid = ?1 AND principal_id IS ?2",
                 params![session_uuid, owner_principal_id],
                 |row| row.get(0),
             )
@@ -3450,6 +4341,419 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    fn compaction_fixture() -> Vec<ConversationMessage> {
+        vec![
+            ConversationMessage::Chat(ChatMessage::user("first request")),
+            ConversationMessage::Chat(ChatMessage::assistant("first answer")),
+            ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ConversationMessage::Chat(ChatMessage::assistant("newest answer")),
+        ]
+    }
+
+    fn retained_context_payload(store: &AcpSessionStore, session_uuid: &str) -> String {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT retained_context_json FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn activate_fixture_checkpoint(
+        store: &AcpSessionStore,
+        session_uuid: &str,
+        principal_id: &str,
+        operation_id: &str,
+        summary_message: &ConversationMessage,
+    ) -> AcpCompactionSnapshot {
+        let snapshot = store
+            .read_compaction_snapshot_for_owner(session_uuid, Some(principal_id))
+            .unwrap()
+            .unwrap();
+        let selection = select_compaction_source(&snapshot.canonical_context).unwrap();
+        let outcome = store
+            .activate_compaction_checkpoint_for_owner(&CompactionActivationRequest {
+                session_uuid,
+                principal_id: Some(principal_id),
+                expected_session_row_id: snapshot.session_row_id,
+                expected_source_context_sha256: &snapshot.canonical_context_sha256,
+                expected_active_operation: None,
+                format_version: 1,
+                operation_id,
+                covered_message_count: selection.covered_message_count,
+                covered_turn_count: selection.covered_turn_count,
+                summary: "summary text",
+                summary_message,
+                summary_model_provider: "test-provider",
+                summary_model: "test-model",
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+            })
+            .unwrap();
+        assert_eq!(outcome, CompactionActivationOutcome::Activated);
+        snapshot
+    }
+
+    #[test]
+    fn compaction_source_keeps_the_newest_user_turn() {
+        let body = vec![
+            ConversationMessage::Chat(ChatMessage::user("first request")),
+            ConversationMessage::Chat(ChatMessage::assistant("first answer")),
+            ConversationMessage::Chat(ChatMessage::user("second request")),
+            ConversationMessage::Chat(ChatMessage::assistant("second answer")),
+            ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ConversationMessage::Chat(ChatMessage::assistant("newest answer")),
+        ];
+
+        let selected = select_compaction_source(&body).unwrap();
+
+        assert_eq!(selected.covered_turn_count, 2);
+        assert_eq!(selected.covered_message_count, 4);
+        assert!(matches!(
+            &body[selected.covered_message_count],
+            ConversationMessage::Chat(chat)
+                if chat.role == "user" && chat.content == "newest request"
+        ));
+    }
+
+    #[test]
+    fn compaction_source_keeps_prompt_mode_tool_results_inside_their_user_turn() {
+        let body = vec![
+            ConversationMessage::Chat(ChatMessage::user("first request")),
+            ConversationMessage::Chat(ChatMessage::assistant(
+                "<tool_call><name>read_file</name></tool_call>",
+            )),
+            ConversationMessage::Chat(ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"read_file\">ok</tool_result>",
+            )),
+            ConversationMessage::Chat(ChatMessage::assistant("first answer")),
+            ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ConversationMessage::Chat(ChatMessage::assistant("newest answer")),
+        ];
+
+        let selected = select_compaction_source(&body).unwrap();
+
+        assert_eq!(selected.covered_turn_count, 1);
+        assert_eq!(selected.covered_message_count, 4);
+        assert!(matches!(
+            &body[selected.covered_message_count],
+            ConversationMessage::Chat(chat)
+                if chat.role == "user" && chat.content == "newest request"
+        ));
+    }
+
+    #[test]
+    fn compaction_activation_fences_owner_incarnation_and_source() {
+        let (_tmp, store) = open_store();
+        let session_uuid = "compaction-fences";
+        let principal_id = "principal-a";
+        let row_id = store
+            .create_session_with_interaction_surface(
+                session_uuid,
+                "alpha",
+                "/tmp/project",
+                Some("zerocode_code"),
+                Some(principal_id),
+            )
+            .unwrap();
+        let canonical = compaction_fixture();
+        store.append_turn(session_uuid, &canonical).unwrap();
+        store
+            .persist_retained_context_seed(session_uuid, &canonical, false)
+            .unwrap();
+        let snapshot = store
+            .read_compaction_snapshot_for_owner(session_uuid, Some(principal_id))
+            .unwrap()
+            .unwrap();
+        let selection = select_compaction_source(&snapshot.canonical_context).unwrap();
+        let summary_message = ConversationMessage::Chat(ChatMessage::assistant("summary"));
+
+        let wrong_owner =
+            store.activate_compaction_checkpoint_for_owner(&CompactionActivationRequest {
+                session_uuid,
+                principal_id: Some("principal-b"),
+                expected_session_row_id: row_id,
+                expected_source_context_sha256: &snapshot.canonical_context_sha256,
+                expected_active_operation: None,
+                format_version: 1,
+                operation_id: "owner-mismatch",
+                covered_message_count: selection.covered_message_count,
+                covered_turn_count: selection.covered_turn_count,
+                summary: "summary",
+                summary_message: &summary_message,
+                summary_model_provider: "test-provider",
+                summary_model: "test-model",
+                input_tokens: None,
+                output_tokens: None,
+            });
+        assert_eq!(wrong_owner, Err(CompactionActivationError::SessionMissing));
+
+        let wrong_incarnation =
+            store.activate_compaction_checkpoint_for_owner(&CompactionActivationRequest {
+                session_uuid,
+                principal_id: Some(principal_id),
+                expected_session_row_id: row_id + 1,
+                expected_source_context_sha256: &snapshot.canonical_context_sha256,
+                expected_active_operation: None,
+                format_version: 1,
+                operation_id: "incarnation-mismatch",
+                covered_message_count: selection.covered_message_count,
+                covered_turn_count: selection.covered_turn_count,
+                summary: "summary",
+                summary_message: &summary_message,
+                summary_model_provider: "test-provider",
+                summary_model: "test-model",
+                input_tokens: None,
+                output_tokens: None,
+            });
+        assert_eq!(
+            wrong_incarnation,
+            Err(CompactionActivationError::IncarnationMismatch {
+                found_session_row_id: row_id,
+            })
+        );
+
+        let wrong_source =
+            store.activate_compaction_checkpoint_for_owner(&CompactionActivationRequest {
+                session_uuid,
+                principal_id: Some(principal_id),
+                expected_session_row_id: row_id,
+                expected_source_context_sha256: "stale-source",
+                expected_active_operation: None,
+                format_version: 1,
+                operation_id: "source-mismatch",
+                covered_message_count: selection.covered_message_count,
+                covered_turn_count: selection.covered_turn_count,
+                summary: "summary",
+                summary_message: &summary_message,
+                summary_model_provider: "test-provider",
+                summary_model: "test-model",
+                input_tokens: None,
+                output_tokens: None,
+            });
+        assert_eq!(wrong_source, Err(CompactionActivationError::SourceMismatch));
+    }
+
+    #[test]
+    fn compaction_active_projection_rejects_a_stale_prefix_identity() {
+        let (_tmp, store) = open_store();
+        let session_uuid = "compaction-stale-prefix";
+        let principal_id = "principal-a";
+        store
+            .create_session_with_interaction_surface(
+                session_uuid,
+                "alpha",
+                "/tmp/project",
+                Some("zerocode_code"),
+                Some(principal_id),
+            )
+            .unwrap();
+        let canonical = compaction_fixture();
+        store.append_turn(session_uuid, &canonical).unwrap();
+        store
+            .persist_retained_context_seed(session_uuid, &canonical, false)
+            .unwrap();
+        let summary_message = ConversationMessage::Chat(ChatMessage::assistant("summary"));
+        activate_fixture_checkpoint(
+            &store,
+            session_uuid,
+            principal_id,
+            "operation-stale-prefix",
+            &summary_message,
+        );
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE acp_compaction_checkpoints
+                    SET covered_prefix_sha256 = 'stale-prefix'
+                  WHERE session_id = (
+                        SELECT id FROM acp_sessions WHERE session_uuid = ?1
+                  )",
+                params![session_uuid],
+            )
+            .unwrap();
+
+        let snapshot = store
+            .read_compaction_snapshot_for_owner(session_uuid, Some(principal_id))
+            .unwrap()
+            .unwrap();
+        let error = snapshot
+            .active_projection()
+            .expect_err("a stale durable prefix must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("prefix no longer matches canonical context")
+        );
+    }
+
+    #[test]
+    fn compact_later_turn_reload_and_restore_preserve_canonical_and_raw_history() {
+        let (_tmp, store) = open_store();
+        let session_uuid = "compaction-lifecycle";
+        let principal_id = "principal-a";
+        store
+            .create_session_with_interaction_surface(
+                session_uuid,
+                "alpha",
+                "/tmp/project",
+                Some("zerocode_code"),
+                Some(principal_id),
+            )
+            .unwrap();
+        let canonical = compaction_fixture();
+        store.append_turn(session_uuid, &canonical).unwrap();
+        store
+            .persist_retained_context_seed(session_uuid, &canonical, false)
+            .unwrap();
+        let summary_message =
+            ConversationMessage::Chat(ChatMessage::assistant("SUMMARY PROJECTION"));
+        let snapshot = activate_fixture_checkpoint(
+            &store,
+            session_uuid,
+            principal_id,
+            "operation-1",
+            &summary_message,
+        );
+
+        let raw_before =
+            serde_json::to_value(&store.load_session(session_uuid).unwrap().unwrap().messages)
+                .unwrap();
+        let canonical_payload = retained_context_payload(&store, session_uuid);
+        assert!(!canonical_payload.contains("SUMMARY PROJECTION"));
+
+        let projected = match store.load_session_for_restore(session_uuid).unwrap() {
+            AcpSessionRestore::Restorable(data) => data.retained_context.unwrap(),
+            AcpSessionRestore::Missing => panic!("expected restorable session"),
+            AcpSessionRestore::Killed => panic!("expected live session"),
+        };
+        assert!(
+            serde_json::to_string(&projected)
+                .unwrap()
+                .contains("SUMMARY PROJECTION")
+        );
+        let history_view = store
+            .load_session_for_agent(session_uuid, "alpha")
+            .unwrap()
+            .unwrap()
+            .retained_context
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&history_view)
+                .unwrap()
+                .contains("SUMMARY PROJECTION"),
+            "session tools must keep their summary-free retained-context view"
+        );
+
+        let later = vec![
+            ConversationMessage::Chat(ChatMessage::user("later request")),
+            ConversationMessage::Chat(ChatMessage::assistant("later answer")),
+        ];
+        store.append_turn(session_uuid, &later).unwrap();
+        let mut projected_with_later = projected;
+        projected_with_later.extend(later.clone());
+        store
+            .persist_retained_context_seed(session_uuid, &projected_with_later, false)
+            .unwrap();
+
+        let reloaded = match store.load_session_for_restore(session_uuid).unwrap() {
+            AcpSessionRestore::Restorable(data) => data.retained_context.unwrap(),
+            AcpSessionRestore::Missing => panic!("expected restorable session"),
+            AcpSessionRestore::Killed => panic!("expected live session"),
+        };
+        let reloaded_json = serde_json::to_string(&reloaded).unwrap();
+        assert!(reloaded_json.contains("SUMMARY PROJECTION"));
+        assert!(reloaded_json.contains("later request"));
+        let canonical_after_later = retained_context_payload(&store, session_uuid);
+        assert!(!canonical_after_later.contains("SUMMARY PROJECTION"));
+        assert!(canonical_after_later.contains("first answer"));
+        assert!(canonical_after_later.contains("later request"));
+
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint_for_owner(
+                    session_uuid,
+                    Some(principal_id),
+                    snapshot.session_row_id,
+                    "operation-1",
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::Deactivated
+        );
+        let restored = match store.load_session_for_restore(session_uuid).unwrap() {
+            AcpSessionRestore::Restorable(data) => data.retained_context.unwrap(),
+            AcpSessionRestore::Missing => panic!("expected restorable session"),
+            AcpSessionRestore::Killed => panic!("expected live session"),
+        };
+        let restored_json = serde_json::to_string(&restored).unwrap();
+        assert!(!restored_json.contains("SUMMARY PROJECTION"));
+        assert!(restored_json.contains("first answer"));
+        assert!(restored_json.contains("later request"));
+
+        let raw_after =
+            serde_json::to_value(&store.load_session(session_uuid).unwrap().unwrap().messages)
+                .unwrap();
+        assert_ne!(raw_after, raw_before);
+        assert_eq!(
+            raw_after.as_array().unwrap().len(),
+            canonical.len() + later.len()
+        );
+        assert!(!raw_after.to_string().contains("SUMMARY PROJECTION"));
+    }
+
+    #[test]
+    fn trimming_away_the_summary_retires_the_checkpoint() {
+        let (_tmp, store) = open_store();
+        let session_uuid = "compaction-trim-retire";
+        let principal_id = "principal-a";
+        store
+            .create_session_with_interaction_surface(
+                session_uuid,
+                "alpha",
+                "/tmp/project",
+                Some("zerocode_code"),
+                Some(principal_id),
+            )
+            .unwrap();
+        let canonical = compaction_fixture();
+        store.append_turn(session_uuid, &canonical).unwrap();
+        store
+            .persist_retained_context_seed(session_uuid, &canonical, false)
+            .unwrap();
+        let summary_message =
+            ConversationMessage::Chat(ChatMessage::assistant("SUMMARY PROJECTION"));
+        activate_fixture_checkpoint(
+            &store,
+            session_uuid,
+            principal_id,
+            "operation-1",
+            &summary_message,
+        );
+
+        let trimmed = vec![
+            ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ConversationMessage::Chat(ChatMessage::assistant("newest answer")),
+        ];
+        store
+            .persist_retained_context_seed(session_uuid, &trimmed, false)
+            .unwrap();
+
+        let snapshot = store
+            .read_compaction_snapshot_for_owner(session_uuid, Some(principal_id))
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.active_checkpoint.is_none());
+        assert_eq!(
+            serde_json::to_value(snapshot.canonical_context).unwrap(),
+            serde_json::to_value(trimmed).unwrap()
+        );
     }
 
     #[test]
