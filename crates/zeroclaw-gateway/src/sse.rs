@@ -7,13 +7,16 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
 use std::convert::Infallible;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use zeroclaw_rpc_client::Method;
+
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 
 pub use zeroclaw_runtime::observability::broadcast::{BroadcastObserver, EventBuffer};
 use zeroclaw_runtime::observability::broadcast::{history_events, is_public_event};
@@ -101,14 +104,34 @@ fn sse_frame_for_stream(
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
+///
+/// Through the core this is `events/history`, which returns the same
+/// `{"events": [...]}` body from the same buffer. A principal the core does
+/// not let read every principal's events is refused with `403`; the route
+/// never substitutes another connection's view.
 pub async fn handle_events_history(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return events_history_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
     Json(history_events_payload(&state.event_buffer)).into_response()
+}
+
+/// `GET /api/events/history` through the core, the body every router
+/// serves for it.
+pub(crate) async fn events_history_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let history = core
+        .request(Method::EventsHistory, serde_json::json!({}))
+        .await?;
+    Ok(Json(history).into_response())
 }
 
 fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {

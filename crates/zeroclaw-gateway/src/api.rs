@@ -5,12 +5,18 @@ use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::{CLIENT_KIND_GATEWAY, SessionEntry, SessionListResult};
+
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1209,6 +1215,7 @@ pub async fn handle_api_memory_delete(
 /// Query parameters for `GET /api/cost`. When `agent` is set, the
 /// returned summary filters to records attributed to that alias.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Clone, Default))]
 pub struct CostQuery {
     #[serde(default)]
     pub agent: Option<String>,
@@ -1229,7 +1236,13 @@ pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CostQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cost_through_core(&core, &query)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1256,19 +1269,81 @@ pub async fn handle_api_cost(
                 .into_response(),
         }
     } else {
-        Json(serde_json::json!({
-            "cost": {
-                "session_cost_usd": 0.0,
-                "daily_cost_usd": 0.0,
-                "monthly_cost_usd": 0.0,
-                "total_tokens": 0,
-                "request_count": 0,
-                "by_model": {},
-                "by_agent": {},
-            }
-        }))
-        .into_response()
+        Json(empty_cost_response()).into_response()
     }
+}
+
+/// `GET /api/cost` through the core, the body every router serves for it.
+/// A core with cost tracking disabled answers the route's disabled body.
+pub(crate) async fn api_cost_through_core(
+    core: &CoreCall,
+    query: &CostQuery,
+) -> Result<Response, CoreError> {
+    match core
+        .request(Method::CostQuery, cost_query_params(query))
+        .await
+    {
+        Ok(summary) => Ok(Json(serde_json::json!({ "cost": summary })).into_response()),
+        Err(CoreError::Rpc(error)) if cost_tracking_disabled(&error) => {
+            Ok(Json(empty_cost_response()).into_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The body this route answers with when cost tracking is disabled.
+fn empty_cost_response() -> serde_json::Value {
+    serde_json::json!({
+        "cost": {
+            "session_cost_usd": 0.0,
+            "daily_cost_usd": 0.0,
+            "monthly_cost_usd": 0.0,
+            "total_tokens": 0,
+            "request_count": 0,
+            "by_model": {},
+            "by_agent": {},
+        }
+    })
+}
+
+/// Lower bound that selects every cost record. No record predates it.
+const ALL_TIME_FROM: &str = "0000-01-01T00:00:00Z";
+
+/// The core's refusal when this daemon has no cost tracker.
+const COST_TRACKING_UNAVAILABLE: &str = "Cost tracking is not available";
+
+fn cost_tracking_disabled(error: &JsonRpcError) -> bool {
+    error.code == INTERNAL_ERROR && error.message == COST_TRACKING_UNAVAILABLE
+}
+
+/// The `cost/query` params that reproduce this route's summary.
+///
+/// This route reads a bound it cannot parse as absent and, with neither
+/// bound, sums every record kept. `cost/query` refuses an unparsable bound
+/// and, with neither, reports the current day and month instead. So only
+/// bounds that parse are forwarded, and a request with none forwards
+/// [`ALL_TIME_FROM`]. An agent selects that agent's summary and no window,
+/// as it does here.
+fn cost_query_params(query: &CostQuery) -> serde_json::Value {
+    if let Some(agent) = query.agent.as_deref().filter(|s| !s.is_empty()) {
+        return serde_json::json!({ "agent": agent });
+    }
+    let parsed = |raw: &Option<String>| {
+        raw.clone()
+            .filter(|raw| chrono::DateTime::parse_from_rfc3339(raw).is_ok())
+    };
+    let (from, to) = match (parsed(&query.from), parsed(&query.to)) {
+        (None, None) => (Some(ALL_TIME_FROM.to_owned()), None),
+        bounds => bounds,
+    };
+    let mut params = serde_json::Map::new();
+    if let Some(from) = from {
+        params.insert("from".into(), from.into());
+    }
+    if let Some(to) = to {
+        params.insert("to".into(), to.into());
+    }
+    serde_json::Value::Object(params)
 }
 
 /// GET /api/cli-tools — discovered CLI tools
@@ -1459,7 +1534,13 @@ pub async fn handle_api_channel_relink(
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_tuis_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1470,6 +1551,7 @@ pub async fn handle_api_tuis(
         .map(|r| {
             r.list()
                 .into_iter()
+                .filter(|e| !is_gateway_client(e.client_kind.as_deref()))
                 .map(|e| {
                     serde_json::json!({
                         "tui_id": e.tui_id,
@@ -1483,6 +1565,41 @@ pub async fn handle_api_tuis(
         .unwrap_or_default();
 
     Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+/// `GET /api/tuis` through the core, the body every router serves for it.
+pub(crate) async fn api_tuis_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let list = core.request(Method::TuiList, serde_json::json!({})).await?;
+    Ok(Json(tuis_response(list)).into_response())
+}
+
+/// This route's body from the core's `tui/list` result, which also reports
+/// each connection time as a Unix timestamp and labels a gateway's own
+/// connections.
+fn tuis_response(mut list: serde_json::Value) -> serde_json::Value {
+    if let Some(tuis) = list
+        .get_mut("tuis")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        tuis.retain(|tui| {
+            !is_gateway_client(tui.get("client_kind").and_then(serde_json::Value::as_str))
+        });
+        for tui in tuis {
+            if let Some(entry) = tui.as_object_mut() {
+                entry.remove("connected_at_unix");
+                entry.remove("client_kind");
+            }
+        }
+    }
+    list
+}
+
+/// Whether a registered client declared itself a gateway on `initialize`,
+/// as every connection a gateway opens for its callers does (this one's and
+/// any separate `zeroclaw-gw`'s). The core registers those connections too;
+/// they are not terminals and this route never listed them.
+fn is_gateway_client(client_kind: Option<&str>) -> bool {
+    client_kind == Some(CLIENT_KIND_GATEWAY)
 }
 
 fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
@@ -1707,7 +1824,13 @@ fn normalized_webhook_path(path: Option<&str>) -> String {
 pub async fn handle_api_health(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_health_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1716,9 +1839,43 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// `GET /api/health` through the core, the body every router serves for it.
+pub(crate) async fn api_health_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let health = core.request(Method::Health, serde_json::json!({})).await?;
+    Ok(Json(health_response(health)).into_response())
+}
+
+/// This route's body from the core's `health` result. The core adds the
+/// process stats that `/api/status` reports; this route never carried them.
+fn health_response(mut health: serde_json::Value) -> serde_json::Value {
+    if let Some(snapshot) = health.as_object_mut() {
+        snapshot.remove("process");
+    }
+    serde_json::json!({ "health": health })
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 // ── Session API handlers ─────────────────────────────────────────
+//
+// Every session route stays in-process for now.
+// - `GET /api/sessions`: the core lists, for a non-local caller, only the
+//   sessions that caller's own connection opened, so the gateway's
+//   credential-bound connection would list none of the dashboard's sessions.
+//   The listing moves to the core once the core scopes such a connection's
+//   view by its principal. The rows already take the core's `SessionEntry`
+//   shape, so that move changes only where they come from. The standalone
+//   preview gateway serves it through the core already
+//   (`api_sessions_list_through_core`).
+// - The routes that address one session by id: the core resolves a session
+//   id by trying `rpc_{id}`, `gw_{id}` and `{id}` in turn, so it cannot be
+//   told to act on exactly the row this gateway's resolver picked. A
+//   competing row with another prefix would be read or deleted instead. That
+//   needs an exact durable-row reference in the core.
+// - A delete must first cancel and wait for the gateway's own chat turn,
+//   which only the gateway can do, while only the core can authorize the
+//   delete. Until those turns run in the core, the two cannot be made one
+//   authorized step.
 
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
@@ -1741,8 +1898,8 @@ pub async fn handle_api_sessions_list(
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
-    let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
+    let entries: Vec<SessionEntry> = backend
+        .list_sessions_with_metadata()
         .into_iter()
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
         .map(|meta| {
@@ -1755,33 +1912,59 @@ pub async fn handle_api_sessions_list(
                     .and_then(|c| config.agent_for_channel(c))
                     .map(str::to_string)
             });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
-            let session_id = meta
-                .key
-                .strip_prefix("gw_")
-                .map(str::to_string)
-                .unwrap_or_else(|| meta.key.clone());
-            let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
-                "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-                "agent_alias": agent_alias,
-                "channel_id": meta.channel_id,
-            });
-            if let Some(name) = meta.name {
-                entry["name"] = serde_json::Value::String(name);
+            SessionEntry {
+                session_id: gateway_display_session_id(&meta.key).to_string(),
+                session_key: meta.key,
+                created_at: meta.created_at.to_rfc3339(),
+                last_activity: meta.last_activity.to_rfc3339(),
+                message_count: meta.message_count,
+                agent_alias,
+                channel_id: meta.channel_id,
+                name: meta.name,
             }
-            entry
         })
         .collect();
 
+    sessions_list_response(entries)
+}
+
+/// `GET /api/sessions` through the core, as the standalone preview gateway
+/// serves it: the sessions the caller's principal may see. Over the daemon's
+/// local socket the core does not narrow the list to the sessions this
+/// connection opened; the principal still scopes it. A paired token is the
+/// shared operator and sees every attributable session, while an
+/// authenticated principal without the admin grant, such as an OIDC user,
+/// sees only its own.
+pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let listed: SessionListResult = core
+        .call(Method::SessionList, serde_json::json!({}))
+        .await?;
+    Ok(sessions_list_response(listed.sessions))
+}
+
+fn sessions_list_response(entries: Vec<SessionEntry>) -> Response {
+    let sessions: Vec<serde_json::Value> = entries.into_iter().map(session_list_row).collect();
     Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// One row of `GET /api/sessions`, whichever path listed it.
+fn session_list_row(entry: SessionEntry) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        // Display form: `gw_` stripped for gateway sessions, full
+        // composite for channel-driven sessions.
+        "session_id": gateway_display_session_id(&entry.session_key),
+        // Full DB key for API operations (delete, messages, abort).
+        "session_key": entry.session_key,
+        "created_at": entry.created_at,
+        "last_activity": entry.last_activity,
+        "message_count": entry.message_count,
+        "agent_alias": entry.agent_alias,
+        "channel_id": entry.channel_id,
+    });
+    if let Some(name) = entry.name {
+        row["name"] = serde_json::Value::String(name);
+    }
+    row
 }
 
 /// Resolve a path `{id}` to the persisted session key.
@@ -2180,6 +2363,19 @@ pub async fn handle_api_session_state(
 
 // ── Session abort endpoint ────────────────────────────────────────
 
+/// Consume the body through the router's canonical size/deadline layers
+/// before cancellation. An ignored chunked body would never poll its limit.
+pub(crate) async fn handle_api_session_abort_request(
+    state: State<AppState>,
+    headers: HeaderMap,
+    id: Path<String>,
+    _body: axum::body::Bytes,
+) -> axum::response::Response {
+    handle_api_session_abort(state, headers, id)
+        .await
+        .into_response()
+}
+
 pub async fn handle_api_session_abort(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2228,6 +2424,14 @@ pub async fn handle_claude_code_hook(
     // back to a session we spawned.
     let _ = &state; // retained for future Slack update wiring
 
+    claude_code_hook(&payload)
+}
+
+/// Log a Claude Code hook event and acknowledge it. The separate gateway
+/// answers with this too.
+pub(crate) fn claude_code_hook(
+    payload: &zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent,
+) -> Json<serde_json::Value> {
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": payload.session_id, "event_type": payload.event_type, "tool_name": payload.tool_name, "summary": payload.summary})), "Claude Code hook event received");
 
     Json(serde_json::json!({ "ok": true }))
@@ -2238,6 +2442,9 @@ pub async fn handle_claude_code_hook(
 
 #[cfg(test)]
 pub(crate) use tests::test_state;
+
+#[cfg(test)]
+mod sessions_core_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2496,7 +2703,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    pub(crate) async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
             .collect()
@@ -3489,7 +3696,7 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
+    pub(crate) fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
     ) -> AppState {

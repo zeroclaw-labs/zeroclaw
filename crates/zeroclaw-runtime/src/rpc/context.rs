@@ -32,6 +32,8 @@ pub struct ApprovalPendingMap {
 struct PendingApprovalEntry {
     session_id: String,
     tx: oneshot::Sender<ChannelApprovalResponse>,
+    connection: Option<std::sync::Weak<zeroclaw_api::jsonrpc::RpcOutbound>>,
+    turn_generation: Option<u64>,
 }
 
 pub struct PendingApproval {
@@ -75,10 +77,63 @@ impl ApprovalPendingMap {
         session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
     ) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, PendingApprovalEntry { session_id, tx });
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id,
+            PendingApprovalEntry {
+                session_id,
+                tx,
+                connection: None,
+                turn_generation: None,
+            },
+        );
+    }
+
+    /// Register the canonical responder with the connection and turn that
+    /// presented it. These identify its viewer; they grant no authority.
+    pub fn register_for_connection(
+        self: &Arc<Self>,
+        request_id: String,
+        session_id: String,
+        connection: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>,
+        turn_generation: Option<u64>,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) -> PendingApproval {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            request_id.clone(),
+            PendingApprovalEntry {
+                session_id,
+                tx,
+                connection: Some(Arc::downgrade(connection)),
+                turn_generation,
+            },
+        );
+        PendingApproval {
+            map: Arc::clone(self),
+            request_id,
+            active: true,
+        }
+    }
+
+    /// Drop only this connection/turn's canonical responder. The receiver's
+    /// closed arm supplies runtime Unreachable provenance; no operator answer
+    /// is synthesized. A different viewer's responder is untouched.
+    pub fn unreachable(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        connection: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>,
+        turn_generation: u64,
+    ) -> bool {
+        let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = pending.get(request_id).is_some_and(|entry| {
+            entry.session_id == session_id
+                && entry.turn_generation == Some(turn_generation)
+                && entry
+                    .connection
+                    .as_ref()
+                    .is_some_and(|owner| owner.ptr_eq(&Arc::downgrade(connection)))
+        });
+        mine && pending.remove(request_id).is_some()
     }
 
     pub fn resolve(

@@ -2,7 +2,6 @@
 
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,15 +65,7 @@ impl CancelCause {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
+pub use zeroclaw_rpc_proto::types::SessionOverrides;
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
 #[derive(Clone, Debug)]
@@ -194,6 +185,10 @@ impl ResumeExistingError {
 }
 
 impl RpcSession {
+    pub(crate) fn has_forwarded_environment(&self) -> bool {
+        self.forwarded_environment.is_some()
+    }
+
     pub fn new(
         agent: Agent,
         alias: &str,
@@ -284,6 +279,37 @@ type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+/// A short borrow of the canonical live-session map for an effect. The
+/// caller reserves writer capacity first and holds this borrow through its
+/// synchronous authority check and enqueue; it stores no second owner view.
+pub(crate) struct SessionEffectGuard<'a> {
+    store: &'a SessionStore,
+    sessions: tokio::sync::MutexGuard<'a, HashMap<String, RpcSession>>,
+}
+
+impl SessionEffectGuard<'_> {
+    pub(crate) fn session(&self, id: &str) -> Option<&RpcSession> {
+        self.sessions.get(id)
+    }
+
+    pub(crate) fn signal_cancel(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        cause: CancelCause,
+    ) -> Option<bool> {
+        if self.session(id).map(|session| session.generation) != generation {
+            return None;
+        }
+        Some(if cause == CancelCause::ClientRpc && generation.is_none() {
+            self.store.signal_cancellation(id, cause)
+        } else {
+            self.store
+                .signal_cancellation_for_generation(id, generation, cause)
+        })
+    }
+}
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
@@ -383,6 +409,23 @@ impl Drop for CancelTokenRegistration<'_> {
 }
 
 impl SessionStore {
+    pub(crate) fn try_effect_guard(&self) -> Option<SessionEffectGuard<'_>> {
+        self.sessions
+            .try_lock()
+            .ok()
+            .map(|sessions| SessionEffectGuard {
+                store: self,
+                sessions,
+            })
+    }
+
+    pub(crate) async fn effect_guard(&self) -> SessionEffectGuard<'_> {
+        SessionEffectGuard {
+            store: self,
+            sessions: self.sessions.lock().await,
+        }
+    }
+
     pub fn new(max_sessions: usize, session_queue: Arc<SessionActorQueue>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),

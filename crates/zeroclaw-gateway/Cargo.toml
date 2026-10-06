@@ -11,6 +11,8 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-rpc-client.workspace = true
+zeroclaw-rpc-proto.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
@@ -122,3 +124,22 @@ gateway-voice-duplex = []
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
 schema-export = ["zeroclaw-config/schema-export", "zeroclaw-runtime/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]
+# Builds the preview `zeroclaw-gw` binary: the gateway as its own process,
+# reaching the core over its local socket. Non-default, not in `dist`, not
+# packaged.
+gw-bin = []
+
+[[bin]]
+name = "zeroclaw-gw"
+path = "src/bin/zeroclaw-gw.rs"
+required-features = ["gw-bin"]
+
+[[test]]
+name = "gw_preview"
+path = "tests/gw_preview.rs"
+required-features = ["gw-bin"]
+
+[[test]]
+name = "gw_chat"
+path = "tests/gw_chat.rs"
+required-features = ["gw-bin"]
