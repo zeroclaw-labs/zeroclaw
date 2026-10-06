@@ -199,8 +199,6 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
-/// Fallback max distinct idempotency keys retained in gateway memory.
-pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -373,171 +371,27 @@ impl GatewayRateLimiter {
     }
 }
 
+/// Request keys the generic `/webhook` and `/sop/*` routes have admitted.
+///
+/// One store per gateway run, with a committed-key budget of its own
+/// (`[gateway] idempotency_max_keys`). Plugin webhook deliveries deduplicate
+/// in the core ingress's store instead, so the two kinds no longer evict each
+/// other's keys.
 #[derive(Debug)]
 pub struct IdempotencyStore {
-    ttl: Duration,
-    max_keys: usize,
-    entries: Mutex<IdempotencyEntries>,
-    #[cfg(feature = "plugins-wasm")]
-    next_generation: std::sync::atomic::AtomicU64,
-}
-
-#[derive(Debug, Default)]
-struct IdempotencyEntries {
-    committed: HashMap<String, Instant>,
-    /// Temporary plugin-delivery owners, bounded independently by `max_keys`.
-    /// Keeping this separate prevents one slow plugin request from making the
-    /// legacy boolean `record_if_new` path misclassify store pressure as a
-    /// committed duplicate.
-    #[cfg(feature = "plugins-wasm")]
-    pending: HashMap<String, PendingIdempotencyReservation>,
-}
-
-#[cfg(feature = "plugins-wasm")]
-#[derive(Debug)]
-struct PendingIdempotencyReservation {
-    generation: u64,
-    status: tokio::sync::watch::Sender<zeroclaw_api::webhook::WebhookReservationStatus>,
+    store: zeroclaw_api::webhook::WebhookReservationStore,
 }
 
 impl IdempotencyStore {
     pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
-            ttl,
-            max_keys: max_keys.max(1),
-            entries: Mutex::new(IdempotencyEntries::default()),
-            #[cfg(feature = "plugins-wasm")]
-            next_generation: std::sync::atomic::AtomicU64::new(1),
+            store: zeroclaw_api::webhook::WebhookReservationStore::new(ttl, max_keys),
         }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-
-        let pending_contains = {
-            #[cfg(feature = "plugins-wasm")]
-            {
-                entries.pending.contains_key(key)
-            }
-            #[cfg(not(feature = "plugins-wasm"))]
-            {
-                false
-            }
-        };
-        if entries.committed.contains_key(key) || pending_contains {
-            return false;
-        }
-
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(k, _)| k.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            } else {
-                return false;
-            }
-        }
-
-        entries.committed.insert(key.to_owned(), now);
-        true
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    fn begin_reservation(&self, key: &str) -> zeroclaw_api::webhook::WebhookReservation {
-        use zeroclaw_api::webhook::{
-            WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
-            WebhookReservationWaiter,
-        };
-
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if entries.committed.contains_key(key) {
-            return WebhookReservation::Committed;
-        }
-        if let Some(pending) = entries.pending.get(key) {
-            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
-                pending.status.subscribe(),
-            ));
-        }
-
-        if entries.pending.len() >= self.max_keys {
-            return WebhookReservation::Unavailable;
-        }
-
-        let generation = self
-            .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (status, _) = tokio::sync::watch::channel(WebhookReservationStatus::InFlight);
-        entries.pending.insert(
-            key.to_string(),
-            PendingIdempotencyReservation { generation, status },
-        );
-        WebhookReservation::Owner(WebhookReservationToken::new(key.to_string(), generation))
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    fn commit_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        if entries
-            .pending
-            .get(token.key())
-            .is_none_or(|pending| pending.generation != token.generation())
-        {
-            return false;
-        }
-        let Some(pending) = entries.pending.remove(token.key()) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::Committed);
-        let now = Instant::now();
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(key, _)| key.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            }
-        }
-        entries.committed.insert(token.key().to_string(), now);
-        true
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    fn rollback_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        if entries
-            .pending
-            .get(token.key())
-            .is_none_or(|pending| pending.generation != token.generation())
-        {
-            return false;
-        }
-        let Some(pending) = entries.pending.remove(token.key()) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::RolledBack);
-        true
+        self.store.record_if_new(key)
     }
 }
 
@@ -649,14 +503,6 @@ pub(crate) fn client_key_from_request(
     peer_addr
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
-    if configured == 0 {
-        fallback.max(1)
-    } else {
-        configured
-    }
 }
 
 fn default_agent_alias(config: &Config) -> Option<String> {
@@ -817,10 +663,12 @@ impl AppState {
     }
 }
 
-/// Daemon-owned services whose lifecycle matches one supervised gateway run.
+/// Daemon-owned services a supervised gateway run borrows.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
-    plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    /// Outlives any one gateway run, so admission and dedup survive a gateway
+    /// restart within the daemon generation.
+    plugin_webhook_ingress: Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
     /// The daemon generation's driver supervisor set. Approval surfaces
     /// register resumed headless drivers here so a reload drains them with the
@@ -829,17 +677,18 @@ pub struct GatewaySupervision {
 }
 
 impl GatewaySupervision {
-    /// Pair startup readiness with the channel supervisor's route generation.
+    /// Pair startup readiness with the daemon generation's plugin webhook
+    /// ingress.
     #[must_use]
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
-        plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        plugin_webhook_ingress: Arc<zeroclaw_infra::plugin_webhook::PluginWebhookIngress>,
         authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
-            plugin_webhooks,
+            plugin_webhook_ingress,
             authority,
             sop_driver_handles,
         }
@@ -1012,6 +861,11 @@ pub async fn run_gateway_with_authority(
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
 ) -> Result<()> {
+    let plugin_webhook_ingress =
+        Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+            config.gateway.idempotency_ttl_secs,
+            config.gateway.idempotency_max_keys,
+        ));
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,
@@ -1025,7 +879,7 @@ pub async fn run_gateway_with_authority(
         daemon_authority,
         GatewaySupervision::new(
             readiness,
-            Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            plugin_webhook_ingress,
             authority,
             sop_driver_handles,
         ),
@@ -1033,10 +887,11 @@ pub async fn run_gateway_with_authority(
     .await
 }
 
-/// Run the supervised gateway with the daemon generation's channel-plugin
-/// webhook registry and live-config authority.
+/// Run the supervised gateway with the daemon generation's plugin webhook
+/// ingress and live-config authority. Standalone callers use [`run_gateway`],
+/// because no channel supervisor exists there to publish live routes.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook ingress
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
@@ -1056,7 +911,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 ) -> Result<()> {
     let GatewaySupervision {
         readiness,
-        plugin_webhooks,
+        plugin_webhook_ingress,
         authority,
         sop_driver_handles,
     } = supervision;
@@ -1721,7 +1576,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             config.gateway.pairing_code,
         )
     }));
-    let rate_limit_max_keys = normalize_max_keys(
+    let rate_limit_max_keys = zeroclaw_infra::normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
     );
@@ -1730,13 +1585,12 @@ pub async fn run_gateway_with_plugin_webhooks(
         config.gateway.webhook_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
-    let idempotency_max_keys = normalize_max_keys(
-        config.gateway.idempotency_max_keys,
-        IDEMPOTENCY_MAX_KEYS_DEFAULT,
-    );
     let idempotency_store = Arc::new(IdempotencyStore::new(
-        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
-        idempotency_max_keys,
+        zeroclaw_infra::effective_idempotency_ttl(config.gateway.idempotency_ttl_secs),
+        zeroclaw_infra::normalize_max_keys(
+            config.gateway.idempotency_max_keys,
+            zeroclaw_infra::IDEMPOTENCY_MAX_KEYS_DEFAULT,
+        ),
     ));
 
     // Resolve optional path prefix for reverse-proxy deployments.
@@ -2326,9 +2180,9 @@ pub async fn run_gateway_with_plugin_webhooks(
         );
 
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.merge(plugin_webhook::routes(plugin_webhooks));
+    let inner = inner.merge(plugin_webhook::routes(plugin_webhook_ingress));
     #[cfg(not(feature = "plugins-wasm"))]
-    let _ = plugin_webhooks;
+    let _ = plugin_webhook_ingress;
 
     #[cfg(feature = "a2a")]
     let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
@@ -7226,11 +7080,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 2);
-        assert!(!entries.committed.contains_key("k1"));
-        assert!(entries.committed.contains_key("k2"));
-        assert!(entries.committed.contains_key("k3"));
+        assert_eq!(store.store.committed_len(), 2);
+        assert!(!store.record_if_new("k3"), "k3 is still held");
+        assert!(!store.record_if_new("k2"), "k2 is still held");
+        assert!(store.record_if_new("k1"), "k1 was evicted");
     }
 
     #[test]
@@ -7267,18 +7120,6 @@ path = "{trigger_path}"
 
         let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "10.0.0.5");
-    }
-
-    #[test]
-    fn normalize_max_keys_uses_fallback_for_zero() {
-        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
-        assert_eq!(normalize_max_keys(0, 0), 1);
-    }
-
-    #[test]
-    fn normalize_max_keys_preserves_nonzero_values() {
-        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
-        assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
     #[tokio::test]
@@ -11721,10 +11562,9 @@ data: [DONE]\n\n";
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 1);
-        assert!(!entries.committed.contains_key("old-key"));
-        assert!(entries.committed.contains_key("new-key"));
+        assert_eq!(store.store.committed_len(), 1);
+        assert!(!store.record_if_new("new-key"), "the newest key is kept");
+        assert!(store.record_if_new("old-key"), "the oldest key was evicted");
     }
 
     #[test]
@@ -11852,8 +11692,10 @@ data: [DONE]\n\n";
             handle.join().unwrap();
         }
 
-        let entries = store.entries.lock();
-        assert!(entries.committed.len() <= 1000, "should respect max_keys");
+        assert!(
+            store.store.committed_len() <= 1000,
+            "should respect max_keys"
+        );
     }
 
     #[test]

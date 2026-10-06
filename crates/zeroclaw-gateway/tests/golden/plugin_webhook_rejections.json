@@ -1,0 +1,313 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/unauthorized"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "unauthorized"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "unauthorized webhook",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 401
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/bad-request"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "bad-request"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "invalid webhook",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/invalid-response"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "invalid-response"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "invalid webhook response",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 502
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/oversized-reply"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "oversized-reply"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "invalid webhook response",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 502
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/unavailable"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "unavailable"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook unavailable",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/timeout-reject"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "timeout-reject"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook processing timed out",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 504
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "signed payload",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/dropped-reply"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "signed payload",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "14"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "dropped-reply"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook unavailable",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "meta",
+      "payload": {
+        "unclaimed_reports": []
+      }
+    }
+  ],
+  "scenario": "plugin_webhook_rejections"
+}

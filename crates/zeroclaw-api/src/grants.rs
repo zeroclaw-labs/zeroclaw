@@ -2,8 +2,8 @@
 //! vocabulary (RFC 7141).
 //!
 //! The grant vocabulary is resource × verb over enum-typed resource classes,
-//! plus three fine-grain selectors (agent aliases, config write paths, tool
-//! names) and an `admin` short-circuit. Providers never construct these:
+//! plus four fine-grain selectors (agent aliases, config write paths, tool
+//! names, channel instances) and an `admin` short-circuit. Providers never construct these:
 //! the shared principal resolver maps verified claims / roster entries
 //! through configured permission profiles into one merged [`ResolvedGrants`],
 //! re-resolved whenever the authorization-policy generation changes.
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::principal::AgentAlias;
 
 /// The explicit all-instances selector for `allowed_agents`,
-/// `allowed_tools`, and `config_write_paths`. Broad access is always this
+/// `allowed_tools`, `allowed_channels`, and `config_write_paths`. Broad access is always this
 /// explicit token (or `admin`) — never an empty list.
 pub const WILDCARD: &str = "*";
 
@@ -152,6 +152,13 @@ pub struct ResolvedGrants {
     /// own tool policy still applies on top.)
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Channel instances, named `<kind>.<alias>` (for example
+    /// `plugin.support`), this principal may reach through the `channels`
+    /// resource: deliver a plugin webhook to the instance's route, or list
+    /// the route. Empty = none; broad access requires the explicit
+    /// [`WILDCARD`] entry.
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
     /// Resource-class grants: which verbs are permitted per resource.
     /// Missing resource = deny.
     #[serde(default)]
@@ -213,6 +220,20 @@ impl ResolvedGrants {
             .any(|t| t == WILDCARD || t == tool)
     }
 
+    /// Whether this principal may reach the named channel instance
+    /// (`<kind>.<alias>`) through the `channels` resource. An empty selector
+    /// list grants no channels; broad access requires the explicit
+    /// [`WILDCARD`] entry or `admin`.
+    #[must_use]
+    pub fn may_use_channel(&self, channel: &str) -> bool {
+        if self.admin {
+            return true;
+        }
+        self.allowed_channels
+            .iter()
+            .any(|c| c == WILDCARD || c == channel)
+    }
+
     /// Whether this principal may write the given dotted config path.
     /// A granted `foo.*` covers `foo` itself and every descendant; a
     /// granted bare `foo.bar` covers exactly that prop; the [`WILDCARD`]
@@ -258,6 +279,11 @@ impl ResolvedGrants {
                 self.allowed_tools.push(tool.clone());
             }
         }
+        for channel in &other.allowed_channels {
+            if !self.allowed_channels.contains(channel) {
+                self.allowed_channels.push(channel.clone());
+            }
+        }
         for (resource, verbs) in &other.resources {
             // Verb sets are BTreeSet: already deterministic by construction.
             self.resources.entry(*resource).or_default().extend(verbs);
@@ -268,6 +294,7 @@ impl ResolvedGrants {
         // checks above are order-insensitive).
         self.allowed_agents.sort();
         self.allowed_tools.sort();
+        self.allowed_channels.sort();
         self.config_write_paths.sort();
     }
 }
@@ -290,6 +317,7 @@ mod tests {
         assert!(!g.may_use_agent("main"));
         assert!(!g.may_write_config("channels.discord"));
         assert!(!g.may_use_tool("shell"));
+        assert!(!g.may_use_channel("plugin.support"));
     }
 
     #[test]
@@ -443,5 +471,32 @@ mod tests {
         let s = serde_json::to_string(&g).unwrap();
         let back: ResolvedGrants = serde_json::from_str(&s).unwrap();
         assert_eq!(g, back);
+    }
+
+    #[test]
+    fn channel_selector_grants_named_instances_or_the_explicit_wildcard() {
+        let mut g = ResolvedGrants::none();
+        g.allowed_channels = vec!["plugin.support".into()];
+        assert!(g.may_use_channel("plugin.support"));
+        assert!(!g.may_use_channel("plugin.billing"));
+        assert!(!g.may_use_channel("plugin"));
+
+        g.allowed_channels = vec![WILDCARD.into()];
+        assert!(g.may_use_channel("plugin.billing"));
+        assert!(ResolvedGrants::all().may_use_channel("plugin.billing"));
+    }
+
+    #[test]
+    fn merge_unions_channel_selectors_deterministically() {
+        let mut a = ResolvedGrants::none();
+        a.allowed_channels = vec!["plugin.support".into()];
+        let mut b = ResolvedGrants::none();
+        b.allowed_channels = vec!["plugin.billing".into(), "plugin.support".into()];
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab.allowed_channels, ["plugin.billing", "plugin.support"]);
+        assert_eq!(ab, ba);
     }
 }
