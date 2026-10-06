@@ -54,6 +54,116 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
     committed_jsonl_import_receipts_exist(&conn)
 }
 
+/// A persisted `sessions` row as read back for a transcript replacement.
+struct StoredRow {
+    role: String,
+    content: String,
+    created_at: String,
+}
+
+fn same_message(row: &StoredRow, message: &ChatMessage) -> bool {
+    row.role == message.role && row.content == message.content
+}
+
+/// For each message of `new`, the index of the `old` row whose `created_at`
+/// it inherits, or `None` when it is a genuinely new message.
+///
+/// The synthetic history-trim breadcrumb is identified by explicit
+/// provenance (`old_crumb`: the stored flag; `new_crumb`: the incoming flag),
+/// never by its text. With both flags set the incoming breadcrumb inherits the
+/// time of the stored one, whatever its text. The remaining rows are aligned
+/// with whichever of two candidates keeps more rows (ties go to the second):
+/// the longest overlap between a suffix of the old body and a prefix of the
+/// new body (append, trim from the start, trim plus delta), or the longest
+/// common prefix (a changed tail). Costs O(old + new).
+fn stamp_sources(
+    old: &[StoredRow],
+    new: &[ChatMessage],
+    old_crumb: bool,
+    new_crumb: bool,
+) -> Vec<Option<usize>> {
+    let old_off = usize::from(old_crumb && !old.is_empty());
+    let new_off = usize::from(new_crumb && !new.is_empty());
+    let (old_body, new_body) = (&old[old_off..], &new[new_off..]);
+    let overlap = longest_suffix_prefix(old_body, new_body);
+    let common_prefix = old_body
+        .iter()
+        .zip(new_body)
+        .take_while(|(row, message)| same_message(row, message))
+        .count();
+    // Keep as many rows as possible, i.e. drop the fewest (ties: drop none).
+    let (dropped, kept) = if common_prefix >= overlap {
+        (0, common_prefix)
+    } else {
+        (old_body.len() - overlap, overlap)
+    };
+    let mut sources = vec![None; new.len()];
+    if old_off == 1 && new_off == 1 {
+        // A breadcrumb that is kept keeps its own time.
+        sources[0] = Some(0);
+    }
+    for j in 0..kept {
+        sources[new_off + j] = Some(old_off + dropped + j);
+    }
+    sources
+}
+
+/// Length of the longest suffix of `old` that equals a prefix of `new` (KMP).
+fn longest_suffix_prefix(old: &[StoredRow], new: &[ChatMessage]) -> usize {
+    if new.is_empty() || old.is_empty() {
+        return 0;
+    }
+    let same = |a: &ChatMessage, b: &ChatMessage| a.role == b.role && a.content == b.content;
+    let mut failure = vec![0usize; new.len()];
+    let mut k = 0;
+    for i in 1..new.len() {
+        while k > 0 && !same(&new[i], &new[k]) {
+            k = failure[k - 1];
+        }
+        if same(&new[i], &new[k]) {
+            k += 1;
+        }
+        failure[i] = k;
+    }
+    let mut matched = 0;
+    for row in old {
+        if matched == new.len() {
+            matched = failure[matched - 1];
+        }
+        while matched > 0 && !same_message(row, &new[matched]) {
+            matched = failure[matched - 1];
+        }
+        if same_message(row, &new[matched]) {
+            matched += 1;
+        }
+    }
+    matched
+}
+
+/// Whether every old row stays where it is, so that only the tail of `new`
+/// has to be inserted. With both breadcrumb flags set the breadcrumb row must
+/// also be unchanged, otherwise keeping it would keep its old text.
+fn keeps_every_old_row_in_place(
+    old: &[StoredRow],
+    new: &[ChatMessage],
+    sources: &[Option<usize>],
+    old_crumb: bool,
+    new_crumb: bool,
+) -> bool {
+    let crumb_unchanged = !(old_crumb && new_crumb)
+        || old
+            .first()
+            .zip(new.first())
+            .is_some_and(|(row, message)| same_message(row, message));
+    crumb_unchanged
+        && old.len() <= new.len()
+        && sources
+            .iter()
+            .take(old.len())
+            .enumerate()
+            .all(|(i, source)| *source == Some(i))
+}
+
 impl SqliteSessionBackend {
     /// Open or create the sessions database.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
@@ -234,24 +344,117 @@ impl SqliteSessionBackend {
         Ok(())
     }
 
+    /// Replace the transcript of `session_key` with `messages`, keeping the
+    /// `created_at` of every row that survives (#11420).
+    ///
+    /// A row's `created_at` is the time its message was first persisted.
+    /// Rather than stamping the whole batch with the time of the write, each
+    /// new message inherits the time of the old row it lines up with (see
+    /// [`stamp_sources`]); only genuinely new messages get the time of this
+    /// write. The common per-turn case (the old transcript is a prefix of the
+    /// new one) inserts only the delta and deletes nothing; a trim, a
+    /// cancellation or a compaction deletes and reinserts the transcript with
+    /// the inherited times.
+    ///
+    /// `new_crumb` says whether `messages[0]` is the synthetic history-trim
+    /// breadcrumb. The stored flag is read here, before the caller updates it
+    /// in the same transaction.
+    ///
+    /// Known limits, both fixed by tests:
+    /// - Identical messages that cannot be told apart after a trim resolve
+    ///   towards dropping the fewest old rows, so a retained row may inherit
+    ///   the time of an earlier identical row.
+    /// - `new_crumb == true` with no breadcrumb in `messages[0]` makes the
+    ///   first row inherit the time of the old first row.
     fn rewrite_messages_on(
         conn: &Connection,
         session_key: &str,
         messages: &[ChatMessage],
+        new_crumb: bool,
     ) -> rusqlite::Result<()> {
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )?;
+        let old_crumb = Self::get_session_trim_breadcrumb_on(conn, session_key)?.unwrap_or(false);
+        let old = Self::load_rows_on(conn, session_key)?;
         let now = Utc::now().to_rfc3339();
-        for message in messages {
-            Self::append_on(conn, session_key, message, &now)?;
+        let sources = stamp_sources(&old, messages, old_crumb, new_crumb);
+        if keeps_every_old_row_in_place(&old, messages, &sources, old_crumb, new_crumb) {
+            Self::insert_rows_on(conn, session_key, &messages[old.len()..], |_| now.as_str())?;
+        } else {
+            conn.execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )?;
+            Self::insert_rows_on(conn, session_key, messages, |i| {
+                sources[i].map_or(now.as_str(), |j| old[j].created_at.as_str())
+            })?;
         }
-        conn.execute(
-            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
-            params![session_key, messages.len() as i64],
-        )?;
+        if messages.is_empty() {
+            conn.execute(
+                "UPDATE session_metadata SET message_count = 0 WHERE session_key = ?1",
+                params![session_key],
+            )?;
+        } else {
+            // `last_activity` is the time of THIS write, never an inherited
+            // message time.
+            conn.execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+                 VALUES (?1, ?2, ?2, ?3)
+                 ON CONFLICT(session_key) DO UPDATE SET
+                    last_activity = excluded.last_activity,
+                    message_count = excluded.message_count",
+                params![session_key, now, messages.len() as i64],
+            )?;
+        }
         Ok(())
+    }
+
+    fn load_rows_on(conn: &Connection, session_key: &str) -> rusqlite::Result<Vec<StoredRow>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+        )?;
+        stmt.query_map(params![session_key], |row| {
+            Ok(StoredRow {
+                role: row.get(0)?,
+                content: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?
+        .collect()
+    }
+
+    fn insert_rows_on<'a>(
+        conn: &Connection,
+        session_key: &str,
+        messages: &[ChatMessage],
+        created_at: impl Fn(usize) -> &'a str,
+    ) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO sessions (session_key, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (i, message) in messages.iter().enumerate() {
+            stmt.execute(params![
+                session_key,
+                message.role,
+                message.content,
+                created_at(i)
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn get_session_trim_breadcrumb_on(
+        conn: &Connection,
+        session_key: &str,
+    ) -> rusqlite::Result<Option<bool>> {
+        Ok(conn
+            .query_row(
+                "SELECT trim_breadcrumb FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|n| n != 0))
     }
 
     fn set_session_trim_breadcrumb_on(
@@ -903,8 +1106,12 @@ impl SessionBackend for SqliteSessionBackend {
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
         let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // No incoming provenance here: the breadcrumb flag is not part of this call.
+        Self::rewrite_messages_on(&tx, session_key, messages, false)
+            .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(())
     }
@@ -923,8 +1130,11 @@ impl SessionBackend for SqliteSessionBackend {
         breadcrumb_present: bool,
     ) -> std::io::Result<()> {
         let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
         Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
             .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
@@ -947,7 +1157,12 @@ impl SessionBackend for SqliteSessionBackend {
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
         let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        // IMMEDIATE: this transaction reads before it writes, and a DEFERRED
+        // one can fail with `database is locked` when another connection
+        // commits between the read and the write.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
         let exists = tx
             .query_row(
                 "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
@@ -960,7 +1175,8 @@ impl SessionBackend for SqliteSessionBackend {
         if !exists {
             return Ok(false);
         }
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
         Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
             .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
@@ -3279,5 +3495,865 @@ mod tests {
             backend.get_session_trim_breadcrumb("s1").unwrap(),
             Some(false)
         );
+    }
+
+    // ---- created_at preservation across transcript replacement (#11420) ----
+    //
+    // Contract: a row's `created_at` is the time its message was first
+    // persisted. Replacing the transcript keeps the time of every row that
+    // survives and stamps only genuinely new rows with the time of the write.
+
+    fn nap() {
+        std::thread::sleep(StdDuration::from_millis(30));
+    }
+
+    fn stamped(backend: &SqliteSessionBackend, key: &str) -> Vec<(String, chrono::DateTime<Utc>)> {
+        backend
+            .load_with_timestamps(key)
+            .into_iter()
+            .map(|m| {
+                (
+                    m.message.content,
+                    m.created_at.expect("RFC 3339 created_at"),
+                )
+            })
+            .collect()
+    }
+
+    fn contents(rows: &[(String, chrono::DateTime<Utc>)]) -> Vec<&str> {
+        rows.iter().map(|(c, _)| c.as_str()).collect()
+    }
+
+    fn raw_created_at(backend: &SqliteSessionBackend, key: &str) -> Vec<String> {
+        let conn = backend.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .unwrap();
+        stmt.query_map(params![key], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn row_ids(backend: &SqliteSessionBackend, key: &str) -> Vec<i64> {
+        let conn = backend.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .unwrap();
+        stmt.query_map(params![key], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// (created_at, last_activity, message_count) of `session_metadata`.
+    fn meta(backend: &SqliteSessionBackend, key: &str) -> (String, String, i64) {
+        let conn = backend.conn.lock();
+        conn.query_row(
+            "SELECT created_at, last_activity, message_count FROM session_metadata
+             WHERE session_key = ?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// Replace through the chosen route; the production route must report a write.
+    fn replace(
+        backend: &SqliteSessionBackend,
+        via_if_exists: bool,
+        key: &str,
+        messages: &[ChatMessage],
+        crumb: bool,
+    ) {
+        // The guarded route only writes to existing sessions: the first write creates it.
+        if via_if_exists && backend.session_exists(key) {
+            assert!(
+                backend
+                    .replace_conversation_state_if_exists(key, messages, crumb)
+                    .unwrap()
+            );
+        } else {
+            backend
+                .replace_conversation_state(key, messages, crumb)
+                .unwrap();
+        }
+    }
+
+    /// Persist `messages` one prefix at a time so each row gets its own time.
+    fn seed_sequentially(backend: &SqliteSessionBackend, key: &str, messages: &[ChatMessage]) {
+        for n in 1..=messages.len() {
+            backend
+                .replace_conversation_state(key, &messages[..n], false)
+                .unwrap();
+            nap();
+        }
+    }
+
+    fn u(text: &str) -> ChatMessage {
+        ChatMessage::user(text)
+    }
+
+    fn a(text: &str) -> ChatMessage {
+        ChatMessage::assistant(text)
+    }
+
+    #[test]
+    fn t01_append_keeps_created_at_of_retained_rows_on_both_routes() {
+        for via_if_exists in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            replace(&backend, via_if_exists, "k", &[u("q1"), a("a1")], false);
+            let before = stamped(&backend, "k");
+            nap();
+            replace(
+                &backend,
+                via_if_exists,
+                "k",
+                &[u("q1"), a("a1"), u("q2"), a("a2")],
+                false,
+            );
+            let after = stamped(&backend, "k");
+            assert_eq!(contents(&after), ["q1", "a1", "q2", "a2"]);
+            assert_eq!(after[0].1, before[0].1, "route if_exists={via_if_exists}");
+            assert_eq!(after[1].1, before[1].1, "route if_exists={via_if_exists}");
+            assert!(after[2].1 > after[1].1, "new rows get a later time");
+            assert!(after[3].1 >= after[2].1);
+        }
+    }
+
+    #[test]
+    fn t02_first_trim_inherits_body_and_stamps_breadcrumb_when_first_written() {
+        for via_if_exists in [false, true] {
+            for with_delta in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+                seed_sequentially(&backend, "k", &[u("q1"), a("a1"), u("q2"), a("a2")]);
+                let t = stamped(&backend, "k");
+                // The breadcrumb text is arbitrary: it is identified by the flag.
+                let mut next = vec![u("[older turns omitted]"), u("q2"), a("a2")];
+                if with_delta {
+                    next.extend([u("q3"), a("a3")]);
+                }
+                nap();
+                replace(&backend, via_if_exists, "k", &next, true);
+                let after = stamped(&backend, "k");
+                let ctx = format!("if_exists={via_if_exists} delta={with_delta}");
+                assert_eq!(after.len(), next.len(), "{ctx}");
+                assert_eq!(after[1].1, t[2].1, "q2 keeps its time ({ctx})");
+                assert_eq!(after[2].1, t[3].1, "a2 keeps its time ({ctx})");
+                assert!(after[0].1 > t[3].1, "breadcrumb is written now ({ctx})");
+                if with_delta {
+                    assert!(after[3].1 >= after[0].1, "{ctx}");
+                }
+                assert_eq!(meta(&backend, "k").2, next.len() as i64, "{ctx}");
+                assert_eq!(
+                    backend.get_session_trim_breadcrumb("k").unwrap(),
+                    Some(true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t03_successive_trims_never_change_a_time_once_seen() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let turn = |n: usize| [u(&format!("q{n}")), a(&format!("a{n}"))];
+        let mut known: std::collections::HashMap<String, chrono::DateTime<Utc>> =
+            std::collections::HashMap::new();
+        let mut crumb_time = None;
+        for n in 2..8 {
+            // Window of the last two turns behind a breadcrumb whose text
+            // changes on every trim.
+            let mut next = vec![u(&format!("[omitted before turn {n}]"))];
+            next.extend(turn(n - 1));
+            next.extend(turn(n));
+            nap();
+            replace(&backend, true, "k", &next, true);
+            let after = stamped(&backend, "k");
+            assert_eq!(after.len(), 5);
+            let crumb = *crumb_time.get_or_insert(after[0].1);
+            assert_eq!(after[0].1, crumb, "the kept breadcrumb keeps its own time");
+            for (content, at) in &after[1..] {
+                let first_seen = *known.entry(content.clone()).or_insert(*at);
+                assert_eq!(*at, first_seen, "{content} changed time at step {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn t04_repeated_messages_keep_their_own_times() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("ok"), a("ok"), u("ok"), a("ok")]);
+        let t = stamped(&backend, "k");
+        assert!(t[0].1 < t[1].1 && t[1].1 < t[2].1 && t[2].1 < t[3].1);
+        nap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("ok"), a("ok"), u("ok"), a("ok"), u("ok"), a("ok")],
+            false,
+        );
+        let after = stamped(&backend, "k");
+        for i in 0..4 {
+            assert_eq!(after[i].1, t[i].1, "row {i} must keep its own time");
+        }
+        assert!(after[4].1 > t[3].1 && after[5].1 >= after[4].1);
+    }
+
+    #[test]
+    fn t05_ambiguous_repeats_after_a_trim_resolve_to_dropping_the_fewest_rows() {
+        // Known limit (#11420): after a trim that leaves only identical
+        // rows the surviving rows cannot be told apart from the dropped
+        // ones. The write resolves towards discarding the fewest old rows,
+        // so the retained rows inherit the EARLIEST candidate times.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("ok"), a("ok"), u("ok"), a("ok")]);
+        let t = stamped(&backend, "k");
+        nap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("ok"), a("ok"), u("ok"), a("ok")],
+            false,
+        );
+        let same = stamped(&backend, "k");
+        for i in 0..4 {
+            assert_eq!(same[i].1, t[i].1);
+        }
+        nap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("[omitted]"), u("ok"), a("ok"), u("ok")],
+            true,
+        );
+        let after = stamped(&backend, "k");
+        assert!(after[0].1 > t[3].1, "the breadcrumb is new");
+        assert_eq!(after[1].1, t[0].1);
+        assert_eq!(after[2].1, t[1].1);
+        assert_eq!(after[3].1, t[2].1);
+    }
+
+    #[test]
+    fn t06_append_only_replace_is_atomic_with_the_flag() {
+        for rows in [&[u("q1"), a("a1"), u("boom")][..], &[u("boom")][..]] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            seed_sequentially(&backend, "k", &[u("q1"), a("a1")]);
+            backend.set_session_trim_breadcrumb("k", false).unwrap();
+            let before = stamped(&backend, "k");
+            let meta_before = meta(&backend, "k");
+            {
+                let conn = backend.conn.lock();
+                conn.execute_batch(
+                    "CREATE TRIGGER poison_row BEFORE INSERT ON sessions
+                     WHEN NEW.content = 'boom'
+                     BEGIN SELECT RAISE(ABORT, 'simulated row write failure'); END;",
+                )
+                .unwrap();
+            }
+            nap();
+            assert!(backend.replace_conversation_state("k", rows, true).is_err());
+            assert!(
+                backend
+                    .replace_conversation_state_if_exists("k", rows, true)
+                    .is_err()
+            );
+            let after = stamped(&backend, "k");
+            assert_eq!(contents(&after), contents(&before));
+            assert_eq!(after, before);
+            assert_eq!(meta(&backend, "k"), meta_before);
+            assert_eq!(
+                backend.get_session_trim_breadcrumb("k").unwrap(),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn t07_legacy_flattened_rows_are_inherited_as_is_and_nothing_is_invented() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("k", &u("q1")).unwrap();
+        backend.append("k", &a("a1")).unwrap();
+        backend.append("k", &u("q2")).unwrap();
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE sessions SET created_at = '2020-01-01T00:00:00+00:00'
+                 WHERE content = 'q1'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET created_at = 'ayer' WHERE content = 'a1'",
+                [],
+            )
+            .unwrap();
+        }
+        let raw_before = raw_created_at(&backend, "k");
+        nap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("q1"), a("a1"), u("q2"), a("a2")],
+            false,
+        );
+        let raw_after = raw_created_at(&backend, "k");
+        assert_eq!(raw_after[..3], raw_before[..3], "inherited verbatim");
+        assert_eq!(raw_after[0], "2020-01-01T00:00:00+00:00");
+        assert_eq!(raw_after[1], "ayer");
+        let rows = backend.load_with_timestamps("k");
+        assert!(rows[1].created_at.is_none(), "unparseable stays unknown");
+        assert!(rows[3].created_at.unwrap() > rows[2].created_at.unwrap());
+
+        // Empty transcript: rows go away, metadata stays, nothing is touched.
+        let meta_before = meta(&backend, "k");
+        nap();
+        replace(&backend, true, "k", &[], true);
+        assert!(backend.load("k").is_empty());
+        let meta_after = meta(&backend, "k");
+        assert_eq!(meta_after.2, 0);
+        assert_eq!(meta_after.1, meta_before.1, "last_activity untouched");
+        assert_eq!(meta_after.0, meta_before.0);
+    }
+
+    #[test]
+    fn t08_last_activity_is_the_write_time_and_never_an_inherited_time() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("q1"), a("a1"), u("q2"), a("a2")]);
+        let created = meta(&backend, "k").0;
+        let cases: [Vec<ChatMessage>; 3] = [
+            vec![u("[omitted]"), u("q2"), a("a2")],
+            vec![u("[omitted]"), u("q2"), a("a2"), u("q3"), a("a3")],
+            vec![u("[omitted]"), u("q2"), a("a2"), u("q3"), a("a3")],
+        ];
+        for next in cases {
+            nap();
+            let before_call = Utc::now();
+            replace(&backend, true, "k", &next, true);
+            let (created_now, last_activity, count) = meta(&backend, "k");
+            let last_activity = chrono::DateTime::parse_from_rfc3339(&last_activity)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert!(last_activity >= before_call);
+            let newest_inherited = stamped(&backend, "k")
+                .iter()
+                .map(|(_, t)| *t)
+                .filter(|t| *t < before_call)
+                .max()
+                .unwrap();
+            assert!(last_activity > newest_inherited);
+            assert_eq!(created_now, created, "session creation time is untouched");
+            assert_eq!(count, next.len() as i64);
+        }
+    }
+
+    #[test]
+    fn t09_kept_breadcrumb_takes_the_new_text_and_keeps_its_time() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("[omitted v1]"), u("q"), a("a")],
+            true,
+        );
+        let first = stamped(&backend, "k");
+        nap();
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("[omitted v2]"), u("q"), a("a"), u("q2"), a("a2")],
+            true,
+        );
+        let after = stamped(&backend, "k");
+        assert_eq!(after[0].0, "[omitted v2]", "content comes from the write");
+        assert_eq!(after[0].1, first[0].1);
+        assert_eq!(after[1].1, first[1].1);
+        assert_eq!(after[2].1, first[2].1);
+        assert!(after[3].1 > first[2].1);
+    }
+
+    #[test]
+    fn t10_flag_true_without_a_breadcrumb_row_is_a_documented_limit() {
+        // Known limit (#11420): with both flags true the first row is
+        // assumed to be the breadcrumb. If the flag lies, the new first row
+        // inherits the time of the old first row.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for n in 1..=5 {
+            let all = [u("X"), u("u1"), a("a1"), u("u2"), a("a2")];
+            replace(&backend, true, "k", &all[..n], true);
+            nap();
+        }
+        let t = stamped(&backend, "k");
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("u1"), a("a1"), u("u2"), a("a2")],
+            true,
+        );
+        let after = stamped(&backend, "k");
+        assert_eq!(contents(&after), ["u1", "a1", "u2", "a2"]);
+        assert_eq!(after[0].1, t[0].1, "u1 inherits the time of X");
+        assert_eq!(after[1].1, t[2].1);
+        assert_eq!(after[2].1, t[3].1);
+        assert_eq!(after[3].1, t[4].1);
+    }
+
+    #[test]
+    fn t11_breadcrumb_is_identified_by_provenance_not_by_text() {
+        // (i) a plain user message that reads like a breadcrumb, flags false/false.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "i", &[u("[omitted]"), u("q"), a("a")]);
+        let t = stamped(&backend, "i");
+        replace(
+            &backend,
+            true,
+            "i",
+            &[u("[omitted]"), u("q"), a("a"), u("q2")],
+            false,
+        );
+        let after = stamped(&backend, "i");
+        for k in 0..3 {
+            assert_eq!(after[k].1, t[k].1, "(i) row {k}");
+        }
+
+        // (ii) legacy row, stored flag NULL: the incoming breadcrumb is new,
+        // no time is invented for it, and the body still inherits.
+        seed_sequentially(&backend, "ii", &[u("[legacy omitted]"), u("q"), a("a")]);
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE session_metadata SET trim_breadcrumb = NULL WHERE session_key = 'ii'",
+                [],
+            )
+            .unwrap();
+        }
+        let t = stamped(&backend, "ii");
+        nap();
+        replace(
+            &backend,
+            true,
+            "ii",
+            &[u("[omitted]"), u("q"), a("a")],
+            true,
+        );
+        let after = stamped(&backend, "ii");
+        assert!(
+            after[0].1 > t[2].1,
+            "(ii) crumb is new, not the legacy time"
+        );
+        assert_eq!(after[1].1, t[1].1);
+        assert_eq!(after[2].1, t[2].1);
+
+        // (iii) the breadcrumb disappears (true -> false).
+        replace(&backend, true, "iii", &[], false);
+        replace(
+            &backend,
+            true,
+            "iii",
+            &[u("[omitted]"), u("q"), a("a")],
+            true,
+        );
+        let t = stamped(&backend, "iii");
+        nap();
+        replace(
+            &backend,
+            true,
+            "iii",
+            &[u("q"), a("a"), u("q2"), a("a2")],
+            false,
+        );
+        let after = stamped(&backend, "iii");
+        assert_eq!(after[0].1, t[1].1, "(iii) q");
+        assert_eq!(after[1].1, t[2].1, "(iii) a");
+
+        // (iv) rewrite_messages has no incoming provenance: it must not
+        // hand the stored breadcrumb time to a different first row.
+        nap();
+        let t = stamped(&backend, "iii");
+        backend
+            .rewrite_messages("iii", &[u("q"), a("a"), u("q2"), a("a2"), u("q3")])
+            .unwrap();
+        let after = stamped(&backend, "iii");
+        assert_eq!(contents(&after), ["q", "a", "q2", "a2", "q3"]);
+        assert_eq!(after[0].1, t[0].1);
+        assert!(after[4].1 > t[3].1);
+    }
+
+    #[test]
+    fn t12_sessions_without_metadata_follow_the_existing_contract() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(
+            !backend
+                .replace_conversation_state_if_exists("nope", &[u("x")], false)
+                .unwrap()
+        );
+        assert!(backend.load("nope").is_empty());
+        assert!(!backend.session_exists("nope"));
+        backend
+            .replace_conversation_state("fresh", &[u("x"), a("y")], false)
+            .unwrap();
+        assert_eq!(meta(&backend, "fresh").2, 2);
+        assert_eq!(backend.load("fresh").len(), 2);
+    }
+
+    #[test]
+    fn t13_replacing_one_session_leaves_the_others_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("q1"), a("a1")]);
+        seed_sequentially(&backend, "other", &[u("o1"), a("o2")]);
+        let other_rows = stamped(&backend, "other");
+        let other_ids = row_ids(&backend, "other");
+        let other_meta = meta(&backend, "other");
+        replace(&backend, true, "k", &[u("q1"), a("a1"), u("q2")], false);
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("[omitted]"), u("q2"), a("a2")],
+            true,
+        );
+        assert_eq!(stamped(&backend, "other"), other_rows);
+        assert_eq!(row_ids(&backend, "other"), other_ids);
+        assert_eq!(meta(&backend, "other"), other_meta);
+    }
+
+    #[test]
+    fn t14_longest_overlap_wins() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("x"), u("a"), u("a")]);
+        let t = stamped(&backend, "k");
+        nap();
+        replace(&backend, true, "k", &[u("a"), u("a"), u("y")], false);
+        let after = stamped(&backend, "k");
+        assert_eq!(after[0].1, t[1].1);
+        assert_eq!(after[1].1, t[2].1);
+        assert!(after[2].1 > t[2].1);
+    }
+
+    #[test]
+    fn t15_append_only_replace_does_not_delete_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("q1"), a("a1")]);
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER no_delete BEFORE DELETE ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'rows must not be deleted'); END;",
+            )
+            .unwrap();
+        }
+        let ids = row_ids(&backend, "k");
+        replace(&backend, true, "k", &[u("q1"), a("a1"), u("q2")], false);
+        assert_eq!(row_ids(&backend, "k")[..2], ids[..]);
+        replace(&backend, true, "k", &[u("q1"), a("a1"), u("q2")], false);
+        assert_eq!(row_ids(&backend, "k").len(), 3);
+    }
+
+    #[test]
+    fn t18_same_text_with_another_role_is_a_new_message() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        replace(&backend, true, "k", &[u("x")], false);
+        let t = stamped(&backend, "k");
+        nap();
+        replace(&backend, true, "k", &[a("x")], false);
+        assert!(stamped(&backend, "k")[0].1 > t[0].1);
+    }
+
+    #[test]
+    fn replacement_keeps_the_full_text_index_in_sync() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        seed_sequentially(&backend, "k", &[u("alpha"), a("bravo"), u("charlie")]);
+        replace(
+            &backend,
+            true,
+            "k",
+            &[u("[omitted]"), a("bravo"), u("charlie"), a("delta")],
+            true,
+        );
+        let hits = |q: &str| {
+            backend
+                .search(&SessionQuery {
+                    keyword: Some(q.to_string()),
+                    limit: Some(10),
+                })
+                .len()
+        };
+        assert_eq!(hits("alpha"), 0, "a dropped row leaves the index");
+        assert_eq!(hits("bravo"), 1);
+        assert_eq!(hits("delta"), 1);
+        let conn = backend.conn.lock();
+        conn.execute(
+            "INSERT INTO sessions_fts(sessions_fts, rank) VALUES('integrity-check', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn rows_of(spec: &[&str]) -> Vec<StoredRow> {
+        spec.iter()
+            .enumerate()
+            .map(|(i, s)| StoredRow {
+                role: "user".into(),
+                content: (*s).into(),
+                created_at: format!("t{i}"),
+            })
+            .collect()
+    }
+
+    fn msgs_of(spec: &[&str]) -> Vec<ChatMessage> {
+        spec.iter().map(|s| u(s)).collect()
+    }
+
+    fn sources(old: &[&str], new: &[&str], old_crumb: bool, new_crumb: bool) -> Vec<Option<usize>> {
+        stamp_sources(&rows_of(old), &msgs_of(new), old_crumb, new_crumb)
+    }
+
+    #[test]
+    fn t16_stamp_sources_table() {
+        let n = None;
+        let s = Some;
+        assert_eq!(sources(&[], &[], false, false), vec![]);
+        assert_eq!(
+            sources(&["a", "b"], &["a", "b"], false, false),
+            [s(0), s(1)]
+        );
+        assert_eq!(
+            sources(&["a", "b"], &["a", "b", "c"], false, false),
+            [s(0), s(1), n]
+        );
+        assert_eq!(sources(&["a", "b"], &["x", "y"], false, false), [n, n]);
+        // First trim: the breadcrumb is new, the retained body inherits.
+        assert_eq!(
+            sources(
+                &["q1", "a1", "q2", "a2"],
+                &["C", "q2", "a2", "q3", "a3"],
+                false,
+                true
+            ),
+            [n, s(2), s(3), n, n]
+        );
+        // Both flags: the breadcrumb keeps its time whatever its text.
+        assert_eq!(
+            sources(&["C", "q2", "a2"], &["C2", "a2", "q3"], true, true),
+            [s(0), s(2), n]
+        );
+        // The breadcrumb disappears.
+        assert_eq!(
+            sources(&["C", "q", "a"], &["q", "a", "q2"], true, false),
+            [s(1), s(2), n]
+        );
+        // Guards: empty sides with breadcrumb flags set.
+        assert_eq!(sources(&[], &[], true, true), vec![]);
+        assert_eq!(sources(&["C"], &[], true, true), vec![]);
+        assert_eq!(sources(&[], &["x"], true, true), [n]);
+        assert_eq!(sources(&["C"], &["C2"], true, true), [s(0)]);
+        // Fallback after a full match must not index out of range.
+        assert_eq!(
+            sources(&["a", "b", "x", "a", "b", "a"], &["a", "b"], false, false),
+            [s(0), s(1)]
+        );
+        assert_eq!(
+            sources(&["a", "a", "a", "a"], &["a", "a"], false, false),
+            [s(0), s(1)]
+        );
+        // A cancelled turn that also trimmed: nothing lines up (documented limit).
+        assert_eq!(
+            sources(&["q1", "a1", "q2", "a2"], &["C", "q2", "a2x"], false, true),
+            [n, n, n]
+        );
+        // Content changed in the middle: only the common prefix inherits.
+        assert_eq!(
+            sources(
+                &["q1", "a1", "q2", "a2"],
+                &["q1", "a1x", "q2", "a2"],
+                false,
+                false
+            ),
+            [s(0), n, n, n]
+        );
+        // A changed tail keeps what precedes it.
+        assert_eq!(
+            sources(
+                &["q1", "a1", "q2", "a2"],
+                &["q1", "a1", "q2", "a2x"],
+                false,
+                false
+            ),
+            [s(0), s(1), s(2), n]
+        );
+    }
+
+    #[test]
+    fn t16_stamp_sources_is_linear_on_long_identical_input() {
+        let spec: Vec<&str> = vec!["ok"; 50_000];
+        let started = std::time::Instant::now();
+        let out = sources(&spec, &spec, false, false);
+        assert!(started.elapsed() < StdDuration::from_secs(5));
+        assert!(out.iter().enumerate().all(|(i, x)| *x == Some(i)));
+    }
+
+    /// Randomised appends, trims, cancellations, no-op rewrites and clears
+    /// over unique contents. Independent oracle: a message that is still in
+    /// the stored transcript keeps the time it was first seen with; the
+    /// transcript read back equals the transcript written; counts agree.
+    #[test]
+    fn c3_random_replacements_preserve_times_and_content() {
+        let seed: u64 = 0x5eed_11420;
+        eprintln!("c3 seed = {seed:#x}");
+        let mut state = seed;
+        let mut rnd = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for (route, key) in [(false, "plain"), (true, "guarded")] {
+            let mut fresh = 0usize;
+            let mut next_msg = |prefix: &str| {
+                fresh += 1;
+                if fresh.is_multiple_of(2) {
+                    a(&format!("{prefix}{fresh}"))
+                } else {
+                    u(&format!("{prefix}{fresh}"))
+                }
+            };
+            let mut current: Vec<ChatMessage> = Vec::new();
+            let mut crumb = false;
+            let mut crumb_time: Option<chrono::DateTime<Utc>> = None;
+            let mut known: std::collections::HashMap<(String, String), chrono::DateTime<Utc>> =
+                std::collections::HashMap::new();
+            for step in 0..250 {
+                let was_crumb = crumb;
+                let mut next = current.clone();
+                match rnd(10) {
+                    0..=3 => {
+                        for _ in 0..=rnd(3) {
+                            next.push(next_msg("m"));
+                        }
+                    }
+                    4..=6 if next.len() > 3 => {
+                        let first_body = usize::from(crumb);
+                        let drop = 1 + rnd((next.len() - first_body - 1).min(3));
+                        next.drain(first_body..first_body + drop);
+                        if crumb {
+                            next[0] = next_msg("crumb");
+                        } else {
+                            next.insert(0, next_msg("crumb"));
+                        }
+                        crumb = true;
+                        if rnd(2) == 0 {
+                            next.push(next_msg("m"));
+                        }
+                    }
+                    7 if next.len() > 1 + usize::from(crumb) => {
+                        let last = next.len() - 1;
+                        next[last] = next_msg("cancelled");
+                    }
+                    8 => {}
+                    9 if rnd(4) == 0 => {
+                        next.clear();
+                        crumb = false;
+                    }
+                    _ => next.push(next_msg("m")),
+                }
+                if next.is_empty() {
+                    crumb = false;
+                }
+                let before_max = known.values().max().copied();
+                replace(&backend, route, key, &next, crumb);
+                let after = stamped(&backend, key);
+                let expected: Vec<&str> = next.iter().map(|m| m.content.as_str()).collect();
+                assert_eq!(contents(&after), expected, "step {step}");
+                assert_eq!(
+                    backend
+                        .load(key)
+                        .iter()
+                        .map(|m| m.role.clone())
+                        .collect::<Vec<_>>(),
+                    next.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),
+                    "roles at step {step}"
+                );
+                assert_eq!(meta(&backend, key).2, next.len() as i64, "step {step}");
+                assert_eq!(row_ids(&backend, key).len(), next.len(), "step {step}");
+                for (i, (content, at)) in after.iter().enumerate() {
+                    let is_crumb = crumb && i == 0;
+                    if is_crumb {
+                        if was_crumb && crumb_time.is_some() {
+                            assert_eq!(Some(*at), crumb_time, "crumb time, step {step}");
+                        } else {
+                            crumb_time = Some(*at);
+                        }
+                        continue;
+                    }
+                    let id = (content.clone(), next[i].role.clone());
+                    match known.get(&id) {
+                        Some(first) => assert_eq!(at, first, "{content} changed, step {step}"),
+                        None => {
+                            if let Some(max) = before_max {
+                                assert!(*at >= max, "new row older than known ones, step {step}");
+                            }
+                            known.insert(id, *at);
+                        }
+                    }
+                }
+                if !crumb {
+                    crumb_time = None;
+                }
+                current = next;
+            }
+        }
+    }
+
+    #[test]
+    fn t19_replacements_do_not_fail_with_database_is_locked_under_contention() {
+        let tmp = TempDir::new().unwrap();
+        let writer = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let other = SqliteSessionBackend::new(tmp.path()).unwrap();
+        writer
+            .replace_conversation_state("mine", &[u("seed")], false)
+            .unwrap();
+        let handle = std::thread::spawn(move || {
+            for i in 0..300 {
+                other
+                    .append("theirs", &u(&format!("noise {i}")))
+                    .expect("other handle write");
+            }
+        });
+        let mut transcript = vec![u("seed")];
+        for i in 0..300 {
+            transcript.push(u(&format!("turn {i}")));
+            assert!(
+                writer
+                    .replace_conversation_state_if_exists("mine", &transcript, false)
+                    .expect("replacement must not fail under contention")
+            );
+        }
+        handle.join().unwrap();
+        assert_eq!(writer.load("mine").len(), transcript.len());
     }
 }

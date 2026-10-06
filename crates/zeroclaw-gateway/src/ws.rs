@@ -2796,7 +2796,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .build()
                     .expect("test runtime")
                     .block_on(
-                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(),
+                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(
+                            false,
+                        ),
                     );
             })
             .expect("spawn WebSocket regression thread")
@@ -2804,7 +2806,18 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect("WebSocket regression thread must not panic");
     }
 
-    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner() {
+    #[test]
+    fn websocket_restore_time_trim_keeps_created_at_of_retained_sqlite_rows() {
+        // #11420: the restore-time trim replaces the stored transcript. With
+        // the SQLite backend the retained rows must keep the time they were
+        // first persisted, which only holds when the agent's breadcrumb flag
+        // reaches the backend together with the replacement.
+        run_ws_regression("ws-restore-trim-sqlite-times", || {
+            websocket_connect_persists_a_restore_time_trim_before_going_live_inner(true)
+        });
+    }
+
+    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner(sqlite: bool) {
         use zeroclaw_infra::session_backend::SessionBackend;
 
         let tmp = tempfile::tempdir().expect("temporary gateway workspace");
@@ -2856,8 +2869,11 @@ data: {\"type\":\"message_stop\"}\n\n",
             },
         );
 
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = if sqlite {
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap())
+        } else {
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap())
+        };
         let session_id = "restore-trim-session";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let over_cap = vec![
@@ -2868,9 +2884,20 @@ data: {\"type\":\"message_stop\"}\n\n",
             zeroclaw_providers::ChatMessage::user("turn three request"),
             zeroclaw_providers::ChatMessage::assistant("turn three answer"),
         ];
-        backend
-            .replace_conversation_state(&session_key, &over_cap, false)
-            .unwrap();
+        if sqlite {
+            // One prefix at a time, so every seeded row has its own time.
+            for end in 1..=over_cap.len() {
+                backend
+                    .replace_conversation_state(&session_key, &over_cap[..end], false)
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        } else {
+            backend
+                .replace_conversation_state(&session_key, &over_cap, false)
+                .unwrap();
+        }
+        let seeded = backend.load_with_timestamps(&session_key);
 
         let mut state = crate::api::tests::test_state(config);
         state.session_backend = Some(backend.clone());
@@ -2949,6 +2976,32 @@ data: {\"type\":\"message_stop\"}\n\n",
             Some(true),
             "restore-time trim must persist the corrected breadcrumb"
         );
+
+        if sqlite {
+            let stored = backend.load_with_timestamps(&session_key);
+            let newest_seeded = seeded.iter().filter_map(|m| m.created_at).max().unwrap();
+            let mut retained = 0;
+            for (i, row) in stored.iter().enumerate() {
+                let original = seeded
+                    .iter()
+                    .find(|m| m.message.content == row.message.content);
+                match original {
+                    Some(original) => {
+                        retained += 1;
+                        assert_eq!(
+                            row.created_at, original.created_at,
+                            "retained row {:?} must keep its original time",
+                            row.message.content
+                        );
+                    }
+                    None => assert!(
+                        i == 0 && row.created_at.unwrap() > newest_seeded,
+                        "only the breadcrumb is new: {row:?}"
+                    ),
+                }
+            }
+            assert!(retained > 0, "the trim must retain some rows: {stored:?}");
+        }
 
         gateway_server.abort();
     }
