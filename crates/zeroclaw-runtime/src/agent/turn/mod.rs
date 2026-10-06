@@ -2820,7 +2820,7 @@ fn sop_step_excluded_tools(
 #[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
-    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2912,7 +2912,7 @@ impl OwnedAgentExecution {
 #[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -2932,7 +2932,7 @@ pub(crate) async fn assemble_owned_execution(
 
 pub(crate) async fn assemble_owned_execution_with_admission(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -5979,14 +5979,14 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             SopConfig::default(),
         )));
 
         let owned = assemble_owned_execution(
             &config,
-            Some(Arc::clone(&live_config)),
+            Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
             None,
@@ -6007,11 +6007,11 @@ mod sop_step_reassembly_tests {
             .expect("first run");
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let second = file_download.execute(args).await.expect("second run");
         assert!(

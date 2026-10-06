@@ -628,3 +628,68 @@ mod plan_wire_tests {
         assert_eq!(back, entry);
     }
 }
+
+// Config publication receipts and the daemon's bounded application ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedConfigRevision {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigStatusResult {
+    #[serde(default)]
+    pub application: Option<ConfigApplicationStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationStatus {
+    pub published_revision: PublishedConfigRevision,
+    pub records: Vec<ConfigApplicationRecord>,
+    pub record_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationRecord {
+    pub path: Vec<String>,
+    pub target: ConfigApplicationTarget,
+    pub revision: PublishedConfigRevision,
+    pub outcome: ConfigApplicationOutcome,
+    #[serde(default)]
+    pub reason: Option<ConfigApplicationReason>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigApplicationTarget {
+    Daemon,
+    Session {
+        id: String,
+        generation: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationOutcome {
+    Pending,
+    AppliedLive,
+    QueuedForReload,
+    Rejected,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationReason {
+    AwaitingAcknowledgement,
+    DaemonReloadRequired,
+    ChangeScopeUnavailable,
+    TargetRetired,
+    #[serde(other)]
+    Unknown,
+}

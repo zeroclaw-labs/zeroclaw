@@ -298,6 +298,11 @@ keyactions! {
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
         ApplyTemplate [Chord::char('t')] => "apply template",
+        ApplicationStatus [Chord::char('s')] => "application status",
+        PageUp [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown [Chord::key(KeyCode::PageDown)] => "page down",
+        JumpStart [Chord::key(KeyCode::Home)] => "jump to start",
+        JumpEnd [Chord::key(KeyCode::End)] => "jump to end",
     }
 }
 

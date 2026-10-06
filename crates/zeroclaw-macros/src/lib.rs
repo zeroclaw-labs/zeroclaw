@@ -75,6 +75,9 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[application = "model_provider_refresh"]` on a struct classifies all
+///   emitted children, or on a scalar field classifies only that property.
+///   Unannotated properties require reload.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
 ///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
@@ -146,6 +149,7 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         integration,
         resource_key,
         credential_class,
+        application,
         natural_key,
         tab,
         group,
@@ -158,6 +162,15 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let prefix = extract_prefix(&input);
     let category = derive_category(&prefix);
+    let struct_application = match extract_application(&input.attrs) {
+        Ok(Some(application)) => quote! {
+            for field in &mut fields {
+                field.application = #application;
+            }
+        },
+        Ok(None) => quote! {},
+        Err(err) => return err.to_compile_error().into(),
+    };
     let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
         Ok(method) => method,
         Err(err) => return err.to_compile_error().into(),
@@ -242,6 +255,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_resource_key = has_attr(field, "resource_key");
         let is_multiline = has_attr(field, "multiline");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
+        let application = match extract_application(&field.attrs) {
+            Ok(application) => application,
+            Err(err) => return err.to_compile_error().into(),
+        };
+        let application_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
+        if application.is_some()
+            && (is_nested || is_compound_type(application_ty) || serde_skip || is_serde_flatten)
+        {
+            return syn::Error::new_spanned(
+                field,
+                "field application annotations require an emitted scalar property",
+            )
+            .to_compile_error()
+            .into();
+        }
+        let field_application = application.unwrap_or_else(|| {
+            quote! {
+                crate::config::ApplicationCapability::ReloadRequired
+            }
+        });
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
             Err(err) => return err.to_compile_error().into(),
@@ -355,6 +388,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 description: #description_lit,
                                 derived_from_secret: false,
                                 credential_class: #credential_class_expr,
+                                application: crate::config::ApplicationCapability::ReloadRequired,
                                 tab: #tab_token,
                                 alias_source: None,
                                 multiline: false,
@@ -2028,6 +2062,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         description: #description_lit,
                         derived_from_secret: #derived_from_secret,
                         credential_class: #credential_class_expr,
+                        application: crate::config::ApplicationCapability::ReloadRequired,
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
                         multiline: #is_multiline,
@@ -2036,23 +2071,27 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             });
         } else {
             prop_field_entries.push(quote! {
-                crate::config::make_prop_field(
-                    __table.as_ref(),
-                    #full_name_lit,
-                    #serde_name_lit,
-                    #category_lit,
-                    #type_hint_lit,
-                    #kind_token,
-                    #is_secret,
-                    #enum_variants_expr,
-                    #description_lit,
-                    #derived_from_secret,
-                    #credential_class_expr,
-                    #tab_token,
-                    &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
-                    #alias_source_expr,
-                    #is_multiline,
-                )
+                {
+                    let mut field = crate::config::make_prop_field(
+                        __table.as_ref(),
+                        #full_name_lit,
+                        #serde_name_lit,
+                        #category_lit,
+                        #type_hint_lit,
+                        #kind_token,
+                        #is_secret,
+                        #enum_variants_expr,
+                        #description_lit,
+                        #derived_from_secret,
+                        #credential_class_expr,
+                        #tab_token,
+                        &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+                        #alias_source_expr,
+                        #is_multiline,
+                    );
+                    field.application = #field_application;
+                    field
+                }
             });
         }
     }
@@ -2152,6 +2191,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut fields = vec![#(#prop_field_entries),*];
                 #(#nested_prop_fields)*
                 #(#dynamic_secret_map_prop_fields)*
+                #struct_application
                 fields
             }
 
@@ -2695,6 +2735,51 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
     })
 }
 
+fn extract_application(attrs: &[syn::Attribute]) -> syn::Result<Option<proc_macro2::TokenStream>> {
+    let mut application = None;
+    for attr in attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("application"))
+    {
+        if application.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "duplicate application annotation",
+            ));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[application = \"model_provider_refresh\"]",
+            ));
+        };
+        let syn::Expr::Lit(expr) = &nv.value else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "application must be a string literal",
+            ));
+        };
+        let Lit::Str(value) = &expr.lit else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "application must be a string literal",
+            ));
+        };
+        let variant = match value.value().as_str() {
+            "reload_required" => quote! { ReloadRequired },
+            "model_provider_refresh" => quote! { ModelProviderRefresh },
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "unknown application; expected reload_required or model_provider_refresh",
+                ));
+            }
+        };
+        application = Some(quote! { crate::config::ApplicationCapability::#variant });
+    }
+    Ok(application)
+}
+
 /// Shared `set_prop` delegation gate for nested sites whose dotted namespace
 /// is (or may be) shared with sibling candidates: serde-flatten fields and
 /// the two-level dotted-key candidate loop.
@@ -2899,6 +2984,26 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_application_annotation_accepts_only_known_literal_capabilities() {
+        let attrs = vec![syn::parse_quote!(#[application = "model_provider_refresh"])];
+        assert!(extract_application(&attrs).unwrap().is_some());
+        let attrs = vec![syn::parse_quote!(#[application = "reload_required"])];
+        assert!(extract_application(&attrs).unwrap().is_some());
+        assert!(extract_application(&[]).unwrap().is_none());
+        for attrs in [
+            vec![syn::parse_quote!(#[application = "unknown"])],
+            vec![syn::parse_quote!(#[application = 1])],
+            vec![syn::parse_quote!(#[application(model_provider_refresh)])],
+            vec![
+                syn::parse_quote!(#[application = "model_provider_refresh"]),
+                syn::parse_quote!(#[application = "reload_required"]),
+            ],
+        ] {
+            assert!(extract_application(&attrs).is_err());
+        }
+    }
+
     use super::*;
     use syn::parse_quote;
 

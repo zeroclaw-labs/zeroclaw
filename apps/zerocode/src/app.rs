@@ -1941,6 +1941,9 @@ pub async fn run(
             chrome_status.tick(&rpc);
             sidebar.drain_picker_fetch();
         }
+        config_app.tick_application_status(
+            mode == Mode::Config && !matches!(conn_state, ConnectionState::Disconnected { .. }),
+        );
         inbound_router.drain(&mut chat_pane, &mut acp_pane);
         acp_pane.tick_transport_events();
         chat_pane.tick_transport_events();
