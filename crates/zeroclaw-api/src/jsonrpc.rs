@@ -301,6 +301,18 @@ pub struct RpcOutbound {
     next_id: AtomicU64,
 }
 
+/// Room for one line on an [`RpcOutbound`] writer, reserved by
+/// [`RpcOutbound::reserve`]. Dropping it unused gives the room back.
+#[derive(Debug)]
+pub struct OutboundSlot<'a>(mpsc::Permit<'a, String>);
+
+impl OutboundSlot<'_> {
+    /// Enqueue `json` in the reserved room, without waiting.
+    pub fn send(self, json: String) {
+        self.0.send(json);
+    }
+}
+
 struct PendingRequestGuard<'a> {
     pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
     id: String,
@@ -325,8 +337,20 @@ impl RpcOutbound {
     }
 
     /// Send a raw pre-serialized JSON line. Returns `true` on success.
+    ///
+    /// Not for a stream a revocable grant gates: it waits for writer room
+    /// after any check the caller made. Such a stream reserves room with
+    /// [`Self::reserve`], then checks and sends in the reserved slot (the
+    /// runtime's subscription forwarders do this through one helper).
     pub async fn send_raw(&self, json: String) -> bool {
         self.writer_tx.send(json).await.is_ok()
+    }
+
+    /// Wait for room for one line on the writer. `None` once the writer is
+    /// closed. The slot lets a caller decide whether to send after the wait,
+    /// and the send itself never waits.
+    pub async fn reserve(&self) -> Option<OutboundSlot<'_>> {
+        self.writer_tx.reserve().await.ok().map(OutboundSlot)
     }
 
     /// Resolve when the writer end is closed (peer dropped). Useful for
@@ -870,6 +894,31 @@ mod tests {
             v["error"].get("data").is_none(),
             "error.data omitted when None"
         );
+    }
+
+    /// A reserved slot holds the writer's room: a line sent through it lands
+    /// without waiting, a slot dropped unused gives the room back, and a
+    /// closed writer has no room to reserve.
+    #[tokio::test]
+    async fn a_reserved_slot_sends_without_waiting_and_returns_unused_room() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outbound = RpcOutbound::new(tx);
+
+        let slot = outbound.reserve().await.expect("room on an open writer");
+        assert!(
+            outbound.writer_tx.try_reserve().is_err(),
+            "the slot holds the only room"
+        );
+        drop(slot);
+        outbound
+            .reserve()
+            .await
+            .expect("an unused slot gives its room back")
+            .send("line".into());
+        assert_eq!(rx.recv().await.as_deref(), Some("line"));
+
+        drop(rx);
+        assert!(outbound.reserve().await.is_none(), "a closed writer");
     }
 
     #[test]

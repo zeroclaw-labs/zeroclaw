@@ -9203,7 +9203,8 @@ Add pricing to the active provider profile or supply a catalog entry."
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
                 if json {
-                    // Machine-readable shape consumed by the gateway's
+                    // Machine-readable shape consumed by the daemon's
+                    // `system/version-check`, which backs the gateway's
                     // `GET /api/version/check`. Keep field names stable.
                     println!(
                         "{}",
