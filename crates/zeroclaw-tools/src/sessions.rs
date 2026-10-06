@@ -1184,6 +1184,7 @@ mod tests {
         message_count: usize,
     ) -> SessionMetadata {
         SessionMetadata {
+            file_identity: None,
             key: key.to_string(),
             name: None,
             created_at: Utc::now(),
@@ -2205,6 +2206,7 @@ mod tests {
         let (_acp_tmp, _store, view, current, _other, _foreign) = acp_fixture();
         let (_chat_tmp, inner) = test_backend();
         let old_chat = SessionMetadata {
+            file_identity: None,
             key: "telegram__old".into(),
             name: None,
             created_at: Utc::now() - chrono::Duration::days(2),

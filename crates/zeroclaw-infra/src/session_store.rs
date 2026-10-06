@@ -153,6 +153,10 @@ impl SessionStore {
             Err(e) => return Err(e),
         }
         let file = std::fs::File::open(&path)?;
+        Self::try_load_file(&file)
+    }
+
+    fn try_load_file(file: &std::fs::File) -> std::io::Result<Vec<ChatMessage>> {
         let reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
         for line in reader.lines() {
@@ -341,6 +345,10 @@ impl SessionStore {
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
+        self.delete_session_unlocked(session_key)
+    }
+
+    fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
@@ -351,6 +359,51 @@ impl SessionStore {
         std::fs::remove_file(&path)?;
         let _ = std::fs::remove_file(crumb_path);
         Ok(true)
+    }
+
+    fn snapshot_unlocked(
+        &self,
+        key: &str,
+    ) -> std::io::Result<Option<crate::session_backend::SessionSnapshot>> {
+        use crate::session_backend::{SessionMetadata, SessionSnapshot, TimestampedMessage};
+        let path = self.session_path(key);
+        if !validate_jsonl_session_file_path(&path)? {
+            return Ok(None);
+        }
+        let identity = std::sync::Arc::new(crate::session_backend::SessionFileIdentity(
+            same_file::Handle::from_path(&path)?,
+        ));
+        let file = identity.0.as_file().metadata()?;
+        // Filesystem birth time is canonical when available. On filesystems
+        // without it, mtime conservatively refuses a changed transcript.
+        let created_at =
+            chrono::DateTime::<chrono::Utc>::from(file.created().or_else(|_| file.modified())?);
+        let last_activity = chrono::DateTime::<chrono::Utc>::from(file.modified()?);
+        let messages = Self::try_load_file(identity.0.as_file())?;
+        let metadata = SessionMetadata {
+            file_identity: Some(identity),
+            key: key.to_owned(),
+            name: None,
+            created_at,
+            last_activity,
+            message_count: messages.len(),
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
+            principal_id: None,
+        };
+        Ok(Some(SessionSnapshot {
+            metadata,
+            messages: messages
+                .into_iter()
+                .map(|message| TimestampedMessage {
+                    message,
+                    created_at: None,
+                })
+                .collect(),
+            state: None,
+        }))
     }
 
     /// Return the modification time of a regular session JSONL file.
@@ -471,6 +524,51 @@ pub(crate) fn forget_session_directory_migration_state_for_test(
 }
 
 impl SessionBackend for SessionStore {
+    fn try_get_session_metadata(
+        &self,
+        key: &str,
+    ) -> std::io::Result<Option<crate::session_backend::SessionMetadata>> {
+        let _guard = self.mutation_lock.lock();
+        self.snapshot_unlocked(key)
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.metadata))
+    }
+
+    fn get_session_metadata(&self, key: &str) -> Option<crate::session_backend::SessionMetadata> {
+        let _guard = self.mutation_lock.lock();
+        self.snapshot_unlocked(key)
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.metadata)
+    }
+
+    fn read_session_snapshot(
+        &self,
+        key: &str,
+    ) -> std::io::Result<Option<crate::session_backend::SessionSnapshot>> {
+        let _guard = self.mutation_lock.lock();
+        self.snapshot_unlocked(key)
+    }
+
+    fn delete_session_matching(
+        &self,
+        key: &str,
+        created_at: &str,
+        owner: Option<&str>,
+        file_identity: Option<&crate::session_backend::SessionFileIdentity>,
+    ) -> std::io::Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let matches = self.snapshot_unlocked(key)?.is_some_and(|snapshot| {
+            snapshot.metadata.created_at.to_rfc3339() == created_at
+                && snapshot.metadata.principal_id.as_deref() == owner
+                && file_identity.is_some()
+                && snapshot.metadata.file_identity.as_deref() == file_identity
+        });
+        if !matches {
+            return Ok(false);
+        }
+        self.delete_session_unlocked(key)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
     }
@@ -546,27 +644,9 @@ impl SessionBackend for SessionStore {
     }
 
     fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
-        use chrono::{DateTime, Utc};
         self.list_sessions()
             .into_iter()
-            .map(|key| {
-                let last_activity: DateTime<Utc> = self
-                    .session_mtime(&key)
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
-                    name: None,
-                    created_at: last_activity,
-                    last_activity,
-                    message_count: 0,
-                    key,
-                    agent_alias: None,
-                    channel_id: None,
-                    room_id: None,
-                    sender_id: None,
-                    principal_id: None,
-                }
-            })
+            .filter_map(|key| self.get_session_metadata(&key))
             .collect()
     }
 
@@ -634,6 +714,78 @@ mod tests {
             entry_contents: file_type.is_file().then(|| std::fs::read(path).unwrap()),
             tracked_target_contents: tracked_target.map(|target| std::fs::read(target).ok()),
         }
+    }
+
+    #[test]
+    fn conditional_session_delete_preserves_an_unowned_or_replaced_jsonl_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("boundary", &ChatMessage::user("original"))
+            .unwrap();
+        let admitted = store.get_session_metadata("boundary").unwrap();
+        let created = admitted.created_at.to_rfc3339();
+        assert!(
+            !store
+                .delete_session_matching(
+                    "boundary",
+                    &created,
+                    Some("user:alice"),
+                    admitted.file_identity.as_deref()
+                )
+                .unwrap()
+        );
+        store.delete_session("boundary").unwrap();
+        store
+            .append("boundary", &ChatMessage::user("replacement"))
+            .unwrap();
+        assert!(
+            !store
+                .delete_session_matching(
+                    "boundary",
+                    &created,
+                    None,
+                    admitted.file_identity.as_deref()
+                )
+                .unwrap()
+        );
+        let snapshot = store.read_session_snapshot("boundary").unwrap().unwrap();
+        assert_eq!(snapshot.messages[0].message.content, "replacement");
+        // Even an identical/coarse birth time cannot authorize a new file.
+        assert!(
+            !store
+                .delete_session_matching(
+                    "boundary",
+                    &snapshot.metadata.created_at.to_rfc3339(),
+                    None,
+                    admitted.file_identity.as_deref(),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .read_session_snapshot("boundary")
+                .unwrap()
+                .unwrap()
+                .messages[0]
+                .message
+                .content,
+            "replacement"
+        );
+        assert_eq!(
+            store.list_sessions_with_metadata()[0].created_at,
+            snapshot.metadata.created_at
+        );
+        assert!(
+            store
+                .delete_session_matching(
+                    "boundary",
+                    &snapshot.metadata.created_at.to_rfc3339(),
+                    None,
+                    snapshot.metadata.file_identity.as_deref(),
+                )
+                .unwrap()
+        );
     }
 
     #[test]

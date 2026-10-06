@@ -12,6 +12,7 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 
 import { loadLocale, saveLocale } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
+import type { LinkBanner } from "./lib/authBootstrap";
 import { DraftContext, useDraftStore } from "./hooks/useDraft";
 import { getAdminPairCode, generatePairCode, PairCodeForbiddenError, getQuickstartState } from "./lib/api";
 import { basePath } from "./lib/basePath";
@@ -371,8 +372,110 @@ function PairingDialog({
   );
 }
 
+// Sign-in for a gateway with no pairing-code exchange (the preview
+// zeroclaw-gw): paste a token the core already accepts. The gateway checks it
+// before it is stored.
+function TokenSignIn({
+  onSignIn,
+  banner,
+}: {
+  onSignIn: (token: string) => Promise<void>;
+  banner: LinkBanner | null;
+}) {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      await onSignIn(token);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Sign-in failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div
+      className="min-h-screen flex items-center justify-center"
+      style={{ background: "var(--pc-bg-base)" }}
+    >
+      <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
+        <div className="text-center mb-8">
+          <h1 className="text-2xl font-bold mb-2 text-gradient-blue">
+            ZeroClaw
+          </h1>
+          <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
+            This gateway signs in with an existing token. Paste a token the
+            core accepts.
+          </p>
+        </div>
+        {banner && (
+          <div
+            role="alert"
+            className="mb-6 p-4 rounded-2xl border text-sm"
+            style={{
+              background: "var(--pc-bg-elevated)",
+              borderColor: "var(--color-status-error)",
+              color: "var(--pc-text-primary)",
+            }}
+          >
+            <p className="font-semibold mb-1">{banner.error}</p>
+            {banner.hint && (
+              <p style={{ color: "var(--pc-text-muted)" }}>{banner.hint}</p>
+            )}
+          </div>
+        )}
+        <form onSubmit={handleSubmit}>
+          <input
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="token"
+            className="input-electric w-full px-4 py-4 text-center font-medium mb-4"
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+            autoFocus
+          />
+          {error && (
+            <p
+              aria-live="polite"
+              className="text-sm mb-4 text-center animate-fade-in"
+              style={{ color: "var(--color-status-error)" }}
+            >
+              {error}
+            </p>
+          )}
+          <button
+            type="submit"
+            disabled={loading || token.trim().length === 0}
+            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+          >
+            {loading ? "Signing in..." : "Sign in"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function AppContent() {
-  const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
+  const {
+    isAuthenticated,
+    requiresPairing,
+    loading,
+    loginMode,
+    linkBanner,
+    pair,
+    signInWithToken,
+    logout,
+  } = useAuth();
   const [locale, setLocaleState] = useState(loadLocale());
   const draftStore = useDraftStore();
   setLocale(locale as Locale);
@@ -412,7 +515,11 @@ function AppContent() {
   }
 
   if (!isAuthenticated && requiresPairing) {
-    return <PairingDialog onPair={pair} />;
+    return loginMode === "bearer" ? (
+      <TokenSignIn onSignIn={signInWithToken} banner={linkBanner} />
+    ) : (
+      <PairingDialog onPair={pair} />
+    );
   }
 
   return (

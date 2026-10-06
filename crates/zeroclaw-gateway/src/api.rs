@@ -5,12 +5,21 @@ use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::{
+    CLIENT_KIND_GATEWAY, MessageEntry, SessionDeleteResult, SessionEntry, SessionListResult,
+    SessionMessagesParams, SessionMessagesResult, SessionStateResult, SessionTargetParams,
+};
+
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
@@ -1209,6 +1218,7 @@ pub async fn handle_api_memory_delete(
 /// Query parameters for `GET /api/cost`. When `agent` is set, the
 /// returned summary filters to records attributed to that alias.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(Clone, Default))]
 pub struct CostQuery {
     #[serde(default)]
     pub agent: Option<String>,
@@ -1229,7 +1239,13 @@ pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<CostQuery>,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_cost_through_core(&core, &query)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1256,19 +1272,81 @@ pub async fn handle_api_cost(
                 .into_response(),
         }
     } else {
-        Json(serde_json::json!({
-            "cost": {
-                "session_cost_usd": 0.0,
-                "daily_cost_usd": 0.0,
-                "monthly_cost_usd": 0.0,
-                "total_tokens": 0,
-                "request_count": 0,
-                "by_model": {},
-                "by_agent": {},
-            }
-        }))
-        .into_response()
+        Json(empty_cost_response()).into_response()
     }
+}
+
+/// `GET /api/cost` through the core, the body every router serves for it.
+/// A core with cost tracking disabled answers the route's disabled body.
+pub(crate) async fn api_cost_through_core(
+    core: &CoreCall,
+    query: &CostQuery,
+) -> Result<Response, CoreError> {
+    match core
+        .request(Method::CostQuery, cost_query_params(query))
+        .await
+    {
+        Ok(summary) => Ok(Json(serde_json::json!({ "cost": summary })).into_response()),
+        Err(CoreError::Rpc(error)) if cost_tracking_disabled(&error) => {
+            Ok(Json(empty_cost_response()).into_response())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The body this route answers with when cost tracking is disabled.
+fn empty_cost_response() -> serde_json::Value {
+    serde_json::json!({
+        "cost": {
+            "session_cost_usd": 0.0,
+            "daily_cost_usd": 0.0,
+            "monthly_cost_usd": 0.0,
+            "total_tokens": 0,
+            "request_count": 0,
+            "by_model": {},
+            "by_agent": {},
+        }
+    })
+}
+
+/// Lower bound that selects every cost record. No record predates it.
+const ALL_TIME_FROM: &str = "0000-01-01T00:00:00Z";
+
+/// The core's refusal when this daemon has no cost tracker.
+const COST_TRACKING_UNAVAILABLE: &str = "Cost tracking is not available";
+
+fn cost_tracking_disabled(error: &JsonRpcError) -> bool {
+    error.code == INTERNAL_ERROR && error.message == COST_TRACKING_UNAVAILABLE
+}
+
+/// The `cost/query` params that reproduce this route's summary.
+///
+/// This route reads a bound it cannot parse as absent and, with neither
+/// bound, sums every record kept. `cost/query` refuses an unparsable bound
+/// and, with neither, reports the current day and month instead. So only
+/// bounds that parse are forwarded, and a request with none forwards
+/// [`ALL_TIME_FROM`]. An agent selects that agent's summary and no window,
+/// as it does here.
+fn cost_query_params(query: &CostQuery) -> serde_json::Value {
+    if let Some(agent) = query.agent.as_deref().filter(|s| !s.is_empty()) {
+        return serde_json::json!({ "agent": agent });
+    }
+    let parsed = |raw: &Option<String>| {
+        raw.clone()
+            .filter(|raw| chrono::DateTime::parse_from_rfc3339(raw).is_ok())
+    };
+    let (from, to) = match (parsed(&query.from), parsed(&query.to)) {
+        (None, None) => (Some(ALL_TIME_FROM.to_owned()), None),
+        bounds => bounds,
+    };
+    let mut params = serde_json::Map::new();
+    if let Some(from) = from {
+        params.insert("from".into(), from.into());
+    }
+    if let Some(to) = to {
+        params.insert("to".into(), to.into());
+    }
+    serde_json::Value::Object(params)
 }
 
 /// GET /api/cli-tools — discovered CLI tools
@@ -1459,7 +1537,13 @@ pub async fn handle_api_channel_relink(
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_tuis_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1470,6 +1554,7 @@ pub async fn handle_api_tuis(
         .map(|r| {
             r.list()
                 .into_iter()
+                .filter(|e| !is_gateway_client(e.client_kind.as_deref()))
                 .map(|e| {
                     serde_json::json!({
                         "tui_id": e.tui_id,
@@ -1483,6 +1568,41 @@ pub async fn handle_api_tuis(
         .unwrap_or_default();
 
     Json(serde_json::json!({ "tuis": tuis })).into_response()
+}
+
+/// `GET /api/tuis` through the core, the body every router serves for it.
+pub(crate) async fn api_tuis_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let list = core.request(Method::TuiList, serde_json::json!({})).await?;
+    Ok(Json(tuis_response(list)).into_response())
+}
+
+/// This route's body from the core's `tui/list` result, which also reports
+/// each connection time as a Unix timestamp and labels a gateway's own
+/// connections.
+fn tuis_response(mut list: serde_json::Value) -> serde_json::Value {
+    if let Some(tuis) = list
+        .get_mut("tuis")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        tuis.retain(|tui| {
+            !is_gateway_client(tui.get("client_kind").and_then(serde_json::Value::as_str))
+        });
+        for tui in tuis {
+            if let Some(entry) = tui.as_object_mut() {
+                entry.remove("connected_at_unix");
+                entry.remove("client_kind");
+            }
+        }
+    }
+    list
+}
+
+/// Whether a registered client declared itself a gateway on `initialize`,
+/// as every connection a gateway opens for its callers does (this one's and
+/// any separate `zeroclaw-gw`'s). The core registers those connections too;
+/// they are not terminals and this route never listed them.
+fn is_gateway_client(client_kind: Option<&str>) -> bool {
+    client_kind == Some(CLIENT_KIND_GATEWAY)
 }
 
 fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
@@ -1707,7 +1827,13 @@ fn normalized_webhook_path(path: Option<&str>) -> String {
 pub async fn handle_api_health(
     State(state): State<AppState>,
     headers: HeaderMap,
+    access: CoreAccess,
 ) -> impl IntoResponse {
+    if let CoreAccess::Core(core) = access {
+        return api_health_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
@@ -1716,9 +1842,44 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// `GET /api/health` through the core, the body every router serves for it.
+pub(crate) async fn api_health_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let health = core.request(Method::Health, serde_json::json!({})).await?;
+    Ok(Json(health_response(health)).into_response())
+}
+
+/// This route's body from the core's `health` result. The core adds the
+/// process stats that `/api/status` reports; this route never carried them.
+fn health_response(mut health: serde_json::Value) -> serde_json::Value {
+    if let Some(snapshot) = health.as_object_mut() {
+        snapshot.remove("process");
+    }
+    serde_json::json!({ "health": health })
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 // ── Session API handlers ─────────────────────────────────────────
+//
+// Every session route stays in-process for now.
+// - `GET /api/sessions`: the core lists, for a non-local caller, only the
+//   sessions that caller's own connection opened, so the gateway's
+//   credential-bound connection would list none of the dashboard's sessions.
+//   The listing moves to the core once the core scopes such a connection's
+//   view by its principal. The rows already take the core's `SessionEntry`
+//   shape, so that move changes only where they come from. The standalone
+//   preview gateway serves it through the core already
+//   (`api_sessions_list_through_core`).
+// - The routes that address one session by id: the core takes the exact
+//   stored keys this gateway's resolver tries (`session_keys`), and the
+//   standalone preview gateway serves messages, state and delete that way
+//   (`api_session_*_through_core`). This gateway keeps its own bodies: its
+//   core connection sees only the sessions it opened itself, as for the
+//   listing, and its delete must settle its own turns first (below).
+// - A delete must first cancel and wait for the gateway's own chat turn,
+//   which only the gateway can do, while only the core can authorize the
+//   delete. Until those turns run in the core, the two cannot be made one
+//   authorized step.
 
 /// GET /api/sessions — list gateway sessions
 pub async fn handle_api_sessions_list(
@@ -1741,8 +1902,8 @@ pub async fn handle_api_sessions_list(
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
-    let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
+    let entries: Vec<SessionEntry> = backend
+        .list_sessions_with_metadata()
         .into_iter()
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
         .map(|meta| {
@@ -1755,33 +1916,59 @@ pub async fn handle_api_sessions_list(
                     .and_then(|c| config.agent_for_channel(c))
                     .map(str::to_string)
             });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
-            let session_id = meta
-                .key
-                .strip_prefix("gw_")
-                .map(str::to_string)
-                .unwrap_or_else(|| meta.key.clone());
-            let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
-                "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-                "agent_alias": agent_alias,
-                "channel_id": meta.channel_id,
-            });
-            if let Some(name) = meta.name {
-                entry["name"] = serde_json::Value::String(name);
+            SessionEntry {
+                session_id: gateway_display_session_id(&meta.key).to_string(),
+                session_key: meta.key,
+                created_at: meta.created_at.to_rfc3339(),
+                last_activity: meta.last_activity.to_rfc3339(),
+                message_count: meta.message_count,
+                agent_alias,
+                channel_id: meta.channel_id,
+                name: meta.name,
             }
-            entry
         })
         .collect();
 
+    sessions_list_response(entries)
+}
+
+/// `GET /api/sessions` through the core, as the standalone preview gateway
+/// serves it: the sessions the caller's principal may see. Over the daemon's
+/// local socket the core does not narrow the list to the sessions this
+/// connection opened; the principal still scopes it. A paired token is the
+/// shared operator and sees every attributable session, while an
+/// authenticated principal without the admin grant, such as an OIDC user,
+/// sees only its own.
+pub(crate) async fn api_sessions_list_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let listed: SessionListResult = core
+        .call(Method::SessionList, serde_json::json!({}))
+        .await?;
+    Ok(sessions_list_response(listed.sessions))
+}
+
+fn sessions_list_response(entries: Vec<SessionEntry>) -> Response {
+    let sessions: Vec<serde_json::Value> = entries.into_iter().map(session_list_row).collect();
     Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// One row of `GET /api/sessions`, whichever path listed it.
+fn session_list_row(entry: SessionEntry) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        // Display form: `gw_` stripped for gateway sessions, full
+        // composite for channel-driven sessions.
+        "session_id": gateway_display_session_id(&entry.session_key),
+        // Full DB key for API operations (delete, messages, abort).
+        "session_key": entry.session_key,
+        "created_at": entry.created_at,
+        "last_activity": entry.last_activity,
+        "message_count": entry.message_count,
+        "agent_alias": entry.agent_alias,
+        "channel_id": entry.channel_id,
+    });
+    if let Some(name) = entry.name {
+        row["name"] = serde_json::Value::String(name);
+    }
+    row
 }
 
 /// Resolve a path `{id}` to the persisted session key.
@@ -1799,18 +1986,30 @@ pub async fn handle_api_sessions_list(
 /// 3. the canonical sanitized gateway key
 /// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
 ///    canonical sanitized gateway key
+///
+/// The candidates, in that order, are [`gateway_session_key_candidates`].
 fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
-    if exists(id) {
-        return id.to_string();
+    let mut keys = gateway_session_key_candidates(id);
+    match keys.iter().position(|key| exists(key)) {
+        Some(found) => keys.swap_remove(found),
+        None => keys.pop().unwrap_or_else(|| id.to_string()),
     }
-    if !id.starts_with("gw_") {
-        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
-        if exists(&legacy_key) {
-            return legacy_key;
-        }
-        return gateway_session_key(id);
+}
+
+/// The persisted keys a path `{id}` may name, in the order
+/// [`resolve_gateway_session_key`] tries them: the first that exists is the
+/// session, and the last is the key used when none does. Sent to the core as
+/// `session_keys`, so the core acts on the row this gateway would.
+pub(crate) fn gateway_session_key_candidates(id: &str) -> Vec<String> {
+    if id.starts_with(GW_SESSION_PREFIX) {
+        return vec![id.to_string()];
     }
-    id.to_string()
+    let mut keys = vec![id.to_string(), format!("{GW_SESSION_PREFIX}{id}")];
+    let canonical = gateway_session_key(id);
+    if !keys.contains(&canonical) {
+        keys.push(canonical);
+    }
+    keys
 }
 
 /// Resolve an API session id to a live process-local cancellation key.
@@ -1860,20 +2059,258 @@ pub async fn handle_api_session_messages(
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
         .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
-                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
-            })
+            session_message_row(
+                m.message.role,
+                m.message.content,
+                m.created_at.map(|dt| dt.to_rfc3339()),
+            )
         })
         .collect();
 
+    session_messages_response(&id, messages)
+}
+
+/// The body of `GET /api/sessions/{id}/messages`, whichever path read it.
+fn session_messages_response(id: &str, messages: Vec<serde_json::Value>) -> Response {
     Json(serde_json::json!({
         "session_id": id,
         "messages": messages,
         "session_persistence": true,
     }))
     .into_response()
+}
+
+/// One transcript row of `GET /api/sessions/{id}/messages`.
+fn session_message_row(
+    role: String,
+    content: String,
+    created_at: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "role": role,
+        "content": content,
+        "created_at": created_at,
+    })
+}
+
+/// The most transcript bytes the gateway asks the core for in one
+/// `session/messages` call. It leaves room under the RPC client's 8 MiB frame
+/// for the envelope and the echoed session id.
+const CORE_MESSAGE_PAGE_BYTES: usize = 7 * 1024 * 1024;
+
+/// How many times a transcript read starts over after the core reports it
+/// changed between pages, before the gateway gives up with a conflict.
+const CORE_MESSAGE_READ_ATTEMPTS: usize = 3;
+
+/// Why a paged transcript read through the core did not complete.
+#[derive(Debug)]
+enum TranscriptReadError {
+    Core(CoreError),
+    /// One stored message is larger than a page can carry.
+    MessageTooLarge {
+        index: u64,
+        bytes: u64,
+    },
+    /// The projected transcript kept changing between pages.
+    Changed,
+}
+
+/// Read a whole transcript newest page first. `page(row, before_index)`
+/// fetches one page: `row` is `None` for the newest page, which the core
+/// resolves from the candidate keys, and afterwards the exact key that page
+/// read, so every later page comes from the same row; `before_index` is the
+/// index the page ends before. Indices count from the oldest entry. The
+/// derived whole-history revision binds every page to the same projection.
+/// A changed revision, different row, or shorter history starts the walk over.
+/// A core without revision support is refused before assembling a response.
+async fn read_transcript_pages<F, Fut>(
+    mut page: F,
+) -> Result<Vec<MessageEntry>, TranscriptReadError>
+where
+    F: FnMut(Option<String>, Option<usize>) -> Fut,
+    Fut: std::future::Future<Output = Result<SessionMessagesResult, CoreError>>,
+{
+    'attempt: for _ in 0..CORE_MESSAGE_READ_ATTEMPTS {
+        let newest = page(None, None).await.map_err(page_error)?;
+        if newest.session_revision.as_deref().is_none_or(str::is_empty) {
+            return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                code: zeroclaw_api::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                message: "session/messages lacks transcript revision support".to_owned(),
+                data: None,
+            })));
+        }
+        let first_total = newest.total;
+        let mut start = newest.start;
+        let row = (
+            newest.session_key,
+            newest.session_created_at,
+            newest.session_revision,
+        );
+        let mut pages = vec![newest.messages];
+        while start > 0 {
+            let Some(key) = row.0.clone() else {
+                return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "session/messages did not name the row it read".to_owned(),
+                    data: None,
+                })));
+            };
+            let older = page(Some(key), Some(start)).await.map_err(page_error)?;
+            if older.total < first_total
+                || (
+                    older.session_key,
+                    older.session_created_at,
+                    older.session_revision,
+                ) != row
+            {
+                continue 'attempt;
+            }
+            if older.start >= start {
+                // The core made no progress; never loop on it.
+                return Err(TranscriptReadError::Core(CoreError::Rpc(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "session/messages returned no older entries".to_owned(),
+                    data: None,
+                })));
+            }
+            start = older.start;
+            pages.push(older.messages);
+        }
+        return Ok(pages.into_iter().rev().flatten().collect());
+    }
+    Err(TranscriptReadError::Changed)
+}
+
+fn page_error(error: CoreError) -> TranscriptReadError {
+    if let CoreError::Rpc(refusal) = &error
+        && let Some(data) = &refusal.data
+        && data["reason"] == "entry_exceeds_max_bytes"
+    {
+        return TranscriptReadError::MessageTooLarge {
+            index: data["index"].as_u64().unwrap_or_default(),
+            bytes: data["bytes"].as_u64().unwrap_or_default(),
+        };
+    }
+    TranscriptReadError::Core(error)
+}
+
+/// `GET /api/sessions/{id}/messages` through the core: the transcript of the
+/// stored row this gateway's resolution names, read in pages that each fit
+/// one RPC frame and all come from that one row.
+pub(crate) async fn api_session_messages_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let candidates = gateway_session_key_candidates(id);
+    let read = read_transcript_pages(|row: Option<String>, before_index| {
+        let params = SessionMessagesParams {
+            session_id: id.to_owned(),
+            limit: None,
+            before_index,
+            cursor: None,
+            session_keys: Some(row.map_or_else(|| candidates.clone(), |key| vec![key])),
+            max_bytes: Some(CORE_MESSAGE_PAGE_BYTES),
+        };
+        async move {
+            core.call(
+                Method::SessionMessages,
+                serde_json::to_value(params).unwrap_or_default(),
+            )
+            .await
+        }
+    })
+    .await;
+    let entries = match read {
+        Ok(entries) => entries,
+        Err(TranscriptReadError::Core(error)) => return Err(error),
+        Err(TranscriptReadError::MessageTooLarge { index, bytes }) => {
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "message {index} is {bytes} bytes, more than the gateway can \
+                         carry from the core ({CORE_MESSAGE_PAGE_BYTES} bytes)"
+                    ),
+                    "code": "message_too_large",
+                })),
+            )
+                .into_response());
+        }
+        Err(TranscriptReadError::Changed) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "The session changed while its messages were read; retry",
+                    "code": "conflict",
+                })),
+            )
+                .into_response());
+        }
+    };
+    let messages = entries
+        .into_iter()
+        .map(|entry| session_message_row(entry.role, entry.content, entry.created_at))
+        .collect();
+    Ok(session_messages_response(id, messages))
+}
+
+/// `GET /api/sessions/{id}/state` through the core, for the stored row this
+/// gateway's resolution names.
+pub(crate) async fn api_session_state_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let state: SessionStateResult = core
+        .call(Method::SessionState, session_target_params(id))
+        .await?;
+    Ok(Json(session_state_body(
+        id,
+        state.state,
+        state.turn_id,
+        state.turn_started_at,
+    ))
+    .into_response())
+}
+
+/// `DELETE /api/sessions/{id}` through the core, for the stored row this
+/// gateway's resolution names. Only a gateway that runs no chat turns of its
+/// own may serve it this way: the core cannot settle such a turn.
+pub(crate) async fn api_session_delete_through_core(
+    core: &CoreCall,
+    id: &str,
+) -> Result<Response, CoreError> {
+    let _: SessionDeleteResult = core
+        .call(Method::SessionDelete, session_target_params(id))
+        .await?;
+    Ok(Json(serde_json::json!({"deleted": true, "session_id": id})).into_response())
+}
+
+fn session_target_params(id: &str) -> serde_json::Value {
+    serde_json::to_value(SessionTargetParams {
+        session_id: id.to_owned(),
+        session_keys: Some(gateway_session_key_candidates(id)),
+    })
+    .unwrap_or_default()
+}
+
+/// The body of `GET /api/sessions/{id}/state`, whichever path read it.
+fn session_state_body(
+    id: &str,
+    state: String,
+    turn_id: Option<String>,
+    turn_started_at: Option<String>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "session_id": id,
+        "state": state,
+    });
+    if let Some(turn_id) = turn_id {
+        body["turn_id"] = serde_json::Value::String(turn_id);
+    }
+    if let Some(started) = turn_started_at {
+        body["turn_started_at"] = serde_json::Value::String(started);
+    }
+    body
 }
 
 /// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
@@ -2152,19 +2589,13 @@ pub async fn handle_api_session_state(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     match backend.get_session_state(&session_key) {
-        Ok(Some(ss)) => {
-            let mut resp = serde_json::json!({
-                "session_id": id,
-                "state": ss.state,
-            });
-            if let Some(turn_id) = ss.turn_id {
-                resp["turn_id"] = serde_json::Value::String(turn_id);
-            }
-            if let Some(started) = ss.turn_started_at {
-                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
-            }
-            Json(resp).into_response()
-        }
+        Ok(Some(ss)) => Json(session_state_body(
+            &id,
+            ss.state,
+            ss.turn_id,
+            ss.turn_started_at.map(|started| started.to_rfc3339()),
+        ))
+        .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -2238,6 +2669,9 @@ pub async fn handle_claude_code_hook(
 
 #[cfg(test)]
 pub(crate) use tests::test_state;
+
+#[cfg(test)]
+mod sessions_core_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2496,7 +2930,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    pub(crate) async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
             .collect()
@@ -3489,7 +3923,7 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
+    pub(crate) fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
     ) -> AppState {
