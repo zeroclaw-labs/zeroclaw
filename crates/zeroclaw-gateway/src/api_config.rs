@@ -14,7 +14,10 @@ use zeroclaw_config::traits::MaskSecrets;
 
 use super::AppState;
 use super::ConfigWriteGuard;
+use crate::core_rpc::{CoreAccess, CoreCall, CoreError};
 use std::sync::Arc;
+use zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS;
+use zeroclaw_rpc_client::Method;
 
 // ── Request / response shapes ───────────────────────────────────────
 
@@ -93,10 +96,23 @@ pub struct PatchResponse {
 /// dashboard pages. New clients should prefer the per-property API, but
 /// returning a masked snapshot here avoids a hard 405 when an older page is
 /// served by a newer gateway.
-pub async fn handle_config_get(State(state): State<AppState>) -> Response {
+pub async fn handle_config_get(State(state): State<AppState>, access: CoreAccess) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return config_get_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let mut cfg = state.config.read().clone();
     cfg.mask_secrets();
     Json(cfg).into_response()
+}
+
+/// `GET /api/config` through the core: the core's masked configuration.
+pub(crate) async fn config_get_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let config = core
+        .request(Method::ConfigGet, serde_json::json!({}))
+        .await?;
+    Ok(Json(config).into_response())
 }
 
 fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
@@ -1315,7 +1331,12 @@ pub struct TemplateEntry {
     pub description: &'static str,
 }
 
-pub async fn handle_templates(State(state): State<AppState>) -> Response {
+pub async fn handle_templates(State(state): State<AppState>, access: CoreAccess) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return templates_through_core(&core)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let _ = state; // templates are static per build, but auth-gated for consistency
 
     let templates: Vec<TemplateEntry> = zeroclaw_config::schema::Config::map_key_sections()
@@ -1332,6 +1353,14 @@ pub async fn handle_templates(State(state): State<AppState>) -> Response {
         .collect();
 
     axum::Json(TemplatesResponse { templates }).into_response()
+}
+
+/// `GET /api/config/templates` through the core.
+pub(crate) async fn templates_through_core(core: &CoreCall) -> Result<Response, CoreError> {
+    let templates = core
+        .request(Method::ConfigTemplates, serde_json::json!({}))
+        .await?;
+    Ok(Json(templates).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1351,31 +1380,80 @@ pub struct AliasSourceQuery {
 /// config via the shared `Config::resolve_alias_source`.
 pub async fn handle_resolve_alias_source(
     State(state): State<AppState>,
+    access: CoreAccess,
     Query(q): Query<AliasSourceQuery>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return resolve_alias_source_through_core(&core, &q)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let cfg = state.config.read().clone();
     let values = cfg.resolve_alias_source(q.source);
     axum::Json(serde_json::json!({ "source": q.source, "values": values })).into_response()
+}
+
+/// `GET /api/config/resolve-alias-source` through the core.
+pub(crate) async fn resolve_alias_source_through_core(
+    core: &CoreCall,
+    q: &AliasSourceQuery,
+) -> Result<Response, CoreError> {
+    let resolved = core
+        .request(
+            Method::ConfigResolveAliasSource,
+            serde_json::json!({ "source": q.source }),
+        )
+        .await?;
+    Ok(Json(resolved).into_response())
 }
 
 /// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
 /// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
 pub async fn handle_get_map_keys(
     State(state): State<AppState>,
+    access: CoreAccess,
     Query(q): Query<MapPathQuery>,
 ) -> Response {
+    if let CoreAccess::Core(core) = access {
+        return map_keys_through_core(&core, &q)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let cfg = state.config.read().clone();
     match cfg.get_map_keys(&q.path) {
         Some(keys) => {
             axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
         }
-        None => error_response(
-            ConfigApiError::new(
-                ConfigApiCode::PathNotFound,
-                format!("no map-keyed section at `{}`", q.path),
-            )
-            .with_path(&q.path),
-        ),
+        None => no_map_keyed_section(&q.path),
+    }
+}
+
+fn no_map_keyed_section(path: &str) -> Response {
+    error_response(
+        ConfigApiError::new(
+            ConfigApiCode::PathNotFound,
+            format!("no map-keyed section at `{path}`"),
+        )
+        .with_path(path),
+    )
+}
+
+/// `GET /api/config/map-keys` through the core. The core refuses a path with
+/// no map-keyed section as invalid params, the only way this call can be
+/// invalid; it answers as the in-process route does.
+pub(crate) async fn map_keys_through_core(
+    core: &CoreCall,
+    q: &MapPathQuery,
+) -> Result<Response, CoreError> {
+    match core
+        .request(Method::ConfigMapKeys, serde_json::json!({ "path": q.path }))
+        .await
+    {
+        Ok(keys) => Ok(Json(keys).into_response()),
+        Err(CoreError::Rpc(error)) if error.code == INVALID_PARAMS => {
+            Ok(no_map_keyed_section(&q.path))
+        }
+        Err(error) => Err(error),
     }
 }
 

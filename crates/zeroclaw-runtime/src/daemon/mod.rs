@@ -812,6 +812,11 @@ pub async fn run_with_authority(
         )?,
     );
 
+    // In-process RPC seam for the supervised gateway. Created before the
+    // gateway starts and bound once this generation's RPC context exists;
+    // the gateway's connect waits for that bind.
+    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
@@ -825,6 +830,7 @@ pub async fn run_with_authority(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            inproc: Some(inproc_connector.clone()),
             channel_generation_control: Some(channel_generation_control.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
@@ -1133,6 +1139,10 @@ pub async fn run_with_authority(
         None
     };
 
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        inproc_connector.bind(std::sync::Arc::clone(ctx));
+    }
+
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
         socket_required = true;
@@ -1403,7 +1413,23 @@ pub async fn run_with_authority(
     // that is refused below instead of handing over. Only this wait carries
     // the listeners' budget: the per-component grace below stays as it was, so
     // an unrelated pending component adds no reload latency.
-    let drain = await_rpc_connection_drain(&rpc_connection_count).await;
+    // The in-process seam's connections are the retiring generation's work
+    // too: the connector joins them (aborting stragglers at the same grace
+    // the socket listener uses) while the wait below counts their activity
+    // alongside the socket clients. They stay out of the ephemeral-exit count
+    // above on purpose; they are not external clients.
+    // Seal admission first, so a zero the wait below observes cannot be
+    // followed by a late in-process admission; the drain then joins what was
+    // admitted before the seal.
+    inproc_connector.close_admission();
+    let inproc_for_drain = inproc_connector.clone();
+    let (_aborted_inproc, drain) = tokio::join!(
+        inproc_connector.drain(),
+        await_rpc_connection_drain_with(|| {
+            rpc_connection_count.load(std::sync::atomic::Ordering::Relaxed)
+                + inproc_for_drain.connection_count()
+        })
+    );
     let exit_result = settle_exit_against_drain(exit_result, drain);
 
     // Channel teardown owns listener cleanup plus all accepted message work.
@@ -1632,26 +1658,28 @@ pub(crate) enum RpcDrain {
     Outstanding(usize),
 }
 
-/// Wait for the connections the RPC listeners accepted to finish draining.
+/// Wait for the connections the RPC listeners and the in-process connector
+/// accepted to finish draining.
 ///
-/// `count` is decremented when the last task started by a connection has
-/// ended: the connection task, each prompt it spawned, and the nested turn task
-/// each hold a clone of the connection's liveness token. A count of zero is
-/// therefore the daemon-visible proof that no old-generation work is still
-/// running, not merely that the connection task was aborted. The wait is
-/// bounded just past the listeners' own forced-abort deadline
-/// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
-/// ignored cancellation is aborted. Returns immediately when no connection was
-/// accepted, which is also the case when no RPC listener is running at all.
-pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
-    use std::sync::atomic::Ordering;
-
+/// `outstanding` reads the live activity: the daemon sums the socket
+/// listeners' client count with the in-process connector's count, so both
+/// kinds of accepted work gate the generation handover. Each count is
+/// decremented when the last task started by a connection has ended: the
+/// connection task, each prompt it spawned, and the nested turn task each hold
+/// a clone of the connection's liveness token. Zero is therefore the
+/// daemon-visible proof that no old-generation work is still running, not
+/// merely that the connection task was aborted. The wait is bounded just past
+/// the listeners' own forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`),
+/// the point at which a connection that ignored cancellation is aborted.
+/// Returns immediately when nothing was accepted, which is also the case when
+/// no RPC listener is running at all.
+pub(crate) async fn await_rpc_connection_drain_with(outstanding: impl Fn() -> usize) -> RpcDrain {
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     let deadline = tokio::time::Instant::now()
         + crate::rpc::CONNECTION_DRAIN_GRACE.saturating_add(Duration::from_millis(500));
 
     loop {
-        let outstanding = count.load(Ordering::Relaxed);
+        let outstanding = outstanding();
         if outstanding == 0 {
             return RpcDrain::Complete;
         }
@@ -3109,6 +3137,34 @@ mod tests {
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(
+            await_rpc_connection_drain_with(|| count.load(std::sync::atomic::Ordering::Relaxed))
+                .await,
+            RpcDrain::Complete
+        );
+        release.await.unwrap();
+    }
+
     #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3139,6 +3195,184 @@ mod tests {
         assert!(
             control.begin_attempt(&daemon_cancel).is_none(),
             "retired generation must not admit a replacement attempt"
+        );
+    }
+
+    /// Drive the real daemon through a reload while an authenticated
+    /// in-process connection holds activity for `hold`: the connection is
+    /// initialized with a paired token over `reload_controls.inproc`, then a
+    /// prompt's activity token is held (a model turn needs a provider this
+    /// harness has none of; the token is what such a task holds). Returns the
+    /// daemon's exit and whether the token was released before it exited.
+    async fn reload_with_held_in_process_activity(hold: Duration) -> (DaemonExit, bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_daemon_inproc_token".to_string()];
+        // The in-process seam is served under the non-local session policy,
+        // whose `initialize` refuses every caller while TUI identity signing is
+        // off, so this daemon gets a signing key, as one with a `.secret_key` has.
+        std::fs::write(config.data_dir.join(".secret_key"), "42".repeat(32)).unwrap();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_gateway = released.clone();
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, _client_count, readiness| {
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _authority,
+                  _event_bus,
+                  reload_controls,
+                  _tui_reg,
+                  _auth,
+                  _ready| {
+                let released = released_for_gateway.clone();
+                Box::pin(async move {
+                    let controls = reload_controls
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let connector = controls
+                        .inproc
+                        .clone()
+                        .expect("daemon passes the connector");
+                    let client = connector.connect().await.expect("bound connector connects");
+                    let (read_half, mut write_half) = tokio::io::split(client);
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let init = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocol_version": 1, "auth_token": "zc_daemon_inproc_token"},
+                    });
+                    write_half
+                        .write_all(format!("{init}\n").as_bytes())
+                        .await
+                        .expect("write initialize");
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.expect("read initialize");
+                    let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                    assert!(
+                        frame.get("result").is_some(),
+                        "paired token must be accepted over the in-process seam: {frame}"
+                    );
+                    // The prompt's activity, held past the reload request.
+                    let token = connector.activity_token();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    tokio::time::sleep(hold).await;
+                    drop(token);
+                    released.store(true, Ordering::SeqCst);
+                    // Keep the connection open like a real gateway would.
+                    let _keep = (reader, write_half);
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(25),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon finishes inside the drain budget plus component grace")
+        .expect("daemon run should succeed");
+        (exit, released.load(Ordering::SeqCst))
+    }
+
+    /// In-process activity released within the drain budget: the generation
+    /// proves itself retired and the reload hands over.
+    #[tokio::test]
+    async fn reload_hands_over_once_held_in_process_activity_is_released() {
+        let (exit, released) =
+            reload_with_held_in_process_activity(Duration::from_millis(1200)).await;
+        assert!(
+            released,
+            "the daemon must wait for the in-process activity to end"
+        );
+        assert_eq!(exit, DaemonExit::Reload);
+    }
+
+    /// In-process activity that outlives the drain budget: the generation
+    /// cannot prove it retired, so the reload is downgraded to a shutdown.
+    /// Fails if the daemon stops counting in-process activity in its drain
+    /// (the socket count alone is zero here).
+    #[tokio::test]
+    async fn reload_is_downgraded_when_in_process_activity_outlives_the_drain_budget() {
+        let budget = crate::rpc::CONNECTION_DRAIN_GRACE + Duration::from_secs(3);
+        let (exit, _released) = reload_with_held_in_process_activity(budget).await;
+        assert_eq!(
+            exit,
+            DaemonExit::Shutdown,
+            "a reload must not hand over while in-process work is still live"
+        );
+    }
+
+    /// An authenticated in-process connection is the retiring generation's
+    /// work: while its activity token is live the generation drain must not
+    /// complete, so a reload is downgraded to a shutdown; once the generation
+    /// is cancelled and the connector drained, the same reload is admissible.
+    #[tokio::test(start_paused = true)]
+    async fn reload_is_refused_while_an_in_process_connection_is_still_live() {
+        use crate::rpc::inproc::InprocConnector;
+        use crate::rpc::session::SessionStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(4, 10, 60),
+        );
+        let ctx = crate::rpc::context::RpcContext::minimal(
+            config,
+            std::sync::Arc::new(SessionStore::new(16, session_queue)),
+        );
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let socket_clients = AtomicUsize::new(0);
+
+        // Hold the connection open across the drain budget.
+        let held = connector.connect().await.expect("bound connector connects");
+        tokio::task::yield_now().await;
+        assert_eq!(connector.connection_count(), 1);
+        let outstanding = || socket_clients.load(Ordering::Relaxed) + connector.connection_count();
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(
+            drain,
+            RpcDrain::Outstanding(1),
+            "a live in-process connection must keep the generation undrained"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), drain).unwrap(),
+            DaemonExit::Shutdown,
+            "a reload must not hand over while in-process work is live"
+        );
+
+        // Retire the generation: cancel, join the connection tasks, and the
+        // count reaches zero, so the same reload is now admissible.
+        cancel.cancel();
+        let aborted = connector.drain().await;
+        assert_eq!(
+            aborted, 0,
+            "a cancelled in-process connection unwinds cooperatively"
+        );
+        drop(held);
+        let drain = await_rpc_connection_drain_with(outstanding).await;
+        assert_eq!(drain, RpcDrain::Complete);
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), drain).unwrap(),
+            DaemonExit::Reload
         );
     }
 
@@ -7022,29 +7256,6 @@ mod tests {
 
         // `_hook_guard` drops here, releasing the serialising lock
         // and clearing the global hook for the next test.
-    }
-
-    /// The reload drain must report the connections that were still unwinding
-    /// when its budget expired, not silently declare the generation retired.
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
-        let count = std::sync::atomic::AtomicUsize::new(2);
-        assert_eq!(
-            await_rpc_connection_drain(&count).await,
-            RpcDrain::Outstanding(2)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let releaser = std::sync::Arc::clone(&count);
-        let release = zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
-        });
-        assert_eq!(await_rpc_connection_drain(&count).await, RpcDrain::Complete);
-        release.await.unwrap();
     }
 
     /// A reload hands the same durable sessions to a replacement generation, so

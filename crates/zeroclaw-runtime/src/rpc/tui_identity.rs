@@ -26,6 +26,9 @@ pub struct TuiEntry {
     /// Used to pass the user's real env (PATH, SSH_AUTH_SOCK, etc.) through
     /// to subprocesses spawned by the daemon on their behalf.
     pub env: HashMap<String, String>,
+    /// The client kind the connection declared on `initialize`, when the
+    /// core knows it. A label for `tui/list`; it grants nothing.
+    pub client_kind: Option<String>,
 }
 
 // ── Registry ─────────────────────────────────────────────────────
@@ -285,6 +288,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            client_kind: None,
         });
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.list()[0].tui_id, "tui_aabb0011");
@@ -300,6 +304,7 @@ mod tests {
             peer_label: peer_label.to_string(),
             transport: "wss".to_string(),
             env: HashMap::new(),
+            client_kind: None,
         }
     }
 
@@ -391,6 +396,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            client_kind: None,
         });
         // generate_unique should return something different
         let id = registry.generate_unique_tui_id();
@@ -412,6 +418,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            client_kind: None,
         });
 
         let entries = registry.list();
@@ -437,6 +444,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            client_kind: None,
         });
 
         let entries = registry.list();
@@ -455,6 +463,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            client_kind: None,
         });
         assert_eq!(registry.list().len(), 1);
 
@@ -477,6 +486,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            client_kind: None,
         };
         let cloned = entry.clone();
         assert_eq!(
@@ -498,6 +508,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            client_kind: None,
         });
 
         let got = registry
@@ -530,6 +541,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            client_kind: None,
         });
         assert!(
             registry
@@ -554,6 +566,7 @@ mod tests {
             peer_label: "first".to_string(),
             transport: "unix".to_string(),
             env: HashMap::from([("SENTINEL_SOCK".to_string(), "/tmp/first.sock".to_string())]),
+            client_kind: None,
         });
         let epoch_second = registry.register(TuiEntry {
             tui_id: id.to_string(),
@@ -561,6 +574,7 @@ mod tests {
             peer_label: "second".to_string(),
             transport: "unix".to_string(),
             env: HashMap::from([("OTHER_SOCK".to_string(), "/tmp/second.sock".to_string())]),
+            client_kind: None,
         });
 
         assert!(
