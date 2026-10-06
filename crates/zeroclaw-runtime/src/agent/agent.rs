@@ -9457,6 +9457,13 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
+        config.tools.optional = vec![
+            "delegate".into(),
+            "sessions_list".into(),
+            "sessions_history".into(),
+            "sessions_current".into(),
+            "sessions_send".into(),
+        ];
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
         config

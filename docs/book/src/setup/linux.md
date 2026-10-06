@@ -124,6 +124,15 @@ sudo usermod -aG gpio,spi,i2c $USER
 
 ## Update
 
+Standard release updates carry the native adapters for both minimal and full
+tool settings. Existing schema-3 configurations without `[tools]` now use minimal
+by default: eleven tools in Chat, eight in Code/ACP. To retain the previous
+built-in selection, add `optional = ["*"]` under `[tools]`; named entries select
+individual extras. Full preserves existing integration prerequisites and
+permission gates. Plain Cargo-default source builds, including a Homebrew formula
+that uses only those defaults, can still omit adapters. See
+[minimal/full tools and build recovery](../tools/overview.md#builds-and-upgrade-path).
+
 Re-run the installer, it detects the existing install and upgrades in place:
 
 <div class="os-tabs-src">

@@ -19,9 +19,111 @@ recorded in the inventory's
 [Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
 section.
 
+## Minimal and full tools
+
+New and existing schema-3 configurations use **minimal** unless they explicitly
+select extras: eleven built-ins in Chat, or eight in Code/ACP, which retains its
+exclusion of persistent-memory tools. Chat's eleven are `shell`, `file_read`,
+`file_write`, `file_edit`, `glob_search`, `content_search`, `memory_recall`,
+`memory_store`, `memory_forget`, `web_fetch`, and `git_operations`. Existing
+policy can narrow either catalog.
+
+Both settings use the same configuration field:
+
+```toml
+[tools]
+optional = [] # minimal, also the default when this section is absent
+```
+
+For **full**, restore all built-ins carried by this binary and allowed by their
+existing configuration, prerequisites and permission rules:
+
+```toml
+[tools]
+optional = ["*"] # full
+```
+
+For minimal plus selected extras, use their callable names:
+
+```toml
+[tools]
+optional = ["calculator", "cron_list", "sessions_history"]
+```
+
+The wildcard is a union with named entries: `["*", "calculator"]` has the same
+selection as `["*"]`, with no duplicate tool. Full is not a fixed tool count;
+configured integrations, runtime capabilities and policy determine the effective
+catalog. It does not enable every integration. Selecting a tool does not install
+a browser or vendor CLI, supply credentials, enable a disabled integration or
+grant permission. Full also preserves Code/ACP's existing memory exclusion.
+
+Selection happens before constructors run. An unselected tool contributes no
+schema or tool-catalog prompt text. Risk profiles, caller narrowing, approval,
+path/network policy and receipts still apply. Explicit MCP servers, skills,
+plugins and peripherals retain their existing activation and authority paths.
+Progressive schema disclosure is a separate feature, not part of these settings.
+
+To opt out of the new minimal default when upgrading, set `optional = ["*"]` in
+`[tools]`, or run:
+
+```sh
+zeroclaw config set tools.optional '["*"]' --no-interactive
+```
+
+Reload the daemon after changing selection. Config schema stays version 3;
+existing configurations without `[tools]` take the minimal default without a
+migration. Return to minimal by setting `optional = []`.
+
+### Builds and upgrade path
+
+| Channel | Compiled capability | Runtime selection |
+| --- | --- | --- |
+| Release archive | Standard `dist` includes the native `tools-compat` adapters | Minimal by default; full and named extras work without another download |
+| Desktop sidecar | The same target-resolved `dist` CLI, plus requested desktop features | The same minimal/full settings and prerequisites |
+| Homebrew source build | Depends on the formula's feature selection; a Cargo-default build omits native adapters | Full reports missing adapters; use the standard source build below when the formula does not carry them |
+| Docker `dist` image | Standard `dist`, including native adapters | The same minimal/full settings; configure dependencies explicitly |
+
+One release matrix has ten target legs, with unchanged archive names. Android is
+experimental and allowed to fail; publication requires the other nine targets.
+There is no second compatibility archive matrix or dedicated `compat-tools`
+image. The historical `all-features` Docker image remains broader than `dist`,
+including additional channels and hardware features.
+
+`dist` includes `tools-compat` (`tools-saas`, `tools-coding-cli`, `tools-external`).
+`dist-compat` is a compatibility alias for the same build. Plain Cargo defaults
+remain smaller: custom source builds can omit adapters. With full or named
+selection, each compiled-out external adapter gets a clear diagnostic; enabled
+vendor/CLI sections retain their existing missing-feature diagnostic. Runtime
+configuration cannot add compiled-out code. Build the standard selection to
+recover it:
+
+```sh
+# From a source checkout; use the target you intend to run.
+TARGET=x86_64-unknown-linux-gnu
+FEATURES="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection dist --target "$TARGET")"
+cargo build --release --locked --bin zeroclaw --target "$TARGET" --no-default-features --features "$FEATURES"
+# For a local Linux image, resolve features for its build target.
+docker build -t zeroclaw-dist-local .
+```
+
+For a Homebrew installation whose formula omits adapters, run the standard
+source-built binary alongside the package-managed binary and use its own
+config, data and service paths. A config setting cannot change a bottle's
+compiled features. Source users can also select individual existing `tool-*`
+features or `tools-compat`; they still need the runtime selection.
+
+Standard `dist` retains `plugins-wasm-cranelift` on the seven supported native
+64-bit targets: GNU and musl Linux on x86_64 and aarch64, both macOS architectures,
+and x86_64 Windows MSVC. ARMv6/ARMv7 omit Cranelift and Prometheus; experimental
+Android omits Cranelift and WhatsApp Web. Cargo defaults do not include a plugin
+host. Compiling the host leaves `plugins.enabled` and `plugins.auto_discover`
+false; consent, trust, grants and configured activation still apply. Runtime-only
+precompiled `.cwasm` support and Pulley do not replace portable registry `.wasm`
+compilation. Target policy comes from `package.metadata.zeroclaw` in `Cargo.toml`.
+
 ## Built-in tools
 
-A minimal build ships with:
+The following capabilities are available when compiled and selected; the eleven-tool default is listed above:
 
 | Tool | What it does |
 |---|---|
@@ -58,16 +160,16 @@ ZeroClaw sends it only as a Bearer authorization header; without a key, no
 queries to a third-party service even in anonymous mode. It does not change the
 default provider and is not used as an automatic fallback.
 
-Always registered alongside the built-ins:
+Additional first-party built-ins require selection:
 
 | Tool | Notes |
 |---|---|
 | `cron_*` | Manage scheduled jobs: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs` |
 | `schedule` | Shell-only one-shot/recurring scheduling |
-| `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
+| `memory_export`, `memory_purge` | Long-term memory management |
 | `spawn_subagent`, `delegate` | Run a subtask in a child agent |
 
-Conditionally registered:
+Selected tools also retain these prerequisites:
 
 | Tool | Enabled by |
 |---|---|

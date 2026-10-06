@@ -1,8 +1,23 @@
-# ZeroClaw v0.8.5
+# ZeroClaw changelog
+
+## v0.8.6 (unreleased)
+
+- Built-in tools now default to **minimal**: eleven in Chat and eight in Code/ACP.
+  Existing schema-3 configurations without `[tools]` take this default without
+  migration. Set `optional = ["*"]` under `[tools]` for **full**, or add named
+  extras to minimal. Full preserves configured prerequisites, permissions,
+  approvals and Code/ACP memory exclusions; it does not enable integrations.
+- Standard release archives and desktop/container `dist` builds retain native
+  adapter implementations for both settings. The release matrix still has ten
+  target legs (Android experimental; the other nine required), with unchanged
+  archive names. Custom Cargo-default source builds can omit adapters and report
+  selected compiled-out tools. Progressive disclosure remains separate.
+
+## v0.8.5
 
 ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spanning **454 commits** from **73 contributors**. It introduces ZeroRelay and ZeroRouter, expands live chat and provider capabilities, hardens plugin, sandbox, webhook, credential, and file boundaries, and makes cross-platform builds and coordinated crate publication more reproducible. This release also removes or narrows several deprecated surfaces; review [Breaking Changes](#breaking-changes) before upgrading plugins, skills, legacy node integrations, WATI deployments, TodoWrite configuration, or contributor tooling.
 
-## Highlights
+### Highlights
 
 - **ZeroRelay and ZeroRouter arrive together:** ZeroRelay provides blind forwarding with native mTLS enrollment, while ZeroRouter adds a first-class hosted routing preset and public model catalog (#10142, #9645, #10453).
 - **Chat becomes more capable:** the dashboard can keep several conversations open per agent, open the same agent in multiple tabs, and attach or drop images through the new upload path (#9353, #9355, #10544).
@@ -11,9 +26,9 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **Operator feedback improves across surfaces:** Matrix, Telegram, Slack, WhatsApp Web, SOP, MCP, logs, queued messages, and clipboard flows expose clearer progress and recovery behavior (#8443, #9822, #8985, #9385, #9476, #9196, #10057, #10096).
 - **Release portability improves:** routine builders move to Rust 1.98 while source compatibility remains at Rust 1.96, release tools use pinned binaries, MUSL and Alpine coverage expands, and the coordinated 23-crate workspace gains protected crates.io publication (#9527, #10122, #10174, #9286, #9514, #10158).
 
-## What's New
+### What's New
 
-### ZeroRelay, Routing, and Providers
+#### ZeroRelay, Routing, and Providers
 
 - Add ZeroRelay secure transport with blind forwarding, native mTLS enrollment, bounded admission, and per-node routing (#10142).
 - Add the ZeroRouter provider preset and public catalog, then point new defaults at the hosted beta deployment (#9645, #10453).
@@ -22,7 +37,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Preserve OpenRouter attribution and streaming metadata, model context during Gemini requests, compatible tool-result image policy, and accurate served-model and lifecycle accounting (#9974, #9782, #10435, #10448, #10027, #10144).
 - Improve terminal provider errors, model-list bounds, OAuth refresh behavior, proxy handling, and reasoning-tool fallback classification; retry replay-safe empty streams once and evict compatible-provider images individually (#10234, #10314, #10012, #9606, #9400, #10211, #10602, #10564).
 
-### Dashboard, ZeroCode, and RPC
+#### Dashboard, ZeroCode, and RPC
 
 - Hold several independent conversations per agent, allow the same agent to remain open in multiple chat tabs, and add session-local Todo close control (#9353, #9355, #10584).
 - Add image upload plus dashboard attach/drop UI through a bounded gateway endpoint (#10544).
@@ -31,7 +46,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Keep chat WebSockets alive, preserve persisted ACP transcripts and prompt completion, expose `keep_siblings` control, and describe the originating ZeroCode interaction context on new sessions (#9701, #10380, #10466, #9738, #10382).
 - Keep input and inactive-chat refresh responsive during reconnects, make modifier intent explicit, show the active log path on payload fallback, and improve terminal restoration, clipboard errors, mouse decoding, paste ownership, file-search keys, and local-session fallback (#10374, #10393, #10479, #10474, #10184, #10443, #10444, #10278, #10065, #10541).
 
-### Channels, Gateway, SOP, and MCP
+#### Channels, Gateway, SOP, and MCP
 
 - Add single-message progress drafts for Matrix, tool-progress drafts for Telegram, visible lifecycle progress for Slack, and first-interaction Slack thread hydration (#8443, #9822, #8985, #8969).
 - Port WhatsApp Web to the registry-backed 0.7 stack, add approval requests and configurable push names, make an empty group allowlist fail closed, preserve storage integrity, and clean up cloud approval tokens on every exit (#10153, #9385, #10201, #9382, #10438, #9612).
@@ -41,7 +56,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Materialize MCP resource blobs with an aggregate budget preflight, support per-server custom CA trust, and preserve persistent SSE event boundaries (#9196, #9405, #10459).
 - Add tool-owned invocation triggers using the shared `send_via` vocabulary (#9766).
 
-### Plugins, Skills, Configuration, and Tools
+#### Plugins, Skills, Configuration, and Tools
 
 - Require typed instance schemas for plugins that read configuration and add coherent channel-config services (#9126, #9129).
 - Add scoped tool-secret access, a shared plugin egress foundation, host-owned `wasi:http` policy, and logical channel instances (#9128, #9137, #9582, #10146).
@@ -50,7 +65,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Report the active native shell dialect, support PowerShell on Windows, and preserve coding-CLI environments across platform adapters (#9981, #9182, #10403).
 - Warn about dangling channel references, expose workspace paths to config tooling, retain detailed tool output alongside short errors, and make config/provider path handling fallible and safer around bare paths (#9311, #9616, #10132, #10364, #10498).
 
-### Security and Supply Chain
+#### Security and Supply Chain
 
 - Reject plugin `wasm_path` traversal before discovery or installation, closing the arbitrary-write issue tracked as **GHSA-93f6-34w8-5g98**.
 - Patch the Wasmtime sandbox escape, upgrade the Wasmtime stack for RUSTSEC-2026-0222, and remove obsolete advisory exceptions (#10508, #9589, #8781).
@@ -62,7 +77,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Authorize channel approval responders independently, enforce delegate-specific approval policy, and make agent-scoped cron mutations atomic (#9574, #10188, #10177).
 - Harden webhook audit exports and redact duplicate idempotency keys, Slack tokens, URL query secrets, Anthropic credential fragments, and TTS keys (#9995, #10256, #8918, #9435, #10092, #10433, #10191).
 
-### Installation, Containers, Documentation, and Release Engineering
+#### Installation, Containers, Documentation, and Release Engineering
 
 - Generate canonical installation documentation from the typed installer specification and include the Git channel in official artifacts (#9267, #10363).
 - Add optional multi-architecture Alpine images and enforce non-root metadata across production container variants (#9514, #10095, #10176).
@@ -74,7 +89,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Move the official website and documentation links to `zeroclaw.com` and `docs.zeroclaw.com` while retaining redirects from the legacy domain (#10616).
 - Rehearse Scoop credentials before release, retry AUR publication through outages, detect stale packages, and bound shared apt installation attempts (#9785, #9787, #10156).
 
-## Bug Fixes
+### Bug Fixes
 
 | Area | Fix |
 |---|---|
@@ -90,7 +105,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 | Hardware and desktop | Clean Arduino temporary directories, keep platform paths panic-free, select Windows Common Controls v6, clean screenshot artifacts, and keep Unix-only cleanup off Windows (#9903, #10136, #10080, #9931, #9721) |
 | Install, CI, and release | Align Rust 1.98 diagnostics and builders, include Git in artifacts, bound apt retries, strengthen generated-dashboard and PR-history validation, verify release tools and packaging across native targets, and add protected publication of the 23-crate workspace (#10204, #10353, #9527, #10363, #10156, #10399, #10514, #10174, #10158) |
 
-## Breaking Changes
+### Breaking Changes
 
 - **Typed plugin instance configuration is mandatory.** Plugins that read operator configuration must declare a schema and use the full instance key shown by `zeroclaw plugin info <package>`; legacy package- or binding-only entries are not consulted (#9126).
 - **Skill HTTP requests are now fail-closed.** Placeholders are URL-component values and can no longer inject `/`, `?`, `&`, or `#`; redirects and ambient proxy variables are ignored; destinations must resolve directly to admitted public addresses. Update affected skill manifests to use direct URLs and data-only placeholders (#10369).
@@ -100,7 +115,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **The Aardvark transport and legacy robot-kit crates were removed from the workspace.** Users that still need the in-tree integration should remain on v0.8.4; independently published library versions are unaffected (#9853).
 - **The root Cargo package is now named `zeroclaw`.** The installed binary name is unchanged, but contributor scripts using `cargo ... -p zeroclawlabs` must switch to `-p zeroclaw` (#9835).
 
-## Contributors
+### Contributors
 
 @Aarlington
 @abhinavmathur-atlan
@@ -176,7 +191,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 @ZiBibro
 @zyw02
 
-## Full Changelog
+### Full Changelog
 
 The 454-commit range contains 57 feature, 277 fix, 13 refactor, 2 performance, 27 documentation, 20 CI, 29 test, 28 chore, and one prefixless security-fix commit. Internal maintenance entries are grouped above when user-visible and remain available individually in the full comparison.
 

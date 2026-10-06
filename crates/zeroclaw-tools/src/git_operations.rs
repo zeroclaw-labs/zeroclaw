@@ -3097,24 +3097,55 @@ mod tests {
 
     #[tokio::test]
     async fn git_credential_op_fails_fast_without_terminal_prompt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private/repo.git/info/refs"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("WWW-Authenticate", "Basic realm=\"zeroclaw-test-only\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let tmp = TempDir::new().unwrap();
         git_init_no_sign(tmp.path(), &[]);
         let tool = test_tool(tmp.path());
+        let remote = format!("{}/private/repo.git", server.uri());
 
-        let fetch = tool.run_git_command(
-            &["fetch", "https://127.0.0.1:1/private/repo.git"],
-            tmp.path(),
-        );
+        // Isolate only this invocation from credential helpers, askpass,
+        // proxy settings and extra headers; production must disable prompting.
+        let args = [
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "http.proxy=",
+            "-c",
+            "http.extraHeader=",
+            "fetch",
+            &remote,
+        ];
+        let fetch = tool.run_git_command(&args, tmp.path());
         let res = tokio::time::timeout(std::time::Duration::from_secs(10), fetch).await;
-
         assert!(
             res.is_ok(),
             "git fetch hung — it likely prompted for credentials on the terminal"
         );
+        let error = res
+            .unwrap()
+            .expect_err("an unauthenticated private remote must fail");
         assert!(
-            res.unwrap().is_err(),
-            "fetch to an unreachable private remote should fail, not succeed"
+            error.to_string().contains("terminal prompts disabled"),
+            "the real 401 must reach Git's non-interactive credential boundary: {error}"
         );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].headers.contains_key("authorization"));
+        server.verify().await;
     }
 
     #[tokio::test]

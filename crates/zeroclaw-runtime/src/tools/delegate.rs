@@ -6684,6 +6684,43 @@ mod tests {
         tool.with_task_control_plane(task_control_plane(store))
     }
 
+    async fn isolated_background_failure_tool(
+        workspace: PathBuf,
+    ) -> (DelegateTool, wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "controlled background provider failure"
+            })))
+            .expect(1..=2)
+            .mount(&server)
+            .await;
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let providers = HashMap::from([(
+            "ollama".into(),
+            HashMap::from([(
+                "researcher".into(),
+                ModelProviderConfig {
+                    model: Some("test-background-model".into()),
+                    ..Default::default()
+                },
+            )]),
+        )]);
+        let tool = with_in_memory_task_store(
+            DelegateTool::new_with_options(sample_agents(), None, test_security(), options)
+                .with_workspace_dir(workspace)
+                .with_providers_models(providers),
+        );
+        (tool, server)
+    }
+
     fn background_result(
         task_id: &str,
         status: BackgroundTaskStatus,
@@ -12176,10 +12213,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, server) = isolated_background_failure_tool(workspace.clone()).await;
 
         let result = tool
             .execute(json!({
@@ -12214,13 +12248,12 @@ mod tests {
         let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
-        // The task will have failed because ollama isn't running, but it should be persisted
-        assert!(
-            bg_result.status == BackgroundTaskStatus::Completed
-                || bg_result.status == BackgroundTaskStatus::Failed
-        );
+        assert_eq!(bg_result.status, BackgroundTaskStatus::Failed);
+        assert!(bg_result.error.is_some());
         assert!(bg_result.finished_at.is_some());
 
+        server.verify().await;
+        assert!(!server.received_requests().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -12232,10 +12265,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, server) = isolated_background_failure_tool(workspace.clone()).await;
 
         // Start background task
         let result = tool
@@ -12272,6 +12302,8 @@ mod tests {
         assert!(check.output.contains(&task_id));
         assert!(check.output.contains("researcher"));
 
+        server.verify().await;
+        assert!(!server.received_requests().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -12354,10 +12386,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, server) = isolated_background_failure_tool(workspace.clone()).await;
 
         // Start a background task
         let result = tool
@@ -12389,6 +12418,8 @@ mod tests {
         assert!(list.success);
         assert!(list.output.contains("researcher"));
 
+        server.verify().await;
+        assert!(!server.received_requests().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(workspace);
     }
 

@@ -32,6 +32,11 @@ pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
 pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
     "security_audit_disabled_drops_certificate_record";
 
+/// Stable code for a section that enables an opt-in tool this build was
+/// compiled without. The section has no effect, and the tool's own settings
+/// are not checked; see [`crate::opt_in_tools`].
+pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -90,6 +95,9 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 ///   that trace has no sink under `observability.log_persistence = "none"`;
 ///   this warning is the channel that survives, since `zeroclaw doctor` and the
 ///   config API read the structured list rather than the log.
+/// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
+///   compiled without the tool's `tool-*` feature, so the section has no
+///   effect and its settings are not validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

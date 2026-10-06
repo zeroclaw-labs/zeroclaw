@@ -123,6 +123,22 @@ plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 # cannot load, so a runtime-only backend has no plugin tool to execute).
 plugins-wasm-cranelift = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
 webauthn = []
+# SaaS and coding-CLI tool integrations: each compiles its tool into
+# `zeroclaw-tools` and registers it here. Opt-in; see the root crate's
+# `tools-saas` and `tools-coding-cli` bundles.
+tools-external = ["zeroclaw-tools/tools-external"]
+tool-jira = ["zeroclaw-tools/tool-jira"]
+tool-notion = ["zeroclaw-tools/tool-notion"]
+tool-linkedin = ["zeroclaw-tools/tool-linkedin"]
+tool-composio = ["zeroclaw-tools/tool-composio"]
+tool-google-workspace = ["zeroclaw-tools/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-tools/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-tools/tool-project-intel"]
+tool-claude-code = ["zeroclaw-tools/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-tools/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-tools/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-tools/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-tools/tool-opencode-cli"]
 sandbox-bubblewrap = []
 # Exposes test-only helpers (including `ScopedToolRegistry::from_raw_for_test`
 # and the deterministic Agent clock seam) to OTHER crates' test builds (e.g.

@@ -315,7 +315,7 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Channels: pre-built binaries ship the standard distribution channel set; availability is target-specific."
   info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 

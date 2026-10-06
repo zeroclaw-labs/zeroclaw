@@ -133,7 +133,8 @@ fn shell_escape(value: &std::ffi::OsStr) -> String {
     }
 }
 
-#[cfg(test)]
+// The executor's fixtures drive it through `CodexCliTool`.
+#[cfg(all(test, feature = "tool-codex-cli"))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

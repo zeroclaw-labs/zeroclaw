@@ -2475,16 +2475,27 @@ mod tests {
     #[tokio::test]
     async fn transport_search_failure_redacts_query_bearing_url() {
         let query = "private 多字节 query";
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("test should reserve a task-owned loopback port");
+        let address = listener.local_addr().unwrap();
+        drop(listener);
         let client = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
             .build()
             .expect("test client should build without proxy discovery");
         let error = client
-            .get(format!("http://127.0.0.1:1/search?q={query}"))
+            .get(format!("http://{address}/search?q={query}"))
             .send()
             .await
             .expect_err("closed local port should produce a deterministic transport error");
 
+        assert!(error.is_connect());
+        assert!(
+            !error.is_timeout(),
+            "the task-owned closed port must refuse: {error}"
+        );
         let message = transport_search_failure("duckduckgo", "request", &error).to_string();
         assert!(message.contains("duckduckgo search failed"));
         assert!(message.contains("transport=connect"));

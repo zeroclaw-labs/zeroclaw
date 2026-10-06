@@ -4142,6 +4142,54 @@ mod tests {
         );
     }
 
+    /// Enabling an opt-in tool through the config API follows the build. A
+    /// build without Microsoft 365 saves the section without its credentials
+    /// and says once that the tool is compiled out; a build with it still
+    /// refuses the section until its credentials are set.
+    #[tokio::test]
+    async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/microsoft365/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        if OptInTool::Microsoft365.compiled() {
+            assert_ne!(status, StatusCode::OK, "{json}");
+            assert!(
+                json.to_string().contains("microsoft365.tenant_id"),
+                "{json}"
+            );
+            assert!(!state.config.read().microsoft365.enabled);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["saved"], true);
+            assert!(state.config.read().microsoft365.enabled);
+            let compiled_out: Vec<_> = json["warnings"]
+                .as_array()
+                .expect("warnings is an array")
+                .iter()
+                .filter(|warning| warning["code"] == "tool_compiled_out")
+                .collect();
+            assert_eq!(compiled_out.len(), 1, "{json}");
+            assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
+    }
+
     #[tokio::test]
     async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
         let tmp = tempfile::tempdir().unwrap();

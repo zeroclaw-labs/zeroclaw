@@ -210,10 +210,16 @@ libc = "0.2"
 # it lives here in the canonical registry. install.sh and `cargo cmd convert`
 # both read this; neither shadows it with its own list.
 [package.metadata.zeroclaw]
+# Published CLI archives use this selection across the release target matrix.
+# Every archive carries adapters for both runtime tool settings; no second archive.
+release_distributions = ["dist"]
 non_row_features = [
     "default",
     "default-channels",
     "channels-full",
+    "tools-saas",
+    "tools-coding-cli",
+    "tools-compat",
     "ci-all",
     "fantoccini",
     "landlock",
@@ -228,6 +234,8 @@ dist_extra_features = [
     "channel-lark",
     "channel-git",
     "whatsapp-web",
+    "plugins-wasm-cranelift",
+    "tools-compat",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -242,9 +250,9 @@ container_excluded_features = [
 # Compatibility exclusions for standard distribution artifacts. Release
 # workflows pass only their target triple; feature policy stays here.
 [package.metadata.zeroclaw.dist_target_exclusions]
-aarch64-linux-android = ["whatsapp-web"]
-arm-unknown-linux-gnueabihf = ["observability-prometheus"]
-armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
+aarch64-linux-android = ["whatsapp-web", "plugins-wasm-cranelift"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
 
 [features]
 default = [
@@ -291,6 +299,44 @@ channels-full = [
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
+
+# Native adapters are opt-in for Cargo-default source builds. Standard
+# distributions carry their implementations for minimal/full runtime selection.
+tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
+# Standard/source adapter bundle; registration still requires [tools].optional.
+tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
+tools-saas = [
+    "tool-jira",
+    "tool-notion",
+    "tool-linkedin",
+    "tool-composio",
+    "tool-google-workspace",
+    "tool-microsoft365",
+    "tool-project-intel",
+]
+
+# Opt-in tools that delegate to external coding CLIs.
+tools-coding-cli = [
+    "tool-claude-code",
+    "tool-claude-code-runner",
+    "tool-codex-cli",
+    "tool-gemini-cli",
+    "tool-opencode-cli",
+]
+
+# Tools — each forwards to zeroclaw-runtime, which registers it.
+tool-jira = ["zeroclaw-runtime/tool-jira"]
+tool-notion = ["zeroclaw-runtime/tool-notion"]
+tool-linkedin = ["zeroclaw-runtime/tool-linkedin"]
+tool-composio = ["zeroclaw-runtime/tool-composio"]
+tool-google-workspace = ["zeroclaw-runtime/tool-google-workspace"]
+tool-microsoft365 = ["zeroclaw-runtime/tool-microsoft365"]
+tool-project-intel = ["zeroclaw-runtime/tool-project-intel"]
+tool-claude-code = ["zeroclaw-runtime/tool-claude-code"]
+tool-claude-code-runner = ["zeroclaw-runtime/tool-claude-code-runner", "zeroclaw-gateway?/tool-claude-code-runner"]
+tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
+tool-gemini-cli = ["zeroclaw-runtime/tool-gemini-cli"]
+tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
 
 # Major subsystems — each forwards to exactly ONE crate
 gateway = [
@@ -358,7 +404,7 @@ peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
-browser-native = ["zeroclaw-tools/browser-native"]
+browser-native = ["tools-external", "zeroclaw-tools/browser-native"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
     "zeroclaw-runtime/plugins-wasm",
@@ -411,6 +457,7 @@ ci-all = [
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
+    "tools-saas", "tools-coding-cli", "tools-external",
 ]
 
 [profile.dev]

@@ -26,7 +26,7 @@ env:
 
 # ── Runner selection: a checked-in label on each compile-heavy job ──────────
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
+# check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
 # directly, so runner selection does not wait for fmt. Only the separate
 # windows-task-owner-recovery job waits for path-changes; the build matrix
@@ -1043,6 +1043,46 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 
+  # The SaaS and coding-CLI tools are out of Cargo `default`, so `test` no
+  # longer builds them, and `lint` compiles them under `ci-all` without running
+  # a test. This lane runs their tests with the compatibility bundle:
+  # the tool modules, the coding-CLI executor, adapter and action-budget
+  # suites, config validation with the tools compiled in, the runner's gateway
+  # hook, and the root report-template tests.
+  test-tool-features:
+    name: Test (opt-in tools)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'true'
+          shared-key: tool-features
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run opt-in tool tests
+        run: >-
+          cargo nextest run --locked --no-fail-fast
+          -p zeroclaw -p zeroclaw-config -p zeroclaw-tools -p zeroclaw-runtime -p zeroclaw-gateway
+          --features tools-compat
+          --lib --test integration
+          -E 'not binary(integration) or test(/^report_template_tool_test::/)'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
     needs: [master-debounce]
@@ -1527,7 +1567,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
