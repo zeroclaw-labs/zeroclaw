@@ -79,6 +79,31 @@ pub struct PatchOpResult {
     pub comment: Option<String>,
 }
 
+impl PatchOp {
+    /// The operation as the shared JSON Patch staging takes it.
+    fn into_wire(self) -> ConfigPatchOp {
+        ConfigPatchOp {
+            op: self.op,
+            path: self.path,
+            value: self.value,
+            comment: self.comment,
+        }
+    }
+}
+
+impl PatchOpResult {
+    /// The route's entry for one staged operation's result.
+    fn from_wire(result: ConfigPatchOpResult) -> Self {
+        Self {
+            op: result.op,
+            path: result.path,
+            value: result.value,
+            populated: result.populated,
+            comment: result.comment,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PatchResponse {
@@ -291,12 +316,7 @@ fn error_response(err: ConfigApiError) -> Response {
 /// `ConfigApiError`. Path-not-found errors get the specific code; everything
 /// else falls through to ValidationFailed.
 fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
-    let msg = err.to_string();
-    if msg.starts_with("Unknown property") {
-        ConfigApiError::path_not_found(path)
-    } else {
-        ConfigApiError::from_validation(err).with_path(path)
-    }
+    ConfigApiError::for_prop(err, path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -311,77 +331,21 @@ use crate::principal_gate::{
     ConfigWriteAuthorization, ConfigWriteSet, RequestPrincipal, authorize_config_write,
     authorize_whole_config_write,
 };
+// The JSON Patch semantics, the field lookup and the scoped validation are
+// shared with the RPC `config/set-many` `ops` batch, so both surfaces stage a
+// write the same way.
+use crate::core_rpc::{CoreCall, CoreError};
 use zeroclaw_api::grants::Verb;
-
-/// Look up the prop_field metadata for a path. Used by the per-prop GET / PUT
-/// handlers to decide whether the field is a secret.
-fn lookup_prop_field(
-    config: &zeroclaw_config::schema::Config,
-    path: &str,
-) -> Option<zeroclaw_config::traits::PropFieldInfo> {
-    config
-        .prop_fields()
-        .into_iter()
-        .find(|info| info.name == path)
-        .or_else(|| {
-            zeroclaw_config::schema::Config::prop_is_secret(path).then(|| {
-                zeroclaw_config::traits::PropFieldInfo {
-                    name: path.to_string(),
-                    category: "Secrets",
-                    display_value: zeroclaw_config::traits::UNSET_DISPLAY.to_string(),
-                    type_hint: "String",
-                    kind: zeroclaw_config::traits::PropKind::String,
-                    is_secret: true,
-                    enum_variants: None,
-                    description: "",
-                    derived_from_secret: false,
-                    credential_class: Some(
-                        zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
-                    ),
-                    tab: zeroclaw_config::traits::ConfigTab::None,
-                    alias_source: None,
-                    multiline: false,
-                }
-            })
-        })
-}
-
-fn scoped_validate(
-    working: &zeroclaw_config::schema::Config,
-) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
-    if let Err(e) = working.validate() {
-        let api_err = ConfigApiError::from_validation(e);
-        let err_path = api_err.path.as_deref().unwrap_or("");
-        let touches_dirty = !err_path.is_empty()
-            && working.dirty_paths.iter().any(|d| {
-                err_path == d.as_str()
-                    || err_path.starts_with(&format!("{d}."))
-                    || d.starts_with(&format!("{err_path}."))
-            });
-        if touches_dirty || err_path.is_empty() {
-            return Err(api_err);
-        }
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": err_path})),
-            &format!(
-                "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
-             surfacing as a warning: {}",
-                api_err.message
-            )
-        );
-        return Ok(vec![
-            zeroclaw_config::validation_warnings::ValidationWarning::new(
-                "pre_existing_validation_error",
-                api_err.message,
-                err_path.to_string(),
-            ),
-        ]);
-    }
-    Ok(Vec::new())
-}
+use zeroclaw_config::validation_warnings::ValidationWarning;
+use zeroclaw_rpc_client::Method;
+use zeroclaw_rpc_proto::types::{
+    ConfigMapKeyCreateResult, ConfigMapKeyRenameResult, ConfigPatchOp, ConfigPatchOpResult,
+    ConfigSetManyResult,
+};
+use zeroclaw_runtime::config_ops::patch as config_patch;
+use zeroclaw_runtime::config_ops::patch::{
+    json_pointer_to_dotted, lookup_prop_field, reject_masked_secret_value, scoped_validate,
+};
 
 fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> serde_json::Value {
     let agents: std::collections::BTreeMap<&str, serde_json::Value> = config
@@ -685,26 +649,6 @@ async fn read_config_snapshot(
             format!("failed to snapshot existing config before save: {error}"),
         )),
     }
-}
-
-/// Reject masked or empty values from writes to secret-bearing properties.
-/// Dashboard surfaces may send the masked display sentinel when no real edit
-/// was made; accepting it would replace the live secret with that sentinel.
-fn reject_masked_secret_value(
-    path: &str,
-    is_sensitive: bool,
-    value: &str,
-) -> Result<(), ConfigApiError> {
-    if is_sensitive
-        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
-    {
-        return Err(ConfigApiError::new(
-            ConfigApiCode::ValidationFailed,
-            format!("Refusing to overwrite secret `{path}` with a masked or empty value"),
-        )
-        .with_path(path));
-    }
-    Ok(())
 }
 
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
@@ -1369,13 +1313,7 @@ pub async fn handle_get_map_keys(
         Some(keys) => {
             axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
         }
-        None => error_response(
-            ConfigApiError::new(
-                ConfigApiCode::PathNotFound,
-                format!("no map-keyed section at `{}`", q.path),
-            )
-            .with_path(&q.path),
-        ),
+        None => error_response(ConfigApiError::no_map_section(&q.path)),
     }
 }
 
@@ -1708,20 +1646,7 @@ pub async fn handle_map_key(
     let created =
         match zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &path, &key) {
             Ok(b) => b,
-            Err(zeroclaw_config::alias_refs::CreateError::Reserved(a)) => {
-                return error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::ValidationFailed,
-                        format!("alias `{a}` is reserved and cannot be created"),
-                    )
-                    .with_path(format!("{path}.{key}")),
-                );
-            }
-            Err(zeroclaw_config::alias_refs::CreateError::Invalid(msg)) => {
-                return error_response(
-                    ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
-                );
-            }
+            Err(e) => return error_response(e.api_error(&path, &key)),
         };
 
     if created {
@@ -1943,23 +1868,7 @@ fn rename_error_response(
     from: &str,
     err: zeroclaw_config::alias_refs::RenameError,
 ) -> Response {
-    use zeroclaw_config::alias_refs::RenameError;
-    let (code, msg) = match err {
-        RenameError::NotFound(p) => (
-            ConfigApiCode::PathNotFound,
-            format!("{p} is not configured"),
-        ),
-        RenameError::InvalidName(m) => (ConfigApiCode::ValidationFailed, m),
-        RenameError::Reserved(a) => (
-            ConfigApiCode::ValidationFailed,
-            format!("alias `{a}` is reserved and cannot be renamed"),
-        ),
-        RenameError::PostCondition(m) => (
-            ConfigApiCode::InternalError,
-            format!("rename cascade post-condition failed: {m}"),
-        ),
-    };
-    error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{from}")))
+    error_response(err.api_error(path, from))
 }
 
 /// Map a [`CascadeError`](zeroclaw_config::alias_refs::CascadeError) to the
@@ -2527,235 +2436,25 @@ pub async fn handle_patch(
         Err(e) => return error_response(e),
     };
 
-    let agent_aliases: std::collections::BTreeSet<String> = ops
-        .iter()
-        .filter(|op| matches!(op.op.as_str(), "add" | "replace" | "remove"))
-        .filter_map(|op| {
-            let path = json_pointer_to_dotted(&op.path);
-            zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).map(str::to_owned)
-        })
-        .collect();
+    let ops: Vec<ConfigPatchOp> = ops.into_iter().map(PatchOp::into_wire).collect();
+    let agent_aliases = config_patch::agent_aliases(&ops);
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let working = state.config.read().clone();
 
-    let override_drift = headers
-        .get("x-zeroclaw-override-drift")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !override_drift {
+    if !override_drift(&headers) {
         let drifted = compute_drift(&working).await;
-        if !drifted.is_empty() {
-            let touched: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| json_pointer_to_dotted(&op.path))
-                .collect();
-            let conflicts: Vec<&DriftEntry> = drifted
-                .iter()
-                .filter(|d| touched.contains(&d.path))
-                .collect();
-            if !conflicts.is_empty() {
-                let conflict_paths: Vec<String> =
-                    conflicts.iter().map(|d| d.path.clone()).collect();
-                return error_response(ConfigApiError::new(
-                    ConfigApiCode::ConfigChangedExternally,
-                    format!(
-                        "on-disk config has drifted from in-memory state on \
-                         {} path(s) being patched: {}. Send `X-ZeroClaw-Override-Drift: true` \
-                         to overwrite, or GET /api/config/drift to inspect first.",
-                        conflicts.len(),
-                        conflict_paths.join(", "),
-                    ),
-                ));
-            }
+        if let Some(conflict) =
+            config_patch::drift_conflict(drifted.iter().map(|d| d.path.as_str()), &ops)
+        {
+            return error_response(conflict);
         }
     }
 
     let mut working = working;
-    let mut results = Vec::with_capacity(ops.len());
-
-    for (idx, op) in ops.iter().enumerate() {
-        let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
-            // Refused to vivify the reserved `default` agent: surface the same
-            // reserved error the explicit create surfaces do, not a generic 404.
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    "alias `default` is reserved and cannot be created",
-                )
-                .with_path(&path)
-                .with_op_index(idx),
-            );
-        }
-        let info = lookup_prop_field(&working, &path);
-        let is_sensitive = info
-            .as_ref()
-            .map(|i| i.is_secret || i.derived_from_secret)
-            .unwrap_or(false);
-
-        match op.op.as_str() {
-            "test" => {
-                // Secret values can't leave the server, so a differential
-                // test response would be the only signal — ban the op.
-                if is_sensitive {
-                    return error_response(
-                        ConfigApiError::secret_test_forbidden(&path).with_op_index(idx),
-                    );
-                }
-                let want = match op.value.as_ref() {
-                    Some(v) => v.clone(),
-                    None => {
-                        return error_response(
-                            ConfigApiError::new(
-                                ConfigApiCode::ValueTypeMismatch,
-                                "JSON Patch `test` op requires `value` field",
-                            )
-                            .with_path(&path)
-                            .with_op_index(idx),
-                        );
-                    }
-                };
-                let actual_str = match working.get_prop(&path) {
-                    Ok(v) => v,
-                    Err(e) => return error_response(map_prop_error(e, &path).with_op_index(idx)),
-                };
-                let want_str = match json_to_setprop_string(&want, info.as_ref().map(|i| i.kind)) {
-                    Ok(s) => s,
-                    Err(e) => return error_response(e.with_path(&path).with_op_index(idx)),
-                };
-                if actual_str != want_str {
-                    return error_response(
-                        ConfigApiError::new(
-                            ConfigApiCode::ValidationFailed,
-                            format!("`test` op failed: expected {want_str:?}, got {actual_str:?}"),
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx),
-                    );
-                }
-                results.push(PatchOpResult {
-                    op: op.op.clone(),
-                    path,
-                    value: Some(serde_json::Value::String(actual_str)),
-                    populated: None,
-                    comment: None, // `test` ops don't write
-                });
-            }
-            "add" | "replace" => {
-                let value = match op.value.as_ref() {
-                    Some(v) => v.clone(),
-                    None => {
-                        return error_response(
-                            ConfigApiError::new(
-                                ConfigApiCode::ValueTypeMismatch,
-                                format!("JSON Patch `{}` op requires `value` field", op.op),
-                            )
-                            .with_path(&path)
-                            .with_op_index(idx),
-                        );
-                    }
-                };
-                let value_str = match json_to_setprop_string(&value, info.as_ref().map(|i| i.kind))
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return error_response(e.with_path(&path).with_op_index(idx));
-                    }
-                };
-                if let Err(e) = reject_masked_secret_value(&path, is_sensitive, &value_str) {
-                    return error_response(e.with_op_index(idx));
-                }
-                if let Err(e) = working.set_prop_persistent(&path, &value_str) {
-                    return error_response(map_prop_error(e, &path).with_op_index(idx));
-                }
-                if is_sensitive {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: None,
-                        populated: Some(!value_str.is_empty()),
-                        comment: op.comment.clone(),
-                    });
-                } else {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: Some(serde_json::Value::String(value_str)),
-                        populated: None,
-                        comment: op.comment.clone(),
-                    });
-                }
-            }
-            "remove" => {
-                if let Err(e) = working.set_prop_persistent(&path, "") {
-                    return error_response(map_prop_error(e, &path).with_op_index(idx));
-                }
-                if is_sensitive {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: None,
-                        populated: Some(false),
-                        comment: op.comment.clone(),
-                    });
-                } else {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: Some(serde_json::Value::Null),
-                        populated: None,
-                        comment: op.comment.clone(),
-                    });
-                }
-            }
-            "comment" => {
-                // Comment-only update: record the (path, comment) pair
-                // for `apply_comments` after the patch commits, but
-                // skip `set_prop` entirely. Lets the operator annotate
-                // a secret without rotating its ciphertext.
-                if info.is_none() {
-                    return error_response(
-                        ConfigApiError::path_not_found(&path).with_op_index(idx),
-                    );
-                }
-                let Some(comment) = op.comment.clone() else {
-                    return error_response(
-                        ConfigApiError::new(
-                            ConfigApiCode::ValueTypeMismatch,
-                            "JSON Patch `comment` op requires `comment` field",
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx),
-                    );
-                };
-                results.push(PatchOpResult {
-                    op: op.op.clone(),
-                    path,
-                    value: None,
-                    populated: None,
-                    comment: Some(comment),
-                });
-            }
-            "move" | "copy" => {
-                return error_response(
-                    ConfigApiError::op_not_supported(&op.op)
-                        .with_path(&path)
-                        .with_op_index(idx),
-                );
-            }
-            other => {
-                return error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::OpNotSupported,
-                        format!("unknown JSON Patch operation `{other}`"),
-                    )
-                    .with_path(&path)
-                    .with_op_index(idx),
-                );
-            }
-        }
-    }
+    let results = match config_patch::apply_patch_ops(&mut working, &ops) {
+        Ok(results) => results,
+        Err(e) => return error_response(e),
+    };
 
     // Per-PATCH validation is scoped to the dirty paths. See
     // `scoped_validate` for the contract.
@@ -2767,11 +2466,7 @@ pub async fn handle_patch(
     // Collect (path, comment) pairs from any op that supplied a non-None
     // comment. Applied after save() so the comment-preserving sync_table
     // pass doesn't strip them.
-    let annotations: Vec<(String, String)> = ops
-        .iter()
-        .zip(results.iter())
-        .filter_map(|(op, res)| op.comment.as_ref().map(|c| (res.path.clone(), c.clone())))
-        .collect();
+    let annotations = config_patch::annotations(&ops, &results);
 
     let config_path = working.config_path.clone();
     // Collect non-fatal validation warnings against the post-save state
@@ -2790,8 +2485,8 @@ pub async fn handle_patch(
         &working,
         working.dirty_paths.iter().map(String::as_str),
     );
-    for op in ops.iter().filter(|op| op.op == "remove") {
-        writes = writes.with(json_pointer_to_dotted(&op.path), Verb::Delete);
+    for path in config_patch::removed_paths(&ops) {
+        writes = writes.with(path, Verb::Delete);
     }
     let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
         Ok(authorization) => authorization,
@@ -2838,18 +2533,195 @@ pub async fn handle_patch(
 
     axum::Json(PatchResponse {
         saved: true,
-        results,
+        results: results.into_iter().map(PatchOpResult::from_wire).collect(),
         warnings,
     })
     .into_response()
 }
 
-fn json_pointer_to_dotted(path: &str) -> String {
-    if path.starts_with('/') {
-        path.trim_start_matches('/').replace('/', ".")
-    } else {
-        path.to_string()
+/// Whether a `PATCH` asks to overwrite paths whose file value drifted.
+fn override_drift(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-zeroclaw-override-drift")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+// ── Writes through the core ─────────────────────────────────────────
+//
+// The standalone gateway serves the config writes through the core's
+// `config/set-many` `ops` batch, which stages a patch with the same shared
+// semantics as `handle_patch` (`config_ops::patch`), validates the result and
+// authorizes its write set by effect, as the routes above do. Each answers
+// with the route's own response type; a refusal carries the route's config
+// error. The in-process gateway keeps its own write path.
+
+/// A unary HTTP property operation has no batch position. Preserve the
+/// core's reason and config error while projecting away that RPC context.
+fn unary_config_refusal(mut error: CoreError) -> CoreError {
+    if let CoreError::Rpc(rpc_error) = &mut error
+        && let Some(config_error) = rpc_error
+            .data
+            .as_mut()
+            .and_then(|data| data.get_mut("config_error"))
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        config_error.remove("op_index");
     }
+    error
+}
+
+/// The core's answer to a one-operation patch: that operation's result and
+/// the warnings.
+async fn patch_one_through_core(
+    core: &CoreCall,
+    op: ConfigPatchOp,
+) -> Result<(ConfigPatchOpResult, Vec<ValidationWarning>), CoreError> {
+    let patched: ConfigSetManyResult = core
+        .call(Method::ConfigSetMany, serde_json::json!({ "ops": [op] }))
+        .await
+        .map_err(unary_config_refusal)?;
+    let result = patched.results.into_iter().next().ok_or_else(|| {
+        CoreError::Rpc(zeroclaw_api::jsonrpc::JsonRpcError {
+            code: zeroclaw_api::jsonrpc::error_codes::INTERNAL_ERROR,
+            message: "config/set-many answered a one-operation patch with no result".into(),
+            data: None,
+        })
+    })?;
+    Ok((result, patched.warnings))
+}
+
+/// `PATCH /api/config` through the core.
+pub(crate) async fn patch_through_core(
+    core: &CoreCall,
+    headers: &HeaderMap,
+    body: serde_json::Value,
+) -> Result<Response, CoreError> {
+    let ops = match parse_patch_ops(body) {
+        Ok(ops) => ops,
+        Err(e) => return Ok(error_response(e)),
+    };
+    let ops: Vec<ConfigPatchOp> = ops.into_iter().map(PatchOp::into_wire).collect();
+    let patched: ConfigSetManyResult = core
+        .call(
+            Method::ConfigSetMany,
+            serde_json::json!({ "ops": ops, "drift_guard": !override_drift(headers) }),
+        )
+        .await?;
+    Ok(axum::Json(PatchResponse {
+        saved: true,
+        results: patched
+            .results
+            .into_iter()
+            .map(PatchOpResult::from_wire)
+            .collect(),
+        warnings: patched.warnings,
+    })
+    .into_response())
+}
+
+/// `PUT /api/config/prop` through the core: a one-operation `replace`.
+pub(crate) async fn prop_put_through_core(
+    core: &CoreCall,
+    body: PropPutBody,
+) -> Result<Response, CoreError> {
+    // The route takes a dotted path as it is; a JSON Pointer names no
+    // property there.
+    if body.path.starts_with('/') {
+        return Ok(error_response(ConfigApiError::path_not_found(&body.path)));
+    }
+    let (result, warnings) = patch_one_through_core(
+        core,
+        ConfigPatchOp {
+            op: "replace".into(),
+            path: body.path.clone(),
+            value: Some(body.value),
+            comment: body.comment,
+        },
+    )
+    .await?;
+    Ok(prop_write_response(body.path, result, warnings))
+}
+
+/// `DELETE /api/config/prop` through the core: a one-operation `remove`.
+pub(crate) async fn prop_delete_through_core(
+    core: &CoreCall,
+    q: PropQuery,
+) -> Result<Response, CoreError> {
+    if q.path.starts_with('/') {
+        return Ok(error_response(ConfigApiError::path_not_found(&q.path)));
+    }
+    let (result, warnings) = patch_one_through_core(
+        core,
+        ConfigPatchOp {
+            op: "remove".into(),
+            path: q.path.clone(),
+            value: None,
+            comment: None,
+        },
+    )
+    .await?;
+    Ok(prop_write_response(q.path, result, warnings))
+}
+
+/// A property write's answer from its one operation's result: a secret
+/// reports only whether it holds a value.
+fn prop_write_response(
+    path: String,
+    result: ConfigPatchOpResult,
+    warnings: Vec<ValidationWarning>,
+) -> Response {
+    match result.populated {
+        Some(populated) => axum::Json(SecretResponse { path, populated }).into_response(),
+        None => axum::Json(PropResponse {
+            path,
+            value: result.value.unwrap_or(serde_json::Value::Null),
+            warnings,
+        })
+        .into_response(),
+    }
+}
+
+/// `POST /api/config/map-key` through the core.
+pub(crate) async fn map_key_create_through_core(
+    core: &CoreCall,
+    q: MapKeyQuery,
+) -> Result<Response, CoreError> {
+    let created: ConfigMapKeyCreateResult = core
+        .call(
+            Method::ConfigMapKeyCreate,
+            serde_json::json!({ "path": q.path, "key": q.key }),
+        )
+        .await?;
+    Ok(axum::Json(MapKeyResponse {
+        path: created.path,
+        key: created.key,
+        created: created.created,
+        warnings: None,
+    })
+    .into_response())
+}
+
+/// `POST /api/config/rename-map-key` through the core.
+pub(crate) async fn rename_map_key_through_core(
+    core: &CoreCall,
+    body: RenameMapKeyBody,
+) -> Result<Response, CoreError> {
+    let renamed: ConfigMapKeyRenameResult = core
+        .call(
+            Method::ConfigMapKeyRename,
+            serde_json::json!({ "path": body.path, "from": body.from, "to": body.to }),
+        )
+        .await?;
+    Ok(axum::Json(RenameMapKeyResponse {
+        path: renamed.path,
+        from: renamed.from,
+        to: renamed.to,
+        renamed: renamed.renamed,
+        warnings: renamed.warnings,
+    })
+    .into_response())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3548,6 +3420,109 @@ mod tests {
     // tests below fall through into real persistence (`persist_and_swap` ->
     // `save_dirty`), and a bare `Config::default()` would write the developer's
     // live `~/.zeroclaw/config.toml`.
+
+    /// A provider URI's password and query credential reach neither the
+    /// whole-config read nor the property read: the shared config projection
+    /// masks them before any HTTP body is built.
+    #[tokio::test]
+    async fn config_reads_withhold_a_provider_uris_embedded_credentials() {
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}\"\n"
+        ))
+        .unwrap();
+        let state = test_state(config);
+
+        let whole = handle_config_get(State(state.clone())).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        let whole = String::from_utf8(
+            whole
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let (status, prop) = response_json(
+            handle_prop_get(
+                State(state),
+                Query(PropQuery {
+                    path: "providers.models.custom.credential_url.uri".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prop = prop.to_string();
+
+        assert_eq!(
+            [
+                whole.contains(PASSWORD),
+                whole.contains(QUERY),
+                prop.contains(PASSWORD),
+                prop.contains(QUERY),
+            ],
+            [false; 4],
+            "userinfo and query secrets must be withheld: {whole}\n{prop}"
+        );
+        assert!(
+            prop.contains("http://***MASKED***@127.0.0.1:9/v1?***MASKED***"),
+            "{prop}"
+        );
+    }
+
+    /// A provider URI written back through the property route as reads show
+    /// it keeps the stored credentials. A placeholder that no stored value
+    /// can resolve is refused as `validation_failed` and stores nothing.
+    #[tokio::test]
+    async fn prop_put_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
+        const PATH: &str = "providers.models.custom.credential_url.uri";
+        let stored =
+            "http://review-user:uri-password-654738@127.0.0.1:9/v1?credential=uri-query-938472";
+        let tmp = tempfile::tempdir().unwrap();
+        let base = temp_config(&tmp);
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"{stored}\"\n"
+        ))
+        .unwrap();
+        config.config_path = base.config_path;
+        config.data_dir = base.data_dir;
+        let state = test_state(config);
+        let uri = || {
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .and_then(|provider| provider.uri.clone())
+        };
+        let put = |value: &str| {
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: PATH.to_string(),
+                    value: serde_json::json!(value),
+                    comment: None,
+                }),
+            )
+        };
+
+        let (status, json) =
+            response_json(put("http://***MASKED***@127.0.0.1:9/v1?***MASKED***").await).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let (status, json) = response_json(put("http://***MASKED***.example/v1").await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed", "{json}");
+        assert_eq!(uri().as_deref(), Some(stored));
+    }
 
     #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {

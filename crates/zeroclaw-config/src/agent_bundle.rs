@@ -591,6 +591,13 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         if is_masked_secret(value) {
             required_secrets.push(path.to_string());
             value.clear();
+        } else if crate::url_credentials::carries_mask(value) {
+            // A URL whose userinfo, query or fragment may hold a credential
+            // comes out of masking with the placeholder inside it. It travels
+            // as its bare endpoint, which keeps the closure valid (an HTTP MCP
+            // server needs a url), and is listed to be supplied in full.
+            required_secrets.push(path.to_string());
+            *value = crate::url_credentials::endpoint(value);
         }
     });
     if let Some(path) = find_ciphertext(&root, "") {
@@ -1568,11 +1575,14 @@ const CONFIG_HEADER: &str = "\
 # This is a FRAGMENT, not a complete config.toml. `zeroclaw agents import`
 # merges it into the target install; it never replaces the target's config.
 # Empty-string values are credentials that were scrubbed on export and must be
-# supplied on the target — see `required_secrets` in zeroclaw-agent.toml.
+# supplied on the target — see `required_secrets` in zeroclaw-agent.toml. An
+# endpoint URL that had a userinfo, query or fragment, any of which can hold a
+# credential, travels without them and is listed there too: supply it in full.
 #
-# Scrubbing blanks the fields the schema marks secret. It is not credential
-# detection: any other value here travels as written, so a token in an MCP
-# server's `url`, or a credential in its `command` or `args`, is still present.
+# Scrubbing blanks the fields the schema marks secret and cuts those URLs down
+# to their endpoint. It is not credential detection: any other value here
+# travels as written, so a token in a URL's path, or a credential in an MCP
+# server's `command` or `args`, is still present.
 ";
 
 /// Render the closure as the bundle's `config.toml`.
@@ -1726,10 +1736,11 @@ const MANIFEST_HEADER: &str = "\
 # export. `risk_flags` lists capabilities the importing operator is being asked
 # to grant. `dropped` lists configuration that could not travel.
 #
-# Scrubbing blanks the fields the schema marks secret in config.toml, and
-# nothing more. Other config strings travel as written, and `risk_flags` below
-# repeats stdio server command lines verbatim. The files under workspace/ and
-# skills/ are copied as-is. None of it is scanned for secrets.
+# Scrubbing blanks the fields the schema marks secret in config.toml, cuts the
+# endpoint URLs with a userinfo, query or fragment down to their endpoint, and
+# does nothing more. Other config strings travel as written, and `risk_flags`
+# below repeats stdio server command lines verbatim. The files under workspace/
+# and skills/ are copied as-is. None of it is scanned for secrets.
 ";
 
 /// Render the manifest as the bundle's `zeroclaw-agent.toml`.
@@ -1978,6 +1989,62 @@ mod tests {
         )
         .and_then(toml::Value::as_str);
         assert_eq!(key, Some(""));
+    }
+
+    /// An endpoint URL with a userinfo or a query travels as its bare
+    /// endpoint and is listed like a secret: masking would otherwise leave
+    /// its placeholder in the bundle, and blanking it would leave an HTTP MCP
+    /// server without the url the closure requires.
+    #[test]
+    fn credential_bearing_urls_travel_as_bare_endpoints_and_are_listed() {
+        let mut config = fixture();
+        if let Some(bundle) = config.mcp_bundles.get_mut("research") {
+            bundle.exclude.clear();
+        }
+        config.mcp.servers[1].url = Some(
+            "https://user:mcp-password-38475@search.example.com/mcp?token=mcp-token-91827".into(),
+        );
+        if let Some(main) = config.providers.models.anthropic.get_mut("main") {
+            main.base.uri = Some("https://proxy.example/v1?key=uri-key-55120".into());
+        }
+
+        let plan = plan_export(&config, "researcher").unwrap();
+
+        let search_url = lookup(&plan.config, &["mcp", "servers"])
+            .and_then(toml::Value::as_array)
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|s| s.get("name").and_then(toml::Value::as_str) == Some("search"))
+            })
+            .and_then(|server| server.get("url"))
+            .and_then(toml::Value::as_str);
+        assert_eq!(search_url, Some("https://search.example.com/mcp"));
+        let uri = lookup(
+            &plan.config,
+            &["providers", "models", "anthropic", "main", "uri"],
+        )
+        .and_then(toml::Value::as_str);
+        assert_eq!(uri, Some("https://proxy.example/v1"));
+        for path in [
+            "mcp.servers.search.url",
+            "providers.models.anthropic.main.uri",
+        ] {
+            assert!(
+                plan.required_secrets.contains(&path.to_string()),
+                "{path}: {:?}",
+                plan.required_secrets
+            );
+        }
+        let rendered = render_config_toml(&plan).unwrap();
+        for leaked in [
+            "mcp-password-38475",
+            "mcp-token-91827",
+            "uri-key-55120",
+            "***MASKED***",
+        ] {
+            assert!(!rendered.contains(leaked), "{leaked}: {rendered}");
+        }
     }
 
     #[test]
