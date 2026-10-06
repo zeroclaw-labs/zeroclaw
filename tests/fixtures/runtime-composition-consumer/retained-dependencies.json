@@ -1,0 +1,66 @@
+{
+  "issue": "#10993",
+  "normal": {
+    "zeroclaw-api": {
+      "owner": "crates/zeroclaw-runtime/src/composition.rs",
+      "reason": "Composition ports, model/tool/channel/memory traits, principal identity and observer events; this is the capability contract owner."
+    },
+    "zeroclaw-config": {
+      "owner": "crates/zeroclaw-runtime/src/live_config_authority.rs",
+      "reason": "Authoritative schema3 config generation, policy resolution and admitted agent identity; the runtime keeps enforcement and resolves live state at use time."
+    },
+    "zeroclaw-spawn": {
+      "owner": "crates/zeroclaw-runtime/src/tools/shell.rs",
+      "reason": "Existing process/sandbox execution ownership for the compatibility shell tool and managed background children."
+    },
+    "zeroclaw-infra": {
+      "owner": "crates/zeroclaw-runtime/src/agent/agent.rs",
+      "reason": "Existing ACP session persistence and key-free filesystem/HTTP support; the session lifecycle owns those handles."
+    },
+    "zeroclaw-tls": {
+      "owner": "crates/zeroclaw-runtime/src/lib.rs",
+      "reason": "Existing runtime network clients use the shared TLS provider; no adapter selection authority is supplied by this edge."
+    },
+    "zeroclaw-relay-proto": {
+      "owner": "crates/zeroclaw-runtime/src/relay.rs",
+      "reason": "Existing daemon relay bridge imports control/data framing, connection-window and rate-limit types at crates/zeroclaw-runtime/src/relay.rs:34. The relay bridge and its connection/cancellation lifecycle remain runtime-owned."
+    },
+    "zeroclaw-commands": {
+      "owner": "crates/zeroclaw-runtime/src/rpc/dispatch.rs",
+      "reason": "Existing RPC command catalogue imports CommandSurface and commands_for_surface at crates/zeroclaw-runtime/src/rpc/dispatch.rs:34 and projects the TUI catalogue into InitializeResult at :3707. This catalogue owner is distinct from provider/memory/tool selection."
+    },
+    "zeroclaw-log": {
+      "owner": "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
+      "reason": "Canonical attributed runtime events and observer projection; the turn lifecycle is the producer."
+    },
+    "zeroclaw-providers": {
+      "owner": "crates/zeroclaw-runtime/src/composition/config_backed.rs",
+      "reason": "Compatibility ConfigProviders, existing provider-switch adapter and doctor/quickstart probes still construct native providers; generic capability entries must never invoke them. Agent model-route resolution also uses the shared router value without constructing a concrete provider. Application composition owns default-source selection."
+    },
+    "zeroclaw-memory": {
+      "owner": "crates/zeroclaw-runtime/src/composition/config_backed.rs",
+      "reason": "Compatibility ConfigMemory and legacy memory-free ACP adapters still open or substitute native memory; existing response/session caches retain their memory owner. Generic supplied-memory requests must use MemorySource. Application composition owns default backend selection."
+    },
+    "zeroclaw-tools": {
+      "owner": "crates/zeroclaw-runtime/src/tools/mod.rs",
+      "reason": "The compatibility native registry owns host-coupled tool handles and the existing tier1/tier2 tools; ScopedToolRegistry owns policy/MCP/skill filtering. Generic supplied-tool requests must not invoke the native factory. Application composition owns default adapter selection; retention cannot justify constructing native tools on the consumer path."
+    },
+    "zeroclaw-sop-graph": {
+      "owner": "crates/zeroclaw-runtime/src/sop/mod.rs",
+      "reason": "Existing SOP graph/state definitions owned by the SOP engine; no additional composition capability."
+    },
+    "zeroclaw-plugins": {
+      "owner": "crates/zeroclaw-runtime/src/tools/mod.rs",
+      "reason": "Existing optional runtime plugin adapter boundary and host lifetime; policy and reservations remain enforced by the registry. Optionality does not excuse concrete construction on a supplied-capability path."
+    },
+    "zeroclaw-tool-call-parser": {
+      "owner": "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
+      "reason": "Canonical native/text tool-call parser used by the real engine."
+    },
+    "zeroclaw-macros": {
+      "owner": "crates/zeroclaw-runtime/src/lib.rs",
+      "reason": "Existing compile-time attribution/registration helpers used by runtime-owned agent and tools; no concrete adapter selection or runtime policy cache."
+    }
+  },
+  "build": {}
+}

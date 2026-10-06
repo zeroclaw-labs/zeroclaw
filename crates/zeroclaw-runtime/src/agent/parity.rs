@@ -147,6 +147,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
         parent_agent_alias: None,
         served_route_sink: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,
@@ -261,6 +262,7 @@ fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         escalate_handle: None,
         channel_room_handle: None,
         unfiltered_tool_arcs: Vec::new(),
+        capability_slots: Vec::new(),
         delegate_tool: None,
     }
 }

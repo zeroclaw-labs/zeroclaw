@@ -8912,6 +8912,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-composition-consumer"
+version = "0.8.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-runtime",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"

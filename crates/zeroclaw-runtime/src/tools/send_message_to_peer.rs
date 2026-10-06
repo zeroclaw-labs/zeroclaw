@@ -45,6 +45,11 @@ pub struct SendMessageToPeerTool {
     live_config: Option<Arc<RwLock<Config>>>,
     sender_alias: String,
     description: String,
+    /// The capabilities and principal the sending turn was built from. When
+    /// bound, the recipient's in-process turn runs through them, so it uses
+    /// the sender's sources and resolves for the same principal. Empty only
+    /// for a registry no capability entry point bound.
+    capabilities: crate::composition::CapabilitySlot,
     task_control_plane: Option<ControlPlaneHandle>,
     execution_capability: Option<AgentExecutionCapability>,
 }
@@ -75,9 +80,16 @@ impl SendMessageToPeerTool {
             live_config,
             sender_alias,
             description,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             task_control_plane: None,
             execution_capability,
         }
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     pub fn with_control_plane(mut self, handle: ControlPlaneHandle) -> Self {
@@ -327,25 +339,48 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
+            let bound = self.capabilities.get().cloned();
             let task_id = task.id.clone();
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
                 // Keep the admitted recipient turn out of the cost-scope wrappers.
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
-                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
-                        cfg,
-                        live_config,
-                        &turn_recipient_alias,
-                        &body,
-                        None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                        admission,
-                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                            sender_alias: sender.clone(),
-                        }),
-                    ),
-                );
+                // A bound sender also hands the recipient its capabilities and
+                // principal, so the peer turn stays on the sender's sources; the
+                // admission and the live tool-policy source are kept either way.
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                    match bound {
+                        Some(bound) => Box::pin(
+                            crate::agent::loop_::process_message_shared_with_capabilities(
+                                cfg,
+                                live_config,
+                                bound.capabilities,
+                                bound.principal,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                admission,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
+                            ),
+                        ),
+                        None => Box::pin(
+                            crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                                cfg,
+                                live_config,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                admission,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
+                            ),
+                        ),
+                    };
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
@@ -1538,6 +1573,12 @@ mod tests {
             CostConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
 
+        // Reads usage back from the process-global tracker, which a
+        // concurrent cost-disabled agent turn would otherwise disable.
+        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
+            .lock()
+            .await;
+
         // `[providers.models.ollama.*]` dispatches through the shared
         // OpenAI-compatible client (`factory::build_ollama_compat_provider`),
         // not the native `/api/chat` wire format, so the fake stands in at
@@ -1801,5 +1842,140 @@ mod tests {
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
+    }
+
+    /// A peer send from a capability-bound sender keeps the recipient's
+    /// lifecycle admission on the bound path. With the generation open, the
+    /// detached recipient turn asks the sender's supplied provider source
+    /// while the recipient's turn lease is held. When the generation closes
+    /// after the send is accepted but before the detached turn first runs,
+    /// the turn revalidates its admission and stops before the source is
+    /// asked.
+    #[tokio::test]
+    async fn bound_peer_turn_runs_under_recipient_admission_on_supplied_capabilities() {
+        use crate::composition::test_support::LeaseObservingProviders;
+        use crate::control_plane::ControlPlaneHandle;
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _cost_tracker_lock = crate::agent::cost::GLOBAL_COST_TRACKER_TEST_LOCK
+            .lock()
+            .await;
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.providers.models.openai.insert(
+            "recipient".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "openai.recipient".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        for close_before_turn in [false, true] {
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            let lifecycle = authority.agent_lifecycle();
+            let providers = Arc::new(LeaseObservingProviders::new(lifecycle.clone()));
+            // One store per iteration: the previous iteration's detached turn
+            // may still be settling its inbox task when this one registers.
+            let control_plane_dir = tempfile::TempDir::new().expect("control-plane dir");
+            let control_plane = ControlPlaneHandle::open(control_plane_dir.path())
+                .expect("isolated control plane should initialize");
+            let tool = SendMessageToPeerTool::new_with_capability(
+                Arc::new(config.clone()),
+                "sender",
+                Some(authority.execution_capability()),
+            )
+            .with_control_plane(control_plane);
+            assert!(
+                tool.capabilities_slot()
+                    .set(crate::composition::BoundCapabilities {
+                        capabilities: providers.capabilities(),
+                        principal: None,
+                    })
+                    .is_ok()
+            );
+
+            let result = tool
+                .execute(json!({
+                    "channel": "telegram.prod",
+                    "target": "recipient",
+                    "message": "post a one-line status update"
+                }))
+                .await
+                .expect("the peer send is accepted for detached delivery");
+            assert!(result.success, "{result:?}");
+            assert_eq!(
+                lifecycle.active_turn_count("recipient"),
+                1,
+                "the accepted send holds the recipient's admission"
+            );
+            if close_before_turn {
+                // This test runs on a current-thread runtime and nothing has
+                // yielded since `execute` spawned the recipient turn, so the
+                // turn has not started: it sees the closed generation when it
+                // revalidates.
+                authority.close_agent_lifecycle();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while lifecycle.active_turn_count("recipient") != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the detached recipient turn finishes and releases admission");
+
+            let served = providers.observed();
+            if close_before_turn {
+                assert!(
+                    served.is_empty(),
+                    "a turn refused at revalidation must not ask the supplied source: {served:?}"
+                );
+            } else {
+                assert!(
+                    !served.is_empty()
+                        && served
+                            .iter()
+                            .all(|(alias, active)| alias == "recipient" && *active >= 1),
+                    "the recipient turn must ask the sender's supplied source under the \
+                     recipient's lease: {served:?}"
+                );
+            }
+        }
     }
 }

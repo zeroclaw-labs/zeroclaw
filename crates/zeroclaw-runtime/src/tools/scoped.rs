@@ -278,6 +278,9 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             unfiltered_tool_arcs,
+            // Bound to the owning entry point's capabilities before the
+            // registry reaches `assemble`; nothing here reads it.
+            capability_slots: _,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
@@ -311,17 +314,20 @@ impl ScopedToolRegistry {
             .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
             .cloned()
             .collect();
-        let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
-                config.pipeline.clone(),
-                context_filtered_tool_arcs.clone(),
-                zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                    security.allowed_tools.as_deref(),
-                    security.excluded_tools.as_deref(),
-                    caller_allowed,
-                ),
-            )) as Arc<dyn Tool>
-        });
+        // Supplied-only registries have no native prefilter inputs. An
+        // enabled native integration must not enlarge their complete tool set.
+        let pipeline_tool =
+            (config.pipeline.enabled && !unfiltered_tool_arcs.is_empty()).then(|| {
+                Arc::new(tools::PipelineTool::with_access_policy(
+                    config.pipeline.clone(),
+                    context_filtered_tool_arcs.clone(),
+                    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                        security.allowed_tools.as_deref(),
+                        security.excluded_tools.as_deref(),
+                        caller_allowed,
+                    ),
+                )) as Arc<dyn Tool>
+            });
         if let Some(tool) = pipeline_tool.as_ref() {
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
         }
@@ -787,6 +793,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }
@@ -818,6 +825,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs,
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }

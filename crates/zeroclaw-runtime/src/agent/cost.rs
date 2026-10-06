@@ -49,6 +49,18 @@ pub fn tool_loop_cost_tracking_context_for_agent(
         .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
 }
 
+/// Serializes tests that read usage back from the process-global
+/// `CostTracker` with tests that run agent turns from a cost-disabled config.
+/// Every turn resolves the global tracker through
+/// [`tool_loop_cost_tracking_context_for_agent`], and a disabled config is
+/// applied to the resident tracker whatever its ledger, so a concurrent turn
+/// stops another test's enabled tracker from recording. A `tokio::sync::Mutex`
+/// so async tests can hold the guard across their turn without tripping
+/// `clippy::await_holding_lock`.
+#[cfg(test)]
+pub(crate) static GLOBAL_COST_TRACKER_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub fn tool_loop_cost_tracking_context_from_tracker(
     config: &Config,
     agent_alias: &str,

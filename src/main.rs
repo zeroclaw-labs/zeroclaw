@@ -6862,7 +6862,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
-            Box::pin(agent::run(
+            Box::pin(zeroclaw::composition::run_agent(
                 config,
                 &agent_alias,
                 message,
@@ -8042,8 +8042,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         .map(|supervisor| supervisor.drivers.clone()),
                 );
 
-                let exit = Box::pin(daemon::run_with_authority(
+                // One capability set per config generation: a reload re-reads
+                // config and builds the next generation's set on the next pass.
+                let capabilities =
+                    zeroclaw::composition::DefaultCapabilities::from_config(&current_config);
+                let exit = Box::pin(daemon::run_with_authority_and_capabilities(
                     authority,
+                    capabilities,
                     host.clone(),
                     port,
                     registry,
