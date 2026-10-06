@@ -16,6 +16,7 @@ pub mod util;
 
 pub mod agent;
 pub mod agent_lifecycle;
+pub mod agent_owned_state;
 pub mod approval;
 pub mod browse;
 pub mod calendar;

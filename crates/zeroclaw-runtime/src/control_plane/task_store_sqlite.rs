@@ -104,6 +104,27 @@ impl SqliteTaskStore {
         })
     }
 
+    /// Inspect existing retirement residue without schema initialization or a
+    /// write wait. Callers conservatively retain residue when this fails.
+    pub fn count_existing_by_agent(data_dir: &Path, agent: &str) -> Result<u64> {
+        let path = data_dir.join("control_plane.db");
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            result => {
+                result.context("inspect existing control-plane DB")?;
+            }
+        }
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("open existing control-plane DB read-only")?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE agent = ?1",
+            [agent],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Admin enumeration — count this agent's records (mirrors AcpSessionStore's
     /// `count_*_by_agent`; used by alias-delete cascades / observability).
     pub fn count_by_agent(&self, agent: &str) -> Result<u64> {

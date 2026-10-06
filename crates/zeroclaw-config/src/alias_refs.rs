@@ -441,12 +441,24 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     if clear_acp {
         cfg.acp.default_agent = None;
     }
+    if cfg
+        .knowledge
+        .legacy_owner_agent
+        .as_ref()
+        .is_some_and(|owner| owner.as_str() == alias)
+    {
+        cfg.knowledge.legacy_owner_agent = None;
+    }
     for agent in cfg.agents.values_mut() {
         agent.delegates.retain(|d| d.agent().trim() != alias); // trimmed (validate trims)
         agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
         agent
             .workspace
             .read_memory_from
+            .retain(|m| m.as_str() != alias); // raw
+        agent
+            .workspace
+            .read_knowledge_from
             .retain(|m| m.as_str() != alias); // raw
     }
     for group in cfg.peer_groups.values_mut() {
@@ -538,6 +550,22 @@ pub fn is_reserved_agent_alias(alias: &str) -> bool {
     alias.trim() == RESERVED_DEFAULT_AGENT
 }
 
+/// Validate an agent alias before it is used outside the configured map.
+///
+/// Normal map mutations validate keys while editing the config. Committed
+/// lifecycle recovery also accepts aliases whose config entries are already
+/// gone, so callers must use this guard before deriving filesystem paths or
+/// probing owned state from request input.
+pub fn validate_agent_alias(alias: &str) -> Result<(), String> {
+    crate::helpers::validate_alias_key(alias)?;
+    if is_reserved_agent_alias(alias) {
+        return Err(format!(
+            "alias `{RESERVED_DEFAULT_AGENT}` is reserved and cannot be used for agent lifecycle operations"
+        ));
+    }
+    Ok(())
+}
+
 /// Why a [`create_map_key_checked`] did not create the key.
 #[derive(Debug)]
 pub enum CreateError {
@@ -567,7 +595,51 @@ pub fn create_map_key_checked(
     if path == "agents" && is_reserved_agent_alias(key) {
         return Err(CreateError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
     }
+    if path == "agents" && !cfg.agents.contains_key(key) {
+        ensure_knowledge_owner_retired(cfg, key).map_err(CreateError::Invalid)?;
+    }
     cfg.create_map_key(path, key).map_err(CreateError::Invalid)
+}
+
+/// Creation cannot adopt an old alias's graph residue. Read the canonical
+/// database without creating it or waiting for its writer: callers may hold
+/// config serialization, while graph operations resolve live config only after
+/// their SQLite wait. Busy or uninspectable storage therefore refuses creation.
+fn ensure_knowledge_owner_retired(cfg: &Config, alias: &str) -> Result<(), String> {
+    let path = cfg.knowledge.resolved_db_path();
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect retired knowledge: {error}")),
+        Ok(_) => {}
+    }
+    let inspect = || -> rusqlite::Result<bool> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let attributed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'owner_agent')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !attributed {
+            // Legacy unowned rows cannot be inherited by an alias. Keep the
+            // existing explicit/sole-enabled-owner migration path available.
+            return Ok(false);
+        }
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_agent = ?1) OR EXISTS(SELECT 1 FROM edges WHERE owner_agent = ?1)",
+            [alias], |row| row.get(0),
+        )
+    };
+    match inspect() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(format!(
+            "agent `{alias}` still owns knowledge; finish its retirement before reusing the alias"
+        )),
+        Err(error) => Err(format!("cannot inspect retired knowledge: {error}")),
+    }
 }
 
 /// Outcome of a successful [`rename_with_cascade`].
@@ -633,6 +705,9 @@ pub fn rename_with_cascade(
         return Err(RenameError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
     }
 
+    if matches!(kind, AliasKind::Agent) {
+        ensure_knowledge_owner_retired(cfg, new_alias).map_err(RenameError::InvalidName)?;
+    }
     let section = section_path(kind);
     // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
     // leading-underscore rule also blocks the `_deleted` marker) and refuses a
@@ -725,6 +800,15 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         cfg.acp.default_agent = Some(new.to_string());
         dirty.push("acp.default_agent".to_string());
     }
+    if cfg
+        .knowledge
+        .legacy_owner_agent
+        .as_ref()
+        .is_some_and(|owner| owner.as_str() == old)
+    {
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new(new));
+        dirty.push("knowledge.legacy_owner_agent".to_string());
+    }
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
         for d in agent.delegates.iter_mut() {
@@ -742,6 +826,13 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         for m in agent.workspace.read_memory_from.iter_mut() {
             if m.as_str() == old {
                 *m.agent_mut() = AgentAlias::new(new);
+                touched = true;
+            }
+        }
+        // workspace.read_knowledge_from[] (raw match).
+        for m in agent.workspace.read_knowledge_from.iter_mut() {
+            if m.as_str() == old {
+                *m = AgentAlias::new(new);
                 touched = true;
             }
         }
@@ -1219,6 +1310,15 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             da,
         ));
     }
+    if let Some(owner) = cfg.knowledge.legacy_owner_agent.as_ref()
+        && owner.as_str() == alias
+    {
+        sites.push(RefSite::soft(
+            "knowledge.legacy_owner_agent".to_string(),
+            ScrubAction::ClearOptional,
+            owner.as_str(),
+        ));
+    }
     for (name, agent) in sorted_agents(cfg) {
         // delegates[].agent — validate() trims.
         for (i, d) in agent.delegates.iter().enumerate() {
@@ -1244,6 +1344,16 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             if m.as_str() == alias {
                 sites.push(RefSite::soft(
                     format!("agents.{name}.workspace.read_memory_from[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    alias,
+                ));
+            }
+        }
+        // workspace.read_knowledge_from[].
+        for (i, m) in agent.workspace.read_knowledge_from.iter().enumerate() {
+            if m.as_str() == alias {
+                sites.push(RefSite::soft(
+                    format!("agents.{name}.workspace.read_knowledge_from[{i}]"),
                     ScrubAction::DropFromVec { index: i },
                     alias,
                 ));
@@ -1325,6 +1435,27 @@ mod tests {
             category: ProviderCategory::Models,
             family: family.to_string(),
         }
+    }
+
+    #[test]
+    fn create_agent_refuses_knowledge_residue_and_uninspectable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = Config::default();
+        let path = tmp.path().join("graph.db");
+        cfg.knowledge.db_path = path.to_string_lossy().into_owned();
+        assert!(create_map_key_checked(&mut cfg, "agents", "fresh").unwrap());
+        assert!(!path.exists(), "creation must not initialize knowledge");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT); INSERT INTO edges VALUES ('retired');").unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "retired").is_err());
+        assert!(!cfg.agents.contains_key("retired"));
+        conn.execute("DELETE FROM edges", []).unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "retired").unwrap());
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(create_map_key_checked(&mut cfg, "agents", "blocked").is_err());
+        assert!(!cfg.agents.contains_key("blocked"));
     }
 
     #[test]
@@ -1448,6 +1579,7 @@ mod tests {
         cfg.heartbeat.enabled = true;
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let mut referrer = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
@@ -1463,16 +1595,21 @@ mod tests {
             .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
                 "bot",
             )));
+        referrer
+            .workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), referrer);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
         cfg.peer_groups.insert("crew".to_string(), group);
 
         let report = plan_delete(&cfg, &AliasKind::Agent, "bot");
-        // heartbeat (hard) + delegates + access + read_memory_from + peer member + acp
+        // heartbeat (hard) + delegates + access + read_memory_from +
+        // read_knowledge_from + peer member + acp + legacy knowledge owner
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].path, "heartbeat.agent");
-        assert_eq!(report.scrubs.len(), 5);
+        assert_eq!(report.scrubs.len(), 7);
         assert!(!report.allowed);
     }
 
@@ -2077,6 +2214,7 @@ mod tests {
         cfg.heartbeat.enabled = false; // disabled → heartbeat.agent is a SOFT ref
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let mut lead = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
@@ -2090,6 +2228,9 @@ mod tests {
                 agent: AgentAlias::new("bot"),
                 categories: Some(vec!["family".to_string(), "events".to_string()]),
             });
+        lead.workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), lead);
         cfg.peer_groups.insert(
             "crew".to_string(),
@@ -2106,14 +2247,16 @@ mod tests {
             CascadePolicy::RefuseOnHard,
         )
         .expect("soft-only agent delete succeeds");
-        assert_eq!(report.applied.len(), 6);
+        assert_eq!(report.applied.len(), 8);
         assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
         assert!(!cfg.agents.contains_key("bot"));
         assert!(cfg.heartbeat.agent.is_empty());
         assert!(cfg.acp.default_agent.is_none());
+        assert!(cfg.knowledge.legacy_owner_agent.is_none());
         assert!(cfg.agents["lead"].delegates.is_empty());
         assert!(cfg.agents["lead"].workspace.access.is_empty());
         assert!(cfg.agents["lead"].workspace.read_memory_from.is_empty());
+        assert!(cfg.agents["lead"].workspace.read_knowledge_from.is_empty());
         assert!(cfg.peer_groups["crew"].agents.is_empty());
         assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
     }
@@ -2162,12 +2305,20 @@ mod tests {
         cfg.agents
             .insert("bot".to_string(), AliasedAgentConfig::default());
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let report =
             delete_with_cascade(&mut cfg, &AliasKind::Agent, "bot", CascadePolicy::DryRun).unwrap();
         assert!(report.deleted_entry.is_none());
-        assert_eq!(report.plan.scrubs.len(), 1);
+        assert_eq!(report.plan.scrubs.len(), 2);
         assert!(cfg.agents.contains_key("bot"));
         assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot"));
+        assert_eq!(
+            cfg.knowledge
+                .legacy_owner_agent
+                .as_ref()
+                .map(AgentAlias::as_str),
+            Some("bot")
+        );
     }
 
     #[test]
@@ -2424,6 +2575,7 @@ mod tests {
         cfg.heartbeat.enabled = true;
         cfg.heartbeat.agent = "bot".to_string(); // HARD ref — rename rewrites it
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         // The renamed agent itself self-delegates (must be rewritten too).
         let mut bot = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
@@ -2447,6 +2599,9 @@ mod tests {
                 agent: AgentAlias::new("bot"),
                 categories: Some(vec!["family".to_string(), "events".to_string()]),
             });
+        lead.workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), lead);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -2461,6 +2616,13 @@ mod tests {
         // every ref now names bot2
         assert_eq!(cfg.heartbeat.agent, "bot2");
         assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot2"));
+        assert_eq!(
+            cfg.knowledge
+                .legacy_owner_agent
+                .as_ref()
+                .map(AgentAlias::as_str),
+            Some("bot2")
+        );
         assert_eq!(
             cfg.agents["bot2"].delegates,
             vec![DelegateTargetConfig::bounded("bot2")]
@@ -2489,6 +2651,10 @@ mod tests {
             }]
         );
         assert_eq!(
+            cfg.agents["lead"].workspace.read_knowledge_from,
+            vec![AgentAlias::new("bot2")]
+        );
+        assert_eq!(
             cfg.peer_groups["crew"].agents,
             vec![AgentAlias::new("bot2")]
         );
@@ -2499,6 +2665,7 @@ mod tests {
         for expected in [
             "heartbeat.agent",
             "acp.default_agent",
+            "knowledge.legacy_owner_agent",
             "agents.bot", // old entry removed on disk
             "agents.bot2",
             "agents.lead",
@@ -2575,6 +2742,17 @@ mod tests {
         assert!(!is_reserved_agent_alias("default2"));
         assert!(!is_reserved_agent_alias("cronos"));
         assert!(!is_reserved_agent_alias(""));
+    }
+
+    #[test]
+    fn lifecycle_agent_alias_validation_rejects_unsafe_and_reserved_names() {
+        for alias in ["/tmp/outside", "../outside", "agent/name", "default"] {
+            assert!(
+                validate_agent_alias(alias).is_err(),
+                "lifecycle alias `{alias}` must be rejected"
+            );
+        }
+        assert!(validate_agent_alias("safe_agent").is_ok());
     }
 
     #[test]

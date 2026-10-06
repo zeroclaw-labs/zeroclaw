@@ -792,7 +792,7 @@ fn sanitize_agent(
         }
     }
 
-    // The workspace block travels, but three of its fields cannot.
+    // Workspace location and sibling grants are specific to the source install.
     if let Some(toml::Value::Table(workspace)) = table.get_mut("workspace") {
         workspace.remove("path");
         if agent.workspace.path.is_some() {
@@ -820,6 +820,16 @@ fn sanitize_agent(
                 path: format!("agents.{alias}.workspace.read_memory_from"),
                 reason: DropReason::Relational,
                 detail: "cross-agent memory grants name sibling agents that will not exist on \
+                         the target install"
+                    .to_string(),
+            });
+        }
+        workspace.remove("read_knowledge_from");
+        if !agent.workspace.read_knowledge_from.is_empty() {
+            dropped.push(DroppedRef {
+                path: format!("agents.{alias}.workspace.read_knowledge_from"),
+                reason: DropReason::Relational,
+                detail: "cross-agent knowledge grants name sibling agents that will not exist on \
                          the target install"
                     .to_string(),
             });
@@ -1992,6 +2002,7 @@ mod tests {
                 read_memory_from: vec![crate::multi_agent::MemoryGrant::Agent(
                     crate::multi_agent::AgentAlias::new("beta"),
                 )],
+                read_knowledge_from: vec![crate::multi_agent::AgentAlias::new("beta")],
                 unrestricted_filesystem: false,
             };
         }
@@ -2006,6 +2017,7 @@ mod tests {
             assert!(!workspace.contains_key("path"));
             assert!(!workspace.contains_key("access"));
             assert!(!workspace.contains_key("read_memory_from"));
+            assert!(!workspace.contains_key("read_knowledge_from"));
         }
 
         let paths: Vec<&str> = plan.dropped.iter().map(|d| d.path.as_str()).collect();
@@ -2014,6 +2026,7 @@ mod tests {
             "agents.researcher.workspace.path",
             "agents.researcher.workspace.access",
             "agents.researcher.workspace.read_memory_from",
+            "agents.researcher.workspace.read_knowledge_from",
         ] {
             assert!(paths.contains(&expected), "{paths:?} missing {expected}");
         }

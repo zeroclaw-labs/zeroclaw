@@ -17,6 +17,79 @@ enabled = true
 
 Relationship capture is explicit today. Agents store graph entries through `knowledge` actions such as `capture` and `relate`; enabling the tool does not turn on automatic ingestion. Relationship memory can hold sensitive operational or business context, so operators should choose what gets stored.
 
+## Per-agent scoping
+
+The store is one install-wide database, but entries are attributed per agent. Every `capture` and `relate` is stamped with the calling agent's alias, taken from the runtime registration rather than tool arguments, and every action (search, suggest, expert lookup, stats, neighbors, client network, interaction log) only sees:
+
+- rows the calling agent wrote,
+- rows owned by agents the operator explicitly shares via the workspace allowlist:
+
+```toml
+[agents.agent_a.workspace]
+read_knowledge_from = ["agent_b"]
+```
+
+The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors. A configured but disabled sibling remains a valid source so an active agent can deliberately read its retained knowledge; the disabled sibling does not run or receive reciprocal access.
+
+Live sessions retain the caller identity, not a grant snapshot. Each graph
+operation resolves the current allowlist after storage waits; revocation applies
+to an already registered tool, including rows written after revocation. Missing
+or disabled callers are refused. The config read guard remains held only through
+the synchronous storage operation, never across an asynchronous wait.
+
+Scoping is a confidentiality boundary, not a resource boundary. The `knowledge.max_nodes` budget stays install-wide, so one agent sitting at the cap stops `capture` for every agent on the install even though none of them can see each other's rows.
+
+### Assign pre-attribution rows during upgrade
+
+Rows created by older releases have no owner. They are never visible through an
+agent-scoped tool until startup assigns them to one agent:
+
+- With exactly one enabled agent, startup assigns the legacy graph to that agent.
+- With multiple enabled agents, the `knowledge` tool stays unavailable until the
+  operator selects an enabled owner:
+
+```toml
+[knowledge]
+enabled = true
+legacy_owner_agent = "agent_a"
+```
+
+The assignment is transactional and idempotent. When rows are assigned, the
+runtime logs a warning with the selected alias and row count. After a successful
+multi-agent migration, remove `knowledge.legacy_owner_agent`; leaving it set
+means any future unowned row introduced by an older restore, import, or rollback
+is assigned to that alias on the next startup. Assigned rows obey the same
+directional `read_knowledge_from` rules as newly captured knowledge.
+
+Agent rename moves knowledge ownership, while delete archives and purges it.
+Deletion captures its row and affected-edge set before asynchronous archive work.
+After the archive is durable, purge verifies that exact set inside its write
+transaction. Changed or additional rows or edges are retained with a retry warning;
+retry produces a fresh archive. Creating or renaming an alias onto remaining
+knowledge is refused, including when that residue cannot be inspected. A stale
+retirement cannot purge a later incarnation's new rows.
+
+Initial rename works through the supported gateway or CLI lifecycle surfaces.
+After a partially committed rename, the gateway can retry through its local
+residue probe and the RPC lifecycle path can resume the shared owned-state
+cascade when the destination exists and residue remains. The CLI cannot retry
+after the source alias has been durably removed.
+[Issue #10373](https://github.com/zeroclaw-labs/zeroclaw/issues/10373) tracks a
+shared committed-rename recovery contract across all three surfaces.
+
+Delete writes recoverable memory, knowledge, cron, and ACP exports before it
+purges those stores. A list, inspection, or archive-write failure retains the
+affected state and makes a repeated delete retry the same cascade. Session
+transcripts remain in place while their retired agent attribution is cleared.
+
+The migrated edge schema retains the old three-column uniqueness rule for
+owner-less inserts, so temporarily rolling back to a pre-attribution binary does
+not make repeated `INSERT OR IGNORE` operations duplicate legacy edges. Rows
+written by that old binary are unowned and fail closed again when a scoped binary
+restarts unless an owner can be resolved. In particular, a still-configured
+`legacy_owner_agent` assigns those rows to that alias and emits the warning
+described above.
+
 ## Concepts
 
 The graph stores nodes and directed edges.
@@ -217,3 +290,10 @@ Relationship memory is durable. Treat it like any other public or shared knowled
 - [Skills](./skills.md)
 - [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Privacy & PII discipline](../contributing/privacy.md)
+
+Retirement evidence includes durable insertion identities for edges, so deleting
+and recreating an identical relation cannot authorize an older purge. Existing
+stores gain these identities on normal graph open. If a standalone deletion
+first encounters the older schema, it retains the rows with a warning while the
+cascade upgrades the store; repeating deletion archives the upgraded identities
+and completes cleanup. Read-only config lifecycle probes never run migrations.
