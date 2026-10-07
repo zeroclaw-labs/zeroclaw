@@ -139,6 +139,49 @@ const READ_GIT_CONFIG_OVERRIDES: &[&str] = &[
 ];
 const GIT_LOG_FORMAT: &str = "--pretty=format:%H|%an|%ae|%ad|%s";
 
+/// The exact tree a `git checkout` or `git worktree add` will materialize,
+/// resolved by the tool before anything runs.
+///
+/// Git resolves a bare short name differently per command: `ls-tree`/`diff`
+/// follow rev-parse precedence (tags before branches before remotes) while
+/// `checkout` and `worktree add` interpret the same string branch-first,
+/// and both additionally dwim a not-found branch name to a unique
+/// remote-tracking branch. Passing the same bare string to a preflight
+/// listing and to the mutating command can therefore check one tree and
+/// write another (observed with Git 2.49/2.50: a tag/branch name collision,
+/// and `worktree.guessRemote` after a fetch). Resolving to a fully-spelled
+/// refname or SHA here — and handing THAT form to both commands — removes
+/// the selection ambiguity by construction: the mutating command performs
+/// no dwim of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedGitReference {
+    /// Check out this existing local branch (full `refs/heads/…` refname);
+    /// no branch is created.
+    Branch(String),
+    /// Git's dwim: the named branch does not exist locally, but exactly one
+    /// remote carries it. Create `new_branch` at this remote-tracking ref
+    /// (full `refs/remotes/…` refname) and mark it upstream — the
+    /// documented equivalent of the bare-name convenience.
+    RemoteTrack { refname: String, new_branch: String },
+    /// Any other commit-ish: a custom `refs/…` refname, a full
+    /// `refs/tags/…` refname, or a commit SHA. Both `git checkout` and
+    /// `git worktree add` detach HEAD at this commit — no branch is
+    /// created (basename-branch creation applies only to the omitted and
+    /// dwim selections above).
+    Commit(String),
+}
+
+impl ResolvedGitReference {
+    /// The rev the preflight must list: a full refname or SHA that resolves
+    /// identically in every Git command.
+    fn listing_ref(&self) -> &str {
+        match self {
+            Self::Branch(refname) | Self::Commit(refname) => refname,
+            Self::RemoteTrack { refname, .. } => refname,
+        }
+    }
+}
+
 impl GitOperationsTool {
     /// Construct the tool without a runtime execution boundary.
     ///
@@ -1228,14 +1271,18 @@ impl GitOperationsTool {
 
     /// Reject a `checkout` before it runs if any file that differs between
     /// `HEAD` and the target would land on a `deny_write`-guarded path (for
-    /// example the `.env`/`.git/config` guardrails). `--no-renames` is
-    /// essential here: with rename detection a rename lists only its
-    /// destination, but checkout also deletes the source, which must be
-    /// checked. Fails closed if the difference cannot be listed (unknown ref,
-    /// unborn `HEAD`).
+    /// example the `.env`/`.git/config` guardrails). `listing_ref` is the
+    /// caller-resolved rev the checkout is pinned to — never the bare
+    /// user-supplied name, whose tag/branch collisions `diff` and
+    /// `checkout` resolve differently. `--no-renames` is essential here:
+    /// with rename detection a rename lists only its destination, but
+    /// checkout also deletes the source, which must be checked. Fails
+    /// closed if the difference cannot be listed (unknown ref, unborn
+    /// `HEAD`).
     async fn preflight_checkout(
         &self,
         branch_name: &str,
+        listing_ref: &str,
         working_dir: &Path,
     ) -> anyhow::Result<()> {
         let operation = format!("Checkout of '{branch_name}'");
@@ -1251,7 +1298,7 @@ impl GitOperationsTool {
             "--no-textconv",
             "--end-of-options",
             "HEAD",
-            branch_name,
+            listing_ref,
             "--",
         ];
         let (root, paths) = self
@@ -1336,20 +1383,232 @@ impl GitOperationsTool {
         Ok(())
     }
 
+    /// Enumerate refnames under `namespaces` through the read-classified
+    /// runner. Reference matching elsewhere compares these strings for EXACT
+    /// equality, so pattern characters in a user-supplied name can never
+    /// widen a match the way a `for-each-ref` pattern argument would.
+    async fn list_ref_names(
+        &self,
+        namespaces: &[&str],
+        working_dir: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut args: Vec<&str> =
+            vec!["--no-optional-locks", "for-each-ref", "--format=%(refname)"];
+        args.extend(namespaces.iter().copied());
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        let listing = String::from_utf8(stdout).map_err(|_| {
+            anyhow::Error::msg("Git reference listing is not valid UTF-8; refusing to guess")
+        })?;
+        Ok(listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `checkout`/`worktree add` tracking setup requires the dwim's
+    /// `<remote>/<branch>` spelling — a full `refs/remotes/…` refname is
+    /// rejected as "not a branch". That short spelling resolves through
+    /// rev-parse precedence, so refuse it when anything under a
+    /// higher-precedence namespace (`refs/…`, `refs/heads/…`,
+    /// `refs/tags/…`) would shadow the remote-tracking ref it must map
+    /// back to.
+    fn ensure_unshadowed_remote_start_point(refs: &[String], refname: &str) -> anyhow::Result<()> {
+        let Some(short) = refname.strip_prefix("refs/remotes/") else {
+            anyhow::bail!("Internal error: '{refname}' is not a remote-tracking ref");
+        };
+        for shadow in [
+            format!("refs/{short}"),
+            format!("refs/heads/{short}"),
+            format!("refs/tags/{short}"),
+        ] {
+            if refs.contains(&shadow) {
+                anyhow::bail!(
+                    "Reference '{short}' is shadowed by '{shadow}'; refusing a \
+                     selection that cannot be named exactly"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Remote-tracking branches named exactly `name`
+    /// (`refs/remotes/<remote>/<name>`), excluding `<remote>/HEAD` symrefs,
+    /// which dwim never selects. Returns the FULL refnames. More than one
+    /// match is ambiguous: Git itself refuses the dwim unless
+    /// `checkout.defaultRemote` names one, and this tool refuses it
+    /// outright rather than guessing.
+    fn remote_tracking_matches<'a>(refs: &'a [String], name: &str) -> Vec<&'a str> {
+        refs.iter()
+            .filter(|found| {
+                found
+                    .strip_prefix("refs/remotes/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .is_some_and(|(_, branch)| branch == name && branch != "HEAD")
+            })
+            .map(|found| found.as_str())
+            .collect()
+    }
+
+    /// Read one boolean configuration value with the same hardened
+    /// subprocess configuration the mutating command will run under, so the
+    /// value the tool reasons about is the value Git will act on.
+    /// `Ok(None)` means the key is unset. A value Git cannot parse as a
+    /// boolean refuses the operation, since Git itself would fail on it
+    /// later — after a preflight that assumed something else.
+    async fn read_config_bool(
+        &self,
+        key: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<Option<bool>> {
+        let repository = self
+            .validated_repository_root_async(working_dir, false)
+            .await?;
+        let mut command = tokio::process::Command::new("git");
+        Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
+        command
+            .args(["config", "--null", "--includes", "--get", key])
+            .current_dir(Self::git_subprocess_current_dir(working_dir))
+            .stdin(std::process::Stdio::null());
+        self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
+        let output = command.output().await?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) {
+                return Ok(None);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Git configuration query for '{key}' failed: {stderr}");
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        let value = value.trim_end_matches('\0').trim();
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" | "" => Ok(Some(false)),
+            _ => anyhow::bail!(
+                "Git configuration value '{key}' is not a valid boolean \
+                 ('{value}'); refusing an operation whose selection it controls"
+            ),
+        }
+    }
+
+    /// Resolve a user-supplied checkout-ish name to the exact tree Git will
+    /// select, following the branch-first order `checkout` and
+    /// `worktree add` themselves use: an existing local branch, then the
+    /// unique-remote dwim, then tags and other commit-ishes. The returned
+    /// form is handed to both the preflight listing and the mutating
+    /// command, so neither command re-derives — and mis-derives — the
+    /// selection: a bare short name can resolve differently per command
+    /// (rev-parse precedence puts tags first, while checkout and worktree
+    /// add interpret the same string branch-first).
+    ///
+    /// The order replicates the mutating commands' own selection, verified
+    /// against Git 2.49/2.50: an existing local branch is checked out; a
+    /// name that resolves to any other ref (custom `refs/…` entry or tag)
+    /// detaches at that commit — the remote dwim is only consulted when the
+    /// name resolves to nothing else; a name matching remote-tracking
+    /// branches in exactly one remote dwims to a new tracking branch; and
+    /// anything left over must resolve through rev-parse to one commit id
+    /// or the operation is refused.
+    ///
+    /// `allow_remote_dwim` carries the caller's dwim gating: a supplied
+    /// name that is not a local branch dwims to a unique remote-tracking
+    /// branch for both commands regardless of `worktree.guessRemote`, but
+    /// `checkout.guess=false` disables that convenience for checkout — in
+    /// which case a remote-only name is refused rather than silently
+    /// reinterpreted as a detached commit.
+    async fn resolve_supplied_git_reference(
+        &self,
+        supplied: &str,
+        working_dir: &Path,
+        allow_remote_dwim: bool,
+    ) -> anyhow::Result<ResolvedGitReference> {
+        if supplied.is_empty() {
+            anyhow::bail!("Cannot resolve an empty Git reference");
+        }
+        let refs = self
+            .list_ref_names(&["refs/heads/", "refs/remotes/", "refs/tags/"], working_dir)
+            .await?;
+        let local = format!("refs/heads/{supplied}");
+        if refs.contains(&local) {
+            return Ok(ResolvedGitReference::Branch(local));
+        }
+        // A name that resolves to any ref other than a branch detaches at
+        // that commit; the remote dwim below is only consulted when the
+        // name resolves to nothing else (verified with Git 2.49/2.50: a
+        // name that is both a tag and a unique remote-tracking branch
+        // detaches at the TAG).
+        for resolvable in [format!("refs/{supplied}"), format!("refs/tags/{supplied}")] {
+            if refs.contains(&resolvable) {
+                return Ok(ResolvedGitReference::Commit(resolvable));
+            }
+        }
+        let remotes = Self::remote_tracking_matches(&refs, supplied);
+        match remotes.as_slice() {
+            [] => {}
+            [only] => {
+                if !allow_remote_dwim {
+                    anyhow::bail!(
+                        "Reference '{supplied}' exists only as a remote-tracking branch \
+                         and remote guessing is disabled (checkout.guess=false); \
+                         refusing a tree that cannot be named exactly"
+                    );
+                }
+                Self::ensure_unshadowed_remote_start_point(&refs, only)?;
+                return Ok(ResolvedGitReference::RemoteTrack {
+                    refname: (*only).to_string(),
+                    new_branch: supplied.to_string(),
+                });
+            }
+            _ => anyhow::bail!(
+                "Reference '{supplied}' exists as a remote-tracking branch in {} \
+                 remotes; refusing an ambiguous selection that cannot be checked \
+                 exactly",
+                remotes.len()
+            ),
+        }
+        // Not a branch, a remote dwim, or a tag: resolve the remaining
+        // commit-ish (SHA, ref expression) to a full commit id. The commit
+        // id is what both the preflight and execution use, so no later
+        // resolution step can disagree.
+        let rev = format!("{supplied}^{{commit}}");
+        let args = [
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &rev,
+        ];
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        let commit = String::from_utf8(stdout)
+            .map_err(|_| anyhow::Error::msg("Git revision output is not valid UTF-8"))?
+            .trim()
+            .to_string();
+        let hexadecimal = commit.chars().all(|c| c.is_ascii_hexdigit());
+        if !hexadecimal || (commit.len() != 40 && commit.len() != 64) {
+            anyhow::bail!(
+                "Reference '{supplied}' did not resolve to exactly one commit; \
+                 refusing a tree that cannot be named exactly"
+            );
+        }
+        Ok(ResolvedGitReference::Commit(commit))
+    }
+
     /// Resolve which tree `git worktree add -- <path>` materializes when the
     /// branch argument is omitted. Git's convenience rule checks out an
-    /// EXISTING branch named after the path's basename when one exists, and
-    /// only creates a new branch from `HEAD` when it does not — so `HEAD` is
-    /// not always the tree that gets written. The exact ref is resolved
-    /// through a read-classified listing; any outcome that cannot be proven
-    /// exactly (non-UTF-8 basename, a basename whose pattern matches more than
-    /// the one expected ref, or a Git failure) refuses the operation instead
-    /// of guessing.
-    async fn resolve_worktree_add_reference(
+    /// EXISTING branch named after the path's basename when one exists; with
+    /// `worktree.guessRemote` enabled it instead bases a new branch on a
+    /// remote-tracking branch of the same name when exactly one remote
+    /// carries it, and only creates a new branch from `HEAD` otherwise — so
+    /// `HEAD` is not always the tree that gets written. `Ok(None)` is the
+    /// create-from-HEAD case. Any outcome that cannot be proven exactly
+    /// (non-UTF-8 basename, a basename matching more than one remote, or a
+    /// Git failure) refuses the operation instead of guessing.
+    async fn resolve_worktree_omitted_reference(
         &self,
         target: &Path,
         working_dir: &Path,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Option<ResolvedGitReference>> {
         let Some(basename) = target
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
@@ -1361,34 +1620,38 @@ impl GitOperationsTool {
                  refusing to authorize a tree that cannot be named exactly"
             );
         };
+        let refs = self
+            .list_ref_names(&["refs/heads/", "refs/remotes/"], working_dir)
+            .await?;
         let expected = format!("refs/heads/{basename}");
-        let args = [
-            "--no-optional-locks",
-            "for-each-ref",
-            "--format=%(refname)",
-            &expected,
-        ];
-        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
-        let listing = String::from_utf8(stdout).map_err(|_| {
-            anyhow::Error::msg("Worktree add blocked: the branch listing is not valid UTF-8")
-        })?;
-        let matched: Vec<&str> = listing
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        if matched.iter().any(|found| *found != expected.as_str()) {
-            anyhow::bail!(
-                "Worktree add blocked: the omitted branch argument is ambiguous (basename \
-                 '{basename}' does not name exactly one branch); refusing to authorize a \
-                 tree that cannot be named exactly"
-            );
+        if refs.contains(&expected) {
+            return Ok(Some(ResolvedGitReference::Branch(expected)));
         }
-        if matched.is_empty() {
-            Ok("HEAD".to_string())
-        } else {
-            Ok(expected)
+        if self
+            .read_config_bool("worktree.guessRemote", working_dir)
+            .await?
+            .unwrap_or(false)
+        {
+            let remotes = Self::remote_tracking_matches(&refs, &basename);
+            match remotes.as_slice() {
+                [only] => {
+                    Self::ensure_unshadowed_remote_start_point(&refs, only)?;
+                    return Ok(Some(ResolvedGitReference::RemoteTrack {
+                        refname: (*only).to_string(),
+                        new_branch: basename,
+                    }));
+                }
+                [] => {}
+                _ => anyhow::bail!(
+                    "Worktree add blocked: the omitted branch argument is ambiguous \
+                     (basename '{basename}' matches a remote-tracking branch in {} \
+                     remotes); refusing to authorize a tree that cannot be named \
+                     exactly",
+                    remotes.len()
+                ),
+            }
         }
+        Ok(None)
     }
 
     /// Check every file `git worktree add` would materialize under `target`.
@@ -2179,16 +2442,89 @@ impl GitOperationsTool {
             anyhow::bail!("Branch name contains invalid characters");
         }
 
+        // Resolve the exact tree `git checkout <branch_name>` materializes
+        // and pin execution to it: a bare short name that collides across
+        // namespaces (tag vs branch) resolves differently in `diff` than in
+        // `checkout`, and checkout additionally dwims a not-found branch to
+        // a unique remote-tracking branch (unless checkout.guess=false).
+        // `HEAD` re-checks out the current branch and moves nothing, so it
+        // passes through as-is — the same string reaches both commands.
+        // A name that cannot be resolved exactly is refused, not run.
+        let resolved = if branch_name == "HEAD" {
+            None
+        } else {
+            let allow_remote_dwim = match self.read_config_bool("checkout.guess", working_dir).await
+            {
+                Ok(guess) => guess.unwrap_or(true),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout failed: {e}")),
+                    });
+                }
+            };
+            match self
+                .resolve_supplied_git_reference(branch_name, working_dir, allow_remote_dwim)
+                .await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "branch": branch_name,
+                            })),
+                        "git_operations: checkout reference refused before Git ran"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout failed: {e}")),
+                    });
+                }
+            }
+        };
+        let listing_ref = resolved
+            .as_ref()
+            .map(ResolvedGitReference::listing_ref)
+            .unwrap_or("HEAD");
+
         if let Some(refused) = preflight_outcome(
-            self.preflight_checkout(branch_name, working_dir).await,
+            self.preflight_checkout(branch_name, listing_ref, working_dir)
+                .await,
             false,
         )? {
             return Ok(refused);
         }
 
-        let output = self
-            .run_git_command(&["checkout", branch_name], working_dir)
-            .await;
+        // Same fully-spelled form the preflight listed; options precede the
+        // positional so no user string is re-interpreted by Git's dwim
+        // rules at run time.
+        let mut checkout_args: Vec<String> = vec!["checkout".to_string()];
+        match &resolved {
+            None => checkout_args.push("HEAD".to_string()),
+            Some(ResolvedGitReference::Branch(refname))
+            | Some(ResolvedGitReference::Commit(refname)) => checkout_args.push(refname.clone()),
+            Some(ResolvedGitReference::RemoteTrack {
+                refname,
+                new_branch,
+            }) => {
+                checkout_args.push("--track".to_string());
+                checkout_args.push("-b".to_string());
+                checkout_args.push(new_branch.clone());
+                // Tracking setup needs the `<remote>/<branch>` spelling;
+                // resolution verified it maps back to `refname` alone.
+                let start_point = refname
+                    .strip_prefix("refs/remotes/")
+                    .unwrap_or(refname.as_str());
+                checkout_args.push(start_point.to_string());
+            }
+        }
+        let checkout_args: Vec<&str> = checkout_args.iter().map(String::as_str).collect();
+        let output = self.run_git_command(&checkout_args, working_dir).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
@@ -2440,29 +2776,75 @@ impl GitOperationsTool {
                     .get("branch")
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
-                let mut git_args = vec!["worktree", "add", "--", git_worktree_path];
-                if !branch.is_empty() {
-                    self.sanitize_git_args(branch)?;
-                    git_args.push(branch);
-                }
-                // Without a branch argument, Git checks out an existing branch
-                // named after the worktree path's basename when one exists, and
-                // only creates a new branch from HEAD otherwise. Resolve which
-                // of the two applies so the preflight inspects the tree Git
-                // actually materializes, not unconditionally `HEAD`.
-                let reference = if branch.is_empty() {
-                    self.resolve_worktree_add_reference(&worktree_path, working_dir)
+                // Resolve the exact tree this add materializes BEFORE
+                // anything runs — the omitted-branch dwim (basename branch,
+                // `worktree.guessRemote` remote match, or HEAD) or the
+                // supplied reference (branch-first, then other resolvable
+                // refs which detach, then the unique-remote dwim) — and pin
+                // execution to the resolution. The preflight lists the
+                // resolved ref and the command below receives the same
+                // fully-spelled form, so Git never re-derives the selection
+                // at run time: the checked tree is the tree that gets
+                // written.
+                let resolved = if branch.is_empty() {
+                    self.resolve_worktree_omitted_reference(&worktree_path, working_dir)
                         .await?
                 } else {
-                    branch.to_string()
+                    self.sanitize_git_args(branch)?;
+                    Some(
+                        self.resolve_supplied_git_reference(branch, working_dir, true)
+                            .await?,
+                    )
                 };
+                let listing_ref = resolved
+                    .as_ref()
+                    .map(ResolvedGitReference::listing_ref)
+                    .unwrap_or("HEAD");
                 if let Some(refused) = preflight_outcome(
-                    self.preflight_worktree_add(&worktree_path, &reference, working_dir)
+                    self.preflight_worktree_add(&worktree_path, listing_ref, working_dir)
                         .await,
                     true,
                 )? {
                     return Ok(refused);
                 }
+                // Options precede `--`; only tool-built full refnames or
+                // commit ids follow it, so no user string is re-interpreted
+                // by Git's dwim rules at run time.
+                let mut git_args: Vec<String> = vec!["worktree".to_string(), "add".to_string()];
+                let mut positional: Option<String> = None;
+                match &resolved {
+                    Some(ResolvedGitReference::Branch(refname))
+                    | Some(ResolvedGitReference::Commit(refname)) => {
+                        positional = Some(refname.clone());
+                    }
+                    Some(ResolvedGitReference::RemoteTrack {
+                        refname,
+                        new_branch,
+                    }) => {
+                        git_args.push("--track".to_string());
+                        git_args.push("-b".to_string());
+                        git_args.push(new_branch.clone());
+                        // Tracking setup needs the `<remote>/<branch>` spelling;
+                        // resolution verified it maps back to `refname` alone.
+                        let start_point = refname
+                            .strip_prefix("refs/remotes/")
+                            .unwrap_or(refname.as_str());
+                        positional = Some(start_point.to_string());
+                    }
+                    None => {
+                        // Create the basename branch from HEAD. Pinning
+                        // --no-guess-remote keeps execution on this
+                        // resolution even if a remote-tracking branch of
+                        // the same name exists.
+                        git_args.push("--no-guess-remote".to_string());
+                    }
+                }
+                git_args.push("--".to_string());
+                git_args.push(git_worktree_path.to_string());
+                if let Some(positional) = positional {
+                    git_args.push(positional);
+                }
+                let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
                 self.run_git_command(&git_args, working_dir).await?;
                 Ok(ToolResult {
                     success: true,
@@ -7314,6 +7696,816 @@ mod tests {
         assert!(
             wt.join("notes.txt").exists(),
             "the new worktree must materialize HEAD's tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_a_guess_remote_branch_tree() {
+        // `git worktree add -- <path>` with no branch and
+        // `worktree.guessRemote=true` bases the new branch on a unique
+        // remote-tracking branch of the same name — NOT on HEAD. The
+        // preflight must inspect that remote tree: HEAD here is clean while
+        // `origin/topic` carries a denied `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "test setup must keep .env off HEAD's tree"
+        );
+        let wt = root.join("topic");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add must inspect the guess-remote tree when the branch is omitted: {:?}",
+            result.error
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the remote tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_ref_checks_the_branch_over_the_same_named_tag() {
+        // With a tag and a branch both named `topic`, `ls-tree topic`
+        // resolves the TAG (rev-parse precedence) while
+        // `git worktree add … topic` checks out the BRANCH. Passing the
+        // bare string to both commands checks one tree and writes another;
+        // the tool must resolve once, branch-first, and pin both commands
+        // to that tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add of an ambiguous name must inspect the branch tree: {:?}",
+            result.error
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the branch tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_guess_remote_creates_tracking_branch_when_allowed() {
+        // The refused guess-remote selection must remain a real dwim when
+        // the remote tree is allowed: the add succeeds, materializes the
+        // remote tree, and marks the remote branch upstream — the pinned
+        // `--track -b` form's documented equivalent.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("topic");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed guess-remote add must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("remote-note.txt").exists(),
+            "the worktree must materialize the remote tree, not HEAD's"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "topic",
+            "the dwim must create the basename-named branch"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim-created branch must track the remote branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_remote_only_ref_creates_tracking_branch_when_allowed() {
+        // A supplied name that is not a local branch but exists on exactly
+        // one remote dwims to `--track -b <name> <remote>/<name>` even with
+        // `worktree.guessRemote` unset. The preflight must inspect the
+        // remote tree, and an allowed one must still create the tracking
+        // branch the bare command would.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed remote-only dwim must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("remote-note.txt").exists(),
+            "the worktree must materialize the remote tree"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim must set up tracking for the supplied name"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_ref_prefers_the_tag_over_a_remote_match() {
+        // A name that is BOTH a tag and a unique remote-tracking branch (no
+        // local branch) detaches at the TAG — Git consults the remote dwim
+        // only when the name resolves to nothing else (verified with Git
+        // 2.49/2.50). The resolution must replicate that, not dwim past a
+        // resolvable tag and materialize the remote's tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "tag-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("tagged.txt"), "tagged").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tagged.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tagged",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "remote-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/remote-carrier",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "tag-carrier", "remote-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a tag/remote name collision must keep working, detached at the tag: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("tagged.txt").exists(),
+            "the worktree must materialize the tag's tree"
+        );
+        assert!(
+            !wt.join("remote-note.txt").exists(),
+            "the remote-tracking tree must NOT win over the resolvable tag"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            !branch.status.success(),
+            "the tag selection must detach HEAD, not dwim to a tracking branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_tag_ref_materializes_the_tag_tree() {
+        // A tag with no same-named branch is a plain commit-ish: the add
+        // checks out the tag's commit with a DETACHED HEAD, exactly as the
+        // bare command does. Pinning the resolution must keep that
+        // outcome — with the tag's tree, not a guessed one, listed first.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("tagged.txt"), "tagged").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tagged.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tagged",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed tag commit-ish must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("tagged.txt").exists(),
+            "the worktree must materialize the tag's tree"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            !branch.status.success(),
+            "the tag commit-ish must detach HEAD, as the bare command does"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_when_multiple_remotes_match() {
+        // `worktree.guessRemote=true` with the basename carried by more
+        // than one remote is a selection Git itself refuses; the tool
+        // refuses it in the preflight rather than guessing a tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        for remote in ["origin", "upstream"] {
+            std::process::Command::new("git")
+                .args([
+                    "update-ref",
+                    &format!("refs/remotes/{remote}/topic"),
+                    "refs/heads/master",
+                ])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("topic");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await;
+
+        match result {
+            Ok(result) => assert!(
+                !result.success,
+                "a basename on multiple remotes must be refused, not guessed: {:?}",
+                result.error
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("ambiguous"),
+                "a basename on multiple remotes must be refused, not guessed: {error:#}"
+            ),
+        }
+        assert!(!wt.exists(), "a refused add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn checkout_supplied_ref_checks_the_branch_over_the_same_named_tag() {
+        // The checkout sibling of the worktree finding: with a tag and a
+        // branch both named `topic`, `diff HEAD topic` resolves the TAG
+        // (empty diff here, so nothing would be checked) while
+        // `git checkout topic` checks out the BRANCH and writes `.env`.
+        // The preflight must list the resolved branch tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "test setup must keep .env out of the working tree"
+        );
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout of an ambiguous name must inspect the branch tree: {:?}",
+            result.error
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked checkout must not write the branch tree"
+        );
+        let head = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "master",
+            "a blocked checkout must not move HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_remote_only_ref_creates_tracking_branch_when_allowed() {
+        // A supplied name that exists only as a remote-tracking branch
+        // dwims to a new tracking branch, exactly as the bare command
+        // would; the pinned `--track -b` form must preserve that.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed remote-only checkout dwim must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            root.join("remote-note.txt").exists(),
+            "the checkout must materialize the remote tree"
+        );
+        let head = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "topic",
+            "the dwim must create and switch to the named branch"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim-created branch must track the remote branch"
         );
     }
 
