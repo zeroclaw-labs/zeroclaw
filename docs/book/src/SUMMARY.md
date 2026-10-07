@@ -64,6 +64,7 @@
   - [Generated documentation pipeline](./architecture/generated-documentation-pipeline.md)
   - [Localization catalog lifecycle](./architecture/localization-catalog-lifecycle.md)
   - [RPC socket transport](./architecture/rpc-socket.md)
+  - [Gateway route coverage](./architecture/gateway-ipc-coverage.md)
 - [Reference](./reference/index.md)
   - [CLI](./reference/cli.md)
   - [Config](./reference/config.md)
