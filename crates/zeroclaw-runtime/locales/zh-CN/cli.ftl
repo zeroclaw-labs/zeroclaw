@@ -1160,6 +1160,7 @@ channel-telegram-approval-ack-already-resolved = 审批已被处理
 channel-telegram-voice-drop-too-long = ⚠️ 已跳过音频消息：时长超过 { $limit_secs } 秒的上限。请发送更短的录音，或分段发送。
 channel-telegram-voice-drop-file-unavailable = ⚠️ 已跳过音频消息：无法从 Telegram 获取该文件——可能文件过大或已不可用。请尝试更小或更短的文件。
 channel-telegram-voice-drop-empty-transcript = ⚠️ 已跳过音频消息：未能从录音中识别出任何内容。请用更清晰的录音重试。
+channel-telegram-voice-drop-transcription-rejected = ⚠️ 已跳过音频消息：转写服务无法处理这段录音——可能过长或格式不受支持。请尝试更短的录音或其他格式。
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许

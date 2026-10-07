@@ -1159,6 +1159,7 @@ channel-telegram-approval-ack-already-resolved = 承認はすでに処理済み�
 channel-telegram-voice-drop-too-long = ⚠️ 音声メッセージをスキップしました: { $limit_secs }秒の上限を超えています。短い録音を送るか、分割して送ってください。
 channel-telegram-voice-drop-file-unavailable = ⚠️ 音声メッセージをスキップしました: Telegram からファイルを取得できませんでした。大きすぎるか、すでに利用できない可能性があります。より小さいか短いファイルでお試しください。
 channel-telegram-voice-drop-empty-transcript = ⚠️ 音声メッセージをスキップしました: 録音から何も認識できませんでした。より明瞭な録音でもう一度お試しください。
+channel-telegram-voice-drop-transcription-rejected = ⚠️ 音声メッセージをスキップしました: 文字起こしサービスでこの録音を処理できませんでした。長すぎるか、未対応の形式の可能性があります。短い録音か別の形式でお試しください。
 channel-discord-approval-btn-allow-once = 今回のみ許可
 channel-discord-approval-btn-allow-session = このセッションのみ許可
 channel-discord-approval-btn-allow-always = 常に許可
