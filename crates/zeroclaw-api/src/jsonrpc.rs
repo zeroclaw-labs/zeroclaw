@@ -329,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Enqueue a raw JSON line immediately. Returns `false` and drops the line
+    /// when the writer queue is full or closed.
+    pub fn try_send_raw(&self, json: String) -> bool {
+        self.writer_tx.try_send(json).is_ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.

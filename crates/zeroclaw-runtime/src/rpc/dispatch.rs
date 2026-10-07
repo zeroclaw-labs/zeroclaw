@@ -2195,6 +2195,64 @@ impl RpcDispatcher {
         std::collections::HashMap::new()
     }
 
+    /// Connection origin and live read authority own this private UI capability.
+    /// An unbound direct adapter cannot inherit local native RPC permission.
+    fn local_file_diffs_allowed(&self, agent_alias: &str) -> bool {
+        let lease = self.ctx.auth.hold_authority();
+        self.local_file_diffs_allowed_under(&lease, agent_alias)
+    }
+
+    fn local_file_diffs_allowed_under(
+        &self,
+        lease: &crate::rpc::auth::AuthorityLease<'_>,
+        agent_alias: &str,
+    ) -> bool {
+        use zeroclaw_api::grants::{Resource, Verb};
+        if self.transport_kind != crate::rpc::transport::TransportKind::Local
+            || self.access_policy != RpcAccessPolicy::TrustedLocal
+            || self.connection_cancel.is_cancelled()
+        {
+            return false;
+        }
+        let Some(auth) = self.auth.as_ref() else {
+            return false;
+        };
+        current_authority_under(lease, auth, Method::SessionPrompt).is_ok_and(|grants| {
+            grants.admin
+                || (grants.permits(Resource::Files, Verb::Read)
+                    && grants.permits(Resource::Sessions, Verb::Read)
+                    && grants.may_use_agent(agent_alias))
+        })
+    }
+
+    async fn forward_local_file_diff(
+        &self,
+        session_id: &str,
+        agent_alias: &str,
+        event: &TurnEvent,
+    ) {
+        let TurnEvent::LocalFileDiff { id, diff } = event else {
+            return;
+        };
+        let params = serde_json::json!({
+            "type": "local_file_diff",
+            "session_id": session_id,
+            "tool_call_id": id,
+            "previous": diff.previous(),
+            "written": diff.written(),
+        });
+        let notification = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+        if let Ok(serialized) = serde_json::to_string(&notification) {
+            // Order the final authority check and enqueue before any policy
+            // revocation. A full queue drops this private payload immediately;
+            // waiting for space could send it after its grants are revoked.
+            let lease = self.ctx.auth.hold_authority();
+            if self.local_file_diffs_allowed_under(&lease, agent_alias) {
+                let _ = self.rpc.try_send_raw(serialized);
+            }
+        }
+    }
+
     fn may_use_forwarded_environment(
         &self,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
@@ -6695,6 +6753,9 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
+        let local_file_diffs = self.local_file_diffs_allowed(&agent_alias);
+        let local_diff_agent_alias = agent_alias.clone();
+        let local_diff_delivery = Arc::new(self.spawn_handle());
         let turn = execute_turn(
             agent,
             prompt.clone(),
@@ -6705,6 +6766,7 @@ impl RpcDispatcher {
                 model_provider,
                 model,
                 channel: "rpc",
+                local_file_diffs,
             },
             cost_context,
             self.connection_activity.clone(),
@@ -6716,7 +6778,15 @@ impl RpcDispatcher {
                 let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
                 let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
                 let checkpoint_cancel = checkpoint_cancel.clone();
+                let local_diff_delivery = Arc::clone(&local_diff_delivery);
+                let local_diff_agent_alias = local_diff_agent_alias.clone();
                 async move {
+                    if matches!(&event, TurnEvent::LocalFileDiff { .. }) {
+                        local_diff_delivery
+                            .forward_local_file_diff(&sid, &local_diff_agent_alias, &event)
+                            .await;
+                        return;
+                    }
                     if let (
                         Some(store),
                         TurnEvent::Usage {
@@ -12676,6 +12746,7 @@ fn plan_replay_notification(
 
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
+        TurnEvent::LocalFileDiff { .. } => return None,
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
             session_id: session_id.to_string(),
             text: delta.clone(),
@@ -14051,6 +14122,158 @@ mod tests {
             },
         );
         config
+    }
+
+    fn private_file_diff_event() -> TurnEvent {
+        TurnEvent::LocalFileDiff {
+            id: "write-1".into(),
+            diff: zeroclaw_api::local_file_diff::LocalFileDiff::new(
+                "private-old-sentinel".into(),
+                "replacement".into(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_delivery_requires_current_local_connection_authority() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (mut dispatcher, mut rx) = local_operator(&ctx).await;
+        let event = private_file_diff_event();
+        assert!(dispatcher.local_file_diffs_allowed("test-agent"));
+        dispatcher
+            .forward_local_file_diff("local-chat-or-code", "test-agent", &event)
+            .await;
+        let notification: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(notification["method"], "session/update");
+        assert_eq!(notification["params"]["type"], "local_file_diff");
+        assert_eq!(notification["params"]["session_id"], "local-chat-or-code");
+        assert_eq!(notification["params"]["tool_call_id"], "write-1");
+        assert_eq!(notification["params"]["previous"], "private-old-sentinel");
+        assert_eq!(notification["params"]["written"], "replacement");
+
+        dispatcher.transport_kind = crate::rpc::transport::TransportKind::Wss;
+        assert!(!dispatcher.local_file_diffs_allowed("test-agent"));
+        dispatcher
+            .forward_local_file_diff("s1", "test-agent", &event)
+            .await;
+        assert!(rx.try_recv().is_err());
+        dispatcher.transport_kind = crate::rpc::transport::TransportKind::Local;
+        dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+        assert!(!dispatcher.local_file_diffs_allowed("test-agent"));
+        dispatcher
+            .forward_local_file_diff("s1", "test-agent", &event)
+            .await;
+        assert!(rx.try_recv().is_err());
+        dispatcher.access_policy = RpcAccessPolicy::TrustedLocal;
+        dispatcher.auth = None;
+        assert!(!dispatcher.local_file_diffs_allowed("test-agent"));
+        dispatcher
+            .forward_local_file_diff("s1", "test-agent", &event)
+            .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_delivery_rechecks_scoped_read_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config_in(&tmp, 4242);
+        configure_agent_alpha(&mut config);
+        let profile = config.permission_profiles.get_mut("reader").unwrap();
+        profile
+            .grants
+            .insert(Resource::Sessions, vec![Verb::Execute, Verb::Read]);
+        profile.grants.insert(Resource::Files, vec![Verb::Read]);
+        profile.allowed_agents = vec!["alpha".into()];
+        let ctx = enforcement_ctx(config.clone());
+        let (dispatcher, mut rx) = roster_peer(&ctx, 4242).await;
+        assert!(dispatcher.local_file_diffs_allowed("alpha"));
+        let event = private_file_diff_event();
+        dispatcher
+            .forward_local_file_diff("s1", "alpha", &event)
+            .await;
+        assert!(rx.try_recv().is_ok());
+        // Retain prompt authority while independently removing each read grant.
+        // The connection's original grants still contain both permissions.
+        for resource in [Resource::Files, Resource::Sessions] {
+            let mut narrowed = config.clone();
+            let verbs = narrowed
+                .permission_profiles
+                .get_mut("reader")
+                .unwrap()
+                .grants
+                .get_mut(&resource)
+                .unwrap();
+            verbs.retain(|verb| *verb != Verb::Read);
+            ctx.auth.refresh_from_config(&narrowed).unwrap();
+            assert!(!dispatcher.local_file_diffs_allowed("alpha"));
+            dispatcher
+                .forward_local_file_diff("s1", "alpha", &event)
+                .await;
+            assert!(rx.try_recv().is_err());
+        }
+        let profile = config.permission_profiles.get_mut("reader").unwrap();
+        profile.allowed_agents.clear();
+        ctx.auth.refresh_from_config(&config).unwrap();
+        assert!(!dispatcher.local_file_diffs_allowed("alpha"));
+        dispatcher
+            .forward_local_file_diff("s1", "alpha", &event)
+            .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_file_diff_has_no_checkpoint_or_generic_notification_projection() {
+        let event = private_file_diff_event();
+        assert!(checkpoint_fragment_for_event(&event).is_none());
+        assert!(notification_for_turn_event("s1", &event).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_full_writer_queue_drops_payload_without_delayed_delivery() {
+        use futures_util::FutureExt;
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config_in(&tmp, 4242);
+        configure_agent_alpha(&mut config);
+        let profile = config.permission_profiles.get_mut("reader").unwrap();
+        profile
+            .grants
+            .insert(Resource::Sessions, vec![Verb::Execute, Verb::Read]);
+        profile.grants.insert(Resource::Files, vec![Verb::Read]);
+        profile.allowed_agents = vec!["alpha".into()];
+        let ctx = enforcement_ctx(config.clone());
+        let (mut dispatcher, _original_rx) = roster_peer(&ctx, 4242).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+        assert!(dispatcher.rpc.try_send_raw("occupied".into()));
+        assert!(dispatcher.local_file_diffs_allowed("alpha"));
+
+        let event = private_file_diff_event();
+        dispatcher
+            .forward_local_file_diff("s1", "alpha", &event)
+            .now_or_never()
+            .expect("a full writer queue must drop the private diff without waiting");
+
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .unwrap()
+            .grants
+            .remove(&Resource::Files);
+        ctx.auth.refresh_from_config(&config).unwrap();
+        assert!(!dispatcher.local_file_diffs_allowed("alpha"));
+        assert_eq!(rx.recv().await.as_deref(), Some("occupied"));
+        // Reopening the slot must not release a private payload retained by a
+        // waiting send. A new event is also denied by the now-revoked grant.
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        dispatcher
+            .forward_local_file_diff("s1", "alpha", &event)
+            .await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

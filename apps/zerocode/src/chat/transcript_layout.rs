@@ -29,6 +29,7 @@ pub(super) struct EntryLayoutInput<'a> {
     pub entry: &'a ChatEntry,
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
+    pub local_file_diff: Option<&'a zeroclaw_api::local_file_diff::LocalFileDiff>,
 }
 
 /// Coupled committed layout indexes. Production consumers only borrow this view.
@@ -262,6 +263,7 @@ impl TranscriptLayoutCache {
             show_thoughts,
             input.disclosure,
             width,
+            input.local_file_diff,
             &mut self.layout.cached_lines,
         );
         let after = self.layout.cached_lines.len();
