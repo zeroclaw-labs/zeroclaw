@@ -69,8 +69,14 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-/// Trait for session persistence backends.
-/// Implementations must be `Send + Sync` for sharing across async tasks.
+/// Guard returned by admission and retained through a synchronous storage effect.
+pub trait SessionEffectGuard {}
+impl<T> SessionEffectGuard for T {}
+
+pub type SessionEffectAuthorization<'a> =
+    dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
+
+/// Trait for session persistence backends shared across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
@@ -372,6 +378,21 @@ pub trait SessionBackend: Send + Sync {
 
     /// Set the session state (e.g. "idle", "running", "error").
     /// `turn_id` identifies the current turn (set when running, cleared on idle).
+    /// Admit a no-state backend against the caller's locked live owner.
+    /// Persisting backends must instead resolve their stored owner under the
+    /// mutation lock and retain the returned guard through commit.
+    fn set_session_state_authorized(
+        &self,
+        _session_key: &str,
+        _state: &str,
+        _turn_id: Option<&str>,
+        live_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let _authority = authorize(live_owner)?;
+        Ok(())
+    }
+
     fn set_session_state(
         &self,
         _session_key: &str,

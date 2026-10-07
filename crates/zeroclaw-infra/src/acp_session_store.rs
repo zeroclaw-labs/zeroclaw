@@ -1998,11 +1998,23 @@ impl AcpSessionStore {
         turn_id: &str,
         messages: &[ConversationMessage],
     ) -> Result<()> {
+        self.begin_turn_checkpoint_authorized(session_uuid, turn_id, messages, |_| Ok(()))
+    }
+
+    pub fn begin_turn_checkpoint_authorized<G>(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP turn checkpoint transaction")?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
         tx.execute(
             "INSERT INTO acp_turn_checkpoints (session_id, turn_id) VALUES (?1, ?2)",
             params![session_id, turn_id],
@@ -2012,6 +2024,17 @@ impl AcpSessionStore {
         tx.commit()
             .context("Failed to commit ACP turn checkpoint")?;
         Ok(())
+    }
+
+    fn effect_owner(conn: &Connection, session_uuid: &str) -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT principal_id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn append_turn_checkpoint(
@@ -3440,6 +3463,69 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn guarded_prompt_checkpoint_rechecks_after_storage_wait() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+        store
+            .create_session("s", "test", "/tmp", Some("user:bob"))
+            .unwrap();
+        store
+            .append_turn(
+                "s",
+                &[ConversationMessage::Chat(ChatMessage::user("retained"))],
+            )
+            .unwrap();
+        let before =
+            serde_json::to_value(store.load_session("s").unwrap().unwrap().messages).unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let lock = store.conn.lock();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let worker_store = Arc::clone(&store);
+        let worker_allowed = Arc::clone(&allowed);
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            worker_store.begin_turn_checkpoint_authorized(
+                "s",
+                "turn",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "must not persist",
+                ))],
+                |owner| {
+                    assert_eq!(owner, Some("user:bob"));
+                    anyhow::ensure!(worker_allowed.load(Ordering::SeqCst), "revoked");
+                    Ok(())
+                },
+            )
+        });
+        waiting.recv().unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        drop(lock);
+        assert!(worker.join().unwrap().is_err());
+        assert!(!store.recover_turn_checkpoint("s", "unexpected").unwrap());
+        assert_eq!(
+            serde_json::to_value(store.load_session("s").unwrap().unwrap().messages).unwrap(),
+            before
+        );
+        store
+            .begin_turn_checkpoint_authorized(
+                "s",
+                "control",
+                &[ConversationMessage::Chat(ChatMessage::user("accepted"))],
+                |owner| {
+                    assert_eq!(owner, Some("user:bob"));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(store.recover_turn_checkpoint("s", "expected").unwrap());
+    }
+
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::{

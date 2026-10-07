@@ -27710,16 +27710,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
-        tools::AllToolsResult {
-            tools,
-            delegate_handle: None,
-            ask_user_handle: None,
-            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            poll_handle: None,
-            escalate_handle: None,
-            channel_room_handle: None,
-            unfiltered_tool_arcs: Vec::new(),
-        }
+        tools::AllToolsResult::from_prebuilt_tools(tools)
     }
 
     /// A mock HTTP MCP server that advertises `resources` support and serves one
