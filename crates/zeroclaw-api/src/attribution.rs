@@ -244,6 +244,7 @@ impl ProviderKind {
 #[strum(serialize_all = "snake_case")]
 pub enum ModelProviderKind {
     Anthropic,
+    ClaudeCodeNative,
     #[strum(serialize = "openai")]
     OpenAi,
     #[strum(serialize = "openai_codex")]

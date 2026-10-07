@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroclaw_config::presets::{
     AgentIdentity, BuilderSubmission, MemoryChoice, SelectorChoice, risk_preset,
 };
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{ClaudeCodeBillingSource, Config, ModelProviderConfig};
 use zeroclaw_providers::auth::{self, AuthFlowContext, AuthService};
 use zeroclaw_runtime::quickstart::{self, QuickstartApplyOutcome, Surface};
 
@@ -26,8 +26,16 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(90);
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Client {
     ChatgptPlan,
-    #[value(skip)]
     ClaudeCode,
+}
+
+impl Client {
+    fn family(self) -> &'static str {
+        match self {
+            Self::ChatgptPlan => "openai",
+            Self::ClaudeCode => "claude_code_native",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -37,6 +45,24 @@ pub(crate) enum ExpectedBilling {
     Api,
     #[value(name = "cloud_or_gateway")]
     CloudOrGateway,
+}
+
+impl ExpectedBilling {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Api => "api",
+            Self::CloudOrGateway => "cloud_or_gateway",
+        }
+    }
+
+    fn claude_source(self) -> ClaudeCodeBillingSource {
+        match self {
+            Self::Subscription => ClaudeCodeBillingSource::Subscription,
+            Self::Api => ClaudeCodeBillingSource::Api,
+            Self::CloudOrGateway => ClaudeCodeBillingSource::CloudOrGateway,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -154,16 +180,15 @@ fn validate_request(request: &Request) -> Result<()> {
             "API billing requires --accept-api-billing on this invocation.",
         ));
     }
-    if request.client == Client::ClaudeCode {
-        // The typed native family and its probe arrive in a separate dependent
-        // layer. Never materialize an unknown family that serde could discard.
+    if request.client == Client::ClaudeCode && request.auth_profile != "subscriber" {
         return Err(error(
-            "cli-native-onboard-claude-unavailable",
-            "This build does not contain the native Claude Code onboarding provider. Use the dependent native-provider build; no instance was created.",
+            "cli-native-onboard-claude-profile",
+            "Claude Code owns native authentication; --auth-profile is only for ChatGPT plan onboarding. Leave its default unchanged; no instance was created.",
         ));
     }
-    if request.expected_billing != ExpectedBilling::Subscription
-        || request.native_config_dir.is_some()
+    if request.client == Client::ChatgptPlan
+        && (request.expected_billing != ExpectedBilling::Subscription
+            || request.native_config_dir.is_some())
     {
         return Err(error(
             "cli-native-onboard-plan-billing",
@@ -190,10 +215,11 @@ fn validate_request(request: &Request) -> Result<()> {
     }
     // Ask the canonical alias API to validate each name, without persisting.
     let mut names = Config::default();
+    let family = format!("providers.models.{}", request.client.family());
     for (section, alias) in [
-        ("providers.models.openai", &request.provider_alias),
+        (family.as_str(), &request.provider_alias),
         ("agents", &request.agent_alias),
-        ("providers.models.openai", &request.auth_profile),
+        (family.as_str(), &request.auth_profile),
     ] {
         zeroclaw_config::alias_refs::create_map_key_checked(&mut names, section, alias).map_err(
             |_| {
@@ -203,6 +229,64 @@ fn validate_request(request: &Request) -> Result<()> {
                 )
             },
         )?;
+    }
+    Ok(())
+}
+
+fn resolve_native_account(request: &mut Request) -> Result<()> {
+    if request.client == Client::ClaudeCode {
+        if request.native_config_dir.is_none() {
+            request.native_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        }
+        if request
+            .native_config_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || !path.is_dir() || path.to_str().is_none())
+        {
+            return Err(error(
+                "cli-native-onboard-claude-account",
+                "Native Claude Code requires an existing absolute native account directory. Select --native-config-dir or complete native setup in a terminal; no instance was created.",
+            ));
+        }
+        // None pins native default authentication, not an explicit override to
+        // ~/.claude. Some retains the literal operator/inherited selector;
+        // resolving a symlink can select a different native credential namespace.
+    }
+    Ok(())
+}
+
+fn validate_native_boundary(root: &Path, request: &Request) -> Result<()> {
+    if request.client != Client::ClaudeCode {
+        return Ok(());
+    }
+    let location = |path: &Path| -> Result<PathBuf> {
+        if !path.is_absolute() {
+            return Err(root_error());
+        }
+        match path.canonicalize() {
+            Ok(path) => Ok(path),
+            Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path.parent().ok_or_else(root_error)?;
+                let name = path.file_name().ok_or_else(root_error)?;
+                Ok(parent.canonicalize().map_err(|_| root_error())?.join(name))
+            }
+            Err(_) => Err(root_error()),
+        }
+    };
+    let account = request
+        .native_config_dir
+        .clone()
+        .or_else(|| directories::UserDirs::new().map(|user| user.home_dir().join(".claude")))
+        .ok_or_else(root_error)?;
+    // Canonical paths are temporary filesystem safety facts. They never replace
+    // the native authentication selector persisted in Request or Config.
+    let root = location(root)?;
+    let account = location(&account)?;
+    if root.starts_with(&account) || account.starts_with(&root) {
+        return Err(error(
+            "cli-native-onboard-claude-overlap",
+            "The separate instance and native Claude account directories must not overlap. No instance was created and no native account files were changed.",
+        ));
     }
     Ok(())
 }
@@ -500,11 +584,28 @@ struct SourceModelFields {
 }
 
 impl SourceModelFields {
-    fn for_request(request: &Request) -> Self {
-        // The request validator refuses unavailable native Claude before root
-        // acquisition. Its dependent layer supplies a typed family here.
-        Self {
-            family: "openai",
+    fn for_request(request: &Request) -> Result<Self> {
+        if request.client == Client::ClaudeCode {
+            let mut fields = vec![
+                ("model", request.model.clone()),
+                ("expected_billing", request.expected_billing.name().into()),
+            ];
+            if let Some(directory) = &request.native_config_dir {
+                fields.push((
+                    "claude_config_dir",
+                    directory
+                        .to_str()
+                        .context("native account pointer is not UTF-8")?
+                        .into(),
+                ));
+            }
+            return Ok(Self {
+                family: request.client.family(),
+                fields,
+            });
+        }
+        Ok(Self {
+            family: request.client.family(),
             fields: vec![
                 ("kind", "chatgpt-plan".into()),
                 ("model", request.model.clone()),
@@ -514,7 +615,7 @@ impl SourceModelFields {
                     format!("chatgpt-plan:{}", request.auth_profile),
                 ),
             ],
-        }
+        })
     }
 
     fn materialize(&self, config: &mut Config, request: &Request) -> Result<String> {
@@ -554,6 +655,54 @@ fn config_digest(config: &Config) -> Result<String> {
     }
     let bytes = serde_json::to_vec(&canonical(serde_json::to_value(config)?))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn verify_provider_binding(
+    config: &Config,
+    request: &Request,
+    entry: &ModelProviderConfig,
+) -> Result<()> {
+    anyhow::ensure!(
+        entry.model.as_deref() == Some(request.model.as_str())
+            && entry.api_key.is_none()
+            && !entry.requires_openai_auth
+            && entry.fallback.is_empty()
+            && entry.fallback_models.is_empty(),
+        "bootstrap explicit grant changed"
+    );
+    match request.client {
+        Client::ChatgptPlan => anyhow::ensure!(
+            entry.kind.as_deref() == Some("chatgpt-plan")
+                && entry
+                    .chatgpt_plan_auth
+                    .as_ref()
+                    .is_some_and(|binding| binding.registration
+                        == format!("chatgpt-plan:{}", request.auth_profile)),
+            "bootstrap explicit grant changed"
+        ),
+        Client::ClaudeCode => {
+            let native = config
+                .providers
+                .models
+                .claude_code_native
+                .get(&request.provider_alias)
+                .context("bootstrap native Claude provider missing")?;
+            anyhow::ensure!(
+                config.providers.models.iter_entries().count() == 1
+                    && entry.kind.is_none()
+                    && entry.uri.is_none()
+                    && entry.extra_headers.is_empty()
+                    && entry.wire_api.is_none()
+                    && entry.chatgpt_plan_auth.is_none()
+                    && native.binary_path.is_none()
+                    && native.claude_config_dir.as_deref()
+                        == request.native_config_dir.as_deref().and_then(Path::to_str)
+                    && native.expected_billing == Some(request.expected_billing.claude_source()),
+                "bootstrap native Claude account/billing binding changed"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn verify_configuration(config: &Config, owned: &OwnedRoot, provider: &str) -> Result<()> {
@@ -610,30 +759,17 @@ fn verify_configuration(config: &Config, owned: &OwnedRoot, provider: &str) -> R
     let entry = config
         .model_provider_for_agent(&request.agent_alias)
         .context("bootstrap provider missing")?;
-    anyhow::ensure!(
-        entry.kind.as_deref() == Some("chatgpt-plan")
-            && entry
-                .chatgpt_plan_auth
-                .as_ref()
-                .is_some_and(|binding| binding.registration
-                    == format!("chatgpt-plan:{}", request.auth_profile))
-            && entry.model.as_deref() == Some(request.model.as_str())
-            && entry.api_key.is_none()
-            && !entry.requires_openai_auth
-            && entry.fallback.is_empty()
-            && entry.fallback_models.is_empty(),
-        "bootstrap explicit grant changed"
-    );
+    verify_provider_binding(config, request, entry)?;
     let configured = config
         .providers
         .models
-        .find("openai", &request.provider_alias);
+        .find(request.client.family(), &request.provider_alias);
     let options = zeroclaw_providers::model_provider_runtime_options_from_model_provider_entry(
         config, configured,
     );
     let _provider = zeroclaw_providers::create_model_provider_for_alias(
         config,
-        "openai",
+        request.client.family(),
         &request.provider_alias,
         None,
         &options,
@@ -723,6 +859,25 @@ async fn load_committed(owned: &OwnedRoot) -> Result<Config> {
 }
 
 async fn authorize(config: &Config, request: &Request) -> Result<()> {
+    if request.client == Client::ClaudeCode {
+        let check = async {
+            let native = config
+                .providers
+                .models
+                .claude_code_native
+                .get(&request.provider_alias)
+                .context("bootstrap native Claude provider missing")?;
+            let provider =
+                zeroclaw_providers::claude_code_native::ClaudeCodeNativeModelProvider::from_config(
+                    &request.provider_alias,
+                    native,
+                    config.config_path.parent(),
+                    Some(PROOF_TIMEOUT.as_secs()),
+                )?;
+            provider.check_auth().await
+        };
+        return check.await.map_err(|_| error("cli-native-onboard-claude-auth", "Native Claude Code authorization or expected billing could not be verified. Complete native login with claude auth login if needed and review native /status in a terminal, then rerun the identical command. No readiness was claimed."));
+    }
     let auth_service = AuthService::from_config(config);
     let binding = format!("chatgpt-plan:{}", request.auth_profile);
     // An already validated grant from a cancelled run can be resumed. The
@@ -780,9 +935,11 @@ async fn pause_stage(stage: &str) {
     }
 }
 
-pub(crate) async fn run(root: Option<&str>, request: Request) -> Result<()> {
+pub(crate) async fn run(root: Option<&str>, mut request: Request) -> Result<()> {
     validate_request(&request)?;
+    resolve_native_account(&mut request)?;
     let root = root.filter(|root| !root.trim().is_empty()).ok_or_else(|| error("cli-native-onboard-root-required", "Native onboarding requires an explicit absolute --config-dir for a separate fresh instance."))?;
+    validate_native_boundary(Path::new(root), &request)?;
     let mut owned = OwnedRoot::acquire(Path::new(root), &request).map_err(|_| root_error())?;
     let result = Box::pin(run_owned(&mut owned)).await;
     if let Err(failure) = result {
@@ -819,6 +976,13 @@ async fn run_owned(owned: &mut OwnedRoot) -> Result<()> {
     } else {
         private_candidate(&owned.root)?
     };
+    let source = SourceModelFields::for_request(&request)?;
+    let provider = format!("{}.{}", source.family, request.provider_alias);
+    if !has_config && request.client == Client::ClaudeCode {
+        // Native preflight consumes the canonical private Config candidate.
+        // This is not persisted until the shared Quickstart transaction passes.
+        source.materialize(&mut candidate, &request)?;
+    }
     owned.transition(
         if has_config {
             Phase::Configured
@@ -838,16 +1002,19 @@ async fn run_owned(owned: &mut OwnedRoot) -> Result<()> {
     tokio::select! {
         biased;
         _ = cancellation.recv() => return Err(error("cli-native-onboard-cancelled", "Native onboarding cancelled. Owned auth/config state was retained; this instance is not ready. Rerun the identical command to resume.")),
-        result = Box::pin(authorize(&candidate, &request)) => result.map_err(|_| error("cli-native-onboard-auth-failed", "Native authorization failed. Owned state was retained; no readiness was claimed."))?,
+        result = Box::pin(authorize(&candidate, &request)) => result.map_err(|failure| match request.client {
+            Client::ClaudeCode => failure,
+            Client::ChatgptPlan => error("cli-native-onboard-auth-failed", "Native authorization failed. Owned state was retained; no readiness was claimed."),
+        })?,
     }
     #[cfg(not(unix))]
     authorize(&candidate, &request).await?;
     #[cfg(test)]
     pause_stage("authorized").await;
-    let source = SourceModelFields::for_request(&request);
-    let provider = format!("{}.{}", source.family, request.provider_alias);
     if !has_config {
-        source.materialize(&mut candidate, &request)?;
+        if request.client == Client::ChatgptPlan {
+            source.materialize(&mut candidate, &request)?;
+        }
         candidate.set_prop("memory.embedding_provider", "none")?;
         candidate.set_prop("memory.auto_save", "false")?;
         candidate.set_prop("query_classification.enabled", "false")?;
@@ -1653,16 +1820,19 @@ mod tests {
     }
 
     #[test]
-    fn native_onboard_unavailable_native_family_refuses_before_root_creation() {
+    fn native_onboard_claude_family_requires_a_resolved_native_account() {
         let mut request = request();
         request.client = Client::ClaudeCode;
-        assert!(validate_request(&request).is_err());
+        request.native_config_dir = Some(PathBuf::from("relative-account"));
+        assert!(validate_request(&request).is_ok());
+        assert!(resolve_native_account(&mut request).is_err());
     }
 
     #[test]
     fn native_onboard_source_fields_use_canonical_config_setter_for_explicit_registration() {
         let mut config = Config::default();
         let provider = SourceModelFields::for_request(&request())
+            .unwrap()
             .materialize(&mut config, &request())
             .unwrap();
         assert_eq!(provider, "openai.subscriber");
@@ -1689,5 +1859,100 @@ mod tests {
                 .unwrap()
                 .requires_openai_auth
         );
+    }
+
+    #[test]
+    fn native_onboard_claude_binding_requires_one_keyless_native_account_and_billing() {
+        let account = tempfile::tempdir().unwrap();
+        let mut request = request();
+        request.client = Client::ClaudeCode;
+        request.native_config_dir = Some(account.path().canonicalize().unwrap());
+        let mut config = Config::default();
+        let reference = SourceModelFields::for_request(&request)
+            .unwrap()
+            .materialize(&mut config, &request)
+            .unwrap();
+        assert_eq!(reference, "claude_code_native.subscriber");
+        let check = |config: &Config| {
+            verify_provider_binding(
+                config,
+                &request,
+                config
+                    .providers
+                    .models
+                    .find("claude_code_native", "subscriber")
+                    .unwrap(),
+            )
+        };
+        check(&config).unwrap();
+        for (field, value) in [
+            ("model", "other-model"),
+            ("api_key", "synthetic-api-key"),
+            ("kind", "claude-code"),
+            ("uri", "https://example.invalid"),
+            ("wire_api", "responses"),
+            ("requires_openai_auth", "true"),
+            ("chatgpt_plan_auth.registration", "chatgpt-plan:subscriber"),
+            ("fallback", "openai.metered"),
+            ("fallback_models", "other-model"),
+            ("binary_path", "/synthetic-other-client"),
+            ("claude_config_dir", "/synthetic-other-account"),
+            ("expected_billing", "api"),
+        ] {
+            let mut changed = config.clone();
+            changed
+                .set_prop(
+                    &format!("providers.models.claude_code_native.subscriber.{field}"),
+                    value,
+                )
+                .unwrap();
+            assert!(
+                check(&changed).is_err(),
+                "must refuse changed native binding: {field}"
+            );
+        }
+        let mut changed = config.clone();
+        changed
+            .providers
+            .models
+            .claude_code_native
+            .get_mut("subscriber")
+            .unwrap()
+            .base
+            .extra_headers
+            .insert("X-Synthetic".into(), "synthetic-key".into());
+        assert!(check(&changed).is_err());
+        changed = config.clone();
+        changed
+            .create_map_key("providers.models.openai", "metered")
+            .unwrap();
+        assert!(
+            check(&changed).is_err(),
+            "a fresh native instance must have one typed provider only"
+        );
+    }
+
+    #[test]
+    fn native_onboard_claude_boundary_uses_physical_locations_without_rewriting_selector() {
+        let parent = tempfile::tempdir().unwrap();
+        let account = parent.path().join("native-account");
+        let alias = parent.path().join("literal-alias");
+        std::fs::create_dir(&account).unwrap();
+        std::os::unix::fs::symlink(&account, &alias).unwrap();
+        let mut accepted = request();
+        accepted.client = Client::ClaudeCode;
+        accepted.native_config_dir = Some(alias.clone());
+        for root in [
+            parent.path().to_path_buf(),
+            account.clone(),
+            account.join("fresh"),
+        ] {
+            assert!(validate_native_boundary(&root, &accepted).is_err());
+        }
+        validate_native_boundary(&parent.path().join("separate"), &accepted).unwrap();
+        assert!(Path::new("src").is_dir());
+        assert!(validate_native_boundary(Path::new("src"), &accepted).is_err());
+        assert_eq!(accepted.native_config_dir, Some(alias));
+        validate_native_boundary(Path::new("relative"), &request()).unwrap();
     }
 }

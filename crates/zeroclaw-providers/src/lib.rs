@@ -7,6 +7,7 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
 pub mod chatgpt_plan;
+pub mod claude_code_native;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -1682,8 +1683,19 @@ fn create_model_provider_inner(
         ));
     }
 
-    factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
+    factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options).map(
+        |provider| {
+            // Native Code owns model selection and may apply its own fallback.
+            // Do not label this opaque native identity as a stable HTTP leaf.
+            if provider_kind == "claude_code_native" {
+                Box::new(vision_override::VisionOverrideProvider::new(
+                    provider, false,
+                )) as Box<dyn ModelProvider>
+            } else {
+                apply_factory_leaf_metadata(provider, options.vision)
+            }
+        },
+    )
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -2402,6 +2414,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("claude_code_native", "Native Claude Code", true),
             ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
@@ -4518,6 +4531,14 @@ mod tests {
             // Grok ACP deliberately refuses the daemon cwd as an implicit
             // trust boundary; a typed alias must provide working_directory.
             if model_provider.name == "grok_cli" {
+                continue;
+            }
+            // Native Code requires a configured account/billing reference and
+            // config-root boundary; implicit credential-based construction is
+            // deliberately closed. Its typed-profile boundary is tested in
+            // claude_code_native::tests::process.
+            if model_provider.name == "claude_code_native" {
+                assert!(create_model_provider(model_provider.name, None).is_err());
                 continue;
             }
             let api_key = if model_provider.name == "hailo_ollama" {

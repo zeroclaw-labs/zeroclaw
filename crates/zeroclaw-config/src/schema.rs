@@ -3041,6 +3041,43 @@ pub struct GeminiCliModelProviderConfig {
 
 // ── Grok Build CLI (subprocess wrapper) ──
 
+/// Billing agreement selected and verified by the unmodified native client.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodeBillingSource {
+    Subscription,
+    Api,
+    CloudOrGateway,
+}
+
+/// Native Claude Code inference; ZeroClaw retains the agent/tool loop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.claude_code_native"]
+pub struct ClaudeCodeNativeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// User-installed, unmodified native client. Defaults to `claude` resolved
+    /// only from absolute PATH entries. Relative executable paths are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Existing absolute native account directory, passed literally as
+    /// CLAUDE_CONFIG_DIR. Unset pins native default and removes that environment
+    /// override from the child; onboarding captures an inherited selection here.
+    /// Canonical paths are only for validation/overlap checks. Native Code owns
+    /// credential access and refresh; ZeroClaw never reads or copies credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
+    /// Required before inference: subscription, API, or cloud/gateway billing.
+    /// Native auth status is checked for this source before every model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_billing: Option<ClaudeCodeBillingSource>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.grok_cli"]
@@ -3762,6 +3799,7 @@ impl_default_family_endpoint! {
     BaichuanModelProviderConfig,
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
+    ClaudeCodeNativeModelProviderConfig,
     GrokCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,

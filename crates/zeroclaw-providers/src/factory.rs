@@ -567,29 +567,29 @@ use zeroclaw_config::schema::{
     AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
     AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
-    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
-    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
-    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
-    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
-    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
-    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    ClaudeCodeNativeModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CrusoeModelProviderConfig, CustomModelProviderConfig,
+    DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
+    DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
+    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    GithubModelsModelProviderConfig, GlmModelProviderConfig, GrokCliModelProviderConfig,
+    GroqModelProviderConfig, HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint,
+    HailoOllamaModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
+    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -1764,6 +1764,42 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
+    }
+}
+
+impl FamilyProviderFactory for ClaudeCodeNativeModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if key.is_some()
+            || self.base.api_key.is_some()
+            || api_url.is_some()
+            || self.base.uri.is_some()
+        {
+            anyhow::bail!(
+                "native Claude Code owns its credentials and endpoint; configure native login instead of api_key/uri"
+            );
+        }
+        Ok(Box::new(
+            crate::claude_code_native::ClaudeCodeNativeModelProvider::from_config(
+                alias,
+                self,
+                opts.zeroclaw_dir.as_deref(),
+                opts.provider_timeout_secs,
+            )?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        // No credential inspection or readiness promise at construction. The
+        // selected native client performs the probe at the inference boundary.
+        self.expected_billing.is_some()
     }
 }
 

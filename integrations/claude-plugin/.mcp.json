@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "preflight": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-I", "-B", "${CLAUDE_PLUGIN_ROOT}/scripts/preflight.py", "--stdio"]
+    }
+  }
+}

@@ -166,6 +166,7 @@
   - [How plugins work](./developing/how-plugins-work.md)
   - [Built-in tool inventory](./developing/tool-inventory.md)
   - [Plugin protocol](./developing/plugin-protocol.md)
+  - [Claude Code onboarding preflight](./developing/claude-code-onboarding.md)
   - [Guides](./plugins/index.md)
     - [Writing a tool plugin](./plugins/writing-a-tool-plugin.md)
     - [Writing a channel plugin](./plugins/writing-a-channel-plugin.md)
