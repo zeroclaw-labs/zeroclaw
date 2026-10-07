@@ -1109,8 +1109,12 @@ impl SessionBackend for SqliteSessionBackend {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
-        // No incoming provenance here: the breadcrumb flag is not part of this call.
-        Self::rewrite_messages_on(&tx, session_key, messages, false)
+        // The breadcrumb flag is not part of this call and stays as stored, so the
+        // incoming transcript has a breadcrumb exactly when the stored flag says so.
+        let stored_crumb = Self::get_session_trim_breadcrumb_on(&tx, session_key)
+            .map_err(std::io::Error::other)?
+            .unwrap_or(false);
+        Self::rewrite_messages_on(&tx, session_key, messages, stored_crumb)
             .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(())
@@ -3994,6 +3998,43 @@ mod tests {
         assert_eq!(contents(&after), ["q", "a", "q2", "a2", "q3"]);
         assert_eq!(after[0].1, t[0].1);
         assert!(after[4].1 > t[3].1);
+    }
+
+    #[test]
+    fn t11b_bare_rewrite_keeps_the_times_of_a_stored_breadcrumb_and_its_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let transcript = [u("[omitted]"), u("q"), a("a")];
+        for n in 1..=transcript.len() {
+            backend
+                .replace_conversation_state("k", &transcript[..n], true)
+                .unwrap();
+            nap();
+        }
+        let t = stamped(&backend, "k");
+
+        // An unchanged transcript keeps every time, the breadcrumb included.
+        nap();
+        backend.rewrite_messages("k", &transcript).unwrap();
+        let after = stamped(&backend, "k");
+        for k in 0..3 {
+            assert_eq!(after[k].1, t[k].1, "unchanged row {k}");
+        }
+
+        // A new turn on top: the retained rows keep their times, only the new one is stamped.
+        nap();
+        backend
+            .rewrite_messages("k", &[u("[omitted]"), u("q"), a("a"), u("q2"), a("a2")])
+            .unwrap();
+        let after = stamped(&backend, "k");
+        for k in 0..3 {
+            assert_eq!(after[k].1, t[k].1, "retained row {k}");
+        }
+        assert!(after[3].1 > t[2].1);
+
+        // Emptying the transcript while the flag is still set must not fail.
+        backend.rewrite_messages("k", &[]).unwrap();
+        assert!(backend.load("k").is_empty());
     }
 
     #[test]
