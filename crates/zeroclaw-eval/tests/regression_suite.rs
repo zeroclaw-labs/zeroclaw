@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
+use zeroclaw_eval::baseline::SuiteKind;
 use zeroclaw_eval::case::load_suite;
 use zeroclaw_eval::grader::evaluate_expects;
 use zeroclaw_eval::{LlmTrace, RecordedCall, RunDeps, RunRecord, run_case, run_suite};
@@ -27,7 +28,7 @@ async fn regression_suite_replays_green() {
         "regression suite failed:\n{}",
         report.render_table()
     );
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.exit_code(SuiteKind::Regression, None), 0);
 }
 
 /// A case earns its place in a required suite only if it fails when the behavior

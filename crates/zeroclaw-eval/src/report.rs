@@ -9,8 +9,9 @@ pub struct CaseReport {
     pub name: String,
     /// The fixture file name the case came from.
     pub source: String,
-    /// The run record (receipt + transcript). `None` when the run errored before
-    /// producing a record.
+    /// The run record (receipt + transcript). Normal execution errors preserve
+    /// provenance with no completion; `None` is reserved for callers that could
+    /// not construct even the pre-run provenance.
     pub record: Option<crate::record::RunRecord>,
     /// Per-check grades.
     pub grades: Vec<GradeResult>,
@@ -76,6 +77,18 @@ pub struct SuiteReport {
     pub cases: Vec<CaseReport>,
 }
 
+/// Capability-suite presentation statistics (see
+/// [`SuiteReport::capability_stats`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityStats {
+    /// Current pass rate as a percentage (0.0 when the suite is empty).
+    pub pass_rate: f64,
+    /// The baseline's pass rate as a percentage, when a baseline was given.
+    pub baseline_rate: Option<f64>,
+    /// Whether the suite is saturated (>= 95% pass rate).
+    pub saturated: bool,
+}
+
 impl SuiteReport {
     pub fn passed_count(&self) -> usize {
         self.cases.iter().filter(|c| c.passed()).count()
@@ -89,10 +102,73 @@ impl SuiteReport {
         self.cases.iter().all(CaseReport::passed)
     }
 
-    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Process exit code for a completed run. Gating is strictly per-case:
+    /// - Regression suites, no baseline: 0 iff every case passed.
+    /// - Regression suites, with a baseline: the comparison is the single
+    ///   authority — 1 iff
+    ///   [`BaselineComparison::gates`](crate::baseline::BaselineComparison::gates),
+    ///   i.e. at least one confirmed per-case Pass->Fail regression or a
+    ///   current run error
+    ///   (classified `CurrentError`; an errored case has no trustworthy
+    ///   comparison). Failures classified `New`, `Unchanged`, `Unverifiable`,
+    ///   or `FlakyUnconfirmed` are reported but never gate; a case that failed
+    ///   in both runs is not a flip.
+    /// - Capability suites: always 0 unless a case ERRORED (a run error, not a
+    ///   check failure), which still exits 1.
+    ///
     /// Kept as a pure function so the CLI gate is testable at its real boundary.
-    pub fn exit_code(&self) -> i32 {
-        if self.all_passed() { 0 } else { 1 }
+    pub fn exit_code(
+        &self,
+        kind: crate::baseline::SuiteKind,
+        comparison: Option<&crate::baseline::BaselineComparison>,
+    ) -> i32 {
+        use crate::baseline::SuiteKind;
+        match kind {
+            SuiteKind::Regression => match comparison {
+                None => i32::from(!self.all_passed()),
+                // One authoritative policy: the per-case classification decides
+                // the gate (confirmed regressions + current run errors).
+                Some(cmp) => i32::from(cmp.gates()),
+            },
+            SuiteKind::Capability => {
+                // Never gate on failing checks; only a run error fails a capability run.
+                i32::from(self.cases.iter().any(|c| c.error.is_some()))
+            }
+        }
+    }
+
+    /// Capability-suite statistics for presentation: the current pass rate, the
+    /// baseline's pass rate when given, and whether the suite is saturated
+    /// (>= 95% pass rate, a candidate for graduating to regression/).
+    /// Rendering is the caller's concern (the CLI localizes it).
+    pub fn capability_stats(
+        &self,
+        baseline: Option<&crate::baseline::Baseline>,
+    ) -> CapabilityStats {
+        let total = self.cases.len();
+        let pass_rate = if total == 0 {
+            0.0
+        } else {
+            self.passed_count() as f64 / total as f64 * 100.0
+        };
+        let baseline_rate = baseline.map(|base| {
+            let bt = base.entries.len();
+            let bp = base
+                .entries
+                .iter()
+                .filter(|e| e.verdict == crate::baseline::Verdict::Pass)
+                .count();
+            if bt == 0 {
+                0.0
+            } else {
+                bp as f64 / bt as f64 * 100.0
+            }
+        });
+        CapabilityStats {
+            pass_rate,
+            baseline_rate,
+            saturated: pass_rate >= 95.0,
+        }
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -134,7 +210,17 @@ impl SuiteReport {
     }
 
     /// Render the report as pretty JSON for machine consumption / CI artifacts.
-    pub fn to_json(&self) -> String {
+    ///
+    /// When a baseline comparison was performed, it MUST be passed here along
+    /// with the resolved suite kind: the artifact then carries a top-level
+    /// `baseline` section (per-case classifications, gate summary) and the
+    /// `exit_code` the process will exit with, so CI never receives a failing
+    /// artifact that omits why the gate failed.
+    pub fn to_json(
+        &self,
+        kind: crate::baseline::SuiteKind,
+        comparison: Option<&crate::baseline::BaselineComparison>,
+    ) -> String {
         let cases: Vec<serde_json::Value> = self
             .cases
             .iter()
@@ -181,13 +267,18 @@ impl SuiteReport {
             })
             .collect();
 
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "passed": self.passed_count(),
             "failed": self.failed_count(),
             "total": self.cases.len(),
             "all_passed": self.all_passed(),
+            "suite_kind": kind.as_str(),
+            "exit_code": self.exit_code(kind, comparison),
             "cases": cases,
         });
+        if let (Some(cmp), Some(map)) = (comparison, value.as_object_mut()) {
+            map.insert("baseline".into(), cmp.to_json_value());
+        }
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 }
@@ -262,7 +353,8 @@ mod tests {
         let suite = SuiteReport {
             cases: vec![case("err", vec![], Some("provider timed out"))],
         };
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(false));
         assert!(
             json["cases"][0]["score"].is_null(),
@@ -285,25 +377,186 @@ mod tests {
         assert!(!suite.all_passed());
     }
 
-    #[test]
-    fn exit_code_is_zero_when_all_cases_pass() {
-        let suite = SuiteReport {
-            cases: vec![case("ok", vec![grade("c", true, "")], None)],
-        };
-        assert!(suite.all_passed());
-        assert_eq!(suite.exit_code(), 0);
+    use crate::baseline::{BaselineComparison, CaseComparison, SuiteKind};
+
+    fn cmp_of(pairs: Vec<(&str, CaseComparison)>) -> BaselineComparison {
+        BaselineComparison {
+            per_case: pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
     }
 
     #[test]
-    fn exit_code_is_one_when_any_case_fails() {
-        let suite = SuiteReport {
+    fn exit_regression_no_baseline_all_pass_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Regression, None), 0);
+    }
+
+    #[test]
+    fn exit_regression_no_baseline_any_fail_is_one() {
+        let s = SuiteReport {
+            cases: vec![case("bad", vec![grade("c", false, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Regression, None), 1);
+    }
+
+    #[test]
+    fn exit_regression_with_baseline_clean_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "ok",
+            CaseComparison::Unchanged {
+                token_delta_pct: None,
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_with_baseline_confirmed_regression_is_one() {
+        let s = SuiteReport {
+            cases: vec![case("bad", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "bad",
+            CaseComparison::Regression {
+                categories: vec![crate::grader::GradeCategory::Response],
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
+    }
+
+    #[test]
+    fn improvement_never_fails_exit() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let cmp = cmp_of(vec![("ok", CaseComparison::Improvement)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_flaky_failure_is_excused() {
+        // A failing live case downgraded to flaky must not gate.
+        let s = SuiteReport {
+            cases: vec![case("live", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("live", CaseComparison::FlakyUnconfirmed)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_unverifiable_failure_is_excused() {
+        // A failing case whose comparability key changed must not gate.
+        let s = SuiteReport {
+            cases: vec![case("changed", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("changed", CaseComparison::Unverifiable)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_new_failing_case_does_not_gate() {
+        // A newly added failing case is classified `New`: reported, not a
+        // confirmed Pass->Fail flip, so it does not gate the baseline run.
+        let s = SuiteReport {
+            cases: vec![case("fresh", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("fresh", CaseComparison::New)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_failed_in_both_runs_does_not_gate() {
+        // A case that failed in the baseline and still fails is `Unchanged`:
+        // no verdict flip, so no gate.
+        let s = SuiteReport {
+            cases: vec![case("still-bad", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "still-bad",
+            CaseComparison::Unchanged {
+                token_delta_pct: None,
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_run_error_gates_even_with_baseline() {
+        // An errored case has no trustworthy comparison; `compare` classifies
+        // it CurrentError and it must gate.
+        let s = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        let cmp = cmp_of(vec![("err", CaseComparison::CurrentError)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
+    }
+
+    #[test]
+    fn exit_regression_mixed_excused_and_regression_gates() {
+        // An excused flaky failure alongside a real regression still gates.
+        let s = SuiteReport {
             cases: vec![
-                case("ok", vec![grade("c", true, "")], None),
+                case("flaky", vec![grade("c", false, "")], None),
                 case("bad", vec![grade("c", false, "")], None),
             ],
         };
-        assert!(!suite.all_passed());
-        assert_eq!(suite.exit_code(), 1);
+        let cmp = cmp_of(vec![
+            ("flaky", CaseComparison::FlakyUnconfirmed),
+            (
+                "bad",
+                CaseComparison::Regression {
+                    categories: vec![crate::grader::GradeCategory::Response],
+                },
+            ),
+        ]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
+    }
+
+    #[test]
+    fn exit_capability_all_pass_is_zero() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 0);
+    }
+
+    #[test]
+    fn exit_capability_check_failure_is_zero() {
+        // A failing check does not gate a capability suite.
+        let s = SuiteReport {
+            cases: vec![case("low", vec![grade("c", false, "")], None)],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 0);
+    }
+
+    #[test]
+    fn exit_capability_run_error_is_one() {
+        // A run error still gates a capability suite.
+        let s = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        assert_eq!(s.exit_code(SuiteKind::Capability, None), 1);
+    }
+
+    #[test]
+    fn capability_stats_report_rate_trend_and_saturation() {
+        let s = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        let stats = s.capability_stats(None);
+        assert!((stats.pass_rate - 100.0).abs() < f64::EPSILON);
+        assert!(stats.saturated);
+        assert_eq!(stats.baseline_rate, None);
+        // An empty suite is 0% and not saturated.
+        let empty = SuiteReport { cases: vec![] };
+        let stats = empty.capability_stats(None);
+        assert!(stats.pass_rate.abs() < f64::EPSILON);
+        assert!(!stats.saturated);
     }
 
     #[test]
@@ -351,11 +604,16 @@ mod tests {
                 case("bad", vec![grade("c", false, "")], None),
             ],
         };
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
         assert_eq!(json["passed"].as_u64(), Some(1));
         assert_eq!(json["failed"].as_u64(), Some(1));
         assert_eq!(json["total"].as_u64(), Some(2));
         assert_eq!(json["all_passed"].as_bool(), Some(false));
+        assert_eq!(json["suite_kind"].as_str(), Some("regression"));
+        // No baseline: exit code mirrors all_passed, and no baseline section.
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert!(json.get("baseline").is_none());
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
@@ -363,6 +621,59 @@ mod tests {
         assert_eq!(
             json["cases"][0]["grades"][0]["category"].as_str(),
             Some("response")
+        );
+    }
+
+    #[test]
+    fn to_json_with_baseline_carries_gate_outcome() {
+        // A failing case classified New: reported in the artifact, gate open.
+        let suite = SuiteReport {
+            cases: vec![case("fresh", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("fresh", CaseComparison::New)]);
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(0));
+        assert_eq!(json["baseline"]["gates"].as_bool(), Some(false));
+        assert_eq!(json["baseline"]["confirmed_regressions"].as_u64(), Some(0));
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["classification"].as_str(),
+            Some("new")
+        );
+
+        // A confirmed regression: the artifact says why the gate failed.
+        let cmp = cmp_of(vec![(
+            "fresh",
+            CaseComparison::Regression {
+                categories: vec![crate::grader::GradeCategory::Tool],
+            },
+        )]);
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert_eq!(json["baseline"]["gates"].as_bool(), Some(true));
+        assert_eq!(json["baseline"]["confirmed_regressions"].as_u64(), Some(1));
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["classification"].as_str(),
+            Some("regression")
+        );
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["categories"][0].as_str(),
+            Some("tool")
+        );
+
+        // A current run error is carried explicitly.
+        let err_suite = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        let cmp = cmp_of(vec![("err", CaseComparison::CurrentError)]);
+        let json: serde_json::Value =
+            serde_json::from_str(&err_suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert_eq!(json["baseline"]["current_errors"].as_u64(), Some(1));
+        assert_eq!(
+            json["baseline"]["per_case"]["err"]["classification"].as_str(),
+            Some("current_error")
         );
     }
 
@@ -387,7 +698,8 @@ mod tests {
                 error: None,
             }],
         };
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
         let case = &json["cases"][0];
         assert_eq!(case["passed"].as_bool(), Some(false));
         assert_eq!(case["score"].as_f64(), Some(0.0));
