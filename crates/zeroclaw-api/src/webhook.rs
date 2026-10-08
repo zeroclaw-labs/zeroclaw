@@ -146,7 +146,7 @@ impl WebhookIdempotency {
     }
 }
 
-/// The deduplication store behind every webhook ingress of one gateway run.
+/// A deduplication store for webhook message keys.
 ///
 /// A plugin delivery reserves its message's key, then commits it once the
 /// message is enqueued for the channel or rolls it back when the delivery
@@ -155,14 +155,16 @@ impl WebhookIdempotency {
 /// owner's outcome. The generic `/webhook` and `/sop/*` routes record their
 /// keys through [`Self::record_if_new`].
 ///
-/// Both kinds share one committed map bounded by `max_keys`, so committing
-/// either kind evicts the oldest committed key of either kind. Committed keys
-/// expire after `ttl`. In-flight plugin reservations are bounded separately by
-/// the same `max_keys`, and a new delivery is refused while every in-flight
-/// slot is taken.
+/// A store's committed keys share one map bounded by `max_keys`, so once the
+/// map is full, committing any key evicts the store's oldest committed key.
+/// Committed keys expire after `ttl`. In-flight reservations are bounded
+/// separately by the same `max_keys`, and a new delivery is refused while
+/// every in-flight slot is taken.
 ///
-/// The daemon creates one store for each gateway run, so its contents last
-/// exactly as long as that run.
+/// Two stores are in use, so plugin deliveries and generic keys have separate
+/// budgets. The core's plugin webhook ingress owns one for each daemon
+/// generation: a gateway restart keeps its contents and a reload clears them.
+/// Each gateway run owns another for its `/webhook` and `/sop/*` keys.
 #[derive(Debug)]
 pub struct WebhookReservationStore {
     ttl: Duration,
