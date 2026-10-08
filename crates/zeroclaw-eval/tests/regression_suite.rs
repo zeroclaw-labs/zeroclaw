@@ -52,20 +52,15 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
         "the fixture must pass on the run it actually produces: {graded:?}"
     );
 
-    let repaired = RunRecord {
-        final_response: observed.final_response.clone(),
-        history: Vec::new(),
-        tool_calls: vec![RecordedCall {
-            name: "echo".to_string(),
-            arguments: r#"{"message":"hello"}"#.to_string(),
-            result: "hello".to_string(),
-            success: true,
-        }],
-        input_tokens: observed.input_tokens,
-        output_tokens: observed.output_tokens,
-        duration_ms: observed.duration_ms,
-        llm_calls: observed.llm_calls,
-    };
+    let mut repaired = observed.clone();
+    let completion = repaired.completion.as_mut().expect("fixture completed");
+    completion.history.clear();
+    completion.tool_calls = vec![RecordedCall {
+        name: "echo".to_string(),
+        arguments: r#"{"message":"hello"}"#.to_string(),
+        result: "hello".to_string(),
+        success: true,
+    }];
     let failures: Vec<String> = evaluate_expects(&trace.expects, &repaired)
         .into_iter()
         .filter(|grade| !grade.passed)
@@ -92,15 +87,18 @@ async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
     assert!(!suite.is_empty(), "the gated suite must not be empty");
 
     for (path, trace) in suite {
-        let idle = RunRecord {
-            final_response: String::new(),
-            history: Vec::new(),
-            tool_calls: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-        };
+        let idle = RunRecord::from_provenance(zeroclaw_eval::record::CaseProvenance {
+            schema: zeroclaw_eval::record::RECORD_SCHEMA.to_string(),
+            mode: zeroclaw_eval::Mode::Replay,
+            case_id: trace.display_id().to_string(),
+            case_hash: zeroclaw_eval::case::case_hash(&trace).unwrap(),
+            provider_ref: "scripted".to_string(),
+            tool_surface: zeroclaw_eval::record::ToolSurface::default(),
+            sandbox: zeroclaw_eval::record::SandboxStamp {
+                autonomy: "supervised".to_string(),
+                workspace_only: false,
+            },
+        });
         let grades = evaluate_expects(&trace.expects, &idle);
         assert!(
             grades.iter().any(|grade| !grade.passed),

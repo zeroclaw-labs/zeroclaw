@@ -9,6 +9,9 @@ pub struct CaseReport {
     pub name: String,
     /// The fixture file name the case came from.
     pub source: String,
+    /// The run record (receipt + transcript). `None` when the run errored before
+    /// producing a record.
+    pub record: Option<crate::record::RunRecord>,
     /// Per-check grades.
     pub grades: Vec<GradeResult>,
     /// Set if the run itself errored (e.g. trace exhausted) — counts as a failure.
@@ -136,7 +139,7 @@ impl SuiteReport {
             .cases
             .iter()
             .map(|c| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "name": c.name,
                     "source": c.source,
                     "passed": c.passed(),
@@ -144,7 +147,37 @@ impl SuiteReport {
                     "category_totals": c.category_totals(),
                     "error": c.error,
                     "grades": c.grades,
-                })
+                });
+                if let (Some(rec), Some(map)) = (&c.record, obj.as_object_mut()) {
+                    // Provenance is emitted unconditionally: it is knowable before
+                    // execution, so an errored case still carries a joinable receipt.
+                    let p = &rec.provenance;
+                    map.insert("schema".into(), p.schema.clone().into());
+                    map.insert(
+                        "mode".into(),
+                        serde_json::to_value(p.mode).unwrap_or_default(),
+                    );
+                    map.insert("case_id".into(), p.case_id.clone().into());
+                    map.insert("case_hash".into(), p.case_hash.clone().into());
+                    map.insert("provider_ref".into(), p.provider_ref.clone().into());
+                    map.insert(
+                        "tool_surface".into(),
+                        serde_json::to_value(&p.tool_surface).unwrap_or_default(),
+                    );
+                    map.insert(
+                        "sandbox".into(),
+                        serde_json::to_value(&p.sandbox).unwrap_or_default(),
+                    );
+                    // Completion-only fields stay absent for a run that never
+                    // finished, rather than being reported as a real zero.
+                    if let Some(done) = &rec.completion {
+                        map.insert(
+                            "total_tokens".into(),
+                            done.input_tokens.saturating_add(done.output_tokens).into(),
+                        );
+                    }
+                }
+                obj
             })
             .collect();
 
@@ -176,6 +209,7 @@ mod tests {
         CaseReport {
             name: name.to_string(),
             source: "fixture.json".to_string(),
+            record: None,
             grades,
             error: error.map(str::to_string),
         }
@@ -343,6 +377,7 @@ mod tests {
             cases: vec![CaseReport {
                 name: "vacuous".to_string(),
                 source: "vacuous.json".to_string(),
+                record: None,
                 grades: vec![GradeResult::new(
                     "effective_checks".to_string(),
                     false,
@@ -383,6 +418,7 @@ mod tests {
         let report = CaseReport {
             name: "mixed".to_string(),
             source: "f.json".to_string(),
+            record: None,
             grades: vec![
                 grade_cat(true, GradeCategory::Response),
                 grade_cat(false, GradeCategory::Response),

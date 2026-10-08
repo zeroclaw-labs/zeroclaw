@@ -206,6 +206,7 @@ impl Grader for BudgetGrader {
     }
 
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        let run = run.completion_or_default();
         // A bound is one inclusive check (`actual <= max`), tagged Budget.
         let check = |label: &str, max: u64, actual: u64| {
             GradeResult::new(
@@ -266,7 +267,7 @@ impl Grader for ResponseJsonGrader {
     }
 
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
-        let parsed = parse_response_json(&run.final_response);
+        let parsed = parse_response_json(&run.completion_or_default().final_response);
         self.pointers
             .iter()
             .map(|(pointer, expected)| {
@@ -313,7 +314,11 @@ impl PayloadKind {
 ///
 /// The failure detail always names the observed payload(s) so a CI failure is
 /// diagnosable without re-running locally.
-fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind) -> GradeResult {
+fn grade_payload(
+    expect: &ToolPayloadExpect,
+    run: &crate::record::RunCompletion,
+    kind: PayloadKind,
+) -> GradeResult {
     let tool = expect.tool.as_str();
     let needle = expect.needle.as_str();
     let payload_of = |c: &crate::observer::RecordedCall| match kind {
@@ -388,6 +393,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
 
 /// Evaluate every declared expectation against the run, one [`GradeResult`] per check.
 pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeResult> {
+    let run = run.completion_or_default();
     let mut out = Vec::new();
     let resp = run.final_response.as_str();
     let tool_names = run.tool_names();
@@ -482,11 +488,11 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     for expect in &expects.tool_arguments_contain {
-        out.push(grade_payload(expect, run, PayloadKind::Arguments));
+        out.push(grade_payload(expect, &run, PayloadKind::Arguments));
     }
 
     for expect in &expects.tool_results_contain {
-        out.push(grade_payload(expect, run, PayloadKind::Result));
+        out.push(grade_payload(expect, &run, PayloadKind::Result));
     }
 
     if let Some(expected) = expects.all_tools_succeeded {
@@ -632,35 +638,39 @@ mod tests {
 
     fn run(resp: &str, tools: &[&str], all_ok: bool) -> RunRecord {
         RunRecord {
-            final_response: resp.to_string(),
-            history: Vec::new(),
-            tool_calls: tools
-                .iter()
-                .map(|s| RecordedCall {
-                    name: (*s).to_string(),
-                    arguments: String::new(),
-                    result: String::new(),
-                    success: all_ok,
-                })
-                .collect(),
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
+            provenance: crate::record::CaseProvenance {
+                schema: crate::record::RECORD_SCHEMA.to_string(),
+                mode: crate::Mode::Replay,
+                case_id: "test".to_string(),
+                case_hash: String::new(),
+                provider_ref: "scripted".to_string(),
+                tool_surface: crate::record::ToolSurface::default(),
+                sandbox: crate::record::SandboxStamp {
+                    autonomy: "supervised".to_string(),
+                    workspace_only: false,
+                },
+            },
+            completion: Some(crate::record::RunCompletion {
+                final_response: resp.to_string(),
+                tool_calls: tools
+                    .iter()
+                    .map(|s| RecordedCall {
+                        name: (*s).to_string(),
+                        arguments: String::new(),
+                        result: String::new(),
+                        success: all_ok,
+                    })
+                    .collect(),
+                ..crate::record::RunCompletion::default()
+            }),
         }
     }
 
     /// A record whose recorded calls carry real argument/result payloads.
     fn run_with_calls(resp: &str, calls: Vec<RecordedCall>) -> RunRecord {
-        RunRecord {
-            final_response: resp.to_string(),
-            history: Vec::new(),
-            tool_calls: calls,
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-        }
+        let mut record = run(resp, &[], true);
+        record.completion.as_mut().unwrap().tool_calls = calls;
+        record
     }
 
     fn call(name: &str, arguments: &str, result: &str) -> RecordedCall {
@@ -861,7 +871,7 @@ mod tests {
     #[tokio::test]
     async fn budget_grader_boundary_inclusive() {
         let mut record = run("", &[], true);
-        record.input_tokens = 100;
+        record.completion.as_mut().unwrap().input_tokens = 100;
         let at_limit = BudgetGrader {
             expects: BudgetExpects {
                 max_input_tokens: Some(100),
@@ -887,8 +897,9 @@ mod tests {
     #[tokio::test]
     async fn budget_total_saturates_instead_of_wrapping() {
         let mut record = run("", &[], true);
-        record.input_tokens = u64::MAX;
-        record.output_tokens = 1;
+        let completion = record.completion.as_mut().unwrap();
+        completion.input_tokens = u64::MAX;
+        completion.output_tokens = 1;
         let grades = BudgetGrader {
             expects: BudgetExpects {
                 max_total_tokens: Some(u64::MAX - 1),

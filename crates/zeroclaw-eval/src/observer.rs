@@ -9,7 +9,7 @@ use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric
 /// arguments the agent actually dispatched and the output the tool actually returned.
 /// That is what lets a fixture grade a round trip instead of grading text the replay
 /// provider scripted for itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecordedCall {
     /// Tool name, as dispatched.
     pub name: String,
