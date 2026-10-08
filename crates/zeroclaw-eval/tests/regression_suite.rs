@@ -94,6 +94,7 @@ async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
             case_id: trace.display_id().to_string(),
             case_hash: zeroclaw_eval::case::case_hash(&trace).unwrap(),
             provider_ref: "scripted".to_string(),
+            judge_ref: None,
             tool_surface: zeroclaw_eval::record::ToolSurface::default(),
             sandbox: zeroclaw_eval::record::SandboxStamp {
                 autonomy: "supervised".to_string(),
