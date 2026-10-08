@@ -4624,9 +4624,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5770,9 +5768,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .try_lock_owned()
-            .ok();
+        let config_generation_guard = self.ctx.config_authority.try_lock_config_writer();
         let config = Box::new(self.ctx.config.read().clone());
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -6034,9 +6030,7 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _gate = ctx.config_authority.lock_config_writer().await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7197,9 +7191,7 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _config_write_guard = self.ctx.config_authority.lock_config_writer().await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -38850,7 +38842,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -38903,7 +38895,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -39092,7 +39084,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -39657,9 +39649,7 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let guard = ctx.config_authority.lock_config_writer().await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -43027,9 +43017,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -43049,9 +43037,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let settled_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         drop(settled_gate);
 
         assert!(matches!(

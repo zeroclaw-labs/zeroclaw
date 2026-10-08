@@ -135,6 +135,21 @@ impl LiveConfigAuthority {
         })
     }
 
+    /// Hold this authority's config writer mutex without admitting a commit.
+    /// Readers in the route-generation transaction (session construction,
+    /// `session/configure`, rehydration and its reconciliation) take it so
+    /// that no commit publishes while they build from config. It admits no
+    /// write lease, so a closing generation never drains against a reader.
+    pub async fn lock_config_writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.config_write_lock).lock_owned().await
+    }
+
+    /// [`Self::lock_config_writer`] without waiting: `None` while a commit or
+    /// another reader holds the mutex.
+    pub fn try_lock_config_writer(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.config_write_lock).try_lock_owned().ok()
+    }
+
     /// Whether the daemon-wide config writer mutex is currently held.
     /// Test/diagnostic witness only: it proves a commit is in flight, not
     /// which one.
@@ -1443,6 +1458,29 @@ mod tests {
             &isolated.config_write_lock
         ));
         assert!(!sharing.live_handle().same_storage(&isolated.live_handle()));
+    }
+
+    #[tokio::test]
+    async fn config_writer_gate_and_commits_serialize_on_one_mutex() {
+        let authority = LiveConfigAuthority::for_tests(Config::default());
+        let gate = authority.lock_config_writer().await;
+        assert!(authority.try_lock_config_writer().is_none());
+        let mut commit = std::pin::pin!(authority.begin_config_commit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut commit)
+                .await
+                .is_err(),
+            "a commit must wait while a reader holds the writer gate"
+        );
+
+        drop(gate);
+        let commit = tokio::time::timeout(std::time::Duration::from_secs(5), commit)
+            .await
+            .expect("the commit proceeds once the reader releases the gate")
+            .expect("an open generation admits the commit");
+        assert!(authority.try_lock_config_writer().is_none());
+        drop(commit);
+        assert!(authority.try_lock_config_writer().is_some());
     }
 
     #[test]

@@ -389,7 +389,7 @@ impl RpcContext {
         )
         .ok();
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = LiveConfigAuthority::new(config);
+        let authority = LiveConfigAuthority::for_tests(config);
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
