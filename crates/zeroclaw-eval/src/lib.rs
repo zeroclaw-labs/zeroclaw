@@ -1,6 +1,7 @@
 //! Agent evaluation harness for ZeroClaw.
 
 pub mod baseline;
+pub mod calibration;
 pub mod case;
 pub mod grader;
 pub mod live;
