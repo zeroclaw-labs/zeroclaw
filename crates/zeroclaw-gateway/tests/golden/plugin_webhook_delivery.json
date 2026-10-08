@@ -1,0 +1,392 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "plain text body, not JSON",
+        "headers": [
+          [
+            "Content-Type",
+            "text/plain; charset=utf-8"
+          ],
+          [
+            "X-Golden-Signature",
+            "sha256=0f1e2d"
+          ],
+          [
+            "X-Golden-Multi",
+            "one"
+          ],
+          [
+            "X-Golden-Multi",
+            "two"
+          ],
+          [
+            "X-Golden-Opaque",
+            "<bytes fffe>"
+          ],
+          [
+            "X-Golden-Accent",
+            "café"
+          ]
+        ],
+        "method": "POST",
+        "path": "/plugin/ack?source=golden&n=1"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "plain text body, not JSON",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-type",
+            "text/plain; charset=utf-8"
+          ],
+          [
+            "x-golden-signature",
+            "sha256=0f1e2d"
+          ],
+          [
+            "x-golden-multi",
+            "one"
+          ],
+          [
+            "x-golden-multi",
+            "two"
+          ],
+          [
+            "content-length",
+            "25"
+          ]
+        ],
+        "method": "POST",
+        "query": "source=golden&n=1",
+        "route": "ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": null,
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "<bytes 00fffe206f706171756520802062797465730d0a>",
+        "headers": [
+          [
+            "Content-Type",
+            "application/octet-stream"
+          ]
+        ],
+        "method": "POST",
+        "path": "/plugin/ack"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "<bytes 00fffe206f706171756520802062797465730d0a>",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-type",
+            "application/octet-stream"
+          ],
+          [
+            "content-length",
+            "20"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": null,
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "",
+        "headers": [],
+        "method": "GET",
+        "path": "/plugin/echo-query?challenge=a%2Bb&part=one&part=two"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "0"
+          ]
+        ],
+        "method": "GET",
+        "query": "challenge=a%2Bb&part=one&part=two",
+        "route": "echo-query"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "challenge=a%2Bb&part=one&part=two",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "{\"type\":\"url_verification\",\"challenge\":\"golden-challenge\"}",
+        "headers": [
+          [
+            "Content-Type",
+            "application/json"
+          ]
+        ],
+        "method": "POST",
+        "path": "/plugin/echo-challenge"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "{\"type\":\"url_verification\",\"challenge\":\"golden-challenge\"}",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-length",
+            "58"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "echo-challenge"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "golden-challenge",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "",
+        "headers": [],
+        "method": "GET",
+        "path": "/plugin/empty-reply"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "0"
+          ]
+        ],
+        "method": "GET",
+        "query": "",
+        "route": "empty-reply"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "{}",
+        "headers": [
+          [
+            "x-golden-message-id",
+            "golden-message-1"
+          ]
+        ],
+        "method": "POST",
+        "path": "/plugin/dedup"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "{}",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "x-golden-message-id",
+            "golden-message-1"
+          ],
+          [
+            "content-length",
+            "2"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "reservation": "owner, committed",
+        "route": "dedup"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": null,
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "{}",
+        "headers": [
+          [
+            "x-golden-message-id",
+            "golden-message-1"
+          ]
+        ],
+        "method": "POST",
+        "path": "/plugin/dedup"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "{}",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "x-golden-message-id",
+            "golden-message-1"
+          ],
+          [
+            "content-length",
+            "2"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "reservation": "committed",
+        "route": "dedup"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": null,
+        "status": 200
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "meta",
+      "payload": {
+        "unclaimed_reports": []
+      }
+    }
+  ],
+  "scenario": "plugin_webhook_delivery"
+}
