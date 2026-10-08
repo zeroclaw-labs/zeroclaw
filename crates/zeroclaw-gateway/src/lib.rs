@@ -1267,7 +1267,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let all_tools_result = tools::all_tools_with_runtime(
+            match tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
@@ -1291,56 +1291,73 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
-            )?;
-            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-                config: &config,
-                agent_alias,
-                security: &security,
-                built: all_tools_result,
-                // The gateway registers no skills today; unifying the two
-                // skill loaders through this seam is the Epic F follow-up.
-                skills: &[],
-                runtime: Arc::clone(&runtime),
-                caller_allowed: None,
-                connect_mcp: true,
-                // Gateway tool-listing path: short-lived, no cross-turn reuse
-                // contract, so the per-call connect is correct.
-                mcp_registry: None,
-                // Listing-only registry: loading peripherals physically opens
-                // hardware (exclusive serial holds) that the live turn paths
-                // need. Never connect them for a registry no turn runs against.
-                connect_peripherals: false,
-                emit_assembly_logs: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: true,
-            })
-            .await;
-            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
-            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
-                &config,
-                &assembled.ask_user_handle,
-                &assembled.channel_room_handle,
-                &reaction_handle_gw_opt,
-                &assembled.poll_handle,
-                &assembled.escalate_handle,
-            );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
-                    &format!(
-                        "Registered {} channel(s) for dashboard agent",
-                        channel_names.len()
-                    ),
-                );
+            ) {
+                Ok(all_tools_result) => {
+                    let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias,
+                        security: &security,
+                        built: all_tools_result,
+                        // The gateway registers no skills today; unifying the two
+                        // skill loaders through this seam is the Epic F follow-up.
+                        skills: &[],
+                        runtime: Arc::clone(&runtime),
+                        caller_allowed: None,
+                        connect_mcp: true,
+                        // Gateway tool-listing path: short-lived, no cross-turn reuse
+                        // contract, so the per-call connect is correct.
+                        mcp_registry: None,
+                        // Listing-only registry: loading peripherals physically opens
+                        // hardware (exclusive serial holds) that the live turn paths
+                        // need. Never connect them for a registry no turn runs against.
+                        connect_peripherals: false,
+                        emit_assembly_logs: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: true,
+                    })
+                    .await;
+                    let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
+                    let channel_names =
+                        zeroclaw_channels::orchestrator::register_channels_for_tools(
+                            &config,
+                            &assembled.ask_user_handle,
+                            &assembled.channel_room_handle,
+                            &reaction_handle_gw_opt,
+                            &assembled.poll_handle,
+                            &assembled.escalate_handle,
+                        );
+                    if !channel_names.is_empty() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                            &format!(
+                                "Registered {} channel(s) for dashboard agent",
+                                channel_names.len()
+                            ),
+                        );
+                    }
+                    // Listing-only registry: no turn runs against it, so the
+                    // deferred-MCP prompt section and activation handle returned by
+                    // `assemble` have no consumer here (live gateway chat resolves
+                    // its tools inside process_message).
+                    (assembled.registry.into_inner(), assembled.delegate_handle)
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{e}")})),
+                        "Gateway: agent tool registry failed to build; booting with empty tools registry. Fix via /admin/reload or /quickstart."
+                    );
+                    (Vec::new(), None)
+                }
             }
-            // Listing-only registry: no turn runs against it, so the
-            // deferred-MCP prompt section and activation handle returned by
-            // `assemble` have no consumer here (live gateway chat resolves
-            // its tools inside process_message).
-            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1401,7 +1418,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = tools::all_tools_with_runtime(
+        let agent_tools_result = match tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1425,7 +1442,23 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent tool registry failed to build; exposing an empty /api/tools listing. Fix via /admin/reload or /quickstart."
+                );
+                // An absent alias falls back to the default agent's tools.
+                tools_registry_by_agent.insert(alias, Arc::new(Vec::new()));
+                continue;
+            }
+        };
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel
@@ -6796,6 +6829,142 @@ path = "{trigger_path}"
             );
         }
         handle.abort();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn run_gateway_isolates_failed_seatbelt_tool_listings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        for failed_default in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cycle = tmp.path().join("cycle");
+            std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+            let mut config = Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            config.gateway.require_pairing = false;
+            config.memory.backend = "none".into();
+            config.risk_profiles.insert(
+                "healthy".into(),
+                RiskProfileConfig {
+                    sandbox_enabled: Some(true),
+                    sandbox_backend: Some("sandbox-exec".into()),
+                    ..RiskProfileConfig::default()
+                },
+            );
+            let mut failed_profile = config.risk_profiles["healthy"].clone();
+            failed_profile.allowed_roots = vec![cycle.display().to_string()];
+            config.risk_profiles.insert("failed".into(), failed_profile);
+            let (failed_alias, healthy_alias) = if failed_default {
+                ("a-failed", "z-healthy")
+            } else {
+                ("z-failed", "a-healthy")
+            };
+            for (alias, profile) in [(failed_alias, "failed"), (healthy_alias, "healthy")] {
+                config.agents.insert(
+                    alias.into(),
+                    AliasedAgentConfig {
+                        enabled: true,
+                        risk_profile: profile.into(),
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            assert_eq!(
+                default_agent_alias(&config).as_deref(),
+                Some(if failed_default {
+                    failed_alias
+                } else {
+                    healthy_alias
+                })
+            );
+
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+            let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+                let _ = ready_tx.send(Some(addr));
+            });
+            let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+            let (reload_tx, _) = tokio::sync::watch::channel(false);
+            let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+                shutdown_tx.clone(),
+                reload_tx,
+            );
+            let server = zeroclaw_spawn::spawn!(async move {
+                run_gateway(
+                    "127.0.0.1",
+                    0,
+                    config,
+                    None,
+                    Some(controls),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(readiness),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                ready_rx.wait_for(Option::is_some).await.unwrap();
+            })
+            .await
+            .expect("failed listing must not prevent gateway readiness");
+            let addr = ready_rx.borrow().unwrap();
+            let get = |path: String| async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                    stream.write_all(request.as_bytes()).await.unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).await.unwrap();
+                    assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+                    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()
+                })
+                .await
+                .expect("gateway must serve the HTTP response")
+            };
+            get("/health".into()).await;
+            get("/api/config".into()).await;
+            let failed = get(format!("/api/tools?agent={failed_alias}")).await;
+            assert_eq!(failed["tools"], serde_json::json!([]));
+            let healthy = get(format!("/api/tools?agent={healthy_alias}")).await;
+            assert!(
+                healthy["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "shell")
+            );
+            let default = get("/api/tools".into()).await;
+            assert_eq!(
+                default["tools"],
+                if failed_default {
+                    failed["tools"].clone()
+                } else {
+                    healthy["tools"].clone()
+                }
+            );
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("gateway should shut down")
+                .expect("gateway task should not panic")
+                .expect("gateway shutdown should succeed");
+        }
     }
 
     #[tokio::test]

@@ -2194,6 +2194,21 @@ fn build_channel_system_prompt(
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
         }
+        // Both WhatsApp backends share a name, but only Web delivers documents.
+        if instructions.contains("[DOCUMENT:")
+            && !matches!(channel_name, "whatsapp" | "whatsapp-web")
+        {
+            prompt.push_str(
+                "\n\nWhen generating large HTML, scripts, spreadsheets or exports, use available \
+                 file-writing tools to save the complete artifact at an absolute path inside the \
+                 configured workspace instead of pasting it into chat. After saving successfully, \
+                 send a short summary plus the document marker described above, using that same absolute path \
+                 and following this channel's path and URL restrictions. If file-writing tools \
+                 are unavailable or saving fails, explain the limitation and provide the content \
+                 in chat. Do not emit a document marker for an \
+                 unsaved file.",
+            );
+        }
     }
 
     if let Some(mention) = bot_mention {
@@ -45760,7 +45775,74 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0][0].1.contains("For media attachments use markers:"),
             "telegram media marker guidance should live in the system prompt"
         );
+        assert!(
+            calls[0][0].1.contains(
+                "save the complete artifact at an absolute path inside the configured workspace"
+            ),
+            "generated artifact guidance should reach the provider's system message"
+        );
+        assert!(
+            calls[0][0].1.contains("using that same absolute path"),
+            "generated artifact markers must use absolute paths in the provider's system message"
+        );
+        assert!(
+            calls[0][0]
+                .1
+                .contains("If file-writing tools are unavailable or saving fails")
+                && calls[0][0]
+                    .1
+                    .contains("explain the limitation and provide the content in chat")
+                && calls[0][0]
+                    .1
+                    .contains("Do not emit a document marker for an unsaved file"),
+            "the no-tools provider request must include an honest inline fallback"
+        );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_guides_large_artifacts_only_for_document_channels() {
+        let base = "Base prompt with literal marker syntax: [DOCUMENT:example.txt]";
+        for channel_name in [
+            "matrix", "discord", "lark", "feishu", "telegram", "qq", "wechat",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                prompt.contains(base),
+                "{channel_name} must retain the base prompt"
+            );
+            assert!(
+                prompt.contains(
+                    "save the complete artifact at an absolute path inside the configured workspace"
+                ) && prompt.contains("instead of pasting it into chat")
+                    && prompt.contains("short summary plus the document marker")
+                    && prompt.contains("using that same absolute path")
+                    && prompt.contains("following this channel's path and URL restrictions")
+                    && prompt.contains("After saving successfully")
+                    && prompt.contains("If file-writing tools are unavailable or saving fails")
+                    && prompt.contains("explain the limitation and provide the content in chat")
+                    && prompt.contains("Do not emit a document marker for an unsaved file"),
+                "{channel_name} must guide large artifacts through its existing document route"
+            );
+            assert_eq!(
+                prompt,
+                build_channel_system_prompt(base, channel_name, None),
+                "{channel_name} artifact guidance must remain byte-stable"
+            );
+        }
+        for channel_name in [
+            "whatsapp",
+            "whatsapp-web",
+            "wecom_ws",
+            "mattermost",
+            "unknown",
+        ] {
+            let prompt = build_channel_system_prompt(base, channel_name, None);
+            assert!(
+                !prompt.contains("short summary plus the document marker"),
+                "{channel_name} must not advertise document delivery from base-prompt marker text"
+            );
+        }
     }
 
     #[test]

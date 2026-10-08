@@ -69,7 +69,9 @@ pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
     CollectedResults, check_identical_output_abort, collect_tool_results,
 };
-pub use steering::drain_steering_messages;
+pub use steering::{
+    SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture, drain_steering_messages,
+};
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
@@ -676,7 +678,7 @@ pub struct ToolLoop<'a> {
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
-    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
+    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<SteeringInput>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub image_cache: Option<ToolLoopImageState<'a>>,
     pub ingress: IngressContext,
@@ -1619,7 +1621,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 merged
             });
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
-        for steering_message in drain_steering_messages(&mut steering) {
+
+        for steering_input in drain_steering_messages(&mut steering) {
+            // This loop cannot narrow its registry mid-run, so it admits only
+            // a sender that is still authorized and whose posture narrows
+            // nothing; anything else is dropped rather than run with more
+            // than the sender now holds.
+            match steering_input.admit() {
+                SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
+                _ => continue,
+            }
+            let steering_message = steering_input.into_text();
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
                 IngressDecision::Loop => {}
