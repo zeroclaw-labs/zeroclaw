@@ -7378,10 +7378,19 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     iteration_config,
                     ownership,
                 );
+
+                // One ingress per daemon generation: the channel supervisor
+                // publishes routes into its registry and every gateway run of
+                // this generation dispatches through it, so message dedup
+                // outlives a gateway restart but not a reload.
                 #[cfg(feature = "gateway")]
-                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                let plugin_webhook_ingress =
+                    Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+                        current_config.gateway.idempotency_ttl_secs,
+                        current_config.gateway.idempotency_max_keys,
+                    ));
                 #[cfg(feature = "gateway")]
-                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                let channel_plugin_webhooks = Some(Arc::clone(plugin_webhook_ingress.registry()));
                 #[cfg(not(feature = "gateway"))]
                 let channel_plugin_webhooks: Option<
                     Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
@@ -7485,7 +7494,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_dh = sop_driver_supervisor
                         .as_ref()
                         .map(|supervisor| supervisor.drivers.clone());
-                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                    let plugin_webhook_ingress = Arc::clone(&plugin_webhook_ingress);
                     move |host,
                           port,
                           config,
@@ -7499,7 +7508,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         let sop_driver_handles = sop_dh.clone();
-                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                        let plugin_webhook_ingress = Arc::clone(&plugin_webhook_ingress);
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
@@ -7514,7 +7523,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 daemon_authority,
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
-                                    plugin_webhooks,
+                                    plugin_webhook_ingress,
                                     authority,
                                     sop_driver_handles,
                                 ),

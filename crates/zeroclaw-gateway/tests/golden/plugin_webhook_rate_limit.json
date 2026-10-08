@@ -1,0 +1,93 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "first",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/ack"
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "recv",
+      "payload": {
+        "body": "first",
+        "headers": [
+          [
+            "host",
+            "<gateway>"
+          ],
+          [
+            "connection",
+            "close"
+          ],
+          [
+            "content-length",
+            "5"
+          ]
+        ],
+        "method": "POST",
+        "query": "",
+        "route": "ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "",
+        "content_type": null,
+        "status": 200
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "second",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "{\"error\":\"Too many webhook requests. Please retry later.\",\"retry_after\":60}",
+        "content_type": "application/json",
+        "status": 429
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "third",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/missing"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "{\"error\":\"Too many webhook requests. Please retry later.\",\"retry_after\":60}",
+        "content_type": "application/json",
+        "status": 429
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "meta",
+      "payload": {
+        "unclaimed_reports": []
+      }
+    }
+  ],
+  "scenario": "plugin_webhook_rate_limit"
+}

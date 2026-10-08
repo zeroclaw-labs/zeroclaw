@@ -1,0 +1,146 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "body",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/missing"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook not found",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 404
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "body",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/not.a.route"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook not found",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 404
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "body",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/queue-full"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook queue full",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 429
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "body",
+        "headers": [],
+        "method": "POST",
+        "path": "/plugin/closed"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "webhook unavailable",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "",
+        "headers": [],
+        "method": "HEAD",
+        "path": "/plugin/ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "allow": "GET, POST",
+        "body": "",
+        "content_type": null,
+        "status": 405
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": "",
+        "headers": [],
+        "method": "PUT",
+        "path": "/plugin/missing"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "allow": "GET, POST",
+        "body": "",
+        "content_type": null,
+        "status": 405
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "declared_body_bytes": 65537,
+        "method": "POST",
+        "path": "/plugin/ack"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": "length limit exceeded",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 413
+      }
+    },
+    {
+      "channel": "plugin",
+      "dir": "meta",
+      "payload": {
+        "unclaimed_reports": []
+      }
+    }
+  ],
+  "scenario": "plugin_webhook_admission"
+}
