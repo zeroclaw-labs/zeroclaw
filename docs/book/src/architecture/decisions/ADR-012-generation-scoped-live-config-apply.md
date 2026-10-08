@@ -71,6 +71,8 @@ This ADR remains proposed until all of these conditions are met:
 
 Canonical publication and the result ledger must ship without new live behavior before the security and channel consumers are enabled. Security live application precedes channel live application.
 
+The canonical publication *foundation* is implemented by [PR #10911](https://github.com/zeroclaw-labs/zeroclaw/pull/10911): one published `Config`-plus-revision pair per authority generation behind a read-only live handle, epoch- and sequence-identified, with participating HTTP/RPC/TUI/Quickstart/pairing/channel-identity writers serialized through admitted, retained config commits. That foundation supplies the serialization half of the first gate only; it does not complete the gate. The generation-scoped applied-state ledger, per-target results, and new live-apply behavior are separate implementation requirements tracked by [#10892](https://github.com/zeroclaw-labs/zeroclaw/issues/10892). This ADR stays proposed until all acceptance gates above are met. Until the new consumers ship, the saved-versus-applied behavior and `/admin/reload` fallback described in [Config lifecycle](../config-lifecycle.md) remain authoritative.
+
 ## Consequences
 
 Positive consequences:
@@ -91,7 +93,10 @@ Negative consequences:
 ## References
 
 - [RFC #7897: Apply security policy and channel config updates without full daemon reload](https://github.com/zeroclaw-labs/zeroclaw/issues/7897)
+- [Issue #10892: canonical config publication foundation](https://github.com/zeroclaw-labs/zeroclaw/issues/10892)
 - [Config lifecycle](../config-lifecycle.md)
 - `crates/zeroclaw-config/src/schema.rs`
+- `crates/zeroclaw-config/src/live.rs`
+- `crates/zeroclaw-runtime/src/live_config_authority.rs`
 - `crates/zeroclaw-gateway/src/api_config.rs`
 - `crates/zeroclaw-channels/src/orchestrator/mod.rs`

@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
 
-use super::context::{ConfigWriteGuard, RpcContext};
+use super::context::RpcContext;
 use super::session::DurableSession;
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
@@ -37,10 +38,7 @@ use zeroclaw_commands::{CommandSurface, commands_for_surface};
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
 
 pub type LocalRpcSessionChannelFactory = Arc<
-    dyn Fn(
-            Arc<parking_lot::RwLock<Config>>,
-            String,
-        ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
+    dyn Fn(LiveConfigHandle, String) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
         + Send
         + Sync,
 >;
@@ -932,20 +930,69 @@ struct PreparedChannelGenerationMutation {
     drain: crate::daemon::PreparedChannelGenerationDrain,
 }
 
-/// Save one prepared config snapshot and install the matching live snapshot
-/// without a dispatcher instance. Used by the retained destructive
-/// transaction, whose task holds the config write guard across the whole
-/// persistence-to-cleanup sequence. The caller must hold the config write
-/// lock while awaiting this.
-async fn save_and_swap_config_detached(
-    config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+/// Post-publication effects that one ordinary config commit prepared and
+/// that must run inside the retained commit task — serialized with every
+/// other config writer and immune to request cancellation, exactly where
+/// they ran when handlers held the raw writer guard to the end.
+#[derive(Default)]
+pub(crate) struct RpcConfigCommitEffects {
+    /// Prepared alias reservations and session views stay owned through apply.
+    config_reservations: Vec<crate::live_config_authority::AgentAdmissionReservation>,
+    prepared_sessions: Vec<PreparedLiveSessionRefresh>,
+    memory_provider_refs: Vec<String>,
+    /// `(config_path, [(prop, comment)])` — write `config/set` comments
+    /// into config.toml after the save. Best-effort, warned on failure.
+    comments: Option<(std::path::PathBuf, Vec<(String, String)>)>,
+    /// `(old_config, agent_alias)` — refresh the live channel handles of
+    /// sessions bound to one alias whose channel authorization changed.
+    channel_handle_refresh: Option<(Box<zeroclaw_config::schema::Config>, Vec<String>)>,
+    /// Prepared channel-generation retirement for channel-affecting
+    /// mutations; drains and schedules the daemon reload.
+    channel_generation: Option<PreparedChannelGenerationMutation>,
+}
+
+/// Save one prepared config snapshot and publish it under its allocated
+/// revision without a dispatcher instance. Used by the retained commit
+/// tasks, which own the [`crate::live_config_authority::ConfigCommit`] (writer guard plus config-write
+/// lease) across the whole persistence-to-publication sequence. A
+/// pre-commit save failure leaves the published pair untouched.
+async fn save_and_publish_config_detached(
+    commit: &crate::live_config_authority::ConfigCommit,
+    revision: zeroclaw_config::live::ConfigRevision,
     mut snapshot: zeroclaw_config::schema::Config,
 ) -> Result<(), JsonRpcError> {
     Box::pin(snapshot.save_dirty())
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-    *config.write() = snapshot;
+    commit
+        .publish(revision, snapshot)
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config publication failed: {e}")))?;
     Ok(())
+}
+
+fn publish_accepted_config_policy(auth: &crate::rpc::auth::RpcInboundAuth, accepted: &Config) {
+    let accepted_revision = auth.accepted_revision().saturating_add(1);
+    if let Err(error) = auth.publish_accepted(accepted, accepted_revision) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+            "config saved but the authorization policy was rejected; the previous policy remains in effect"
+        );
+    }
+}
+
+/// Map a refused config-commit admission to its RPC error. A refused
+/// admission means the daemon generation is closing (reload or shutdown):
+/// the write never started, and disk state is untouched.
+fn config_commit_admission_error(
+    error: crate::live_config_authority::ConfigCommitError,
+) -> JsonRpcError {
+    rpc_err(
+        INTERNAL_ERROR,
+        format!("Daemon generation is closing; config write refused without any change: {error}"),
+    )
 }
 
 /// Dispatch a daemon reload without a dispatcher instance. Extracted so the
@@ -1011,6 +1058,40 @@ async fn drain_channel_generation_without_dispatcher(
     }
     drain_wait.wait().await;
     schedule_daemon_reload_from_parts(reload_tx, gateway_shutdown_tx, "config-channel-generation");
+}
+
+/// Refresh live channel handles for sessions bound to `agent_alias`
+/// between the pre-commit config and the just-published one without
+/// borrowing the dispatcher, so the retained commit task can run it.
+async fn refresh_live_channel_handles_between_configs_detached(
+    sessions: &Arc<crate::rpc::session::SessionStore>,
+    old_config: &Config,
+    new_config: &Config,
+    agent_alias: &str,
+) {
+    let Some(configured) =
+        crate::agent::loop_::configured_channel_maps(old_config, new_config, agent_alias)
+    else {
+        return;
+    };
+    for session_id in sessions.list_ids().await {
+        if sessions.get_agent_alias(&session_id).await.as_deref() != Some(agent_alias) {
+            continue;
+        }
+        let Some(agent) = sessions.get_agent(&session_id).await else {
+            continue;
+        };
+        let agent = agent.lock().await;
+        let handles = agent.channel_handles();
+        crate::agent::loop_::refresh_channel_handles(
+            &configured,
+            &handles.ask_user,
+            &handles.channel_room,
+            &handles.reaction,
+            &handles.poll,
+            &handles.escalate,
+        );
+    }
 }
 
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
@@ -1605,7 +1686,7 @@ impl RpcDispatcher {
     /// followed by the concrete path selector.
     ///
     /// The generation observed here is the one the commit runs under.
-    /// `refresh_from_config` is reached only from `save_and_swap_config`,
+    /// `refresh_from_config` is reached only from `save_and_publish_config`,
     /// which asserts this same lock is held, so no accepted policy can be
     /// installed between this check and the commit. `config/reload` signals
     /// the supervisor instead of refreshing in process, so it opens no window
@@ -1619,7 +1700,7 @@ impl RpcDispatcher {
         &self,
         method: Method,
         path: Option<&str>,
-        _guard: &ConfigWriteGuard,
+        _commit: &crate::live_config_authority::ConfigCommit,
     ) -> Result<(), JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
@@ -2751,7 +2832,7 @@ impl RpcDispatcher {
         let Some(factory) = self.local_session_channel_factory.as_ref() else {
             return;
         };
-        for (name, channel) in factory(Arc::clone(&self.ctx.config), agent_alias.to_string()) {
+        for (name, channel) in factory(self.ctx.config.clone(), agent_alias.to_string()) {
             agent
                 .channel_handles()
                 .reaction
@@ -2801,75 +2882,6 @@ impl RpcDispatcher {
             configured,
             drain,
         }))
-    }
-
-    async fn finish_channel_generation_mutation(
-        &self,
-        prepared: Option<PreparedChannelGenerationMutation>,
-        guard: ConfigWriteGuard,
-    ) -> Result<ConfigWriteGuard, JsonRpcError> {
-        if prepared.is_none() {
-            return Ok(guard);
-        }
-        let sessions = Arc::clone(&self.ctx.sessions);
-        let reload_tx = self.ctx.reload_tx.clone();
-        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
-        // Retirement is irreversible. Keep its completion and serialization
-        // alive even when the requesting future is dropped mid-drain.
-        let task = crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-            drain_channel_generation_without_dispatcher(
-                sessions,
-                prepared,
-                reload_tx,
-                gateway_shutdown_tx,
-            )
-            .await;
-            guard
-        }));
-        task.await.map_err(|error| {
-            rpc_err(
-                INTERNAL_ERROR,
-                format!("Channel completion task failed: {error}"),
-            )
-        })
-    }
-
-    async fn refresh_live_channel_handles_between_configs(
-        &self,
-        old_config: &Config,
-        new_config: &Config,
-        agent_alias: &str,
-    ) {
-        let Some(configured) =
-            crate::agent::loop_::configured_channel_maps(old_config, new_config, agent_alias)
-        else {
-            return;
-        };
-        for session_id in self.ctx.sessions.list_ids().await {
-            if self
-                .ctx
-                .sessions
-                .get_agent_alias(&session_id)
-                .await
-                .as_deref()
-                != Some(agent_alias)
-            {
-                continue;
-            }
-            let Some(agent) = self.ctx.sessions.get_agent(&session_id).await else {
-                continue;
-            };
-            let agent = agent.lock().await;
-            let handles = agent.channel_handles();
-            crate::agent::loop_::refresh_channel_handles(
-                &configured,
-                &handles.ask_user,
-                &handles.channel_room,
-                &handles.reaction,
-                &handles.poll,
-                &handles.escalate,
-            );
-        }
     }
 
     async fn wait_test_session_publication_pause(&self) {
@@ -3088,25 +3100,29 @@ impl RpcDispatcher {
         }
     }
 
-    /// Save `snapshot` to disk, then install it as the live config.
+    /// Commit one prepared config snapshot.
     ///
-    /// `_guard` is a witness that the caller serializes the whole
-    /// read-mutate-save-swap critical section on `config_write_lock`. Holding
-    /// that lock prevents a concurrent write from being lost while disk I/O
-    /// awaits, and lets auth publication consume the exact saved snapshot.
-    async fn save_and_swap_config(
+    /// The irreversible phase — save to disk, publish the pair — runs as a
+    /// retained task that owns the admitted [`crate::live_config_authority::ConfigCommit`] (the
+    /// daemon-wide writer guard plus the parent config-write lifecycle lease), so
+    /// dropping the requesting future cannot abandon a dispatched commit
+    /// between the atomic file replacement and its publication. The
+    /// prepared `effects` stay inside that task too: they were previously
+    /// executed while the handler still held the writer guard, and the
+    /// retained task preserves exactly that serialization boundary.
+    ///
+    /// The revision is allocated (checked) *before* the save, so an
+    /// exhausted epoch refuses the commit while disk state is unchanged.
+    /// The request awaits the task's result and answers truthfully; a
+    /// pre-commit save failure returns with the previously published pair
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_and_publish_config(
         &self,
-        mut snapshot: zeroclaw_config::schema::Config,
-        _guard: &ConfigWriteGuard,
+        commit: crate::live_config_authority::ConfigCommit,
+        snapshot: zeroclaw_config::schema::Config,
+        effects: RpcConfigCommitEffects,
     ) -> Result<(), JsonRpcError> {
-        debug_assert!(
-            self.ctx.config_write_lock.try_lock().is_err(),
-            "save_and_swap_config caller must hold ctx.config_write_lock"
-        );
-        // Validate the auth sections BEFORE anything is persisted or swapped:
-        // an invalid authorization policy must be rejected without being
-        // installed, and the caller should learn why rather than find the
-        // previous policy silently still in effect after a "successful" save.
         snapshot.validate_auth().map_err(|e| {
             rpc_err(
                 INVALID_PARAMS,
@@ -3122,54 +3138,67 @@ impl RpcDispatcher {
                     format!("Authorization config rejected; nothing was saved: {e}"),
                 )
             })?;
-        snapshot
-            .save_dirty()
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
-        // Authorization config may have changed (permission_profiles,
-        // users, oidc, security.trust_daemon_uid): recompile the policy
-        // so a new generation reaches established connections at their
-        // next privileged operation — no reconnect or restart.
-        let refreshed = self.ctx.config.read().clone();
-        // One accepted persistence, one revision. Both the save and this
-        // publication happen under `config_write_lock`, so the revision is
-        // monotonic and the accepted state a consumer observes at revision N
-        // is the policy compiled from the configuration that was persisted as
-        // N.
-        let revision = self.ctx.auth.accepted_revision().saturating_add(1);
-        if let Err(error) = self.ctx.auth.publish_accepted(&refreshed, revision) {
-            // The auth sections were validated before the save, so this is
-            // defensive: the resolver keeps the previous policy and
-            // generation in effect rather than installing anything invalid.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
-                "config saved but the authorization policy was rejected; the previous policy remains in effect"
-            );
-        }
-        Ok(())
-    }
-
-    /// Exercise the historical dirty-path persistence boundary directly.
-    /// Production mutations now use `save_and_swap_config` so the accepted
-    /// auth snapshot and persisted config stay one transaction.
-    #[cfg(test)]
-    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
-        debug_assert!(self.ctx.config_write_lock.try_lock().is_err());
-        let mut snapshot = self.ctx.config.read().clone();
-        let saved_paths = snapshot.dirty_paths.clone();
-        Box::pin(snapshot.save_dirty())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        self.ctx
-            .config
-            .write()
-            .dirty_paths
-            .retain(|path| !saved_paths.contains(path));
-        Ok(())
+        let revision = commit
+            .next_revision()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}")))?;
+        let ctx = Arc::clone(&self.ctx);
+        let sessions = Arc::clone(&ctx.sessions);
+        let reload_tx = self.ctx.reload_tx.clone();
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        let task = crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            // `commit` is owned by this task: serialization and drain
+            // accounting live until the effects below finish.
+            let _config_reservations = effects.config_reservations;
+            let result =
+                save_and_publish_config_detached(&commit, revision, snapshot.clone()).await;
+            if result.is_ok() {
+                let accepted = Arc::new(commit.current_config());
+                publish_accepted_config_policy(&ctx.auth, &accepted);
+                Self::apply_prepared_live_sessions_refresh(
+                    Arc::clone(&ctx),
+                    effects.prepared_sessions,
+                    Arc::clone(&accepted),
+                )
+                .await;
+                drain_channel_generation_without_dispatcher(
+                    Arc::clone(&sessions),
+                    effects.channel_generation,
+                    reload_tx,
+                    gateway_shutdown_tx,
+                )
+                .await;
+                if let Some((config_path, annotations)) = effects.comments
+                    && let Err(error) =
+                        zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations)
+                            .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "failed to apply config/set comment to config.toml"
+                    );
+                }
+                if let Some((old_config, agent_aliases)) = effects.channel_handle_refresh {
+                    for agent_alias in agent_aliases {
+                        refresh_live_channel_handles_between_configs_detached(
+                            &sessions,
+                            &old_config,
+                            &snapshot,
+                            &agent_alias,
+                        )
+                        .await;
+                    }
+                }
+                for provider in effects.memory_provider_refs {
+                    Self::refresh_memory_embedder_for_model_provider(&ctx, &accepted, &provider);
+                }
+            }
+            result
+        }));
+        task.await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config commit task failed: {e}")))?
     }
 
     async fn agent_rename_residue_exists(
@@ -4595,7 +4624,9 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -4677,13 +4708,13 @@ impl RpcDispatcher {
         };
         let execution_capability =
             crate::live_config_authority::AgentExecutionCapability::from_parts(
-                Arc::clone(&self.ctx.config),
+                self.ctx.config.clone(),
                 self.ctx.agent_lifecycle.clone(),
             );
         let mut agent = Box::pin(
             crate::agent::agent::Agent::from_snapshot_with_tui_env_with_capability(
                 &config,
-                Arc::clone(&self.ctx.config),
+                self.ctx.config.clone(),
                 &req.agent_alias,
                 cwd_path,
                 initialize_mcp,
@@ -5739,7 +5770,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = Arc::clone(&self.ctx.config_write_lock)
+        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
             .try_lock_owned()
             .ok();
         let config = Box::new(self.ctx.config.read().clone());
@@ -5747,13 +5778,13 @@ impl RpcDispatcher {
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let execution_capability =
             crate::live_config_authority::AgentExecutionCapability::from_parts(
-                Arc::clone(&self.ctx.config),
+                self.ctx.config.clone(),
                 self.ctx.agent_lifecycle.clone(),
             );
         let Ok(mut agent) = Box::pin(
             crate::agent::agent::Agent::from_snapshot_with_tui_env_with_capability(
                 &config,
-                Arc::clone(&self.ctx.config),
+                self.ctx.config.clone(),
                 &data.agent_alias,
                 cwd_path,
                 false,
@@ -6003,7 +6034,9 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7164,7 +7197,9 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -7174,6 +7209,18 @@ impl RpcDispatcher {
             .capture_session_access(&req.session_id)
             .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        // The ownership check and the waits since then can span a same-ID
+        // replacement. Fence on the incarnation that was authorized: a
+        // successor captured here is refused like one installed during the
+        // lock wait below, instead of becoming the generation that
+        // re-verification expects.
+        if authorized
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_some_and(|generation| generation != session_generation)
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
 
         // Acquire the per-session ordering boundary.
         let _model_provider_update = self
@@ -8332,7 +8379,7 @@ impl RpcDispatcher {
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let selection = crate::live_config_authority::AgentExecutionCapability::from_parts(
-            Arc::clone(&self.ctx.config),
+            self.ctx.config.clone(),
             self.ctx.agent_lifecycle.clone(),
         )
         .capture_selection();
@@ -8402,75 +8449,63 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
         let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        self.recheck_config_write_authority(
-            Method::ConfigSet,
-            Some(&req.prop),
-            &config_write_guard,
-        )?;
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(Method::ConfigSet, Some(&req.prop), &config_commit)?;
         let old_config = self.ctx.config.read().clone();
         let channel_generation_revocation = self.prepare_channel_generation_revocation(
             is_channel_generation_prop(&req.prop),
             &old_config,
         )?;
-        // Clone the live config and perform every mutation — alias creation,
-        // field lookup, value coercion, masked-secret validation, and the
-        // persistent write — on the working copy. Any early error simply
-        // returns and drops the clone, so a partially-applied attempt (e.g. a
-        // freshly auto-created alias followed by a coercion failure) is
-        // discarded as one unit and can never leave a phantom entry on the
-        // live config. Only a fully successful mutation is committed, either
-        // by the live-session refresh transaction (when this prop changes a
-        // route-affecting surface) or by swapping the snapshot in under
-        // `config_write_guard`. This keeps alias-creation ownership inside
-        // `zeroclaw-config` and commit orchestration inside the runtime,
-        // rather than mirroring config transaction semantics through a
-        // tracked tuple.
+        // Clone the published config and perform every mutation — alias
+        // creation, field lookup, value coercion, masked-secret validation,
+        // and the persistent write — on the working copy. Any early error
+        // simply returns and drops the clone (and the un-dispatched commit),
+        // so a partially-applied attempt (e.g. a freshly auto-created alias
+        // followed by a coercion failure) is discarded as one unit and can
+        // never leave a phantom entry on the live config. Only a fully
+        // successful mutation is committed, by publishing the snapshot
+        // under the admitted commit's allocated revision. This keeps
+        // alias-creation ownership inside `zeroclaw-config` and commit
+        // orchestration inside the runtime, rather than mirroring config
+        // transaction semantics through a tracked tuple.
         // `Config` is a large aggregate; box the working clone so it lives on
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
         Self::stage_config_set(&mut config, &req.prop, &req.value)?;
-        let config_path = config.config_path.clone();
+        let effects = RpcConfigCommitEffects {
+            config_reservations: _agent_config_reservation.into_iter().collect(),
+            memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
+            channel_handle_refresh: refresh_channel_agent
+                .map(|alias| (Box::new(old_config), vec![alias])),
+            channel_generation: channel_generation_revocation,
+            comments: req
+                .comment
+                .as_ref()
+                .filter(|comment| !comment.is_empty())
+                .map(|comment| {
+                    (
+                        config.config_path.clone(),
+                        vec![(req.prop.clone(), comment.clone())],
+                    )
+                }),
+            ..RpcConfigCommitEffects::default()
+        };
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 *config,
-                &config_write_guard,
+                config_commit,
                 scope,
+                effects,
             ))
             .await?;
         } else {
-            self.save_and_swap_config(*config, &config_write_guard)
+            self.save_and_publish_config(config_commit, *config, effects)
                 .await?;
-        }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        if let Some(comment) = req.comment.as_ref().filter(|comment| !comment.is_empty()) {
-            let annotations = [(req.prop.clone(), comment.clone())];
-            if let Err(error) =
-                zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                    "failed to apply config/set comment to config.toml"
-                );
-            }
-        }
-        if let Some(agent_alias) = refresh_channel_agent.as_deref() {
-            let new_config = self.ctx.config.read().clone();
-            self.refresh_live_channel_handles_between_configs(
-                &old_config,
-                &new_config,
-                agent_alias,
-            )
-            .await;
-        }
-        if let Some(model_provider_ref) = refresh_model_provider_ref {
-            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
         }
         to_result(ConfigSetResult {
             prop: req.prop,
@@ -8483,11 +8518,11 @@ impl RpcDispatcher {
     const CONFIG_SET_MANY_MAX_ENTRIES: usize = 256;
 
     /// `config/set-many`: stage an ordered batch of `config/set` entries on
-    /// one working copy and commit it with a single `save_and_swap_config`,
+    /// one working copy and commit it with a single `save_and_publish_config`,
     /// so fields that are only valid together (a `[users.<name>]` entry's
     /// `uid` and `permission_profiles`) can be authored without an invalid
     /// intermediate state ever being checked, saved, or installed. Whatever
-    /// commit-time checks `save_and_swap_config` performs run once, over the
+    /// commit-time checks `save_and_publish_config` performs run once, over the
     /// final state. An entry that fails to stage aborts the whole batch
     /// before anything is saved or swapped, and the error names its index.
     ///
@@ -8556,12 +8591,16 @@ impl RpcDispatcher {
             .iter()
             .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
             .collect();
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
         for (index, entry) in req.sets.iter().enumerate() {
             self.recheck_config_write_authority(
                 Method::ConfigSetMany,
                 Some(&entry.prop),
-                &config_write_guard,
+                &config_commit,
             )
             .map_err(|e| {
                 rpc_err(
@@ -8578,14 +8617,14 @@ impl RpcDispatcher {
             })?;
         }
         // Boxed for the same stack-frame reason as in `handle_config_set`.
-        let old_config = self.ctx.config.read().clone();
+        let old_config = Box::new(self.ctx.config.read().clone());
         let channel_generation_revocation = self.prepare_channel_generation_revocation(
             req.sets
                 .iter()
                 .any(|entry| is_channel_generation_prop(&entry.prop)),
             &old_config,
         )?;
-        let mut config = Box::new(old_config.clone());
+        let mut config = old_config.clone();
         for (index, entry) in req.sets.iter().enumerate() {
             Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
                 rpc_err(
@@ -8609,33 +8648,32 @@ impl RpcDispatcher {
             .iter()
             .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
             .collect();
+        let effects = RpcConfigCommitEffects {
+            config_reservations: _agent_config_reservations,
+            memory_provider_refs: req
+                .sets
+                .iter()
+                .filter_map(|entry| model_provider_ref_from_provider_profile_prop(&entry.prop))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            channel_handle_refresh: Some((old_config, channel_agents.into_iter().collect())),
+            channel_generation: channel_generation_revocation,
+            ..RpcConfigCommitEffects::default()
+        };
         if scopes.is_empty() {
-            self.save_and_swap_config(*config, &config_write_guard)
+            self.save_and_publish_config(config_commit, *config, effects)
                 .await?;
         } else {
             Box::pin(self.commit_config_with_live_session_refresh(
                 *config,
-                &config_write_guard,
+                config_commit,
                 &LiveSessionRefreshScope::Batch(scopes),
+                effects,
             ))
             .await?;
         }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        let new_config = self.ctx.config.read().clone();
-        for alias in channel_agents {
-            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
-                .await;
-        }
         let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
-        let providers: std::collections::BTreeSet<_> = props
-            .iter()
-            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
-            .collect();
-        for provider in providers {
-            self.refresh_memory_embedder_for_model_provider(&provider);
-        }
         to_result(ConfigSetManyResult { props, set: true })
     }
 
@@ -8690,24 +8728,25 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
-    fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
-        let resolved = {
-            let config = self.ctx.config.read();
-            if !memory_embeddings_use_provider(&config, model_provider_ref) {
-                return;
-            }
-            // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
-            // is called with `api_key = None`): keys come from the per-route /
-            // `[memory]` override or the referenced profile, never an inherited seed.
-            zeroclaw_memory::resolve_embedding_settings(
-                &config.memory,
-                &config.embedding_routes,
-                None,
-                Some(&config.providers.models),
-            )
-        };
+    fn refresh_memory_embedder_for_model_provider(
+        ctx: &Arc<RpcContext>,
+        config: &Config,
+        model_provider_ref: &str,
+    ) {
+        if !memory_embeddings_use_provider(config, model_provider_ref) {
+            return;
+        }
+        // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
+        // is called with `api_key = None`): keys come from the per-route /
+        // `[memory]` override or the referenced profile, never an inherited seed.
+        let resolved = zeroclaw_memory::resolve_embedding_settings(
+            &config.memory,
+            &config.embedding_routes,
+            None,
+            Some(&config.providers.models),
+        );
         // 1. Install-wide RPC memory handle.
-        if let Some(memory) = self.ctx.memory.as_ref() {
+        if let Some(memory) = ctx.memory.as_ref() {
             memory.refresh_embedder(
                 &resolved.model_provider,
                 resolved.api_key.as_deref(),
@@ -8715,11 +8754,7 @@ impl RpcDispatcher {
                 resolved.dimensions,
             );
         }
-        self.schedule_live_agent_memory_refresh(resolved);
-    }
-
-    fn schedule_live_agent_memory_refresh(&self, resolved: zeroclaw_memory::EmbeddingSettings) {
-        let ctx = Arc::clone(&self.ctx);
+        let ctx = Arc::clone(ctx);
         zeroclaw_spawn::spawn!(async move {
             Self::refresh_live_agent_memory(ctx, resolved).await;
         });
@@ -8751,8 +8786,9 @@ impl RpcDispatcher {
     async fn commit_config_with_live_session_refresh(
         &self,
         working: Config,
-        config_write_guard: &ConfigWriteGuard,
+        config_commit: crate::live_config_authority::ConfigCommit,
         scope: &LiveSessionRefreshScope,
+        mut effects: RpcConfigCommitEffects,
     ) -> Result<(), JsonRpcError> {
         let prepared =
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
@@ -8769,16 +8805,9 @@ impl RpcDispatcher {
             pause.arrived.notify_one();
             pause.release.notified().await;
         }
-        self.save_and_swap_config(working, config_write_guard)
-            .await?;
-        let config_generation = Arc::new(self.ctx.config.read().clone());
-        Self::apply_prepared_live_sessions_refresh(
-            Arc::clone(&self.ctx),
-            prepared,
-            config_generation,
-        )
-        .await;
-        Ok(())
+        effects.prepared_sessions = prepared;
+        self.save_and_publish_config(config_commit, working, effects)
+            .await
     }
 
     async fn prepare_live_sessions_refresh(
@@ -9036,12 +9065,12 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let refresh_scope = LiveSessionRefreshScope::for_prop(&req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        self.recheck_config_write_authority(
-            Method::ConfigDelete,
-            Some(&req.prop),
-            &config_write_guard,
-        )?;
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(Method::ConfigDelete, Some(&req.prop), &config_commit)?;
         let old_config = self.ctx.config.read().clone();
         let channel_generation_revocation = self.prepare_channel_generation_revocation(
             is_channel_generation_prop(&req.prop),
@@ -9051,31 +9080,25 @@ impl RpcDispatcher {
         working
             .set_prop_persistent(&req.prop, "")
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        let effects = RpcConfigCommitEffects {
+            config_reservations: _agent_config_reservation.into_iter().collect(),
+            memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
+            channel_handle_refresh: refresh_channel_agent
+                .map(|alias| (Box::new(old_config), vec![alias])),
+            channel_generation: channel_generation_revocation,
+            ..RpcConfigCommitEffects::default()
+        };
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
-                &config_write_guard,
+                config_commit,
                 scope,
+                effects,
             ))
             .await?;
         } else {
-            self.save_and_swap_config(working, &config_write_guard)
+            self.save_and_publish_config(config_commit, working, effects)
                 .await?;
-        }
-        let _config_write_guard = self
-            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
-            .await?;
-        if let Some(agent_alias) = refresh_channel_agent.as_deref() {
-            let new_config = self.ctx.config.read().clone();
-            self.refresh_live_channel_handles_between_configs(
-                &old_config,
-                &new_config,
-                agent_alias,
-            )
-            .await;
-        }
-        if let Some(model_provider_ref) = refresh_model_provider_ref {
-            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
         }
         to_result(ConfigDeleteResult {
             prop: req.prop,
@@ -9116,11 +9139,15 @@ impl RpcDispatcher {
             .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
             .transpose()
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
         self.recheck_config_write_authority(
             Method::ConfigMapKeyCreate,
             Some(&key_path),
-            &config_write_guard,
+            &config_commit,
         )?;
         let create = |config: &mut Config| -> Result<bool, JsonRpcError> {
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -9134,14 +9161,19 @@ impl RpcDispatcher {
             }
             Ok(created)
         };
+        let effects = RpcConfigCommitEffects {
+            config_reservations: _agent_config_reservation.into_iter().collect(),
+            ..RpcConfigCommitEffects::default()
+        };
         let created = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
                 Box::pin(self.commit_config_with_live_session_refresh(
                     working,
-                    &config_write_guard,
+                    config_commit,
                     &LiveSessionRefreshScope::ModelRoutes,
+                    effects,
                 ))
                 .await?;
             }
@@ -9150,7 +9182,7 @@ impl RpcDispatcher {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                self.save_and_swap_config(working, &config_write_guard)
+                self.save_and_publish_config(config_commit, working, effects)
                     .await?;
             }
             created
@@ -9190,11 +9222,15 @@ impl RpcDispatcher {
                 deleted: true,
             });
         }
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
         self.recheck_config_write_authority(
             Method::ConfigMapKeyDelete,
             Some(&key_path),
-            &config_write_guard,
+            &config_commit,
         )?;
 
         let old_config = self.ctx.config.read().clone();
@@ -9227,14 +9263,19 @@ impl RpcDispatcher {
             Ok(deleted)
         };
 
+        let effects = RpcConfigCommitEffects {
+            channel_generation: channel_generation_revocation,
+            ..RpcConfigCommitEffects::default()
+        };
         let deleted = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let deleted = delete_plain(&mut working)?;
             if deleted {
                 Box::pin(self.commit_config_with_live_session_refresh(
                     working,
-                    &config_write_guard,
+                    config_commit,
                     &LiveSessionRefreshScope::ModelRoutes,
+                    effects,
                 ))
                 .await?;
             }
@@ -9264,8 +9305,9 @@ impl RpcDispatcher {
                 // consulted again.
                 Box::pin(self.commit_config_with_live_session_refresh(
                     working,
-                    &config_write_guard,
+                    config_commit,
                     &LiveSessionRefreshScope::ModelRoutes,
+                    effects,
                 ))
                 .await?;
             }
@@ -9274,19 +9316,11 @@ impl RpcDispatcher {
             let mut working = old_config;
             let deleted = delete_plain(&mut working)?;
             if deleted {
-                self.save_and_swap_config(working, &config_write_guard)
+                self.save_and_publish_config(config_commit, working, effects)
                     .await?;
             }
             deleted
         };
-        if deleted {
-            let _config_write_guard = self
-                .finish_channel_generation_mutation(
-                    channel_generation_revocation,
-                    config_write_guard,
-                )
-                .await?;
-        }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
             key: req.key,
@@ -9357,7 +9391,11 @@ impl RpcDispatcher {
             // Mutex is not reentrant. The guard moves by value into the
             // alias-rename path so it can be released at that handler's
             // commit point, before its slow post-commit side effects.
-            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            let config_commit = self
+                .ctx
+                .begin_config_commit()
+                .await
+                .map_err(config_commit_admission_error)?;
             // Both endpoints are rechecked here, before the alias branch is
             // delegated into, so the alias-rename path inherits the recheck.
             for key_path in [
@@ -9367,7 +9405,7 @@ impl RpcDispatcher {
                 self.recheck_config_write_authority(
                     Method::ConfigMapKeyRename,
                     Some(&key_path),
-                    &config_write_guard,
+                    &config_commit,
                 )?;
             }
             let old_config = self.ctx.config.read().clone();
@@ -9381,7 +9419,7 @@ impl RpcDispatcher {
                     .handle_config_alias_rename(
                         req,
                         kind,
-                        config_write_guard,
+                        config_commit,
                         agent_lifecycle_leases,
                         channel_generation_revocation,
                     )
@@ -9395,23 +9433,22 @@ impl RpcDispatcher {
             if renamed {
                 working.mark_dirty(&format!("{}.{}", req.path, req.from));
                 working.mark_dirty(&format!("{}.{}", req.path, req.to));
+                let effects = RpcConfigCommitEffects {
+                    channel_generation: channel_generation_revocation,
+                    ..RpcConfigCommitEffects::default()
+                };
                 if touches_model_routes(&req.path) {
                     Box::pin(self.commit_config_with_live_session_refresh(
                         working,
-                        &config_write_guard,
+                        config_commit,
                         &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
                     ))
                     .await?;
                 } else {
-                    self.save_and_swap_config(working, &config_write_guard)
+                    self.save_and_publish_config(config_commit, working, effects)
                         .await?;
                 }
-                let _config_write_guard = self
-                    .finish_channel_generation_mutation(
-                        channel_generation_revocation,
-                        config_write_guard,
-                    )
-                    .await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -9428,7 +9465,7 @@ impl RpcDispatcher {
         &'a self,
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
-        config_write_guard: ConfigWriteGuard,
+        config_commit: crate::live_config_authority::ConfigCommit,
         mut agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
         channel_generation_revocation: Option<PreparedChannelGenerationMutation>,
     ) -> BoxRpcFuture<'a> {
@@ -9468,7 +9505,7 @@ impl RpcDispatcher {
                 }
             }
 
-            let mut working = self.ctx.config.read().clone();
+            let mut working = config_commit.current_config();
             let old_workspace = is_agent.then(|| working.agent_workspace_dir(&req.from));
             // If a prior call saved config as `to` but crashed before side effects,
             // re-running `from -> to` should converge lagging owned state instead
@@ -9501,11 +9538,11 @@ impl RpcDispatcher {
 
             let warnings = if is_agent {
                 // Agent rename: spawn the retained transaction before the
-                // first persistence await. The config write guard, both
-                // uncommitted reservations, the prepared config, and the
-                // prepared channel-generation control all live in a task that
-                // request cancellation cannot abort.
-                let live_config = Arc::clone(&self.ctx.config);
+                // first persistence await. The config commit (writer guard
+                // plus config-write lease), both uncommitted reservations, the
+                // prepared config, and the prepared channel-generation
+                // control all live in a task that request cancellation
+                // cannot abort.
                 let cleanup_sessions = Arc::clone(&self.ctx.sessions);
                 let cleanup_reload_tx = self.ctx.reload_tx.clone();
                 let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
@@ -9515,27 +9552,38 @@ impl RpcDispatcher {
                 let session_backend = self.ctx.session_backend.clone();
                 // Same ownership-boundary boxing as the delete transaction:
                 // the rename future carries the same capture shape (prepared
-                // config, channel maps, guard, both leases) and is constructed
-                // directly into its heap allocation off the 2 MiB worker's
-                // dispatcher frame.
+                // config, channel maps, commit, both leases) and is
+                // constructed directly into its heap allocation off the 2 MiB
+                // worker's dispatcher frame.
                 let cleanup =
                     crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-                        // Save the prepared config and install the matching
-                        // live snapshot; a true pre-commit save error ends the
-                        // task with the reservations uncommitted and both
-                        // generations unchanged. A resume run (config already
-                        // committed `from -> to` by a prior crashed attempt)
-                        // skips straight to the commit below.
+                        // Save the prepared config and publish it under the
+                        // commit's allocated revision; a true pre-commit save
+                        // error ends the task with the reservations
+                        // uncommitted, both generations unchanged, and the
+                        // previously published pair still visible. A resume
+                        // run (config already committed `from -> to` by a
+                        // prior crashed attempt) skips straight to the commit
+                        // below — its publication already landed.
                         if !resume_committed_to {
-                            save_and_swap_config_detached(live_config, working.clone()).await?;
+                            let revision = config_commit.next_revision().map_err(|e| {
+                                rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}"))
+                            })?;
+                            save_and_publish_config_detached(
+                                &config_commit,
+                                revision,
+                                working.clone(),
+                            )
+                            .await?;
                         }
                         // Committed: advance both alias generations exactly
-                        // once — synchronous, no await since the live swap.
+                        // once — synchronous, no await since the publication.
                         for lease in &mut agent_lifecycle_leases {
                             lease.commit_destructive_mutation();
                         }
                         // Retire and await the channel generation while still
-                        // holding the config write guard, then schedule reload.
+                        // holding the commit's serialization, then schedule
+                        // reload.
                         drain_channel_generation_without_dispatcher(
                             cleanup_sessions,
                             channel_generation_revocation,
@@ -9543,9 +9591,9 @@ impl RpcDispatcher {
                             cleanup_gateway_shutdown_tx,
                         )
                         .await;
-                        // Release the daemon-wide config mutation lock before
-                        // slow cleanup.
-                        drop(config_write_guard);
+                        // Release the commit's serialization (writer guard
+                        // and config-write lease) before slow cleanup.
+                        config_commit.release_serialization();
                         let mut warnings: Vec<String> =
                             if let (Some(old_ws), Some(new_ws)) = (old_workspace, new_workspace) {
                                 move_renamed_agent_workspace(&old_ws, &new_ws)
@@ -9576,7 +9624,10 @@ impl RpcDispatcher {
                     )
                 })??
             } else {
-                // Non-agent alias renames retain the writer through retirement.
+                let effects = RpcConfigCommitEffects {
+                    channel_generation: channel_generation_revocation,
+                    ..RpcConfigCommitEffects::default()
+                };
                 if !resume_committed_to {
                     if let Some(family) = model_provider_family {
                         let scope = LiveSessionRefreshScope::ProviderAliasRename {
@@ -9585,22 +9636,16 @@ impl RpcDispatcher {
                         };
                         Box::pin(self.commit_config_with_live_session_refresh(
                             working,
-                            &config_write_guard,
+                            config_commit,
                             &scope,
+                            effects,
                         ))
                         .await?;
                     } else {
-                        self.save_and_swap_config(working, &config_write_guard)
+                        self.save_and_publish_config(config_commit, working, effects)
                             .await?;
                     }
                 }
-                let config_write_guard = self
-                    .finish_channel_generation_mutation(
-                        channel_generation_revocation,
-                        config_write_guard,
-                    )
-                    .await?;
-                drop(config_write_guard);
                 Vec::new()
             };
 
@@ -9743,8 +9788,12 @@ impl RpcDispatcher {
             )
         })?;
 
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let mut working = self.ctx.config.read().clone();
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        let mut working = config_commit.current_config();
         let channel_generation_revocation =
             self.prepare_channel_generation_revocation(self.ctx.reload_tx.is_some(), &working)?;
         let preflight =
@@ -9786,16 +9835,16 @@ impl RpcDispatcher {
         let cleanup_sessions = Arc::clone(&self.ctx.sessions);
         let cleanup_reload_tx = self.ctx.reload_tx.clone();
         let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
-        let live_config = Arc::clone(&self.ctx.config);
         // Spawn the retained transaction BEFORE the first persistence await.
         // Config persistence becomes externally visible when config.toml is
-        // atomically renamed, before `save_dirty` returns, so the config write
-        // guard, the uncommitted reservation, the prepared config, and the
-        // prepared channel-generation control must all live in a task that
-        // request cancellation cannot abort. The request only awaits the
-        // handle; dropping it must not abort the task.
+        // atomically renamed, before `save_dirty` returns, so the config
+        // commit (writer guard plus config-write lease), the uncommitted
+        // reservation, the prepared config, and the prepared
+        // channel-generation control must all live in a task that request
+        // cancellation cannot abort. The request only awaits the handle;
+        // dropping it must not abort the task.
         // The transaction future is boxed at this ownership boundary so its
-        // captures (prepared config, channel maps, guard, lease) are
+        // captures (prepared config, channel maps, commit, lease) are
         // constructed directly into its heap allocation instead of
         // materializing in the dispatcher's poll frame: production Tokio
         // workers run at the default 2 MiB stack, and the pinned
@@ -9803,17 +9852,22 @@ impl RpcDispatcher {
         // guards that boundary.
         let cleanup =
             crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-                // Save the prepared config and install the matching live
-                // snapshot. A true pre-commit save error rolls back disk
-                // state, and this task then ends: the guard and the
-                // uncommitted reservation drop with generations unchanged.
-                save_and_swap_config_detached(live_config, working.clone()).await?;
+                // Save the prepared config and publish it under the
+                // commit's allocated revision. A true pre-commit save error
+                // rolls back disk state, and this task then ends: the
+                // commit and the uncommitted reservation drop with
+                // generations unchanged and the prior pair still published.
+                let revision = config_commit.next_revision().map_err(|e| {
+                    rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}"))
+                })?;
+                save_and_publish_config_detached(&config_commit, revision, working.clone()).await?;
                 // Committed: advance the alias generation exactly once.
-                // Synchronous — no await between the live swap and this commit.
+                // Synchronous — no await between the publication and this
+                // commit.
                 lifecycle_lease.commit_destructive_mutation();
                 // Retire and await the existing channel generation while
-                // still holding the config write guard, then schedule the
-                // daemon reload.
+                // still holding the commit's serialization, then schedule
+                // the daemon reload.
                 drain_channel_generation_without_dispatcher(
                     cleanup_sessions,
                     channel_generation_revocation,
@@ -9821,8 +9875,9 @@ impl RpcDispatcher {
                     cleanup_gateway_shutdown_tx,
                 )
                 .await;
-                // Release the daemon-wide config mutation lock before slow cleanup.
-                drop(config_write_guard);
+                // Release the commit's serialization (writer guard and
+                // config-write lease) before slow cleanup.
+                config_commit.release_serialization();
                 let archive = crate::agent_lifecycle::archive_agent_workspace(
                     &working,
                     &cleanup_alias,
@@ -11481,7 +11536,7 @@ impl RpcDispatcher {
                 &outcome,
                 Some(
                     crate::live_config_authority::AgentExecutionCapability::from_parts(
-                        Arc::clone(&self.ctx.config),
+                        self.ctx.config.clone(),
                         self.ctx.agent_lifecycle.clone(),
                     ),
                 ),
@@ -11744,22 +11799,19 @@ impl RpcDispatcher {
 
     async fn apply_quickstart_reserved(&self, req: QuickstartApplyParams) -> RpcResult {
         // Serializes with every other config-mutating handler for the whole
-        // clone-apply-save-swap below, so the install on success can't race
-        // a concurrent config write (see `ctx.config_write_lock`).
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        // Quickstart writes the authorization sections themselves, so it is
-        // held to the same post-admission authority check as the config
-        // mutation handlers.
-        self.recheck_config_write_authority(Method::QuickstartApply, None, &config_write_guard)?;
-        // Clone out of the lock to satisfy `&mut Config`. On success
-        // install the mutated snapshot, mirroring the gateway's
-        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
-        // the clone, so `save_and_swap_config` performs no second disk
-        // write (empty dirty set short-circuits) — just the guarded swap.
-        let mut working = self.ctx.config.read().clone();
-        // The staged policy is compiled BEFORE Quickstart's first write, so a
-        // rejected one cannot reach disk and then be reported as not saved.
-        let result = crate::quickstart::apply_with_surface_checked(
+        // stage-persist-publish sequence below, so the install can't race a
+        // concurrent config write.
+        let config_commit = self
+            .ctx
+            .begin_config_commit()
+            .await
+            .map_err(config_commit_admission_error)?;
+        self.recheck_config_write_authority(Method::QuickstartApply, None, &config_commit)?;
+        let mut working = config_commit.current_config();
+        // Stage the submission (validation, mutation, personality
+        // tempfiles) — cancellable preparation with nothing on disk. A
+        // rejected submission returns with the published pair untouched.
+        let staged = match crate::quickstart::stage_apply_checked(
             req.submission,
             &mut working,
             crate::quickstart::Surface::Tui,
@@ -11769,17 +11821,55 @@ impl RpcDispatcher {
                     .validate_refresh_from_config(staged)
                     .map_err(|e| e.to_string())
             },
-        )
-        .await;
+        ) {
+            Ok(staged) => staged,
+            Err(errors) => return to_result(QuickstartApplyResult::Errors { errors }),
+        };
+        // Allocate the checked revision before the irreversible save.
+        let revision = config_commit
+            .next_revision()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}")))?;
+        // The completion (save, publish, personality install) runs
+        // retained: the task owns the commit, so a cancelled requester
+        // cannot strand a committed config without its publication, and a
+        // post-commit personality failure still publishes the committed
+        // config while the truthful errors reach the caller below.
+        let auth = Arc::clone(&self.ctx.auth);
+        let task = crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let result = crate::quickstart::complete_staged_apply_as_commit(
+                staged,
+                &config_commit,
+                revision,
+            )
+            .await;
+            if result.is_ok() {
+                publish_accepted_config_policy(&auth, &config_commit.current_config());
+            }
+            result
+        }));
+        let result = task.await.map_err(|e| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Quickstart commit task failed: {e}"),
+            )
+        })?;
         let body = match result {
-            Ok(agent) => {
-                self.save_and_swap_config(working, &config_write_guard)
-                    .await?;
+            Ok(crate::quickstart::QuickstartApplyOutcome::Applied(agent)) => {
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent,
                     daemon_restarted: reload_signalled,
                 }
+            }
+            Ok(crate::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                errors,
+                ..
+            }) => {
+                // The config is committed AND published; signal the reload
+                // exactly like a fully successful apply and return the
+                // truthful personality errors.
+                let _ = self.signal_daemon_reload();
+                QuickstartApplyResult::Errors { errors }
             }
             Err(errors) => QuickstartApplyResult::Errors { errors },
         };
@@ -15449,7 +15539,7 @@ mod tests {
             .expect("the fixture profile exists")
             .allowed_agents
             .clear();
-        *ctx.config.write() = narrowed.clone();
+        ctx.config_authority.publish_for_test(narrowed.clone());
         let revision = ctx.auth.accepted_revision().saturating_add(1);
         ctx.auth
             .publish_accepted(&narrowed, revision)
@@ -15936,13 +16026,14 @@ mod tests {
         let sid = "s-rehydrate-narrowed";
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         durable_acp_session_at(&ctx, &mut alice, &mut rx, sid, &root).await;
-        ctx.config
-            .write()
-            .risk_profiles
-            .get_mut("test-profile")
-            .expect("the fixture risk profile exists")
-            .allowed_roots
-            .clear();
+        publish_test_config(&ctx, |config| {
+            config
+                .risk_profiles
+                .get_mut("test-profile")
+                .expect("the fixture risk profile exists")
+                .allowed_roots
+                .clear();
+        });
 
         send_prompt(&mut alice, 3, sid, 5).await;
         let (response, notifications) = response_and_notifications(&mut rx, 3).await;
@@ -19049,13 +19140,14 @@ mod tests {
     }
 
     fn demote_environment_principal(dispatcher: &RpcDispatcher) {
-        let mut config = dispatcher.ctx.config.write();
+        let mut config = dispatcher.ctx.config.snapshot();
         config
             .permission_profiles
             .get_mut("principal-test")
             .unwrap()
             .admin = false;
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+        dispatcher.ctx.config_authority.publish_for_test(config);
     }
 
     #[cfg(unix)]
@@ -19133,12 +19225,10 @@ mod tests {
         assert!(!registered_env(&ctx, &dispatcher).is_empty());
         // This probe exercises the shell result, not the operator approval
         // channel. Keep shell execution automatic after preserving its grant.
-        ctx.config
-            .write()
-            .risk_profiles
-            .get_mut("test-profile")
-            .unwrap()
-            .level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+        publish_test_config(&ctx, |config| {
+            config.risk_profiles.get_mut("test-profile").unwrap().level =
+                zeroclaw_config::autonomy::AutonomyLevel::Full;
+        });
 
         let params = json!({"agent_alias": "test-agent", "session_id": "env-fresh"});
         dispatcher
@@ -19538,12 +19628,13 @@ mod tests {
         // coarse check dominates — a wildcard selector without `tools:execute`
         // still yields the empty (fully constrained) ceiling, not `None`.
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config.snapshot();
             cfg.permission_profiles
                 .get_mut("selector-only")
                 .unwrap()
                 .allowed_tools = vec!["*".into()];
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
         assert_eq!(
             dispatcher.principal_tool_narrowing(),
@@ -19553,12 +19644,13 @@ mod tests {
         // Restore the named selector for the refusal assertion below, so the
         // session refusal is exercised against the originally-seeded profile.
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config.snapshot();
             cfg.permission_profiles
                 .get_mut("selector-only")
                 .unwrap()
                 .allowed_tools = vec!["calculator".into()];
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
 
         // Even though the ceiling is merely empty (not a named subset), the
@@ -19640,7 +19732,7 @@ mod tests {
     }
 
     fn refresh_test_principal(dispatcher: &RpcDispatcher, tools: &[&str], agents: &[&str]) {
-        let mut config = dispatcher.ctx.config.write();
+        let mut config = dispatcher.ctx.config.snapshot();
         let profile = config
             .permission_profiles
             .get_mut("principal-test")
@@ -19648,6 +19740,7 @@ mod tests {
         profile.allowed_tools = tools.iter().map(|s| (*s).into()).collect();
         profile.allowed_agents = agents.iter().map(|s| (*s).into()).collect();
         dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+        dispatcher.ctx.config_authority.publish_for_test(config);
     }
 
     /// A prompt that queued while its principal was still unrestricted must
@@ -19805,7 +19898,7 @@ mod tests {
         // selector still says "*", but the coarse grant that gates any tool
         // execution is gone, so the effective ceiling must be empty.
         {
-            let mut cfg = dispatcher.ctx.config.write();
+            let mut cfg = dispatcher.ctx.config.snapshot();
             let profile = cfg.permission_profiles.get_mut("principal-test").unwrap();
             assert_eq!(
                 profile.allowed_tools,
@@ -19822,6 +19915,7 @@ mod tests {
             profile.grants =
                 std::collections::HashMap::from([(Resource::Sessions, sessions_verbs)]);
             dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+            dispatcher.ctx.config_authority.publish_for_test(cfg);
         }
         // NB: `principal_tool_narrowing()` reads the connection's STAMPED
         // grants, which are re-resolved lazily at the next operation gate, so
@@ -20141,11 +20235,12 @@ mod tests {
 
             // Move the bound principal to this matrix case and re-resolve.
             {
-                let mut cfg = dispatcher.ctx.config.write();
+                let mut cfg = dispatcher.ctx.config.snapshot();
                 let profile = cfg.permission_profiles.get_mut("principal-test").unwrap();
                 profile.allowed_tools = tools.iter().map(|s| (*s).into()).collect();
                 profile.admin = admin;
                 dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+                dispatcher.ctx.config_authority.publish_for_test(cfg);
             }
             let current = dispatcher.current_prompt_authority().unwrap();
             let grants = current
@@ -20725,14 +20820,79 @@ mod tests {
             .await
             .expect("the live session has an update lock");
         let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let waiting = sessions.model_provider_update_waiting();
         let operation = alice.handle_session_configure(&params);
         let replace = async {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // Replace only once configure is parked on the update lock, after
+            // its generation capture; a fixed delay cannot promise that under
+            // parallel test load.
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+                .await
+                .expect("configure must reach the provider update lock");
             assert!(sessions.remove("cfg").await);
             let successor =
                 install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
                     .await;
             drop(lock);
+            successor
+        };
+        let (result, successor) = tokio::join!(operation, replace);
+        let err = result.expect_err("a replaced session cannot be configured by the old owner");
+        assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+        assert!(err.message.contains("Session changed while queued"));
+        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+        assert_eq!(
+            sessions
+                .get_overrides("cfg")
+                .await
+                .and_then(|o| o.temperature),
+            None,
+            "bob's successor keeps its own overrides"
+        );
+    }
+
+    /// The waits between configure's ownership check and its generation
+    /// capture (a provisional binding, the config write lock) can span a
+    /// same-ID replacement too. The successor is refused as a changed
+    /// session, not captured and left for the owner re-check to deny.
+    #[tokio::test]
+    async fn configure_refuses_an_incarnation_replaced_before_the_lock() {
+        use crate::rpc::types::ChatMode;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        // An unconfirmed binding parks configure after its ownership check.
+        let binding = Arc::new(tokio::sync::Notify::new());
+        sessions
+            .insert(
+                "cfg".to_string(),
+                owned_test_session(Some("user:alice"), ChatMode::Chat)
+                    .with_pending_generation(Arc::clone(&binding)),
+            )
+            .await
+            .unwrap();
+        let idle_handles = Arc::strong_count(&binding);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+        let operation = alice.handle_session_configure(&params);
+        let replace = async {
+            // A waiting configure holds its own handle on the binding.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while Arc::strong_count(&binding) == idle_handles {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("configure must wait for the provisional binding");
+            // Publishing over alice's entry swaps incarnations without an
+            // empty slot; then release the wait.
+            let successor =
+                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
+                    .await;
+            binding.notify_waiters();
             successor
         };
         let (result, successor) = tokio::join!(operation, replace);
@@ -21805,7 +21965,7 @@ mod tests {
             .expect("the fixture defines the member profile");
         member.allowed_agents = vec!["test-agent".into()];
         ctx.auth.refresh_from_config(&config).unwrap();
-        *ctx.config.write() = config;
+        ctx.config_authority.publish_for_test(config);
         ctx
     }
 
@@ -23956,7 +24116,19 @@ mod tests {
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         tempfile::TempDir,
     ) {
-        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        sops_run_dispatcher_with_config(zeroclaw_config::schema::Config::default(), sop, handles)
+    }
+
+    fn sops_run_dispatcher_with_config(
+        config: zeroclaw_config::schema::Config,
+        sop: crate::sop::types::Sop,
+        handles: Option<crate::sop::SopDriverHandles>,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
         engine.set_sops_for_test(vec![sop]);
         let engine = Arc::new(std::sync::Mutex::new(engine));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(
@@ -23974,7 +24146,7 @@ mod tests {
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
         let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
         let ctx = RpcContext::minimal_with_sop_engine_and_audit(
-            zeroclaw_config::schema::Config::default(),
+            config,
             sessions,
             Arc::clone(&engine),
             audit,
@@ -23986,6 +24158,78 @@ mod tests {
             engine,
             temp,
         )
+    }
+
+    struct ScriptedSopToolResponder {
+        calls: std::sync::atomic::AtomicUsize,
+        denied_shell_command: String,
+    }
+
+    impl wiremock::Respond for ScriptedSopToolResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use std::sync::atomic::Ordering;
+
+            let (message, finish_reason) = match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "denied-shell-call",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": serde_json::json!({
+                                    "command": self.denied_shell_command.clone()
+                                })
+                                .to_string(),
+                            },
+                        }],
+                    }),
+                    "tool_calls",
+                ),
+                1 => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "allowed-file-write-call",
+                            "type": "function",
+                            "function": {
+                                "name": "file_write",
+                                "arguments": serde_json::json!({
+                                    "path": "allowed.txt",
+                                    "content": "file_write ran within the step scope",
+                                })
+                                .to_string(),
+                            },
+                        }],
+                    }),
+                    "tool_calls",
+                ),
+                _ => (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": "The allowed step completed.",
+                        "tool_calls": [],
+                    }),
+                    "stop",
+                ),
+            };
+
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-sop-step-scope",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "rpc-test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+        }
     }
 
     fn manual_sop(
@@ -24119,6 +24363,168 @@ mod tests {
             None,
             "the producer key must not point at a run nothing will advance"
         );
+    }
+
+    /// A manual RPC run resolves its declared agent and applies the run's
+    /// per-step allowlist before dispatching any model-requested tool. The
+    /// scripted provider still asks for `shell` even though it is not offered;
+    /// that call must not execute, while the allowed `file_write` step can
+    /// complete under the same configured agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_run_uses_configured_agent_and_enforces_step_tool_scope() {
+        use std::sync::atomic::AtomicUsize;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("rpc-ops-workspace");
+        let shell_marker = workspace.join("shell-denied.txt");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ScriptedSopToolResponder {
+                calls: AtomicUsize::new(0),
+                denied_shell_command: format!("touch '{}'", shell_marker.display()),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            sop: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "rpc-test")
+            .unwrap();
+        provider.api_key = Some("unit-test-key".into());
+        provider.uri = Some(server.uri());
+        provider.model = Some("rpc-test-model".into());
+        provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            workspace_only: true,
+            allowed_commands: vec!["touch".into()],
+            allowed_tools: vec!["shell".into(), "file_write".into()],
+            auto_approve: vec!["shell".into(), "file_write".into()],
+            always_ask: Vec::new(),
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
+            ..Default::default()
+        };
+        config.risk_profiles.insert("sop-rpc-test".into(), risk);
+
+        let runtime = zeroclaw_config::schema::RuntimeProfileConfig {
+            agentic: true,
+            max_tool_iterations: 5,
+            parallel_tools: Some(false),
+            ..Default::default()
+        };
+        config
+            .runtime_profiles
+            .insert("sop-rpc-test".into(), runtime);
+
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.rpc-test"),
+            risk_profile: zeroclaw_config::providers::RiskProfileRef::new("sop-rpc-test"),
+            runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("sop-rpc-test"),
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.agents.insert("ops".into(), agent);
+
+        let step = crate::sop::types::SopStep {
+            number: 1,
+            title: "Write within the allowed scope".into(),
+            body: "Write the allowed file after handling the unavailable shell call.".into(),
+            scope: Some(crate::sop::StepToolScope {
+                allow: Some(vec!["file_write".into()]),
+                deny: vec!["shell".into()],
+            }),
+            ..crate::sop::types::SopStep::default()
+        };
+        let mut sop = manual_sop("rpc-step-scope", false, step);
+        sop.agent = Some("ops".into());
+
+        let handles = crate::sop::SopDriverHandles::default();
+        let (dispatcher, engine, _audit_temp) =
+            sops_run_dispatcher_with_config(config, sop, Some(handles));
+        let run_id = start_with_key(&dispatcher, "rpc-step-scope", "rpc-step-scope-test").await;
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .unwrap()
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if matches!(
+                    status,
+                    Some(crate::sop::types::SopRunStatus::Completed)
+                        | Some(crate::sop::types::SopRunStatus::Failed)
+                ) {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the generation-owned RPC driver should finish the scripted step");
+        assert_eq!(
+            status,
+            Some(crate::sop::types::SopRunStatus::Completed),
+            "the configured agent should recover from the refused shell call and finish the allowed step"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("allowed.txt"))
+                .await
+                .expect("the allowed file_write call should execute"),
+            "file_write ran within the step scope"
+        );
+        assert!(
+            !shell_marker.exists(),
+            "the scripted but out-of-scope shell call must never execute"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the scripted provider should record its requests");
+        assert!(
+            requests.len() >= 3,
+            "expected denied, allowed, and final model turns"
+        );
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let offered = body["tools"]
+                .as_array()
+                .expect("the agentic request should carry its configured tool set");
+            let names: Vec<&str> = offered
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(|name| name.as_str())
+                })
+                .collect();
+            assert!(
+                names.contains(&"file_write"),
+                "the allowed tool was omitted: {names:?}"
+            );
+            assert!(
+                !names.contains(&"shell"),
+                "the denied tool was offered: {names:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -28233,14 +28639,10 @@ mod tests {
             let chat_before = chat_backend.load(&format!("rpc_{sid}"));
             let acp_before = acp_store.load_session(sid).unwrap();
 
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .agents
-                .get_mut("test-agent")
-                .unwrap()
-                .model_provider = "openai.missing-profile".into();
+            publish_test_config(&dispatcher.ctx, |config| {
+                config.agents.get_mut("test-agent").unwrap().model_provider =
+                    "openai.missing-profile".into();
+            });
             let failure = dispatcher
                 .handle_session_new(&json!({
                     "agent_alias": "test-agent", "chat_mode": target_mode,
@@ -28623,6 +29025,118 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code, SESSION_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_does_not_resurrect_removed_remote_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions, _, _) = make_persistence_test_dispatcher(config, tmp.path());
+        dispatcher.tui_id = Some("original-owner".into());
+        let sid = "removed-queued-replacement";
+        dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "chat_mode": "chat", "session_id": sid,
+            }))
+            .await
+            .unwrap();
+        dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+        let guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let handle = dispatcher.spawn_handle();
+        let replacement = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": "acp", "session_id": sid,
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        sessions.remove(sid).await;
+        drop(guard);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), replacement)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(sessions.get_agent(sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_publication_preserves_original_on_owner_change() {
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let (mut dispatcher, sessions, _, store) =
+                make_persistence_test_dispatcher(config, tmp.path());
+            dispatcher.tui_id = Some("original-owner".into());
+            let sid = "replacement-publication-fence";
+            dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": "chat", "session_id": sid,
+                }))
+                .await
+                .unwrap();
+            let original = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            let history = serde_json::to_value(original.lock().await.history()).unwrap();
+            store
+                .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .unwrap();
+            dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *sessions.test_construction_publication_pause.lock().unwrap() =
+                Some((entered.clone(), release.clone()));
+            let handle = dispatcher.spawn_handle();
+            let replacement = zeroclaw_spawn::spawn!(async move {
+                handle
+                    .handle_session_new(&json!({
+                        "agent_alias": "test-agent", "chat_mode": "acp", "session_id": sid,
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            sessions
+                .resume_existing(
+                    sid,
+                    "test-agent",
+                    &crate::rpc::types::ChatMode::Chat,
+                    Some("new-owner".into()),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), replacement)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_err());
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent(sid).await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+            assert_eq!(
+                serde_json::to_value(original.lock().await.history()).unwrap(),
+                history
+            );
+            assert_eq!(
+                sessions.chat_mode(sid).await,
+                Some(crate::rpc::types::ChatMode::Chat)
+            );
         }
     }
 
@@ -32097,6 +32611,17 @@ mod tests {
             .await
             .expect("cursor read should recover the interrupted turn");
         assert_eq!(page["messages"][0]["content"], "pending question");
+        assert_eq!(page["messages"][1]["role"], "system");
+        assert_eq!(page["messages"][1]["kind"], "message");
+        assert_eq!(
+            page["messages"][1]["content"],
+            crate::i18n::get_required_cli_string("turn-stream-interrupted")
+        );
+        let full = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("full history should retain the same recovered boundary");
+        assert_eq!(page["messages"], full["messages"]);
         assert!(
             !acp_store
                 .recover_turn_checkpoint(sid, "must not recover twice")
@@ -33487,6 +34012,16 @@ mod tests {
 
     // ── config/set secret-routing ────────────────────────────────
 
+    /// Test stand-in for the raw handle write the RPC context no longer
+    /// exposes: mutate a clone of the published config and publish it as
+    /// the next pair. Unsynchronized on purpose: tests that exercise
+    /// writer serialization hold real admitted commits instead.
+    fn publish_test_config(ctx: &Arc<RpcContext>, mutate: impl FnOnce(&mut Config)) {
+        let mut next = ctx.config.snapshot();
+        mutate(&mut next);
+        ctx.config_authority.publish_for_test(next);
+    }
+
     fn make_config_set_test_dispatcher(config: zeroclaw_config::schema::Config) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -33528,11 +34063,11 @@ mod tests {
         first: &RpcContext,
         config: zeroclaw_config::schema::Config,
     ) -> RpcDispatcher {
-        let mut ctx = Arc::try_unwrap(RpcContext::minimal(config, Arc::clone(&first.sessions)))
-            .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
-        ctx.config_write_lock = Arc::clone(&first.config_write_lock);
+        let authority =
+            crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
+        let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
         dispatcher
     }
@@ -33552,7 +34087,7 @@ mod tests {
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = crate::LiveConfigAuthority::for_tests(config);
-        let data_dir = authority.config().read().data_dir.clone();
+        let data_dir = authority.live_handle().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
                 .expect("supervised test ACP store"),
@@ -33563,8 +34098,8 @@ mod tests {
         ));
         let (reload_tx, _) = tokio::sync::watch::channel(false);
         let ctx = Arc::new(RpcContext {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: Some(control),
             config_commit_pause: None,
@@ -33605,8 +34140,8 @@ mod tests {
     }
 
     // `make_config_set_test_dispatcher` takes the `Config` by value and adds no
-    // isolation of its own, and a successful `config/set` falls through to
-    // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
+    // isolation of its own, and a successful `config/set` persists through the
+    // retained commit's `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
 
     #[tokio::test]
@@ -33839,7 +34374,7 @@ mod tests {
         .await
         .expect("reaped prompt registers cancellation before deletion resumes");
         assert!(sessions.has_inflight_turn(session_id));
-        assert!(ctx.config_write_lock.try_lock().is_err());
+        assert!(ctx.config_authority.config_write_lock_is_held());
         save_gate.release();
         release_prompt.notify_one();
         let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
@@ -34118,7 +34653,7 @@ mod tests {
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(ctx.config.read().channels.cli, new_cli);
         assert!(
-            ctx.config_write_lock.try_lock().is_err(),
+            ctx.config_authority.config_write_lock_is_held(),
             "retained drain must still own serialization"
         );
         assert!(
@@ -34131,12 +34666,11 @@ mod tests {
             .expect("retained completion must reload after caller cancellation")
             .unwrap();
         assert!(*reload.borrow());
-        let _guard = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            ctx.config_write_lock.lock(),
-        )
-        .await
-        .expect("completed drain must release the writer");
+        let _guard =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ctx.begin_config_commit())
+                .await
+                .expect("completed drain must release the writer")
+                .expect("config admission remains open");
     }
 
     #[test]
@@ -34819,7 +35353,7 @@ mod tests {
             .expect("quickstart must reach persistence");
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
-        assert!(dispatcher.ctx.config_write_lock.try_lock().is_err());
+        assert!(dispatcher.ctx.config_authority.config_write_lock_is_held());
         assert!(matches!(
             dispatcher.ctx.agent_lifecycle.delete_blocker("recreated"),
             Some(AgentDeleteBlocker::Reservations { .. })
@@ -36211,14 +36745,13 @@ mod tests {
             .await
             .expect("session update lock exists");
 
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.other-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.other-provider".into();
+        });
         let refresh_ctx = Arc::clone(&dispatcher.ctx);
         let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let refresh_wait = refresh_waiting.notified();
@@ -36300,14 +36833,13 @@ mod tests {
             .await
             .expect("session update lock exists");
 
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.other-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.other-provider".into();
+        });
         let release_older_refresh = Arc::new(tokio::sync::Notify::new());
         let older_release = Arc::clone(&release_older_refresh);
         let older_ctx = Arc::clone(&dispatcher.ctx);
@@ -36318,14 +36850,13 @@ mod tests {
                 .expect("older agent refresh must succeed");
         });
 
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.latest-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.latest-provider".into();
+        });
         let latest_ctx = Arc::clone(&dispatcher.ctx);
         let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
         let latest_wait = latest_waiting.notified();
@@ -36378,14 +36909,13 @@ mod tests {
 
         let dispatcher = make_config_set_test_dispatcher(config);
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .runtime_profiles
-            .get_mut("reloadable")
-            .expect("runtime profile exists")
-            .max_history_messages = Some(1);
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .runtime_profiles
+                .get_mut("reloadable")
+                .expect("runtime profile exists")
+                .max_history_messages = Some(1);
+        });
 
         let agent = dispatcher
             .ctx
@@ -37242,7 +37772,7 @@ mod tests {
         );
     }
 
-    /// The batch's only commit point is `save_and_swap_config`: when that
+    /// The batch's only commit point is `save_and_publish_config`: when that
     /// refuses (here, an unwritable config path), nothing staged is installed.
     #[tokio::test]
     async fn config_set_many_installs_nothing_when_the_commit_is_refused() {
@@ -37436,7 +37966,7 @@ mod tests {
         assert_eq!(dispatcher.ctx.config.read().gateway.port, port_before + 1);
     }
 
-    /// The motivating case: `save_and_swap_config` validates the auth
+    /// The motivating case: `save_and_publish_config` validates the auth
     /// sections before persisting, so a `[users.<name>]` entry cannot be
     /// authored one field at a time in either order — each single
     /// `config/set` is refused. The same two writes in one batch commit.
@@ -37525,7 +38055,7 @@ mod tests {
         let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
         let ctx = Arc::clone(&dispatcher.ctx);
 
-        let response = assert_rpc_blocks_on_config_write_lock(
+        let response = assert_rpc_blocks_on_config_commit_serialization(
             ctx,
             async move {
                 Ok(rpc_roundtrip(
@@ -38319,13 +38849,13 @@ mod tests {
         let mut runner = crate::hooks::HookRunner::new();
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
+        let test_authority =
+            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
-            config: Arc::new(parking_lot::RwLock::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: test_authority.live_handle(),
+            config_authority: test_authority.clone(),
+            agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
@@ -38372,13 +38902,13 @@ mod tests {
         let mut runner = crate::hooks::HookRunner::new();
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
+        let test_authority =
+            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
-            config: Arc::new(parking_lot::RwLock::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: test_authority.live_handle(),
+            config_authority: test_authority.clone(),
+            agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
@@ -38561,13 +39091,13 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
 
+        let test_authority =
+            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
-            config: Arc::new(parking_lot::RwLock::new(
-                zeroclaw_config::schema::Config::default(),
-            )),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: test_authority.live_handle(),
+            config_authority: test_authority.clone(),
+            agent_lifecycle: test_authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
@@ -38946,7 +39476,7 @@ mod tests {
         assert_eq!(response_id_key(&Value::Null), None);
     }
 
-    // ── config_write_lock races ─────────────────────────────────
+    // ── config-commit serialization ─────────────────────────────
 
     fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut cfg = zeroclaw_config::schema::Config {
@@ -38979,88 +39509,54 @@ mod tests {
         }
     }
 
-    /// Regression test: `flush_config` used to clone the live config,
-    /// await `save_dirty()` on the clone, then swap the clone back over the
-    /// live config wholesale. A write landed on `ctx.config` while that save
-    /// was in flight was silently erased by the swap even though it was
-    /// never given a chance to reach disk.
-    ///
-    /// This drives `flush_config` to its first real yield point (inside
-    /// `save_dirty`'s disk I/O) with a single manual poll, proving the
-    /// snapshot has already been cloned out from under the live lock, lands
-    /// a second write directly on the live config, then lets the flush
-    /// finish. Against the old swap-based body this fails: P2 disappears
-    /// from live config when the stale snapshot lands on top of it. It was
-    /// confirmed to fail this way by temporarily reverting `flush_config` to
-    /// the swap-based body and re-running this test.
+    /// Failed-save boundary: a `config/set` whose persistence fails must
+    /// return an error and leave the previously published pair untouched —
+    /// same config, same revision — with nothing from the attempted write
+    /// visible to readers. (This is the boundary the old
+    /// `flush_config_preserves_write_landed_during_save` regression
+    /// guarded from the other side: the raw live-write escape hatch it
+    /// needed no longer exists, because the read-only handle cannot
+    /// bypass the serialized commit, so a concurrent writer can only
+    /// queue behind the in-flight commit rather than interleave with its
+    /// save.)
     #[tokio::test]
-    async fn flush_config_preserves_write_landed_during_save() {
+    async fn config_set_save_failure_leaves_published_pair_unchanged() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
+        let blocked_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"").unwrap();
         let mut cfg = make_two_provider_test_config(&tmp);
-        cfg.set_prop_persistent("providers.models.anthropic.default.model", "p1-value")
-            .expect("mark P1 dirty");
-
+        cfg.config_path = blocked_parent.join("config.toml");
         let dispatcher = make_config_set_test_dispatcher(cfg);
-        let guard = Arc::clone(&dispatcher.ctx.config_write_lock)
-            .lock_owned()
-            .await;
-        let mut flush_fut = Box::pin(dispatcher.flush_config(&guard));
+        let before = dispatcher.ctx.config.snapshot_with_revision();
 
-        // Single manual poll: past the synchronous clone-and-capture prefix
-        // of `flush_config`, into `save_dirty`'s disk I/O, which must
-        // suspend rather than resolve synchronously.
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        let first_poll = std::future::Future::poll(flush_fut.as_mut(), &mut cx);
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "doomed-value"
+        });
+        let result = dispatcher.handle_config_set(&params).await;
+        assert!(result.is_err(), "config/set must fail on the blocked path");
+
+        let after = dispatcher.ctx.config.snapshot_with_revision();
         assert!(
-            first_poll.is_pending(),
-            "flush must suspend on save_dirty's disk I/O for this test to interleave"
+            after.1 == before.1,
+            "a failed save must not advance the published revision"
         );
-
-        // P2: lands directly on the live config while the flush above is
-        // mid-save over its own (now stale) snapshot.
-        {
-            let mut live = dispatcher.ctx.config.write();
-            live.set_prop_persistent("providers.models.openai.default.model", "p2-value")
-                .expect("mark P2 dirty");
-        }
-
-        flush_fut.await.expect("flush of P1 must still succeed");
-        drop(guard);
-
-        let live = dispatcher.ctx.config.read();
+        assert!(
+            provider_model(&after.0, "anthropic").as_deref() != Some("doomed-value"),
+            "a failed save must not publish the attempted value"
+        );
         assert_eq!(
-            provider_model(&live, "openai").as_deref(),
-            Some("p2-value"),
-            "P2, written while the flush was mid-save, must survive in live config"
-        );
-        assert!(
-            live.dirty_paths
-                .contains("providers.models.openai.default.model"),
-            "P2 must still be dirty -- this flush never saved it"
-        );
-        assert!(
-            !live
-                .dirty_paths
-                .contains("providers.models.anthropic.default.model"),
-            "P1 was actually saved, so it must no longer be dirty"
-        );
-        drop(live);
-
-        let on_disk = std::fs::read_to_string(&config_path).unwrap();
-        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
-        assert_eq!(
-            provider_model(&reparsed, "anthropic").as_deref(),
-            Some("p1-value"),
-            "P1 must have reached disk; on-disk file:\n{on_disk}"
+            dispatcher.ctx.agent_lifecycle.active_config_write_count(),
+            0,
+            "the failed commit must release its config-write lease"
         );
     }
 
-    /// Shared blocking scaffold: hold `config_write_lock`, spawn the RPC
+    /// Shared blocking scaffold: hold one admitted config commit (the
+    /// daemon-wide writer guard plus its config-write lease), spawn the RPC
     /// call, assert it stays parked across a bounded sleep-free yield loop,
     /// release, and return the task's result for caller-specific asserts.
-    async fn assert_rpc_blocks_on_config_write_lock<F>(
+    async fn assert_rpc_blocks_on_config_commit_serialization<F>(
         ctx: Arc<RpcContext>,
         rpc_call: F,
         blocked_msg: &'static str,
@@ -39068,22 +39564,22 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let held_commit = ctx.config_authority.begin_config_commit().await.unwrap();
         let task = zeroclaw_spawn::spawn!(rpc_call);
 
         // Bounded, sleep-free: the handler must not race ahead of the
-        // externally held guard no matter how many times it's polled.
+        // externally held commit no matter how many times it's polled.
         for _ in 0..50 {
             tokio::task::yield_now().await;
             assert!(!task.is_finished(), "{blocked_msg}");
         }
 
-        drop(guard);
+        drop(held_commit);
         task.await.expect("blocked RPC task must not panic")
     }
 
     #[tokio::test]
-    async fn config_set_blocks_while_config_write_lock_held() {
+    async fn config_set_blocks_while_config_commit_in_flight() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let cfg = make_two_provider_test_config(&tmp);
@@ -39094,7 +39590,7 @@ mod tests {
             "prop": "providers.models.anthropic.default.model",
             "value": "blocked-value"
         });
-        let result = assert_rpc_blocks_on_config_write_lock(
+        let result = assert_rpc_blocks_on_config_commit_serialization(
             ctx,
             async move { Box::pin(dispatcher.handle_config_set(&params)).await },
             "config/set must block on config_write_lock while it is held",
@@ -39161,7 +39657,9 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -39658,10 +40156,11 @@ mod tests {
         );
     }
 
-    /// Same blocking pattern as `config_set_blocks_while_config_write_lock_held`,
-    /// but for the `save_and_swap_config` path used by alias rename: proves
-    /// alias rename and config/set share the same `config_write_lock` and so
-    /// can never interleave their read-mutate-flush critical sections.
+    /// Same blocking pattern as
+    /// `config_set_blocks_while_config_commit_in_flight`, but for the
+    /// retained-commit path used by alias rename: proves alias rename and
+    /// config/set share the same serialized commit domain and so can never
+    /// interleave their read-mutate-publish critical sections.
     #[tokio::test]
     async fn alias_rename_serializes_with_config_set() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39681,14 +40180,14 @@ mod tests {
             "from": "alpha",
             "to": "beta"
         });
-        let result = assert_rpc_blocks_on_config_write_lock(
+        let result = assert_rpc_blocks_on_config_commit_serialization(
             ctx,
             async move {
                 rename_dispatcher
                     .handle_config_map_key_rename(&params)
                     .await
             },
-            "alias rename must block on config_write_lock while it is held",
+            "alias rename must block on the in-flight config commit while it is held",
         )
         .await;
         assert!(
@@ -42132,15 +42631,14 @@ mod tests {
         // "refreshed-model". This makes the two distinguishable: if the
         // stale refresh leaks through, the successor would flip to
         // "refreshed-model".
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .providers
-            .models
-            .ensure("openai", "test-provider")
-            .expect("openai.test-provider slot exists")
-            .model = Some("old-model".into());
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("openai.test-provider slot exists")
+                .model = Some("old-model".into());
+        });
 
         // Replace the session via ACP rehydration while the stale refresh is
         // paused. Rehydration is only allowed after the live owner is removed,
@@ -42529,7 +43027,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = Arc::clone(&dispatcher.ctx.config_write_lock)
+        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
             .lock_owned()
             .await;
         let rehydrated = dispatcher
@@ -42537,14 +43035,13 @@ mod tests {
             .await
             .expect("an operator's rehydration is never refused");
         assert!(rehydrated.is_some(), "rehydration must publish the session");
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.missing-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.missing-provider".into();
+        });
 
         // Let the spawned reconciliation queue on the writer gate before it
         // is released. Tokio's mutex is FIFO, so reacquiring the gate below
@@ -42552,7 +43049,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = Arc::clone(&dispatcher.ctx.config_write_lock)
+        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
             .lock_owned()
             .await;
         drop(settled_gate);
@@ -42567,14 +43064,13 @@ mod tests {
         // Repair canonical config and use the ordinary live-refresh path. A
         // successful same-generation publication is the recovery event that
         // clears pending; no separate retry state or helper is necessary.
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.test-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.test-provider".into();
+        });
         RpcDispatcher::refresh_live_sessions_for_agent(Arc::clone(&dispatcher.ctx), "test-agent")
             .await
             .expect("repaired live refresh must succeed");
@@ -42624,14 +43120,13 @@ mod tests {
 
         // Point the agent at other-provider so a refresh that does NOT see
         // the configure override would rebuild the agent to other-model.
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .model_provider = "openai.other-provider".into();
+        publish_test_config(&dispatcher.ctx, |config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test agent exists")
+                .model_provider = "openai.other-provider".into();
+        });
 
         // Queue configure FIRST — it will commit a model_provider override.
         let configure_dispatcher = Arc::new(dispatcher);
