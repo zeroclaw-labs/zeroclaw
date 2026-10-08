@@ -44473,7 +44473,14 @@ mod tests {
                     zeroclaw_api::grants::Verb::Execute,
                 ],
             );
-        let workspace = config.agent_workspace_dir("test-agent");
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it; the raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), which a scoped
+        // steer refuses.
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, _handles) = scripted_turn_provider();
         install_state_test_session_owned_at(
