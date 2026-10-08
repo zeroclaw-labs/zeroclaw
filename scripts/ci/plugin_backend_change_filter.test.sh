@@ -63,6 +63,19 @@ expect "the filter itself" "true" \
     "scripts/ci/plugin_backend_change_filter.sh"
 expect "the filter fixture" "true" \
     "scripts/ci/plugin_backend_change_filter.test.sh"
+
+# The artifact smoke harness runs only in this job before a release.
+expect "artifact smoke" "true" "scripts/ci/plugin_artifact_smoke.sh"
+expect "artifact smoke contract tests" "true" \
+    "scripts/ci/plugin_artifact_smoke.test.sh"
+expect "scripted provider" "true" "scripts/ci/plugin_smoke_provider.py"
+expect "scripted provider tests" "true" \
+    "scripts/ci/plugin_smoke_provider_test.py"
+expect "smoke package builder" "true" \
+    "scripts/ci/build_plugin_smoke_packages.sh"
+expect "mixed unrelated then artifact smoke" "true" \
+    "web/src/pages/AgentChat.tsx" \
+    "scripts/ci/plugin_artifact_smoke.sh"
 expect "mixed unrelated then runtime" "true" \
     "docs/book/src/plugins/typed-config.md" \
     "crates/zeroclaw-runtime/src/agent/agent.rs"
@@ -75,6 +88,7 @@ expect "unrelated crate changes" "false" \
     "crates/zeroclaw-providers/src/openai.rs"
 expect "other workflow changes" "false" \
     ".github/workflows/release.yml"
+expect "other ci scripts" "false" "scripts/ci/check_binary_size.sh"
 # The activation e2e is matched by exact path, not by a `tests/*` wildcard, so
 # the rest of the root test suite must stay outside this job.
 expect "other root tests" "false" "tests/test_live.rs"
