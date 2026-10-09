@@ -43,6 +43,7 @@ mod logs;
 mod mouse;
 mod oidc_enroll;
 mod osc_status;
+mod path_open;
 mod quickstart_pane;
 mod relay_proto;
 mod secure_file;
