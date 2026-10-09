@@ -250,11 +250,11 @@ impl AcceptedAuthState {
         identity: &AuthenticatedIdentity,
         evidence: &LocalCredentialEvidence,
         native_token_hash: Option<&str>,
-        pairing: &PairingGuard,
+        is_paired: &dyn Fn(&str) -> bool,
     ) -> Result<(), DenyReason> {
         let reverified = match evidence {
             LocalCredentialEvidence::NativeTokenHash => native_token_hash
-                .is_some_and(|hash| pairing.token_hash_is_paired(hash))
+                .is_some_and(is_paired)
                 .then(|| AuthenticatedIdentity::shared_operator(AuthMethod::Native)),
             LocalCredentialEvidence::Peercred { uid }
                 if *uid == self.daemon_uid && self.trust_daemon_uid.load(Ordering::Relaxed) =>
@@ -322,6 +322,12 @@ pub struct RpcInboundAuth {
     /// publication carrying an older revision is refused, so a slow writer
     /// cannot reinstall superseded policy.
     accepted_revision: AtomicU64,
+    /// Test-only pause inside [`Self::authenticate`], where provider
+    /// verification awaits. Taken by the first authentication that reaches
+    /// it.
+    #[cfg(test)]
+    authenticate_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl RpcInboundAuth {
@@ -343,7 +349,31 @@ impl RpcInboundAuth {
             state: RwLock::new(Arc::new(state)),
             pairing,
             accepted_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            authenticate_pause: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Test-only: park the next authentication where provider verification
+    /// awaits. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_authentication(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.authenticate_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
+    }
+
+    /// Test-only: whether a policy publication has claimed the accepted-state
+    /// lock and is waiting behind a reader that still holds it, such as an
+    /// [`AuthorityLease`]. False once no reader holds it, whether the
+    /// publication is then running, finished, or never came.
+    #[cfg(test)]
+    pub(crate) fn publication_queued_behind_a_lease(&self) -> bool {
+        self.state.is_locked_exclusive() && self.state.try_read_recursive().is_some()
     }
 
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
@@ -479,7 +509,7 @@ impl RpcInboundAuth {
             &auth.identity,
             &auth.local_evidence,
             auth.native_token_hash.as_deref(),
-            &self.pairing,
+            &|hash| self.pairing.token_hash_is_paired(hash),
         )?;
         state.resolve(&auth.identity)
     }
@@ -505,7 +535,7 @@ impl RpcInboundAuth {
                 &auth.identity,
                 &auth.local_evidence,
                 auth.native_token_hash.as_deref(),
-                &self.pairing,
+                &|hash| self.pairing.token_hash_is_paired(hash),
             )?;
         }
         state.resolve(&auth.identity)
@@ -515,24 +545,7 @@ impl RpcInboundAuth {
     /// past its revalidation deadline, and, for a native pairing token, still
     /// paired.
     pub fn credential_is_live(&self, auth: &ConnectionAuth) -> Result<(), AuthDenied> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Some(expires_at) = auth.principal.expires_at
-            && expires_at <= now
-        {
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
-            ));
-        }
-        if let Some(revalidate_by) = auth.principal.revalidate_by
-            && revalidate_by <= now
-        {
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-            ));
-        }
+        credential_unexpired(auth)?;
         if let Some(hash) = auth.native_token_hash.as_deref()
             && !self.pairing.token_hash_is_paired(hash)
         {
@@ -543,6 +556,92 @@ impl RpcInboundAuth {
         Ok(())
     }
 
+    /// Hold the accepted authorization state and the paired-token set still
+    /// until the returned lease is dropped: no policy publication can install
+    /// a new state and no pairing can be revoked meanwhile.
+    ///
+    /// A surface that must not let a revocation land between its final
+    /// authority check and the effect that check guards takes the lease,
+    /// checks with [`AuthorityLease::current_grants`], performs the effect,
+    /// then drops it. A publication or revocation that arrives meanwhile
+    /// completes after the effect, so the effect is ordered before it.
+    ///
+    /// Keep the hold short and synchronous. While a publication or revocation
+    /// is queued behind it, new readers of the same lock wait too, so do not
+    /// reach this layer's other methods on the holding thread; the lease
+    /// answers from what it holds.
+    pub fn hold_authority(&self) -> AuthorityLease<'_> {
+        // State before pairing: a publication takes the state lock and may
+        // consult the pairing set, never the reverse.
+        let state = self.state.read();
+        let pairings = self.pairing.hold_paired_tokens();
+        AuthorityLease { state, pairings }
+    }
+}
+
+/// The accepted authorization state and the paired-token set, held still by
+/// [`RpcInboundAuth::hold_authority`].
+pub struct AuthorityLease<'a> {
+    state: parking_lot::RwLockReadGuard<'a, Arc<AcceptedAuthState>>,
+    pairings: zeroclaw_config::pairing::HeldPairedTokens<'a>,
+}
+
+impl AuthorityLease<'_> {
+    /// [`RpcInboundAuth::current_grants`] answered from the held state: the
+    /// credential is unexpired and still paired, and the grants resolve under
+    /// the policy that stays in force until the lease is dropped.
+    pub fn current_grants(&self, auth: &ConnectionAuth) -> Result<ResolvedGrants, AuthDenied> {
+        credential_unexpired(auth)?;
+        let is_paired = |hash: &str| self.pairings.contains_hash(hash);
+        if let Some(hash) = auth.native_token_hash.as_deref()
+            && !is_paired(hash)
+        {
+            return Err(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+            ));
+        }
+        if auth.generation != self.state.resolver.generation() {
+            self.state
+                .revalidates_local_evidence(
+                    &auth.identity,
+                    &auth.local_evidence,
+                    auth.native_token_hash.as_deref(),
+                    &is_paired,
+                )
+                .map_err(AuthDenied::from_deny_reason)?;
+        }
+        self.state
+            .resolve(&auth.identity)
+            .map(|resolved| resolved.grants)
+            .map_err(AuthDenied::from_deny_reason)
+    }
+}
+
+/// Whether `auth`'s credential is inside its lifetime: not expired and not
+/// past its revalidation deadline.
+fn credential_unexpired(auth: &ConnectionAuth) -> Result<(), AuthDenied> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(expires_at) = auth.principal.expires_at
+        && expires_at <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+        ));
+    }
+    if let Some(revalidate_by) = auth.principal.revalidate_by
+        && revalidate_by <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    Ok(())
+}
+
+impl RpcInboundAuth {
     /// The grants `auth` holds under the accepted policy in force now, not
     /// the ones stamped on it at admission: a live credential, a fresh
     /// resolution, and a generation that did not move underneath that
@@ -573,6 +672,14 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        #[cfg(test)]
+        {
+            let pause = self.authenticate_pause.lock().unwrap().take();
+            if let Some((arrived, release)) = pause {
+                arrived.notify_one();
+                release.notified().await;
+            }
+        }
         let state = self.state();
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
@@ -662,7 +769,7 @@ impl RpcInboundAuth {
                     &identity,
                     &local_evidence,
                     native_token_hash.as_deref(),
-                    &self.pairing,
+                    &|hash| self.pairing.token_hash_is_paired(hash),
                 )
                 .map_err(AuthDenied::from_deny_reason)?;
         }
@@ -730,6 +837,76 @@ mod tests {
             )),
         )
         .expect("valid")
+    }
+
+    /// Wait until `queued()` holds, failing if `writer` finishes first.
+    fn wait_until_queued(queued: impl Fn() -> bool, writer: &std::thread::JoinHandle<impl Send>) {
+        let started = std::time::Instant::now();
+        while !queued() {
+            assert!(
+                !writer.is_finished(),
+                "the writer finished while a lease was held"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the writer never reached its lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Negative control for the upload race tests: while a lease is held a
+    /// publication queues and the probe reports it; once the lease is
+    /// released the publication goes through and the probe turns false. A
+    /// lease released before an upload's write therefore changes what those
+    /// tests observe at the write.
+    #[test]
+    fn a_publication_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let before = auth.generation();
+        let lease = auth.hold_authority();
+        let publisher = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.refresh_from_config(&base_config()).unwrap())
+        };
+        wait_until_queued(|| auth.publication_queued_behind_a_lease(), &publisher);
+        drop(lease);
+        assert_eq!(publisher.join().unwrap(), before + 1);
+        assert!(!auth.publication_queued_behind_a_lease());
+        assert_eq!(auth.generation(), before + 1);
+    }
+
+    /// The same control for an unpairing, which queues at the paired-token
+    /// lock rather than the accepted-state lock.
+    #[test]
+    fn an_unpairing_waits_for_a_held_lease_and_proceeds_once_it_is_released() {
+        let auth = Arc::new(auth_for(&base_config(), &["zc_tok"]));
+        let lease = auth.hold_authority();
+        let revoker = {
+            let auth = Arc::clone(&auth);
+            std::thread::spawn(move || auth.pairing().revoke_token("zc_tok"))
+        };
+        wait_until_queued(
+            || auth.pairing().token_write_queued_behind_a_hold(),
+            &revoker,
+        );
+        drop(lease);
+        assert!(
+            revoker.join().unwrap(),
+            "the token was paired and is now revoked"
+        );
+        assert!(!auth.pairing().token_write_queued_behind_a_hold());
+        assert!(!auth.pairing().token_is_paired("zc_tok"));
+    }
+
+    /// A lease answers from what it holds: a publication that landed before
+    /// it was taken is what it sees.
+    #[test]
+    fn a_lease_taken_after_a_publication_sees_that_publication() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let generation = auth.refresh_from_config(&base_config()).unwrap();
+        let lease = auth.hold_authority();
+        assert_eq!(lease.state.resolver.generation(), generation);
     }
 
     #[tokio::test]

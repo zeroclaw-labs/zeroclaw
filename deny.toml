@@ -12,6 +12,7 @@ ignore = [
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained; matrix-sdk 0.19.1 still depends on it with no replacement release; remove after upstream migration, tracked in #11429" },
 ]
 
 [licenses]

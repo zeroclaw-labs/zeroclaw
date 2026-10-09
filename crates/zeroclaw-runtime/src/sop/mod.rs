@@ -40,8 +40,10 @@ pub use engine::{
 };
 pub use executor::{
     RegisteredSopDriver, SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
-    admit_sop_driver_for_run, drive_resumed_broker_action, spawn_and_register_sop_driver,
-    spawn_headless_run_driver,
+    admit_sop_driver_for_run, drive_resumed_broker_action,
+    drive_resumed_broker_action_with_capability, spawn_and_register_sop_driver,
+    spawn_and_register_sop_driver_with_capability, spawn_headless_run_driver,
+    spawn_headless_run_driver_with_capability,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -144,6 +146,33 @@ pub fn build_sop_engine(
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    build_sop_engine_with_capability(
+        config,
+        decision_models,
+        data_dir,
+        install_root,
+        audit_memory,
+        adapters,
+        None,
+    )
+}
+
+/// Build a SOP engine with the daemon-owned execution capability already
+/// attached. Managed startup must use this constructor before maintenance or
+/// any producer can create an action; `None` remains for unmanaged source and
+/// test callers only.
+pub fn build_sop_engine_with_capability(
+    config: SopConfig,
+    decision_models: &std::collections::HashMap<
+        String,
+        zeroclaw_config::schema::SopDecisionModelConfig,
+    >,
+    data_dir: &Path,
+    install_root: &Path,
+    audit_memory: Arc<dyn Memory>,
+    adapters: SopEngineAdapters,
+    execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
     let mut decision_models = decision::models_from_config(decision_models);
     let SopEngineAdapters {
         route: route_adapter,
@@ -193,6 +222,9 @@ pub fn build_sop_engine(
             decision_models.extend(decision_model_overrides);
             decision_models
         });
+    if let Some(execution_capability) = execution_capability {
+        engine = engine.with_execution_capability(execution_capability);
+    }
     engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));

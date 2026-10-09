@@ -34,6 +34,9 @@ cli-integrations-chat-slack-prepare = Create an app at {$url}, configure its bot
 cli-integrations-chat-configure = Run {$command}, open Config, and configure a {$channel} instance and its credentials.
 cli-integrations-chat-bind = Bind the channel alias to an agent and review peer-group access.
 cli-integrations-chat-enable = Enable the channel instance only after reviewing its settings and access.
+cli-integrations-chat-imessage-transport = Sends messages through AppleScript automation and receives messages by reading the local Messages database.
+cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
+cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
@@ -457,6 +460,7 @@ channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} 
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
@@ -517,6 +521,7 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -718,6 +723,7 @@ cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
 cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
 cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
 cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-partial-personality-failure = The agent config for {$alias} was saved, but installing its personality files failed. Repair the reported paths or permissions, then create or edit the intended personality files in this existing agent's workspace. Do not rerun Quickstart for this saved alias.
 cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
 cli-quickstart-pick-preset = Pick a preset
 cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
@@ -732,6 +738,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-publish-config = failed to publish quickstart config: {$err}
 cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
@@ -882,6 +889,7 @@ cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
+cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
@@ -1043,6 +1051,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-provider-images-quarantined =
+    { $count_plural ->
+        [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
+       *[other] { $count } images that had not previously succeeded with this provider were omitted after the provider rejected the request.
+    } Send an omitted image again in a new message to try it again.
 turn-failed = [turn failed]
 turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
@@ -1074,6 +1087,14 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+# Safe reply delivered when the streaming protocol guard withheld the same
+# response text on two attempts that were both rejected as tool-protocol
+# parse issues (a recovered valid tool call is not stopped this way):
+# retrying cannot recover the withheld envelope, so the turn ends instead of
+# spending another model call. Prose released ahead of the envelope may
+# already have reached the user, so the text claims nothing about the rest
+# of the reply.
+cli-agent-error-protocol-guard-withheld = I withheld the tool-protocol-shaped part of this reply, and a retry produced the same text.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
@@ -1146,6 +1167,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-model-fallback-redacted = ⚡ The requested model was unavailable; a fallback model served this reply.
 channel-runtime-safeguard-footer-server =
     🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
 channel-runtime-safeguard-footer-client =
@@ -1405,6 +1427,10 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+# ── Peer-agent delivery ──
+peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
+peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
 # ── RPC inbound authentication ──

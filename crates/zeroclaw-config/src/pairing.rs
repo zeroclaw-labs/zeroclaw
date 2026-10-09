@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -342,6 +342,16 @@ fn take_live(slot: &mut Option<PendingCode>) -> Option<PendingCode> {
     slot.clone()
 }
 
+/// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashSet<String>>);
+
+impl HeldPairedTokens<'_> {
+    /// Whether `token_hash` is paired, as of this hold.
+    pub fn contains_hash(&self, token_hash: &str) -> bool {
+        self.0.contains(token_hash)
+    }
+}
+
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
@@ -350,7 +360,10 @@ pub struct PairingGuard {
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<PendingCode>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    paired_tokens: Arc<Mutex<HashSet<String>>>,
+    /// A reader-writer lock so that a caller holding it across an effect
+    /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// revocation, not other liveness checks.
+    paired_tokens: Arc<RwLock<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
     /// The admin token this gateway run accepts on the pairing-code admin
@@ -384,7 +397,7 @@ impl PairingReservation {
     /// Commit the reservation, consuming the one-time code and storing the token.
     pub fn commit(mut self) -> String {
         let token = self.token.clone();
-        self.guard.paired_tokens.lock().insert(hash_token(&token));
+        self.guard.paired_tokens.write().insert(hash_token(&token));
         self.committed = true;
         token
     }
@@ -434,7 +447,7 @@ impl PairingGuard {
         Self {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
-            paired_tokens: Arc::new(Mutex::new(tokens)),
+            paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
             admin_token: Arc::new(Mutex::new(None)),
         }
@@ -649,7 +662,7 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.contains(&hashed)
     }
 
@@ -661,42 +674,65 @@ impl PairingGuard {
     /// so an empty token set denies everything.
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        self.paired_tokens.lock().contains(&hashed)
+        self.paired_tokens.read().contains(&hashed)
     }
 
     /// Strict membership check by pre-computed SHA-256 hash (see
     /// [`Self::token_is_paired`]). Lets an established connection re-check
     /// liveness of its pairing without retaining the bearer itself.
     pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
-        self.paired_tokens.lock().contains(token_hash)
+        self.paired_tokens.read().contains(token_hash)
+    }
+
+    /// Hold the paired-token set still: no token can be paired or revoked
+    /// until the returned guard is dropped, while other readers proceed.
+    ///
+    /// For a caller that must keep a liveness decision true through the
+    /// effect it guards. Keep the hold short, and do not call this guard's
+    /// other methods while holding it: a pairing or revocation queued behind
+    /// the hold makes a second read on the same thread wait forever.
+    pub fn hold_paired_tokens(&self) -> HeldPairedTokens<'_> {
+        HeldPairedTokens(self.paired_tokens.read())
+    }
+
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         !tokens.is_empty()
     }
 
     /// Get all paired token hashes (for persisting to config).
     pub fn tokens(&self) -> Vec<String> {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.iter().cloned().collect()
     }
 
     pub fn revoke_token(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(&hashed)
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
     pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
         count

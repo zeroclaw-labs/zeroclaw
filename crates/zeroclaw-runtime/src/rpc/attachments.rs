@@ -282,8 +282,19 @@ pub async fn process_file_entry(
     source: Option<&AttachmentSource>,
     sessions: &SessionStore,
 ) -> Result<FileEntryResult, JsonRpcError> {
+    let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+    persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await
+}
+
+/// Resolve one file entry to its bytes and display filename, without
+/// persisting anything: decode `data_b64`, or read `path` through the
+/// authorized source.
+pub async fn load_file_entry(
+    entry: &FileEntry,
+    is_wss: bool,
+    source: Option<&AttachmentSource>,
+) -> Result<(Vec<u8>, String), JsonRpcError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use sha2::{Digest, Sha256};
 
     // 1. Resolve bytes + filename + mime_type.
     let (bytes, filename) = if let Some(ref b64) = entry.data_b64 {
@@ -359,13 +370,96 @@ pub async fn process_file_entry(
         ));
     };
 
+    Ok((bytes, filename))
+}
+
+/// Hash, deduplicate, persist, and index one uploaded payload for the live
+/// session `session_id`, under the session map lock (see
+/// [`persist_into_index`]). A session that is not live is refused before
+/// anything is written, rather than reported as a successful upload with no
+/// index entry.
+///
+/// This binds only the session id. `file/attach` and `file/upload/commit`
+/// commit through the dispatcher instead, which binds the exact session
+/// incarnation and rechecks authority inside the same lock.
+pub async fn persist_upload_bytes(
+    bytes: Vec<u8>,
+    filename: &str,
+    session_id: &str,
+    upload_root: &str,
+    sessions: &SessionStore,
+) -> Result<FileEntryResult, JsonRpcError> {
+    sessions
+        .with_session_uploads(session_id, |uploads| {
+            persist_into_index(uploads, &bytes, filename, upload_root)
+        })
+        .await
+        .unwrap_or_else(|| Err(rpc_err(SESSION_NOT_FOUND, "Session not found")))
+}
+
+/// Hash, deduplicate, persist, and index one uploaded payload into a
+/// session's upload index.
+///
+/// Shared by `file/attach`, `file/upload/commit`, and prompt attachments, so
+/// every path names, stores, and marks uploads identically: the on-disk name
+/// is the content hash, written through the hardened content-addressed
+/// writer, and a repeat of the same bytes in the same session returns the
+/// existing entry once its file is verified to still hold them.
+///
+/// Synchronous by design: callers run it under the session map lock, so the
+/// dedup lookup, the write, and the index insert cannot interleave with a
+/// change to the session.
+pub fn persist_into_index(
+    uploads: &mut std::collections::HashMap<String, super::session::UploadEntry>,
+    bytes: &[u8],
+    filename: &str,
+    upload_root: &str,
+) -> Result<FileEntryResult, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+
     // 2. SHA-256 → ref_id.
-    let hash = Sha256::digest(&bytes);
+    let hash = Sha256::digest(bytes);
     let hex = format!("{hash:x}");
     let ref_id = format!("sha256:{hex}");
 
-    // 3. Dedup check.
-    if let Some(existing) = sessions.get_upload(session_id, &ref_id).await {
+    // 3. Sanitize filename (display only; the on-disk name is the content hash).
+    let sanitized = sanitize_filename(filename);
+    let extension_of = |name: &str| {
+        std::path::Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+
+    // 4. A repeat of an indexed upload keeps its indexed name. The index
+    // records where the bytes were written, not that they are still there:
+    // the file may since have been edited, removed, or replaced by a symlink.
+    // So the repeat is not answered from the index alone. It goes through
+    // the writer below under the indexed name, which verifies the bytes on
+    // disk and reinstates them if they differ, and the entry is reused only
+    // if that lands on the indexed path.
+    let indexed = uploads.get(&ref_id).cloned();
+    let ext = match &indexed {
+        Some(existing) => extension_of(&existing.workspace_path),
+        None => extension_of(&sanitized),
+    };
+
+    // 5. Persist through the shared hardened content-addressed writer: full-digest
+    // storage name and a directory-handle-bound, no-follow atomic write. This makes
+    // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
+    // instead of duplicating decode/hash/naming/persistence with a plain,
+    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
+    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
+        std::path::Path::new(upload_root),
+        bytes,
+        &ext,
+    )
+    .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+    let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
+
+    if let Some(existing) = indexed
+        && existing.workspace_path == workspace_path
+    {
         return Ok(FileEntryResult {
             ref_id: existing.ref_id,
             marker: existing.marker,
@@ -375,26 +469,6 @@ pub async fn process_file_entry(
         });
     }
 
-    // 4. Sanitize filename (display only; the on-disk name is the content hash).
-    let sanitized = sanitize_filename(&filename);
-
-    // 5. Persist through the shared hardened content-addressed writer: full-digest
-    // storage name and a directory-handle-bound, no-follow atomic write. This makes
-    // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
-    // instead of duplicating decode/hash/naming/persistence with a plain,
-    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
-    let ext = std::path::Path::new(&sanitized)
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
-        std::path::Path::new(upload_root),
-        &bytes,
-        &ext,
-    )
-    .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
-    let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
-
     // IMAGE iff the multimodal loader will actually accept these bytes under
     // this name — the canonical provider-loadable contract from
     // `zeroclaw_api::media` — never a declared MIME. A MIME the loader
@@ -402,7 +476,7 @@ pub async fn process_file_entry(
     // [IMAGE:] marker whose payload the provider path then dropped in
     // favour of a "could not be loaded" note, stranding the upload.
     let is_image =
-        zeroclaw_api::media::provider_loadable_image_mime_for(&sanitized, &bytes).is_some();
+        zeroclaw_api::media::provider_loadable_image_mime_for(&sanitized, bytes).is_some();
     let marker = if is_image {
         format!("[IMAGE:{workspace_path}]")
     } else {
@@ -413,18 +487,16 @@ pub async fn process_file_entry(
 
     let size_bytes = bytes.len() as u64;
 
-    // 7. Index in session upload map.
-    sessions
-        .insert_upload(
-            session_id,
-            super::session::UploadEntry {
-                ref_id: ref_id.clone(),
-                marker: marker.clone(),
-                workspace_path: workspace_path.clone(),
-                size_bytes,
-            },
-        )
-        .await;
+    // 6. Index in session upload map.
+    uploads.insert(
+        ref_id.clone(),
+        super::session::UploadEntry {
+            ref_id: ref_id.clone(),
+            marker: marker.clone(),
+            workspace_path: workspace_path.clone(),
+            size_bytes,
+        },
+    );
 
     Ok(FileEntryResult {
         ref_id,
@@ -1025,6 +1097,94 @@ mod tests {
             .unwrap();
         assert!(r2.deduplicated);
         assert_eq!(r1.ref_id, r2.ref_id);
+    }
+
+    /// Upload `bytes` as `name` to session `s1` and return the result.
+    async fn upload(store: &SessionStore, ws: &str, bytes: &[u8], name: &str) -> FileEntryResult {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(bytes)),
+            filename: Some(name.into()),
+            mime_type: None,
+            source: FileSource::File,
+        };
+        process_file_entry(&entry, "s1", ws, false, None, store)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeat_upload_reinstates_an_indexed_file_edited_to_the_same_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let first = upload(&store, &ws, b"original", "a.txt").await;
+        std::fs::write(&first.workspace_path, b"tampered").unwrap();
+        let repeat = upload(&store, &ws, b"original", "b.txt").await;
+
+        assert!(repeat.deduplicated);
+        assert_eq!(repeat.ref_id, first.ref_id);
+        assert_eq!(repeat.workspace_path, first.workspace_path);
+        assert_eq!(std::fs::read(&repeat.workspace_path).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn repeat_upload_reinstates_an_indexed_file_that_was_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let first = upload(&store, &ws, b"keep me", "a.txt").await;
+        std::fs::remove_file(&first.workspace_path).unwrap();
+        let repeat = upload(&store, &ws, b"keep me", "a.txt").await;
+
+        assert_eq!(repeat.workspace_path, first.workspace_path);
+        assert_eq!(std::fs::read(&repeat.workspace_path).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeat_upload_replaces_a_symlink_substituted_for_the_indexed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let first = upload(&store, &ws, b"payload", "a.txt").await;
+        let decoy = outside.path().join("decoy.txt");
+        std::fs::write(&decoy, b"payload").unwrap();
+        std::fs::remove_file(&first.workspace_path).unwrap();
+        std::os::unix::fs::symlink(&decoy, &first.workspace_path).unwrap();
+
+        let repeat = upload(&store, &ws, b"payload", "a.txt").await;
+        assert_eq!(repeat.workspace_path, first.workspace_path);
+        let meta = std::fs::symlink_metadata(&repeat.workspace_path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the indexed path is a regular file again, not a link out of the workspace"
+        );
+        assert_eq!(std::fs::read(&repeat.workspace_path).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::read(&decoy).unwrap(),
+            b"payload",
+            "the link target is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_to_a_session_that_is_not_live_is_refused_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = make_session_store(4);
+
+        let err = persist_upload_bytes(b"x".to_vec(), "x.txt", "gone", &ws, &store)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+        assert!(!tmp.path().join("uploads").exists(), "nothing is written");
     }
 
     #[tokio::test]

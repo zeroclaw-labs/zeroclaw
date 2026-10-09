@@ -35,6 +35,9 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 
+# Capability-relative dashboard file opening, already used by runtime/tools.
+cap-std = "4"
+
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 
@@ -83,11 +86,12 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
-# Enables the runtime's deterministic clock seam for production-shaped cache
-# fixtures; this feature is dev-only and is not part of the shipped gateway.
+# Enables deterministic clock and shared-authority helpers for gateway fixtures;
+# this feature is dev-only and is not part of the shipped gateway.
 zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
 zeroclaw-channels = { workspace = true, default-features = false, features = ["test-util"] }
