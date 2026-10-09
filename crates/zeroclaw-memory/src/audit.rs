@@ -1,9 +1,10 @@
 //! Audit trail for memory operations.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
+    ProceduralMessage, StoreOptions,
 };
-use crate::sqlite_permissions::harden_sqlite_storage;
+use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -54,10 +55,12 @@ impl<M: Memory> ::zeroclaw_api::attribution::Attributable for AuditedMemory<M> {
 
 impl<M: Memory> AuditedMemory<M> {
     pub fn new(inner: M, workspace_dir: &Path) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("audit.db");
-        harden_sqlite_storage(&db_path)?;
+        let db_path = prepare_sqlite_storage(workspace_dir, "audit.db")?;
 
-        let conn = Connection::open(&db_path)?;
+        let flags = rusqlite::OpenFlags::default();
+        #[cfg(unix)]
+        let flags = flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&db_path, flags)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -73,12 +76,24 @@ impl<M: Memory> AuditedMemory<M> {
              CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON memory_audit(timestamp);
              CREATE INDEX IF NOT EXISTS idx_audit_operation ON memory_audit(operation);",
         )?;
-        harden_sqlite_storage(&db_path)?;
+        check_sqlite_storage(&db_path)?;
 
         Ok(Self {
             inner,
             audit_conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// The audit detail for a private-plane scope: every dimension the
+    /// statement was predicated on, so an audit row names the exact plane.
+    fn scope_detail(scope: &PrincipalScope) -> String {
+        format!(
+            "principal_id={} agent={} namespace={} tenant={}",
+            scope.principal_id,
+            scope.agent_alias.as_deref().unwrap_or("default"),
+            scope.namespace.as_deref().unwrap_or("default"),
+            scope.tenant_id.as_deref().unwrap_or("-"),
+        )
     }
 
     fn log_audit(
@@ -239,6 +254,151 @@ impl<M: Memory> Memory for AuditedMemory<M> {
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.log_audit(AuditOp::Forget, Some(key), None, None, None);
         self.inner.forget(key).await
+    }
+
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            None,
+            session_id,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner
+            .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("{} query={query}", Self::scope_detail(scope))),
+        );
+        self.inner
+            .recall_for_principal(scope, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            session_id,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner
+            .list_for_principal(scope, category, session_id)
+            .await
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Get,
+            Some(key),
+            None,
+            None,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner.get_for_principal(scope, key).await
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        self.log_audit(
+            AuditOp::Forget,
+            Some(key),
+            None,
+            None,
+            Some(&Self::scope_detail(scope)),
+        );
+        self.inner.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        self.inner.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            filter.session_id.as_deref(),
+            Some(&format!("{} export", Self::scope_detail(scope))),
+        );
+        self.inner.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        self.log_audit(
+            AuditOp::Forget,
+            None,
+            None,
+            None,
+            Some(&format!(
+                "{} purge namespace={namespace}",
+                Self::scope_detail(scope)
+            )),
+        );
+        self.inner
+            .purge_namespace_for_principal(scope, namespace)
+            .await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.log_audit(
+            AuditOp::Forget,
+            None,
+            None,
+            Some(session_id),
+            Some(&format!("{} purge session", Self::scope_detail(scope))),
+        );
+        self.inner
+            .purge_session_for_principal(scope, session_id)
+            .await
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
@@ -553,7 +713,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn audited_memory_hardens_existing_audit_storage_permissions() {
+    fn audited_memory_rejects_permissive_storage_and_reopens_after_operator_repair() {
         use std::os::unix::fs::PermissionsExt;
 
         fn mode(path: &Path) -> u32 {
@@ -591,7 +751,18 @@ mod tests {
             }
         }
 
-        let _audited = AuditedMemory::new(NoneMemory::new("none"), tmp.path()).unwrap();
+        assert!(AuditedMemory::new(NoneMemory::new("none"), tmp.path()).is_err());
+        assert_eq!(mode(&db_path), 0o666);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o666);
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let audited = AuditedMemory::new(NoneMemory::new("none"), tmp.path()).unwrap();
+        assert_eq!(audited.audit_count().unwrap(), 1);
 
         assert_eq!(mode(&memory_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);

@@ -27,6 +27,9 @@ ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9
 # --- Stage 1: build only the relay binary ---
 FROM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 WORKDIR /app
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 COPY . .
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \

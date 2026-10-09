@@ -374,6 +374,13 @@ impl VerifiedWebhookMessages {
     pub(crate) fn retain(&mut self, keep: impl FnMut(&ChannelMessage) -> bool) {
         self.messages.retain(keep);
     }
+
+    /// Read-only access for adapter-owned asynchronous interception before the
+    /// verified set is narrowed with [`Self::retain`].
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    pub(crate) fn messages(&self) -> impl Iterator<Item = &ChannelMessage> {
+        self.messages.iter()
+    }
 }
 
 /// Authenticate one inbound webhook request against its adapter's registered

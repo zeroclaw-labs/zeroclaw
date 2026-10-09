@@ -94,6 +94,9 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
+    /// Whether a tool-level approval may satisfy the hidden command-specific
+    /// approval input consumed by command tools.
+    propagate_runtime_command_approval: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -118,6 +121,7 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -130,8 +134,20 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a non-interactive manager for a bounded delegated child.
+    ///
+    /// The target profile decides whether the child may invoke a tool, but it
+    /// cannot grant command-specific approval to caller-owned command tools.
+    pub(crate) fn for_bounded_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            propagate_runtime_command_approval: false,
+            ..Self::for_non_interactive(risk_profile)
         }
     }
 
@@ -142,6 +158,7 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -164,6 +181,24 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            propagate_runtime_command_approval: self.propagate_runtime_command_approval,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a fresh turn-scoped manager while preserving this manager's
+    /// policy and interactivity mode. Mutable session state never crosses a
+    /// channel turn: an `Always` grant and its audit entries belong only to
+    /// the turn that received them.
+    pub fn for_new_turn(&self) -> Self {
+        Self {
+            auto_approve: self.auto_approve.clone(),
+            always_ask: self.always_ask.clone(),
+            autonomy_level: self.autonomy_level,
+            non_interactive: self.non_interactive,
+            non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            propagate_runtime_command_approval: self.propagate_runtime_command_approval,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -173,6 +208,10 @@ impl ApprovalManager {
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
         self.non_interactive
+    }
+
+    pub(crate) fn propagates_runtime_command_approval(&self) -> bool {
+        self.propagate_runtime_command_approval
     }
 
     /// The autonomy level this manager enforces. Prompt rendering reads the
@@ -236,6 +275,20 @@ impl ApprovalManager {
         ApprovalRequirement::Prompt
     }
 
+    /// Whether an approval channel that explicitly reports no approval support
+    /// may hand a shell call back to the shell tool's own policy checks.
+    ///
+    /// This is intentionally narrower than `Prompt`: explicit `always_ask`
+    /// policy must remain fail-closed when no operator can answer.
+    pub(crate) fn unsupported_backchannel_may_fall_back(&self, tool_name: &str) -> bool {
+        self.non_interactive
+            && self.non_interactive_shell_requires_approval
+            && tool_name == "shell"
+            && !self.always_ask.contains("*")
+            && !self.always_ask.contains(tool_name)
+            && self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+    }
+
     /// Record an approval decision and update session state.
     pub fn record_decision(
         &self,
@@ -274,9 +327,10 @@ impl ApprovalManager {
     }
 
     /// Prompt the user on the CLI and return their decision.
+    /// EOF or a read error means no operator decision was available.
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
-    pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
+    pub fn prompt_cli(&self, request: &ApprovalRequest) -> io::Result<ApprovalResponse> {
         prompt_cli_interactive(request)
     }
 }
@@ -285,7 +339,7 @@ impl ApprovalManager {
 
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+fn prompt_cli_interactive(request: &ApprovalRequest) -> io::Result<ApprovalResponse> {
     let summary = summarize_args(&request.arguments);
     let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
@@ -300,11 +354,15 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     );
     let _ = io::stderr().flush();
 
-    let Ok(line) = read_cli_approval_line() else {
-        return ApprovalResponse::No;
-    };
+    let line = read_cli_approval_line()?;
+    if line.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "approval input ended without an operator decision",
+        ));
+    }
 
-    parse_cli_approval_response(&line)
+    Ok(parse_cli_approval_response(&line))
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
@@ -699,6 +757,41 @@ mod tests {
     }
 
     #[test]
+    fn fresh_turn_resets_session_state_but_preserves_policy() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&supervised_config());
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            &ApprovalResponse::Always,
+            "channel",
+        );
+
+        let fresh = mgr.for_new_turn();
+
+        assert!(fresh.is_non_interactive());
+        assert_eq!(
+            fresh.approval_requirement("file_read"),
+            ApprovalRequirement::Approved,
+            "configured auto-approval must survive a fresh turn"
+        );
+        assert_eq!(
+            fresh.approval_requirement("shell"),
+            ApprovalRequirement::Prompt,
+            "configured always-ask policy must survive a fresh turn"
+        );
+        assert!(
+            fresh.needs_approval("file_write"),
+            "an Always grant must not cross into another turn"
+        );
+        assert!(fresh.session_allowlist().is_empty());
+        assert!(fresh.audit_log().is_empty());
+        assert!(fresh.propagates_runtime_command_approval());
+
+        let bounded = ApprovalManager::for_bounded_non_interactive(&supervised_config());
+        assert!(!bounded.for_new_turn().propagates_runtime_command_approval());
+    }
+
+    #[test]
     fn yes_response_does_not_add_to_allowlist() {
         let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
@@ -834,6 +927,25 @@ mod tests {
         let mgr = ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
         assert!(mgr.is_non_interactive());
         assert!(mgr.needs_approval("shell"));
+        assert!(mgr.unsupported_backchannel_may_fall_back("shell"));
+    }
+
+    #[test]
+    fn unsupported_backchannel_fallback_never_bypasses_explicit_always_ask() {
+        for always_ask in [vec!["shell".into()], vec!["*".into()]] {
+            let risk = RiskProfileConfig {
+                always_ask,
+                ..RiskProfileConfig::default()
+            };
+            let mgr = ApprovalManager::for_non_interactive_backchannel(&risk);
+
+            assert!(mgr.needs_approval("shell"));
+            assert!(!mgr.unsupported_backchannel_may_fall_back("shell"));
+        }
+        assert!(
+            !ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default())
+                .unsupported_backchannel_may_fall_back("file_write")
+        );
     }
 
     #[test]

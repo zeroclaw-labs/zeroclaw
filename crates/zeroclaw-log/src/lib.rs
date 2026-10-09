@@ -4,6 +4,7 @@ pub mod broadcast;
 pub mod chain;
 pub mod config;
 pub mod event;
+mod export_bridge;
 pub mod layer;
 mod log_bridge;
 pub mod migrate;
@@ -36,6 +37,9 @@ pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
     Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,
     severity_text_from_tracing_level,
+};
+pub use export_bridge::{
+    LogRecordExporter, clear_log_exporter, flush_log_exporter, set_log_exporter,
 };
 pub use layer::LogCaptureLayer;
 pub use writer::{
@@ -99,4 +103,16 @@ pub fn __private_test_writer_lock() -> impl Drop {
 #[must_use]
 pub fn __private_test_hook_lock() -> impl Drop {
     crate::broadcast::HOOK_TEST_LOCK.lock()
+}
+
+/// Test support: whether the dispatcher active on the calling thread
+/// includes [`LogCaptureLayer`]. Capture tests report this when an
+/// expected event is missing, to tell "the layer never saw it" apart
+/// from "the broadcast channel lost it".
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_capture_layer_active() -> bool {
+    ::tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<LogCaptureLayer>().is_some()
+    })
 }

@@ -16,9 +16,18 @@ fn is_compound_type(ty: &syn::Type) -> bool {
     ident == "Vec" || ident == "HashMap"
 }
 
-/// Check if any `#[serde(...)]` attribute on the field contains `skip`.
+/// Check if any `#[serde(...)]` attribute on the field contains `skip` or
+/// `skip_serializing`, both of which keep the field out of property
+/// enumeration.
+///
+/// `skip_serializing` (the bare form, not `skip_serializing_if`) marks a
+/// write-only field: it may still deserialize, but it is never written back
+/// out. Such a field cannot be a settable property, because a `set_prop` on
+/// it is silently discarded by the next save and the value is gone after the
+/// following reload. Excluding it here keeps property enumeration limited to
+/// fields that actually survive a save/reload round-trip.
 fn has_serde_skip(field: &syn::Field) -> bool {
-    has_serde_meta(field, "skip")
+    has_serde_meta(field, "skip") || has_serde_meta(field, "skip_serializing")
 }
 
 fn has_serde_flatten(field: &syn::Field) -> bool {
@@ -2934,6 +2943,25 @@ mod tests {
             pub value: Option<String>
         };
         assert!(!has_serde_skip(&field));
+    }
+
+    #[test]
+    fn has_serde_skip_detects_skip_serializing() {
+        // A write-only compatibility shim: it still deserializes (and
+        // discards what it read), but it is never serialized back out, so it
+        // must not be enumerated as a settable property.
+        let field: syn::Field = parse_quote! {
+            #[serde(default, skip_serializing, deserialize_with = "f")]
+            pub nevis: Option<serde_json::Value>
+        };
+        assert!(has_serde_skip(&field));
+
+        // Bare `skip_serializing` only: still skipped.
+        let field: syn::Field = parse_quote! {
+            #[serde(skip_serializing)]
+            pub shim: Option<String>
+        };
+        assert!(has_serde_skip(&field));
     }
 
     #[test]

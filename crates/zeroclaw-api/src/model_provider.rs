@@ -312,6 +312,46 @@ pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage
         .collect()
 }
 
+/// Count the conversation entries a transcript projects into, without
+/// materializing them. One entry per chat message; an assistant tool-call
+/// message contributes its non-empty text plus one entry per call; a tool
+/// result folds into the entry of a call still awaiting a result (FIFO by
+/// `tool_call_id`) and otherwise counts as its own orphan entry.
+///
+/// The ACP session store maintains a persisted per-session counter with the
+/// same semantics. Runtime projection (`conversation_message_entries`) and
+/// this function are two expressions of one counting rule and must agree on
+/// every input.
+pub fn projected_entry_count(messages: &[ConversationMessage]) -> usize {
+    let mut count = 0usize;
+    let mut open_calls = std::collections::HashMap::<&str, usize>::new();
+    for message in messages {
+        match message {
+            ConversationMessage::Chat(_) => count += 1,
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                    count += 1;
+                }
+                count += tool_calls.len();
+                for call in tool_calls {
+                    *open_calls.entry(call.id.as_str()).or_insert(0) += 1;
+                }
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    match open_calls.get_mut(result.tool_call_id.as_str()) {
+                        Some(open) if *open > 0 => *open -= 1,
+                        _ => count += 1,
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
@@ -476,6 +516,18 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// The connection for the failing request hop could not be opened
+    /// (connect, TLS handshake or DNS), as reported by the transport at
+    /// the send site. For a request that followed no redirect, nothing
+    /// was delivered. A redirect-following client may already have
+    /// delivered an earlier hop; callers that must not re-send delivered
+    /// work cannot rely on this variant alone.
+    ///
+    /// The display text matches [`StreamError::Http`] so logs, diagnostics
+    /// and user-facing messages are unchanged.
+    #[error("HTTP error: {0}")]
+    ConnectFailed(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
@@ -485,8 +537,22 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// A provider returned a non-success HTTP response before streaming began.
+    #[error("ModelProvider HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
     #[error(transparent)]
     ModelRefusal(#[from] Box<ModelRefusalError>),
+
+    /// The provider already exhausted its own retry/fallback budget producing
+    /// this error; consumers must not retry or fall back. Produced only when a
+    /// completed non-streaming call is synthesized into a stream (the wrapped
+    /// failure already survived the full ladder). A genuine streaming leg never
+    /// emits it, so fallback recovery for streamed failures is unaffected.
+    /// The payload is the completed call's failure; consumers walk its chain
+    /// for the typed terminal cause beneath it.
+    #[error("terminal provider error: {0}")]
+    Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -502,6 +568,14 @@ pub struct ProviderCapabilityError {
     pub capability: String,
     pub message: String,
 }
+
+/// Typed marker returned when a provider intentionally has no live model-list
+/// endpoint. Callers may use a separate canonical static catalog only for this
+/// condition; transport, authentication, and malformed-response failures must
+/// remain actionable.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("live model listing is not supported for this model_provider")]
+pub struct ModelListingUnsupportedError;
 
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
@@ -597,6 +671,14 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// identity. Callers use this fact to fail closed for identity-sensitive
     /// behavior such as persistent full-response caching.
     fn has_stable_request_identity(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Whether this exact request shape can be replayed for `model` on the same
+    /// provider/model route without internal retries, fallback, or key
+    /// mutation. Runtime fails closed when this capability is absent.
+    #[doc(hidden)]
+    fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
         false
     }
 
@@ -700,7 +782,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<String>;
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        anyhow::bail!("live model listing is not supported for this model_provider")
+        Err(ModelListingUnsupportedError.into())
     }
 
     /// Fetch the list of available models with pricing data for this
@@ -903,6 +985,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.as_ref().has_stable_request_identity(model)
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.as_ref().supports_exact_request_replay(request, model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1108,6 +1194,20 @@ mod capability_tests {
         }
     }
 
+    #[tokio::test]
+    async fn default_model_listing_returns_typed_unsupported_error() {
+        let error = NativeAccessorOnlyProvider
+            .list_models()
+            .await
+            .expect_err("default model listing must be unsupported");
+        assert!(
+            error
+                .downcast_ref::<super::ModelListingUnsupportedError>()
+                .is_some(),
+            "default listing error must preserve the typed unsupported marker: {error}"
+        );
+    }
+
     #[test]
     fn model_capabilities_preserve_native_accessor_overrides() {
         let provider = NativeAccessorOnlyProvider;
@@ -1253,6 +1353,64 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod projected_entry_count_tests {
+    use super::projected_entry_count;
+    use super::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        }
+    }
+
+    fn result(id: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: id.into(),
+            content: "out".into(),
+            tool_name: "shell".into(),
+        }
+    }
+
+    fn batch(text: Option<&str>, calls: Vec<ToolCall>) -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: text.map(str::to_string),
+            tool_calls: calls,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn counts_chat_and_call_batches_by_their_parts() {
+        let count = projected_entry_count(&[
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            batch(Some("working"), vec![call("a", "shell"), call("b", "read")]),
+            batch(Some(""), vec![call("c", "read")]),
+            batch(None, vec![]),
+        ]);
+        // 1 chat + (text + 2 calls) + (empty text, 1 call) + (nothing).
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn results_fold_into_open_calls_and_count_orphans() {
+        let count = projected_entry_count(&[
+            batch(None, vec![call("dup", "shell"), call("dup", "shell")]),
+            ConversationMessage::ToolResults(vec![
+                result("dup"),
+                result("dup"),
+                result("dup"), // one more result than calls
+                result("never-issued"),
+            ]),
+        ]);
+        // 2 calls, second batch's extra results are orphans.
+        assert_eq!(count, 4);
     }
 }
 

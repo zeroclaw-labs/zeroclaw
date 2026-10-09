@@ -28,7 +28,7 @@ use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -92,15 +92,22 @@ fn manifest() -> PluginManifest {
         wasm_path: Some("channel-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
+        provides: None,
         // Every fixture channel is ConfigRead-granted so the typed-config and
-        // scoped-secret contract is exercised on every instantiation. The
-        // HttpClient grant attaches the governed `wasi:http` surface (see
+        // scoped-secret contract is exercised on every instantiation, and
+        // State-granted so the durable-state contract is too. The HttpClient
+        // grant attaches the governed `wasi:http` surface (see
         // `new_channel_store`), but these channels are constructed with no egress
         // policy (`from_wasm(.., None)`), so reach is deny-all — no destination
         // is reachable. The deadline tests drive guest compute (a `spin`
         // message), not network, so a linked-but-ungoverned surface does not
         // change what they measure.
-        permissions: vec![PluginPermission::ConfigRead, PluginPermission::HttpClient],
+        permissions: vec![
+            PluginPermission::ConfigRead,
+            PluginPermission::HttpClient,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -148,7 +155,7 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
         })?;
         resolve_plugin_config(&manifest, scope, Some(values))
     });
-    PluginHostServices::new(resolver)
+    PluginHostServices::new(resolver, state_service())
 }
 
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {

@@ -28,7 +28,8 @@ use crate::policy::PolicyEnforcer;
 use crate::redact::{self, RedactCategory};
 use crate::threat::{self, Scope};
 use crate::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
+    ProceduralMessage, StoreOptions,
 };
 use async_trait::async_trait;
 use zeroclaw_config::schema::MemoryPolicyConfig;
@@ -346,6 +347,109 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             )
             .await?;
         self.filter_recalled_limited(entries, limit)
+    }
+
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Private writes go through the same content scan and policy gate
+        // as shared writes.
+        let content = self.process_content(key, content, None)?;
+        self.enforce_policy(key, None, &category).await?;
+        self.inner
+            .store_for_principal(scope, key, &content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .recall_for_principal(
+                scope,
+                query,
+                Self::read_fetch_limit(limit),
+                session_id,
+                since,
+                until,
+            )
+            .await?;
+        self.filter_recalled_limited(entries, limit)
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .list_for_principal(scope, category, session_id)
+            .await?;
+        self.filter_recalled(entries)
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let entry = self.inner.get_for_principal(scope, key).await?;
+        self.filter_single(entry)
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        self.inner.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        self.inner.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self.inner.export_for_principal(scope, filter).await?;
+        self.filter_recalled(entries)
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        self.inner
+            .purge_namespace_for_principal(scope, namespace)
+            .await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.inner
+            .purge_session_for_principal(scope, session_id)
+            .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -945,6 +1049,7 @@ mod tests {
 
     fn test_entry(key: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: key.into(),
             key: key.into(),
             content: content.into(),

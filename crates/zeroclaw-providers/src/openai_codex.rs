@@ -36,9 +36,13 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
-    /// Operator `[multimodal]` policy for this provider's own image-marker
-    /// expansion pass. Resolved once at construction from
-    /// `ModelProviderRuntimeOptions`.
+    /// The configured `[multimodal]` policy.
+    ///
+    /// This provider normalizes image markers on its own boundary, and that
+    /// normalization decodes pixels and applies `max_images` /
+    /// `max_image_size_mb`. Holding the configured policy keeps the boundary
+    /// pass on the same rules the runtime already applied instead of silently
+    /// reverting to defaults and re-trimming an accepted history.
     multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
@@ -362,7 +366,8 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
         match msg.role.as_str() {
             "system" => system_parts.push(&msg.content),
             "user" => {
-                let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
+                let (cleaned_text, image_refs) =
+                    multimodal::parse_user_message_image_refs(&msg.content);
 
                 let mut content_items = Vec::new();
 
@@ -1505,7 +1510,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         }
         messages.push(ChatMessage::user(message));
 
-        // Normalize images: convert file paths to data URIs
+        // Normalize images: convert file paths to data URIs, under the
+        // configured policy rather than defaults.
         let prepared =
             crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
@@ -1521,7 +1527,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Normalize image markers: convert file paths to data URIs
+        // Normalize image markers: convert file paths to data URIs, under the
+        // configured policy rather than defaults.
         let prepared =
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 

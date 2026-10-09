@@ -108,13 +108,17 @@ pub struct DiscordChannel {
     multi_message_delay_ms: u64,
     /// Per-channel rate-limit tracking for draft edits.
     last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
-    /// Tracks how much text has been sent in MultiMessage mode.
-    multi_message_sent_len: Mutex<HashMap<String, usize>>,
+    /// Exact confirmed-delivered frame prefix per recipient in MultiMessage
+    /// mode. The confirmed byte offset is derived as `prefix.len()`; keeping
+    /// the bytes themselves (not just a count) lets `update_draft` detect and
+    /// remap the offset when a later sanitizer pass rewrites the frame before
+    /// it (see [`crate::orchestrator::remap_confirmed_offset`]).
+    multi_message_confirmed_prefix: Mutex<HashMap<String, String>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -182,7 +186,7 @@ impl DiscordChannel {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             last_draft_edit: Mutex::new(HashMap::new()),
-            multi_message_sent_len: Mutex::new(HashMap::new()),
+            multi_message_confirmed_prefix: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -777,6 +781,47 @@ impl DiscordChannel {
     fn is_user_allowed(&self, user_id: &str) -> bool {
         let peers = (self.peer_resolver)();
         crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+    }
+
+    fn canonical_approval_destination(recipient: &str) -> String {
+        recipient.split(':').next().unwrap_or(recipient).to_string()
+    }
+
+    async fn take_authorized_component(
+        components: &parking_lot::Mutex<pending::PendingComponents>,
+        approvals: &AsyncMutex<HashMap<String, crate::util::PendingApproval>>,
+        custom_id: &str,
+        destination: &str,
+    ) -> Option<ComponentIntent> {
+        let destination = Self::canonical_approval_destination(destination);
+        // Acquire the async lock first so no synchronous guard crosses an await.
+        // Checking and consuming the intent stays atomic for every component kind.
+        let approvals = approvals.lock().await;
+        components.lock().take_if(custom_id, |intent| match intent {
+            ComponentIntent::Approval { token, .. } => approvals.get(token).is_none_or(|pending| {
+                !destination.is_empty() && pending.destination == destination
+            }),
+            _ => true,
+        })
+    }
+
+    async fn resolve_approval_reply(
+        &self,
+        content: &str,
+        responder: &str,
+        destination: &str,
+    ) -> Option<crate::util::PendingApprovalResolution> {
+        let (token, response) = crate::util::parse_approval_reply(content)?;
+        Some(
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_user_allowed(responder),
+                &Self::canonical_approval_destination(destination),
+            )
+            .await,
+        )
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
@@ -2879,23 +2924,30 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
-                                        // Single-use: drain the intent bound to
-                                        // this custom_id. The `take` runs ONLY
-                                        // after the fail-closed gate above, so an
-                                        // unauthorized click never drains an
-                                        // entry. Absent/expired/replayed (incl. a
-                                         // forged-but-zc1 id we never registered)
-                                         // → refuse, don't act.
-                                        let intent = pending_components.lock().take(&custom_id_raw);
+                                        // Wrong-destination clicks retain the button;
+                                        // every accepted intent is consumed exactly once.
+                                        let intent = Self::take_authorized_component(
+                                            &pending_components,
+                                            &pending_approvals,
+                                            &custom_id_raw,
+                                            &interaction_channel,
+                                        ).await;
                                         let prompt = match intent {
                                             Some(ComponentIntent::Approval { token, decision }) => {
-                                                let resolved = {
-                                                    let mut guard = pending_approvals.lock().await;
-                                                    approval::resolve_parked_approval(
-                                                        &mut guard, &token, decision,
-                                                    )
-                                                };
-                                                let key = if resolved {
+                                                let resolution = crate::util::resolve_pending_approval(
+                                                    &pending_approvals,
+                                                    &token,
+                                                    decision.response(),
+                                                    true,
+                                                    &Self::canonical_approval_destination(
+                                                        &interaction_channel,
+                                                    ),
+                                                )
+                                                .await;
+                                                let key = if matches!(
+                                                    resolution,
+                                                    crate::util::PendingApprovalResolution::Resolved
+                                                ) {
                                                     "channel-discord-approval-recorded"
                                                 } else {
                                                     "channel-discord-component-expired"
@@ -3285,23 +3337,25 @@ impl Channel for DiscordChannel {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
 
-                    // Intercept approval replies before forwarding to the agent.
-                    if let Some((token, response)) =
-                        crate::util::parse_approval_reply(&final_content)
-                    {
-                        let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
-                            continue;
-                        }
-                    }
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d
                         .get("channel_id")
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+
+                    // Intercept approval replies before forwarding to the agent.
+                    if let Some(resolution) = self
+                        .resolve_approval_reply(&final_content, author_id, &channel_id)
+                        .await
+                        && !matches!(
+                            resolution,
+                            crate::util::PendingApprovalResolution::NotFound
+                        )
+                    {
+                        continue;
+                    }
+
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
@@ -3444,6 +3498,16 @@ impl Channel for DiscordChannel {
         self.multi_message_delay_ms
     }
 
+    async fn multi_message_confirmed_offset(&self, recipient: &str, _message_id: &str) -> usize {
+        if self.stream_mode != zeroclaw_config::schema::StreamMode::MultiMessage {
+            return 0;
+        }
+        self.multi_message_confirmed_prefix
+            .lock()
+            .get(recipient)
+            .map_or(0, String::len)
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         use zeroclaw_config::schema::StreamMode;
         // Interaction replies have no channel to draft into — the recipient
@@ -3479,7 +3543,7 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // No initial draft — paragraphs are sent as new messages.
                 // Store thread context for paragraph delivery.
-                self.multi_message_sent_len.lock().clear();
+                self.multi_message_confirmed_prefix.lock().clear();
                 self.multi_message_thread_ts
                     .lock()
                     .insert(message.recipient.clone(), message.thread_ts.clone());
@@ -3562,30 +3626,42 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // Track accumulated text and send new paragraphs at \n\n boundaries.
                 // Extract paragraph (if any) under the lock, then drop it before async work.
-                let (paragraph, thread_ts) = {
+                let (paragraph, sent_so_far, consumed, thread_ts) = {
                     let thread_ts = self
                         .multi_message_thread_ts
                         .lock()
                         .get(recipient)
                         .cloned()
                         .flatten();
-                    let mut sent_map = self.multi_message_sent_len.lock();
-                    let sent_so_far = sent_map.get(recipient).copied().unwrap_or(0);
-
-                    // DraftEvent::Clear resets accumulated text — reset our counter.
-                    if text.len() < sent_so_far {
-                        sent_map.insert(recipient.to_string(), 0);
-                        return Ok(());
-                    }
+                    let mut sent_map = self.multi_message_confirmed_prefix.lock();
+                    let confirmed = sent_map.get(recipient).map_or("", String::as_str);
+                    let sent_so_far = if text.as_bytes().starts_with(confirmed.as_bytes()) {
+                        confirmed.len()
+                    } else {
+                        // The frame no longer starts with the confirmed bytes:
+                        // either a later sanitizer pass (e.g. a redaction span
+                        // completing on this delta) rewrote text before the
+                        // confirmed offset, or a DraftEvent::Clear restarted
+                        // the accumulation. Remap the offset onto the new
+                        // frame before slicing anything with it; a restart
+                        // remaps to 0.
+                        let remapped = crate::orchestrator::remap_confirmed_offset(confirmed, text);
+                        sent_map.insert(recipient.to_string(), text[..remapped].to_string());
+                        remapped
+                    };
                     if text.len() == sent_so_far {
                         return Ok(());
                     }
 
+                    // `sent_so_far` is a byte-verified prefix of `text` (or a
+                    // remap result on a `\n\n` boundary), so this slice cannot
+                    // split a UTF-8 character.
                     let new_text = &text[sent_so_far..];
                     let mut scan_pos = 0;
                     let mut in_fence = false;
                     let bytes = new_text.as_bytes();
                     let mut found_paragraph = None;
+                    let mut consumed = 0;
 
                     while scan_pos < bytes.len() {
                         let ch = bytes[scan_pos];
@@ -3605,8 +3681,7 @@ impl Channel for DiscordChannel {
                             && bytes[scan_pos + 1] == b'\n'
                         {
                             let paragraph = new_text[..scan_pos].trim().to_string();
-                            let consumed = scan_pos + 2;
-                            *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
+                            consumed = scan_pos + 2;
                             if !paragraph.is_empty() {
                                 found_paragraph = Some(paragraph);
                             }
@@ -3616,28 +3691,36 @@ impl Channel for DiscordChannel {
                         scan_pos += 1;
                     }
                     // Lock is dropped here at end of block.
-                    (found_paragraph, thread_ts)
+                    (found_paragraph, sent_so_far, consumed, thread_ts)
                 };
 
                 if let Some(paragraph) = paragraph {
                     let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message paragraph send failed"
-                        );
-                    }
+                    self.send(&msg).await?;
+                    // Advance only after the transport confirms delivery. A
+                    // failed paragraph remains in the buffer for finalization.
+                    self.multi_message_confirmed_prefix.lock().insert(
+                        recipient.to_string(),
+                        text[..sent_so_far + consumed].to_string(),
+                    );
                     if self.multi_message_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             self.multi_message_delay_ms,
                         ))
                         .await;
                     }
+                    // Recurse to handle remaining text.
+                    return self.update_draft(recipient, message_id, text).await;
+                } else if consumed > 0 {
+                    // An empty paragraph has no transport content, so there is
+                    // no send to confirm: its delimiter advances the confirmed
+                    // coordinate immediately. Without this the scanner would
+                    // rediscover the same empty paragraph on every frame and
+                    // never reach the text behind it.
+                    self.multi_message_confirmed_prefix.lock().insert(
+                        recipient.to_string(),
+                        text[..sent_so_far + consumed].to_string(),
+                    );
                     // Recurse to handle remaining text.
                     return self.update_draft(recipient, message_id, text).await;
                 }
@@ -3661,26 +3744,24 @@ impl Channel for DiscordChannel {
                 .lock()
                 .remove(recipient)
                 .flatten();
-            let sent_so_far = self
-                .multi_message_sent_len
+            let confirmed = self
+                .multi_message_confirmed_prefix
                 .lock()
                 .remove(recipient)
-                .unwrap_or(0);
+                .unwrap_or_default();
+            // The reconciled final text is built to preserve the confirmed
+            // prefix byte-for-byte; remap defensively so a divergent frame
+            // degrades to re-sending whole paragraphs, never a corrupt slice.
+            let sent_so_far = if text.as_bytes().starts_with(confirmed.as_bytes()) {
+                confirmed.len()
+            } else {
+                crate::orchestrator::remap_confirmed_offset(&confirmed, text)
+            };
             if text.len() > sent_so_far {
                 let remaining = text[sent_so_far..].trim().to_string();
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message final flush failed"
-                        );
-                    }
+                    self.send(&msg).await?;
                 }
             }
             return Ok(());
@@ -3824,7 +3905,7 @@ impl Channel for DiscordChannel {
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
-            self.multi_message_sent_len.lock().remove(recipient);
+            self.multi_message_confirmed_prefix.lock().remove(recipient);
             self.multi_message_thread_ts.lock().remove(recipient);
             return Ok(());
         }
@@ -3939,10 +4020,18 @@ impl Channel for DiscordChannel {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: Self::canonical_approval_destination(recipient),
+                tool_name: request.tool_name.clone(),
+            },
+        );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
@@ -3955,7 +4044,7 @@ impl Channel for DiscordChannel {
                 .await
         };
         if let Err(err) = emitted {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -3965,17 +4054,20 @@ impl Channel for DiscordChannel {
         // report it to the model as an operator's refusal.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
                     // Sender dropped: the gateway task went away without a click.
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,
@@ -4458,6 +4550,20 @@ mod tests {
     /// fetch. The typed envelope records that fallback as non-owned, so the
     /// pipeline replaces the URL with inline data and provider preparation
     /// sees one effective image reference without a false partial-load note.
+    /// A real 1x1 JPEG.
+    ///
+    /// Provider preparation now fully decodes image bytes rather than sniffing
+    /// their header, so a fixture that only carries the JPEG magic number is
+    /// rejected as corrupt. Tests that assert an image survives preparation
+    /// must serve bytes that actually decode.
+    fn valid_jpeg_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("test JPEG encodes");
+        buf.into_inner()
+    }
+
     #[tokio::test]
     async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
         use crate::orchestrator::media_pipeline::MediaPipeline;
@@ -4467,7 +4573,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/attachments/1/photo.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_jpeg_bytes()))
             .mount(&server)
             .await;
 
@@ -7794,37 +7900,58 @@ mod tests {
             mention_only,
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let resolution = crate::util::resolve_pending_approval(
+            &ch.pending_approvals,
+            "abc123",
+            ChannelApprovalResponse::Deny,
+            true,
+            "c1",
+        )
+        .await;
+        assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
     }
 
-    /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
-    /// first, and ONLY on success take + resolve. Mirrors mod.rs so the test
-    /// asserts the real ordering contract.
-    fn dispatch_approval_click(
+    /// Compose the production component take and resolver after the ingress gate.
+    async fn dispatch_approval_click(
         peers: &[String],
         user_id: &str,
         custom_id: &str,
         pending_components: &parking_lot::Mutex<pending::PendingComponents>,
-        pending_approvals: &mut std::collections::HashMap<
-            String,
-            oneshot::Sender<ChannelApprovalResponse>,
-        >,
+        pending_approvals: &AsyncMutex<HashMap<String, crate::util::PendingApproval>>,
+        destination: &str,
     ) -> bool {
         // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
         // with an empty peer list = nobody, exactly like the message path.
-        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+        if interaction_gate(peers, &[], &[], user_id, None, destination, None).is_err() {
             return false; // unauthorized: must not drain or resolve anything
         }
-        let intent = pending_components.lock().take(custom_id);
+        let intent = DiscordChannel::take_authorized_component(
+            pending_components,
+            pending_approvals,
+            custom_id,
+            destination,
+        )
+        .await;
         match intent {
             Some(ComponentIntent::Approval { token, decision }) => {
-                approval::resolve_parked_approval(pending_approvals, &token, decision)
+                let resolution = crate::util::resolve_pending_approval(
+                    pending_approvals,
+                    &token,
+                    decision.response(),
+                    true,
+                    destination,
+                )
+                .await;
+                matches!(resolution, crate::util::PendingApprovalResolution::Resolved)
             }
             _ => false,
         }
@@ -7845,12 +7972,20 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
         let resolved =
-            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
+                .await;
         assert!(resolved, "authorized click resolves the oneshot");
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
@@ -7870,9 +8005,16 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, mut rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
         // "intruder" is not in the (specific, non-wildcard) peer list → gate
         // denies BEFORE the take.
@@ -7881,13 +8023,15 @@ mod tests {
             "intruder",
             &wire,
             &reg,
-            &mut approvals,
-        );
+            &approvals,
+            "c1",
+        )
+        .await;
         assert!(!resolved, "unauthorized click resolves nothing");
         // The oneshot is unresolved (rx still pending, sender still parked).
         assert!(rx.try_recv().is_err(), "no decision delivered");
         assert!(
-            approvals.contains_key(token),
+            approvals.lock().await.contains_key(token),
             "the approval entry is NOT drained by an unauthorized click"
         );
         // And the pending component entry survives: an authorized user could
@@ -7895,6 +8039,114 @@ mod tests {
         assert!(
             reg.lock().take(&wire).is_some(),
             "the component entry was not drained by the unauthorized click"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_approval_requires_authorized_responder_and_destination() {
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["u1".to_string()]),
+            false,
+            false,
+        );
+        let (tx, mut rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "tok123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "intruder", "c1")
+                .await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "u1", "c2").await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("tok123"));
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "u1", "c1:thread")
+                .await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 no", "u1", "c1").await,
+            Some(crate::util::PendingApprovalResolution::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_component_take_preserves_non_approval_single_use() {
+        let components = parking_lot::Mutex::new(pending::PendingComponents::default());
+        let approvals = AsyncMutex::new(HashMap::new());
+        components.lock().register(
+            "turn-button".into(),
+            ComponentIntent::ResolveIntoTurn {
+                prompt: "continue".into(),
+            },
+        );
+        let (first, second) = tokio::join!(
+            DiscordChannel::take_authorized_component(&components, &approvals, "turn-button", "c1"),
+            DiscordChannel::take_authorized_component(&components, &approvals, "turn-button", "c1"),
+        );
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_button_wrong_destination_preserves_component_until_right_click() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let approvals = AsyncMutex::new(HashMap::new());
+        let (tx, mut rx) = oneshot::channel();
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c2",)
+                .await
+        );
+        assert!(approvals.lock().await.contains_key(token));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(reg.lock().take(&wire).is_none());
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
         );
     }
 
@@ -7913,22 +8165,27 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
-        assert!(dispatch_approval_click(
-            &[String::from("*")],
-            "u1",
-            &wire,
-            &reg,
-            &mut approvals
-        ));
+        assert!(
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
+        );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
         // The component entry is gone (single-use take), so a replay of the same
         // custom_id resolves nothing even from an authorized user.
         assert!(
-            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals),
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
+                .await,
             "replayed click refused"
         );
     }
@@ -8487,7 +8744,7 @@ mod tests {
             .find("interaction_gate(")
             .expect("type-3/5 arm gates");
         let take35 = region35
-            .find("pending_components.lock().take(")
+            .find("Self::take_authorized_component(")
             .expect("type-3/5 arm takes");
         assert!(
             gate35 < take35,

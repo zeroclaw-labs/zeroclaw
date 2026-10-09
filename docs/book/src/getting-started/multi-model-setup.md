@@ -175,7 +175,7 @@ memory_recall_limit      = 3
 
 This profile composes existing primitives:
 
-- `compact_context` keeps startup context small.
+- `compact_context` keeps startup context small by capping each workspace bootstrap file at 6000 characters on agent-loop and channel turns, before `max_system_prompt_chars` applies; `zeroclaw doctor` warns when a file is over the cap.
 - `prompt_injection_mode = "compact"` keeps skill metadata inline and loads full instructions on demand when `read_skill` is available; providers without that loader retain the existing full-injection fallback.
 - `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
 - `max_tool_iterations`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context. `max_context_tokens` remains the absolute proactive-trim budget; set `context_compact_ratio` explicitly to opt into a model-relative threshold. Every positive effective threshold is capped by the selected model's configured context capacity; `max_context_tokens = 0` remains the proactive-trimming disable sentinel.

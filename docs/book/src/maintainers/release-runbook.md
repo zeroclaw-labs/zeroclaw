@@ -158,6 +158,8 @@ Two independent Core Team approvals are the default. Toolchain-floor and release
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
+The **crates.io Package Preflight** gate runs whenever a PR changes `[workspace.package] version` to a stable `X.Y.Z`. It packages every crate in the release set and compiles each one from its own tarball, with no registry token, so a bump whose crates cannot publish cannot merge. Expect it to add about half an hour to the bump PR. It also runs again in the merge queue. If it fails, read the Preflight step first. A packaging or compile error is real and must be fixed in the bump PR. A crates.io API error, an npm install failure, or a runner timeout is infrastructure. Re-run only the failed jobs rather than pushing again. If the outage persists, keep the bump unmerged until required CI is green. The release run independently repeats the same preflight before the GitHub Release.
+
 **Confirm the merge landed correctly:**
 
 <div class="os-tabs-src">
@@ -415,8 +417,11 @@ re-trigger. Do not try to work around it.
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve all three when they appear. Approve `crates-io` only after its tokenless
-package preflight is green:
+Approve all three when they appear. The `github-releases` gate appears only
+after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
+packaged and compiled every crate. It runs beside the binary builds, so a
+release whose crates cannot publish stops before anything becomes public. The
+later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
 |---|---|---|
@@ -495,11 +500,45 @@ recreate `gh-pages` or change the supported-version window.
 ### What happens automatically
 
 - The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
-- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
-- **Ordering matters:** the tag deploy must land `/vX.Y.Z/` on `gh-pages` *before* a master deploy can flip the stable pointer to it. In the normal release sequence the version-bump PR merges first (Step 2), so its `master` docs deploy typically runs *before* `Release Stable` creates and deploys the tag. That earlier master deploy finds `/vX.Y.Z/` absent and deliberately retains the previous pointer; the flip is deferred (see the deferred-flip logic in `docs-deploy.yml`). The `deploy-docs` job then creates `/vX.Y.Z/`, and the flip publishes on the *next* master deploy after the dir is live. Note that `deploy-docs` only dispatches the tag build and does not wait for it: a green `deploy-docs` job means the dispatch was accepted, not that the docs run finished. After `/vX.Y.Z/` is live, dispatch `docs-deploy.yml` with `tag=master` to publish the stable-pointer flip (and confirm the dispatched runs actually succeeded in the Actions tab).
-- `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
+- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. There is no duplicate `/stable/` tree.
+- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer without another full master build.
+- `gh-pages` is ephemeral: publication replaces it with a single orphan commit. Normal builds enforce retention via `DOCS_KEEP_VERSIONS` (master, the stable pointer target, and the newest N final releases). Promotion preserves all existing version directories.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
+
+### Promote an already deployed release
+
+Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
+`promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
+The default `build` mode retains the normal build behavior.
+
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`, and the
+root `llms.txt` / `llms-full.txt` pair at the site root. That pair mirrors the
+promoted release's English copy, and is withdrawn when the release doesn't carry
+both files, so the fixed LLM URLs always describe the release `/` redirects to.
+It installs no Rust or mdBook tools and preserves every locale, the API
+reference, shared chrome, and retention state. The workflow's existing
+`gh-pages` concurrency group serializes both modes; promotion also uses an exact
+push lease so it cannot replace a site changed by another writer.
+
+The helper requires the dispatch commit to remain protected master's current
+head, its committed pointer to match the requested tag, and GitHub Latest to name
+that same public final release. It resolves the tag to a commit and compares it
+with the deployed version's `.docs-source-commit` receipt. Every locale listed in
+that release's `locales.toml` must have a nonempty landing page. Missing or
+inconsistent metadata, API errors, prereleases, versions below the docs floor,
+and numeric version downgrades fail before publication. The live checks repeat
+immediately before the push. If master advances while the run waits, dispatch a
+fresh run. Repeating a successful promotion is safe.
+
+Deployments made before source receipts were introduced need one normal `build`
+dispatch for that release tag before promotion can verify their source. Do not
+create a receipt by hand. Promotion does not rewrite page-level canonical or
+language-alternate tags, or `sitemap.xml`; those SEO fields refresh on the next
+normal docs deploy. If an immediate SEO refresh is required, use a normal master
+build. A downgrade requires a separately reviewed manual rollback; this mode has
+no rollback override. Reverting the workflow change removes the manual mode but
+does not change the already published pointer.
 
 ### Bootstrapping `gh-pages`
 
@@ -549,6 +588,13 @@ policy instead.
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
+**The crates.io preflight failed:** Nothing was published. The GitHub Release
+waits for this job, and the job holds no registry token. On a dispatched
+release the tag does not exist yet either. Fix the packaging problem on
+`master`, then dispatch Release Stable again for the same version. Run
+`scripts/release/publish-crates.sh` locally first to confirm the fix; without
+`--execute` it only packages and verifies.
+
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
@@ -566,7 +612,19 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, or that the tag does
+not resolve to the release commit, nothing was uploaded; dispatch
+`Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
+
+**The failure is in the publisher scripts, not the crates:** Both v0.8.5
+failures were of this kind. Do not move the tag and do not publish by hand. Fix
+the script on `master`, then dispatch `Pub crates.io` from `master` for the same
+tag. The crates are still packaged from the tag, but the scripts under
+`scripts/release/` come from `master`. The run summary shows both commits as
+`commit` and `release tooling`. The resolver accepts newer tooling only from a
+`master` commit that already contains the release commit, and only on a manual
+dispatch. A release run always uses the scripts it was tagged with.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

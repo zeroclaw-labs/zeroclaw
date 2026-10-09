@@ -4,7 +4,6 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -15,16 +14,12 @@ use zeroclaw_runtime::rpc::types::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 use super::api_config::{persist_and_swap, try_compute_drift};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
-pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_catalog(State(state): State<AppState>) -> Response {
     let _ = state;
 
     let model_providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
@@ -46,24 +41,53 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
+    /// Optional typed-provider alias selected by the configuration form.
+    pub alias: Option<String>,
+}
+
+impl ModelsQuery {
+    /// The dotted `<family>.<alias>` reference is the canonical source for
+    /// catalog resolution (endpoint, credential, headers) for every provider
+    /// family, not just `hailo_ollama` — `model_catalog_with_config_result`
+    /// resolves any configured alias generically via `find_by_name`. Reducing
+    /// non-Hailo families to the bare family name here silently prevented
+    /// their configured alias (custom endpoints, header-only auth, etc.) from
+    /// ever reaching that exact-profile catalog path through the dashboard.
+    fn catalog_provider_ref(&self) -> String {
+        match self.alias.as_deref() {
+            Some(alias) if !alias.trim().is_empty() => {
+                format!("{}.{}", self.model_provider, alias.trim())
+            }
+            _ => self.model_provider.clone(),
+        }
+    }
 }
 
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    let catalog_provider_ref = q.catalog_provider_ref();
     // Snapshot config so the catalog resolves the alias credential and can reach
     // the native /models endpoint (surfacing new native-only models that the
     // models.dev snapshot may not carry yet) instead of silently falling back.
     let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog_with_config(Some(&cfg), &q.model_provider)
-            .await;
+        match zeroclaw_runtime::quickstart::model_catalog_with_config_result(
+            Some(&cfg),
+            &catalog_provider_ref,
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    error.to_string(),
+                ));
+            }
+        };
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
@@ -189,10 +213,7 @@ fn quickstart_agent_missing_requirements(
     missing
 }
 
-pub async fn handle_section_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_section_status(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(derive_section_status(&cfg)).into_response()
 }
@@ -244,18 +265,12 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
 /// `GET /api/config/agent-options` — every alias-reference list the
 /// agent form needs, derived from the live config. Mirrors the lists the
 /// TUI computes locally for its alias pickers.
-pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_agent_options(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(build_agent_options(&cfg)).into_response()
 }
 
-pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     let completed: std::collections::HashSet<String> = cfg
         .onboard_state
@@ -414,12 +429,8 @@ pub struct SectionPath {
 
 pub async fn handle_section_picker(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(SectionPath { section }): axum::extract::Path<SectionPath>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
 
     use zeroclaw_config::sections::Section;
@@ -493,6 +504,7 @@ fn picker_items_for(
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -844,26 +856,65 @@ pub struct SectionSelectBody {
 
 pub async fn handle_section_select(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    principal: crate::principal_gate::RequestPrincipal,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
     body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let alias = body
         .and_then(|b| b.0.alias)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
+    use zeroclaw_config::sections::Section;
+    if matches!(Section::from_key(&section), Some(Section::Agents)) {
+        let reservation = match state.agent_lifecycle.reserve_config_mutation(&key) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(format!("agents.{key}")),
+                );
+            }
+        };
+        // persist_and_swap retains its save. Retain admission until that save
+        // and publication finish, even if the requesting handler is cancelled.
+        let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+            async move {
+                let _reservation = reservation;
+                select_section(state, principal, section, key, alias).await
+            },
+        ));
+        return match task.await {
+            Ok(response) => response,
+            Err(error) => error_response(ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("Agent creation completion failed: {error}"),
+            )),
+        };
+    }
+    select_section(state, principal, section, key, alias).await
+}
+
+async fn select_section(
+    state: AppState,
+    principal: crate::principal_gate::RequestPrincipal,
+    section: String,
+    key: String,
+    alias: String,
+) -> Response {
     // Held through the swap at the end of this handler so a concurrent
     // config writer can't land between this read and the save below.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
+    let _cfg_guard = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("config commit refused without any change: {e}"),
+            ));
+        }
+    };
+    let mut working = _cfg_guard.current_config();
 
     use zeroclaw_config::sections::Section;
     let Some(section_enum) = Section::from_key(&section) else {
@@ -932,6 +983,7 @@ pub async fn handle_section_select(
         }
         Section::Agents
         | Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
@@ -1119,8 +1171,24 @@ pub async fn handle_section_select(
         .into_response();
     }
 
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
-        return error_response(e);
+    // Selecting an existing item writes nothing; creating one writes the
+    // new item's fields. Authorized before the save either way.
+    let before = state.config.read().clone();
+    let mut writes = crate::principal_gate::ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    if created {
+        writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
+    }
+    let authorization =
+        match crate::principal_gate::authorize_config_write(&principal, writes, &_cfg_guard) {
+            Ok(authorization) => authorization,
+            Err(denied) => return denied.into_response(),
+        };
+    if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
+        return e;
     }
 
     axum::Json(SelectItemResponse {
@@ -1136,6 +1204,36 @@ mod tests {
 
     const DEV_CONFIG_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
     const DEV_HARNESS_TEMPLATE: &str = include_str!("../../../dev/config.harness-test.toml");
+
+    #[test]
+    fn models_query_uses_hailo_alias_for_catalog_resolution() {
+        let query = ModelsQuery {
+            model_provider: "hailo_ollama".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "hailo_ollama.edge");
+    }
+
+    #[test]
+    fn models_query_uses_configured_alias_for_every_provider_family() {
+        // Every provider family's configured alias must reach the exact-profile
+        // catalog path, not just hailo_ollama: `model_catalog_with_config_result`
+        // resolves any `<family>.<alias>` dotted reference generically.
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai.edge");
+    }
+
+    #[test]
+    fn models_query_falls_back_to_bare_family_without_an_alias() {
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: None,
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai");
+    }
 
     fn parse_dev_template(raw: &str, name: &str) -> zeroclaw_config::schema::Config {
         toml::from_str(raw).unwrap_or_else(|err| panic!("{name} must parse as schema V3: {err}"))
@@ -1416,12 +1514,56 @@ mod tests {
         zeroclaw_config::schema::Config::default()
     }
 
+    #[tokio::test]
+    async fn agent_section_creation_reserves_url_key_through_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let workspace = config.agent_workspace_dir("recreated");
+        let state = section_test_state(config);
+        let mut cleanup = state.agent_lifecycle.begin_delete("recreated").unwrap();
+        cleanup.commit_destructive_mutation();
+        let path = || {
+            axum::extract::Path(SectionItemPath {
+                section: "agents".into(),
+                key: "recreated".into(),
+            })
+        };
+        let body = || {
+            Some(axum::Json(SectionSelectBody {
+                alias: Some("other".into()),
+            }))
+        };
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+        assert!(!workspace.exists());
+        drop(cleanup);
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(state.config.read().agents.contains_key("recreated"));
+        assert!(!state.config.read().agents.contains_key("other"));
+        assert!(workspace.exists());
+    }
+
     fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
@@ -1488,6 +1630,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -1546,11 +1689,7 @@ mod tests {
     async fn handle_sections_emits_stable_group_key_with_english_fallback() {
         use http_body_util::BodyExt;
 
-        let response = handle_sections(
-            State(section_test_state(empty_cfg())),
-            axum::http::HeaderMap::new(),
-        )
-        .await;
+        let response = handle_sections(State(section_test_state(empty_cfg()))).await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -1811,7 +1950,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -1867,7 +2006,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "providers.models".to_string(),
                 key: "anthropic".to_string(),
@@ -1925,7 +2064,7 @@ mod tests {
 
         let memory_response = handle_section_select(
             State(memory_state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -1976,7 +2115,7 @@ mod tests {
 
         let tunnel_response = handle_section_select(
             State(tunnel_state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -2031,7 +2170,10 @@ mod tests {
 
         let mut disk_cfg = state.config.read().clone();
         disk_cfg.memory.backend = "postgres".to_string();
-        disk_cfg.save().await.expect("write external memory drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external memory drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted memory config");
@@ -2039,7 +2181,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "memory".to_string(),
                 key: "sqlite".to_string(),
@@ -2092,7 +2234,10 @@ mod tests {
             .as_mut()
             .expect("tailscale defaults")
             .funnel = true;
-        disk_cfg.save().await.expect("write external tunnel drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external tunnel drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted tunnel config");
@@ -2100,7 +2245,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "tailscale".to_string(),
@@ -2167,7 +2312,7 @@ mod tests {
                 let live_before = state.config.read().clone();
                 let response = handle_section_select(
                     State(state.clone()),
-                    axum::http::HeaderMap::new(),
+                    None,
                     axum::extract::Path(SectionItemPath {
                         section: section.to_string(),
                         key: key.to_string(),
@@ -2228,7 +2373,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),

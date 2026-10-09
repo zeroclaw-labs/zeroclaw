@@ -247,7 +247,7 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
@@ -392,7 +392,7 @@ jobs:
   build-desktop:
     name: Build Desktop App (macOS Universal)
     needs: [validate, web]
-    runs-on: macos-14
+    runs-on: macos-15
     # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
     # then the universal app build on top.
     timeout-minutes: 180
@@ -400,6 +400,23 @@ jobs:
       MACOS_DMG_PATH: desktop-assets/ZeroClaw.dmg
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Validate before either architecture compiles. Absent credential groups
+      # retain optional signing/notarization; partial or rejected groups fail.
+      # Signing requires a certificate and identity; its PKCS#12 password may
+      # be empty and is forwarded unchanged to Tauri below.
+      # Certificate import, signing identity and bundle acceptance are still
+      # checked by Tauri. Export credentials only at the bundling step below.
+      - name: Validate Apple notarization credentials
+        timeout-minutes: 5
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 scripts/release/apple_preflight.py
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -499,10 +516,9 @@ jobs:
             exit 1
           fi
 
-      # Code-signing + notarization are optional: when the APPLE_* secrets are
-      # configured the Tauri bundler picks them up from the environment and
-      # signs/notarizes the app; when absent the build stays unsigned (ad-hoc),
-      # exactly as before. Secrets never gate the build itself.
+      # The preflight checked completeness and notarization authentication.
+      # Keep credentials out of earlier build steps; Tauri now imports the
+      # certificate, validates the signing identity and notarizes the bundle.
       - name: Enable macOS signing (when secrets are configured)
         shell: bash
         env:
@@ -560,7 +576,7 @@ jobs:
       # validates online (Gatekeeper must reach Apple on first open). Notarize
       # the .dmg too and staple the ticket into it so the downloaded installer
       # validates fully offline. Guarded on APPLE_ID so unsigned builds skip
-      # cleanly — secrets never gate the build.
+      # cleanly when notarization credentials are absent.
       - name: Notarize and staple the .dmg (offline-valid installer)
         if: ${{ env.APPLE_ID != '' }}
         shell: bash
@@ -737,7 +753,9 @@ jobs:
     name: Publish Stable Release
     # The Linux/Windows desktop jobs are continue-on-error: listing them in
     # needs only sequences the download; their failure cannot block publish.
-    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom]
+    # crates-preflight is a hard gate: a release whose crates cannot publish
+    # must fail before the GitHub Release makes the version public.
+    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1215,14 +1233,32 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
   # ── Post-publish: package manager auto-sync ─────────────────────────
-  crates:
-    name: Publish crates.io Workspace
-    needs: [validate, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+  # Packages and compiles every crate beside the binary builds, before any
+  # irreversible step. It verifies github.sha because a dispatched release has
+  # no tag until `publish` creates it. No token: this stage cannot upload.
+  crates-preflight:
+    name: Preflight crates.io Workspace
+    needs: [validate]
     uses: ./.github/workflows/pub-crates.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_sha: ${{ github.sha }}
+      stage: preflight
+      dry_run: true
+
+  # Uploads what crates-preflight verified, without verifying again. The
+  # called workflow requires the new tag to resolve to the same commit and the
+  # restored dashboard bundle to match the recorded digest.
+  crates:
+    name: Publish crates.io Workspace
+    needs: [validate, publish, crates-preflight]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.crates-preflight.result == 'success' }}
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_sha: ${{ github.sha }}
+      stage: publish
+      verified_web_dist_digest: ${{ needs.crates-preflight.outputs.web_dist_digest }}
       dry_run: false
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

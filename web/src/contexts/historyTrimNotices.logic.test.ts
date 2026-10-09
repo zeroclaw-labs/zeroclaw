@@ -11,6 +11,10 @@ import {
 const en: Record<string, string> = {
   'agent.history_trimmed':
     'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
+  'agent.history_trimmed_turns': 'Earlier conversation history was trimmed: {reason} ({dropped} older {dropped_unit} dropped; {kept} {kept_unit} kept).',
+  'agent.history_trimmed_turn_singular': 'turn',
+  'agent.history_trimmed_turn_plural': 'turns',
+  'agent.history_trimmed_tokens_turns': 'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} older {dropped_unit} dropped and {kept} {kept_unit} kept.',
   'agent.history_trimmed_tokens':
     'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} messages dropped and {kept} turns kept.',
   'agent.history_trimmed_floor':
@@ -23,6 +27,25 @@ const en: Record<string, string> = {
   'agent.history_trimmed_unknown_reason': 'history limit exceeded',
 };
 const t = (key: string) => en[key] ?? key;
+
+test('combined turn and token accounting preserves units, sources and floor precedence', () => {
+  const event: HistoryTrimmedNoticeMessage = {
+    dropped_messages: 12, dropped_turns: 1, kept_turns: 2,
+    reason: 'context token budget exceeded', token_budget: 10000,
+    tokens_before: 20000, tokens_after: 6000,
+    tokens_before_source: 'provider', tokens_after_source: 'calibrated',
+  };
+  const text = buildHistoryTrimmedNotice(event, t);
+  assert.match(text, /20000 to 6000 tokens/);
+  assert.match(text, /1 older turn dropped and 2 turns kept/);
+  assert.ok(text.includes("provider-reported before; provider + estimate after"));
+  assert.ok(!text.includes('12 messages'));
+  const zero = buildHistoryTrimmedNotice({ ...event, dropped_turns: 0 }, t);
+  assert.match(zero, /0 older turns dropped/);
+  const floor = buildHistoryTrimmedNotice({ ...event, tokens_after: 12000, unsatisfiable_floor: true }, t);
+  assert.match(floor, /could not be trimmed below/);
+  assert.ok(!floor.includes('Earlier conversation history was trimmed'));
+});
 
 test('recovery below a large configured budget renders counts with the recovery phrase, not the budget as target', () => {
   const text = buildHistoryTrimmedNotice(

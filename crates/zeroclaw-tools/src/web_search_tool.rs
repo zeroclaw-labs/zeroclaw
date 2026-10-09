@@ -424,7 +424,8 @@ impl WebSearchTool {
             .header("Accept-Language", headers.accept_language)
             .header("DNT", "1")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("duckduckgo", "request", &error))?;
         let status = response.status();
         let final_url_is_block =
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
@@ -517,7 +518,8 @@ impl WebSearchTool {
             .header("Accept", "application/json")
             .header("X-Subscription-Token", &api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("brave", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("brave", response.status()));
@@ -1760,7 +1762,8 @@ impl WebSearchTool {
             .get(&search_url)
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("searxng", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("searxng", response.status()));
@@ -2467,6 +2470,27 @@ mod tests {
             msg.contains("different provider"),
             "blocked status must suggest switching providers, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_search_failure_redacts_query_bearing_url() {
+        let query = "private 多字节 query";
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build without proxy discovery");
+        let error = client
+            .get(format!("http://127.0.0.1:1/search?q={query}"))
+            .send()
+            .await
+            .expect_err("closed local port should produce a deterministic transport error");
+
+        let message = transport_search_failure("duckduckgo", "request", &error).to_string();
+        assert!(message.contains("duckduckgo search failed"));
+        assert!(message.contains("transport=connect"));
+        assert!(!message.contains(query));
+        assert!(!message.contains("%E5%A4%9A"));
+        assert!(!message.contains("http://"));
     }
 
     #[test]
@@ -4120,14 +4144,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_serply_connection_refused_error_is_query_free() {
-        // Bind then drop an ephemeral port so the connect is refused
-        // deterministically without touching the network.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port without listening so parallel tests cannot reuse it
+        // before the request and turn connection refusal into a different error.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
 
         let (_tmp, tool) = serply_tool_with_key("serply-test-key");
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("client builder should succeed without a proxy");

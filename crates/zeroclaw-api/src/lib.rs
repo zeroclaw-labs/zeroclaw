@@ -18,6 +18,7 @@ pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
 pub mod plugin;
+pub mod plugin_egress;
 pub mod plugin_key;
 pub mod principal;
 pub mod runtime_status;
@@ -25,6 +26,8 @@ pub mod runtime_traits;
 pub mod schema;
 pub mod session_keys;
 pub mod tool;
+pub mod tool_carrier;
+pub mod turn_stop;
 pub mod vad;
 pub mod webhook;
 
