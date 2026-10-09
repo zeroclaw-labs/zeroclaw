@@ -1603,21 +1603,42 @@ fn native_format_results_maps_tool_call_ids() {
     ];
 
     let msg = dispatcher.format_results(&results);
-    match msg {
+    match &msg {
         ConversationMessage::ToolResults(r) => {
             assert_eq!(r.len(), 2);
             assert_eq!(r[0].tool_call_id, "tc-001");
-            assert!(r[0].content.contains("[IMAGE:"));
+            // The body stays verbatim: a bare image path is text, and no
+            // attachment is inferred from it on the read side either.
+            assert!(!r[0].content.contains("[IMAGE:"));
             assert!(r[0].content.contains(&image_path.display().to_string()));
             assert_eq!(r[1].tool_call_id, "tc-002");
             assert_eq!(r[1].content, "out2");
         }
         _ => panic!("Expected ToolResults"),
     }
+
+    // The read side keeps the boundary: no attachment is promoted from the
+    // stored text, and the carrier still declares the (empty) array.
+    let messages = dispatcher.to_provider_messages(&[msg]);
+    assert_eq!(messages.len(), 2);
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    assert_eq!(
+        payload["content"].as_str(),
+        Some(format!("File: {}", image_path.display().to_string()).as_str())
+    );
+    assert_eq!(
+        payload["attachments"],
+        serde_json::json!([]),
+        "a bare image path in stored tool text must yield zero attachments"
+    );
 }
 
 #[test]
-fn xml_format_results_wraps_local_image_paths() {
+fn xml_format_results_keeps_local_image_paths_as_text() {
+    // A bare existing image path in a tool result is text: no marker is
+    // written and the carrier declares zero attachments — the
+    // attachment-identity boundary, nothing in tool text promoted unless
+    // the tool declared it.
     let temp = tempfile::tempdir().unwrap();
     let image_path = temp.path().join("xml-generated.png");
     std::fs::write(
@@ -1640,8 +1661,9 @@ fn xml_format_results_wraps_local_image_paths() {
         _ => panic!("Expected Chat variant"),
     };
 
-    assert!(content.contains("[IMAGE:"));
+    assert!(!content.contains("[IMAGE:"));
     assert!(content.contains(&image_path.display().to_string()));
+    assert!(content.contains("[Tool attachments: 0]"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1710,8 +1732,20 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages[1].role, "tool");
     let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
     let content = payload["content"].as_str().unwrap();
-    assert!(content.contains("[IMAGE:"));
+    // A bare image path in stored tool text is text: typed replay declares no
+    // attachments — the attachment-identity boundary — and the body keeps
+    // the path.
+    assert_eq!(
+        payload["attachments"],
+        serde_json::json!([]),
+        "no attachment may be inferred from a bare path in replayed text"
+    );
+    assert!(!content.contains("[IMAGE:"));
     assert!(content.contains(&image_path.display().to_string()));
+    // The second result declared nothing.
+    let second: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+    assert_eq!(second["attachments"], serde_json::json!([]));
+    assert_eq!(second["content"].as_str(), Some("output2"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1903,5 +1937,42 @@ async fn turn_streamed_history_no_duplicate_user_message() {
     assert_eq!(
         history_user_count, 1,
         "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 26. Runtime-approved argument tool names are built-in tool names
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `is_runtime_approved_arg_tool` matches literal names, so this test keeps a
+/// second copy of the five names. It checks that each is inventoried and
+/// approved, and that the predicate approves no other inventoried tool. It
+/// cannot see a new `matches!` arm for a name the inventory does not list.
+#[test]
+fn runtime_approved_arg_tool_names_are_inventoried() {
+    use std::collections::BTreeSet;
+    use zeroclaw_tools::inventory::{BUILTIN_TOOLS, is_builtin_tool_name};
+
+    let expected = BTreeSet::from(["shell", "schedule", "cron_add", "cron_update", "cron_run"]);
+    for name in &expected {
+        assert!(
+            is_builtin_tool_name(name),
+            "`{name}` receives the runtime-approved argument but is missing from the built-in inventory"
+        );
+        assert!(
+            crate::agent::is_runtime_approved_arg_tool(name),
+            "`{name}` must receive the runtime-approved argument"
+        );
+    }
+
+    let approved: BTreeSet<&str> = BUILTIN_TOOLS
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| crate::agent::is_runtime_approved_arg_tool(name))
+        .collect();
+    assert_eq!(
+        approved, expected,
+        "is_runtime_approved_arg_tool changed which built-in tools receive the \
+         runtime-approved argument; update this test to the intended set"
     );
 }

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -2037,7 +2037,7 @@ impl TelegramChannel {
         let Some(config) = &self.persist else {
             return false;
         };
-        let config = config.config();
+        let config = config.live_handle();
         let live = config.read();
         let Some(context) =
             Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -2098,7 +2098,7 @@ impl TelegramChannel {
             return ModelPickerCallbackOutcome::Rejected;
         }
         let context = {
-            let config = config.config();
+            let config = config.live_handle();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -2940,7 +2940,7 @@ impl TelegramChannel {
             .as_ref()
             .and_then(|config| {
                 config
-                    .config()
+                    .live_handle()
                     .read()
                     .channels
                     .telegram
@@ -3790,15 +3790,6 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Write a paired user into `peer_groups` and save. Standalone callers
-    /// may provide a config Arc through [`Self::with_persistence`], which
-    /// pairs it with a local mutation witness; supervised callers use
-    /// [`Self::with_persistence_authority`] to share the daemon witness.
-    pub fn with_persistence(mut self, config: Arc<RwLock<Config>>) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
-    }
-
     /// Wire the daemon generation's live-config authority for pairing writes.
     pub fn with_persistence_authority(
         mut self,
@@ -3812,7 +3803,7 @@ impl TelegramChannel {
     ///
     /// Asked before `try_pair`, because pairing consumes the one-time code.
     fn pairing_deny_conflict(&self, identities: &[String]) -> Option<String> {
-        let config = self.persist.as_ref()?.config();
+        let config = self.persist.as_ref()?.live_handle();
         // The same set `is_any_user_allowed` judges at message time. Checking
         // only the identity that would be *written* lets an `ignore` naming the
         // username pass a bind whose numeric id is the one persisted, and every
@@ -7654,7 +7645,7 @@ impl Channel for TelegramChannel {
                 .collect::<Vec<_>>(),
         );
         let context = {
-            let config = config.config();
+            let config = config.live_handle();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, runtime_routes.as_ref())
@@ -8962,11 +8953,10 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::RwLock;
-    use std::sync::Arc;
     use zeroclaw_config::schema::{Config, TelegramConfig};
+    use zeroclaw_runtime::LiveConfigAuthority;
 
-    fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> Arc<RwLock<Config>> {
+    fn telegram_alias_config(alias: &str, multi_message_delay_ms: u64) -> LiveConfigAuthority {
         let mut config = Config::default();
         config.channels.telegram.insert(
             alias.to_string(),
@@ -8976,7 +8966,7 @@ mod tests {
                 ..TelegramConfig::default()
             },
         );
-        Arc::new(RwLock::new(config))
+        LiveConfigAuthority::new(config)
     }
 
     fn multi_message_test_channel(alias: &str, multi_message_delay_ms: u64) -> TelegramChannel {
@@ -8986,7 +8976,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_persistence(telegram_alias_config(alias, multi_message_delay_ms))
+        .with_persistence_authority(telegram_alias_config(alias, multi_message_delay_ms))
         .with_streaming(StreamMode::MultiMessage, 750)
     }
 
@@ -9001,16 +8991,17 @@ mod tests {
             false,
         )
         .with_streaming(StreamMode::MultiMessage, 750)
-        .with_persistence(Arc::clone(&config));
+        .with_persistence_authority(config.clone());
 
         assert_eq!(ch.multi_message_delay_ms(), 500);
-        config
-            .write()
+        let mut updated = config.snapshot_config();
+        updated
             .channels
             .telegram
             .get_mut(alias)
             .expect("telegram alias")
             .multi_message_delay_ms = 0;
+        config.publish_for_test(updated);
         assert_eq!(ch.multi_message_delay_ms(), 0);
     }
 
@@ -9043,11 +9034,8 @@ mod tests {
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[tokio::test]
@@ -9078,7 +9066,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("telegram", "default")
                 .is_empty()
@@ -13416,7 +13404,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13498,7 +13486,7 @@ mod tests {
                 Arc::new(|| vec!["test_user".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+            .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
             .with_mock_api_base(server.uri()),
         );
         let pacing = zeroclaw_config::schema::TelegramConfig {
@@ -13552,7 +13540,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13609,7 +13597,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -13774,7 +13762,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())));
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()));
         let runtime_routes = model_picker_runtime_routes(&model_picker_config());
         let base = PendingModelPicker {
             created_at: Instant::now(),
@@ -14084,7 +14072,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14160,7 +14148,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -14264,7 +14252,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -14420,7 +14408,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14507,7 +14495,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14614,7 +14602,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14721,7 +14709,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14828,7 +14816,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -14986,10 +14974,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config));
+            .with_persistence_authority(config.clone());
 
         let err = ch
             .persist_allowed_identity("123456789")
@@ -15005,7 +14993,7 @@ mod tests {
             "the identity is personal data and the bind path logs this error: {message}"
         );
 
-        let cfg = config.read();
+        let cfg = config.snapshot_config();
         assert_eq!(
             cfg.peer_groups
                 .get("telegram_default")
@@ -15067,14 +15055,14 @@ mod tests {
                     ..Default::default()
                 },
             );
-            Arc::new(RwLock::new(config))
+            LiveConfigAuthority::new(config)
         };
 
         let bind = |ignored: bool| {
             let uri = mock_server.uri();
             async move {
                 let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-                    .with_persistence(config_with(ignored))
+                    .with_persistence_authority(config_with(ignored))
                     .with_api_base(uri);
                 let code = ch
                     .pairing
@@ -15151,10 +15139,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config))
+            .with_persistence_authority(config.clone())
             .with_api_base(mock_server.uri());
 
         let code = ch
@@ -15184,7 +15172,7 @@ mod tests {
         );
         assert!(
             config
-                .read()
+                .snapshot_config()
                 .peer_groups
                 .get("telegram_default")
                 .expect("group untouched")
@@ -15237,10 +15225,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfigAuthority::new(config);
 
         let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
-            .with_persistence(Arc::clone(&config))
+            .with_persistence_authority(config.clone())
             .with_api_base(mock_server.uri());
 
         let guard = ch.pairing.as_ref().expect("pairing offered");
@@ -15266,7 +15254,7 @@ mod tests {
         );
         assert!(
             config
-                .read()
+                .snapshot_config()
                 .peer_groups
                 .get("telegram_default")
                 .expect("group untouched")

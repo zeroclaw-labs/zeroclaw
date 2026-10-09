@@ -2957,7 +2957,7 @@ async fn run_quickstart_cli(
     };
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
             println!(
                 "{}",
@@ -2983,6 +2983,45 @@ async fn run_quickstart_cli(
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors,
+            },
+        ) => {
+            // The config was persisted (the agent exists) but a
+            // post-commit side effect — the personality files — failed.
+            // The committed config is not rolled back: report the partial
+            // success truthfully (no "complete" line), and preserve the
+            // historical nonzero failure result for this outcome.
+            eprintln!();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-quickstart-partial-personality-failure",
+                    &[("alias", &applied.alias)],
+                    "The agent config for {$alias} was saved, but installing its \
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
+                )
+            );
+            eprintln!();
+            for err in &errors {
+                eprintln!("  • {}: {}", quickstart_step_label(err.step), err.message);
+            }
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errors.len().to_string())],
+                )
+            )
         }
         Err(errs) => {
             eprintln!();
@@ -5666,6 +5705,29 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn install_daemon_sigbus_reset() -> Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a successful sigaction call initializes the output structure.
+    if unsafe { libc::sigaction(libc::SIGBUS, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the SIGBUS action");
+    }
+    // SAFETY: the preceding sigaction call succeeded.
+    let mut action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_DFL || action.sa_sigaction == libc::SIG_IGN {
+        return Ok(());
+    }
+
+    // Rust's handler may live on the same volume as the daemon. If that volume
+    // disappears, the kernel must restore SIG_DFL before entering the handler.
+    action.sa_flags |= libc::SA_RESETHAND;
+    // SAFETY: preserve the installed handler and mask; change only SA_RESETHAND.
+    if unsafe { libc::sigaction(libc::SIGBUS, &raw const action, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("installing the SIGBUS reset action");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -6220,6 +6282,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         && config_dir.trim().is_empty()
     {
         bail!("--config-dir cannot be empty");
+    }
+
+    #[cfg(target_os = "macos")]
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        install_daemon_sigbus_reset()?;
     }
 
     #[cfg(feature = "agent-runtime")]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
+use zeroclaw_config::live::{LiveConfig, LiveConfigHandle};
 use zeroclaw_config::schema::Config;
 
 #[cfg(unix)]
@@ -13,20 +13,28 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 /// The live configuration state shared by one supervised daemon generation.
 ///
-/// The write lock is the process-wide config transaction lock, shared with
-/// writers that do not hold this authority.
+/// The write lock is deliberately paired with the published-config storage
+/// so every mutation path uses the same serialization witness as the live
+/// state. The published pair (config plus its opaque revision) lives in
+/// [`zeroclaw_config::live`]; this authority owns who may publish and when.
+///
+/// Readers receive [`LiveConfigHandle`] through [`Self::live_handle`]; the
+/// writable storage is never exposed. Writers admit through
+/// [`Self::begin_config_commit`], which serializes on the writer mutex and
+/// admits a generation write lease as one unit.
 #[derive(Clone)]
 pub struct LiveConfigAuthority {
-    config: Arc<RwLock<Config>>,
+    live: LiveConfig,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     agent_lifecycle: AgentLifecycleCoordinator,
 }
 
 impl LiveConfigAuthority {
-    /// Create the authority for one daemon generation.
+    /// Create the authority for one daemon generation. The initial config
+    /// is the first publication of a fresh epoch.
     pub fn new(config: Config) -> Self {
         Self {
-            config: Arc::new(RwLock::new(config)),
+            live: LiveConfig::new(config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
         }
@@ -41,35 +49,84 @@ impl LiveConfigAuthority {
     /// Create an authority from a guard acquired by a caller that resolved the
     /// config identity before loading the executable config. The guard is
     /// transferred into the authority and shared by every derived capability.
+    /// The loaded config becomes the initial publication of a fresh epoch: a
+    /// full daemon reload is a new publication domain, never a continuation
+    /// of the retired generation's sequence.
     pub fn new_with_ownership(config: Config, ownership: ConfigOwnershipGuard) -> Self {
         Self {
-            config: Arc::new(RwLock::new(config)),
+            live: LiveConfig::new(config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::with_ownership(ownership),
         }
     }
 
-    /// Pair an existing live config handle with the process-wide mutation lock.
+    /// Return the read-only live-config handle shared by all consumers of
+    /// this authority. The handle observes the config and its revision as
+    /// one pair and exposes no write path.
+    pub fn live_handle(&self) -> LiveConfigHandle {
+        self.live.handle()
+    }
+
+    /// Clone the currently published config.
+    pub fn snapshot_config(&self) -> Config {
+        self.live.snapshot()
+    }
+
+    /// The currently published revision.
+    pub fn published_revision(&self) -> zeroclaw_config::live::ConfigRevision {
+        self.live.published_revision()
+    }
+
+    /// The epoch of this authority's publication domain. Cloned
+    /// authorities share it; a full replacement authority does not.
+    pub fn config_epoch(&self) -> zeroclaw_config::live::ConfigEpoch {
+        self.live.epoch()
+    }
+
+    /// Admit one serialized config write: acquire the process-wide writer
+    /// mutex, then admit a generation write lease into the lifecycle
+    /// generation. The returned [`ConfigCommit`] owns both for its whole
+    /// lifetime, so a commit dispatched to a retained task keeps
+    /// serialization and stays drain-visible even when its requester
+    /// disappears.
     ///
-    /// This preserves standalone callers that already own an `Arc<RwLock<Config>>`
-    /// without claiming that their config participates in a supervised daemon's
-    /// shared mutation domain.
-    pub fn from_config(config: Arc<RwLock<Config>>) -> Self {
-        Self {
-            config,
-            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
-            agent_lifecycle: AgentLifecycleCoordinator::default(),
-        }
+    /// Admission fails closed once the generation is closing. The writer
+    /// mutex is acquired *before* the lease: a waiter parked on the mutex
+    /// holds no lifecycle state, so a closing generation never drains
+    /// against a waiter that will simply be refused.
+    pub async fn begin_config_commit(&self) -> Result<ConfigCommit, ConfigCommitError> {
+        let guard = Arc::clone(&self.config_write_lock).lock_owned().await;
+        let lease = self
+            .agent_lifecycle
+            .reserve_config_write()
+            .map_err(|_| ConfigCommitError::GenerationClosing)?;
+        Ok(ConfigCommit {
+            guard,
+            lease,
+            live: self.live.clone(),
+        })
     }
 
-    /// Return the live config Arc shared by all consumers of this authority.
-    pub fn config(&self) -> Arc<RwLock<Config>> {
-        Arc::clone(&self.config)
+    /// Whether the daemon-wide config writer mutex is currently held.
+    /// Test/diagnostic witness only: it proves a commit is in flight, not
+    /// which one.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn config_write_lock_is_held(&self) -> bool {
+        self.config_write_lock.try_lock().is_err()
     }
 
-    /// Return the mutation witness shared by all consumers of this authority.
-    pub fn config_write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.config_write_lock)
+    /// Publish one config as the next revision WITHOUT the writer-mutex
+    /// serialization. Fixture scaffolding only: production publication
+    /// goes through `begin_config_commit` so every participating writer
+    /// serializes before cloning current config through persistence and
+    /// publication. Tests that exercise writer serialization hold real
+    /// commits instead of using this.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn publish_for_test(&self, config: Config) -> zeroclaw_config::live::ConfigRevision {
+        let revision = self.live.next_revision().expect("test revision available");
+        self.live
+            .publish(revision, config)
+            .expect("test publication accepted")
     }
 
     /// Return the alias-scoped lifecycle authority shared by this daemon run.
@@ -83,12 +140,14 @@ impl LiveConfigAuthority {
     /// and does not create another config owner.
     pub fn execution_capability(&self) -> AgentExecutionCapability {
         AgentExecutionCapability {
-            config: self.config(),
+            config: self.live_handle(),
             agent_lifecycle: self.agent_lifecycle(),
         }
     }
 
-    /// Close lifecycle admission for this daemon generation.
+    /// Close lifecycle admission for this daemon generation. New agent work
+    /// and new config commits are both refused afterwards; already-admitted
+    /// work runs to completion and is drained by the drain methods below.
     pub fn close_agent_lifecycle(&self) {
         self.agent_lifecycle.close_generation();
     }
@@ -189,7 +248,7 @@ pub enum AgentExecutionError {
 /// lease is acquired.
 #[derive(Clone)]
 pub struct AgentExecutionCapability {
-    config: Arc<RwLock<Config>>,
+    config: LiveConfigHandle,
     agent_lifecycle: AgentLifecycleCoordinator,
 }
 
@@ -216,7 +275,7 @@ pub struct AgentExecutionSelection {
 }
 
 impl AgentExecutionSelection {
-    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
+    pub fn config_handle(&self) -> LiveConfigHandle {
         self.capability.config_handle()
     }
 
@@ -284,7 +343,7 @@ impl AgentExecutionCapability {
     }
 
     pub fn from_parts(
-        config: Arc<RwLock<Config>>,
+        config: LiveConfigHandle,
         agent_lifecycle: AgentLifecycleCoordinator,
     ) -> Self {
         Self {
@@ -293,8 +352,8 @@ impl AgentExecutionCapability {
         }
     }
 
-    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
-        Arc::clone(&self.config)
+    pub fn config_handle(&self) -> LiveConfigHandle {
+        self.config.clone()
     }
 
     pub fn agent_lifecycle_generation(&self, alias: &str) -> u64 {
@@ -878,7 +937,7 @@ impl AgentLifecycleCoordinator {
         aliases
     }
 
-    fn active_config_write_count(&self) -> usize {
+    pub(crate) fn active_config_write_count(&self) -> usize {
         self.state.lock().active_config_writes
     }
 
@@ -1044,19 +1103,136 @@ impl Drop for ConfigWriteLease {
     }
 }
 
+/// One admitted, serialized config write.
+///
+/// Owns the process-wide writer guard and the generation write lease
+/// from admission until the commit completes (or the value drops before
+/// dispatch, which abandons preparation and releases both). Created only
+/// through [`LiveConfigAuthority::begin_config_commit`].
+///
+/// The intended writer shape is: `current_config()` → stage a mutated
+/// clone → `next_revision()` (checked, *before* any irreversible I/O) →
+/// run persistence → `publish()` the committed candidate under the
+/// allocated revision. To make the irreversible phase uncancellable,
+/// move this value into a detached task (see
+/// [`spawn_agent_lifecycle_job`]) before the first persistence await;
+/// the task then owns serialization and drain accounting until it
+/// finishes, and a dropped requester cannot strand a committed disk
+/// write without its publication.
+pub struct ConfigCommit {
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    lease: ConfigWriteLease,
+    live: LiveConfig,
+}
+
+impl ConfigCommit {
+    /// Clone the currently published config. Read-for-modify under this
+    /// commit's serialization: no other admitted writer can interleave.
+    pub fn current_config(&self) -> Config {
+        self.live.snapshot()
+    }
+
+    /// The revision currently published.
+    pub fn published_revision(&self) -> zeroclaw_config::live::ConfigRevision {
+        self.live.published_revision()
+    }
+
+    /// Allocate the next publication identity, checking
+    /// representability. Call before any irreversible persistence: an
+    /// exhausted epoch must refuse the commit while disk state is still
+    /// unchanged.
+    pub fn next_revision(
+        &self,
+    ) -> Result<zeroclaw_config::live::ConfigRevision, ConfigCommitError> {
+        self.live.next_revision().map_err(ConfigCommitError::from)
+    }
+
+    /// Publish one committed candidate under its pre-allocated revision.
+    /// Installs the config and revision as one pair; refuses a revision
+    /// that is not the exact successor of the published one.
+    pub fn publish(
+        &self,
+        revision: zeroclaw_config::live::ConfigRevision,
+        config: Config,
+    ) -> Result<(), ConfigCommitError> {
+        self.live.publish(revision, config).map_err(|error| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": error.to_string(),
+                    })),
+                "config publication refused a non-successor revision; the published pair is unchanged"
+            );
+            ConfigCommitError::from(error)
+        })?;
+        Ok(())
+    }
+
+    /// Read-only live handle over the storage this commit publishes to,
+    /// for post-commit reads.
+    pub fn live_handle(&self) -> LiveConfigHandle {
+        self.live.handle()
+    }
+
+    /// Release serialization explicitly — the writer guard and the
+    /// generation write lease drop here — while the caller continues with
+    /// slow, non-config side effects. The retained destructive
+    /// transactions call this after their required config work, exactly
+    /// where they previously dropped the raw writer guard before
+    /// workspace cleanup.
+    pub fn release_serialization(self) {
+        drop(self.guard);
+        drop(self.lease);
+    }
+}
+
+/// Why a config commit could not be admitted, allocated, or published.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigCommitError {
+    /// The generation is closing (reload or shutdown); new config writes
+    /// are refused, including through old cloned handles.
+    #[error("config lifecycle generation is closing; refusing new config commits")]
+    GenerationClosing,
+    /// The epoch's sequence space is exhausted; refused before any
+    /// irreversible persistence.
+    #[error("config revision sequence is exhausted for this authority epoch")]
+    RevisionExhausted,
+    /// A publication attempted to install a revision that is not the
+    /// successor of the published one. The published pair is unchanged.
+    #[error("config publication refused a non-successor revision")]
+    NotSuccessor,
+}
+
+impl From<zeroclaw_config::live::LiveConfigError> for ConfigCommitError {
+    fn from(error: zeroclaw_config::live::LiveConfigError) -> Self {
+        match error {
+            zeroclaw_config::live::LiveConfigError::RevisionExhausted => Self::RevisionExhausted,
+            zeroclaw_config::live::LiveConfigError::NotSuccessor { .. } => Self::NotSuccessor,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn cloned_authority_preserves_config_and_write_lock_identity() {
+    fn cloned_authority_preserves_storage_epoch_and_write_lock_identity() {
         let authority = LiveConfigAuthority::new(Config::default());
         let cloned = authority.clone();
 
-        assert!(Arc::ptr_eq(&authority.config(), &cloned.config()));
+        assert!(authority.live_handle().same_storage(&cloned.live_handle()));
+        assert_eq!(authority.config_epoch(), cloned.config_epoch());
+        assert_eq!(authority.published_revision(), cloned.published_revision());
         assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &cloned.config_write_lock()
+            &authority.config_write_lock,
+            &cloned.config_write_lock
+        ));
+        assert!(Arc::ptr_eq(
+            &authority.config_write_lock,
+            &zeroclaw_config::write_lock::shared_config_write_lock()
         ));
         assert!(Arc::ptr_eq(
             &authority.agent_lifecycle().state,
@@ -1064,17 +1240,158 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn from_config_preserves_config_and_shares_process_write_lock() {
-        let config = Arc::new(RwLock::new(Config::default()));
-        let authority = LiveConfigAuthority::from_config(Arc::clone(&config));
-        let other = LiveConfigAuthority::from_config(config.clone());
-
-        assert!(Arc::ptr_eq(&config, &authority.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &other.config_write_lock()
+    #[tokio::test]
+    async fn shared_writer_waiter_is_not_admitted_and_refuses_closed_generation() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let held = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+        let mut pending = std::pin::pin!(authority.begin_config_commit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
+        authority.close_agent_lifecycle();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authority.drain_agent_lifecycle_retaining_ownership(),
+        )
+        .await
+        .expect("a waiting writer must not delay generation drain");
+        drop(held);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await
+                .unwrap(),
+            Err(ConfigCommitError::GenerationClosing)
         ));
+    }
+
+    #[tokio::test]
+    async fn full_replacement_authority_gets_a_fresh_epoch_and_lifecycle() {
+        let first = LiveConfigAuthority::new(Config::default());
+        let first_commit = first.begin_config_commit().await.unwrap();
+        let revision = first_commit.next_revision().unwrap();
+        first_commit.publish(revision, Config::default()).unwrap();
+        let first_published = first.published_revision();
+
+        // A full replacement (daemon reload) constructs a fresh authority:
+        // fresh epoch, fresh lifecycle, sequence restarts at zero, and the
+        // retired generation's revision is never equal to the new one even
+        // though the new initial sequence matches an earlier one.
+        let second = LiveConfigAuthority::new(Config::default());
+        assert_ne!(first.config_epoch(), second.config_epoch());
+        assert!(!second.published_revision().same_epoch(&first_published));
+        assert!(
+            !second
+                .published_revision()
+                .succeeds_within_epoch(&first_published)
+        );
+        assert!(second.agent_lifecycle().reserve_turn("any").is_ok());
+    }
+
+    #[tokio::test]
+    async fn config_commit_admission_fails_closed_after_generation_close() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let old_handle = authority.clone();
+        authority.close_agent_lifecycle();
+
+        // Old handles (clones from before the close) cannot admit new
+        // writes, and neither can the original.
+        assert!(matches!(
+            authority.begin_config_commit().await,
+            Err(ConfigCommitError::GenerationClosing)
+        ));
+        assert!(matches!(
+            old_handle.begin_config_commit().await,
+            Err(ConfigCommitError::GenerationClosing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatched_config_commit_publishes_despite_requester_cancellation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let authority = LiveConfigAuthority::new(config);
+
+        let gate = zeroclaw_config::schema::test_post_replace_pause_gate::arm(config_path);
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut working = commit.current_config();
+        working
+            .set_prop_persistent("gateway.host", "0.0.0.0")
+            .unwrap();
+        working.mark_dirty("gateway.host");
+        let revision = commit.next_revision().unwrap();
+        let prior_revision = commit.published_revision();
+        assert!(revision.succeeds_within_epoch(&prior_revision));
+
+        // The irreversible save+publish phase runs retained; the requester
+        // only awaits the join handle. Simulate the requester disappearing
+        // exactly while the save is paused inside the post-rename window.
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let job = spawn_agent_lifecycle_job(Box::pin(async move {
+            // `commit` owns the writer guard and the generation write lease for
+            // the whole body; dropping this future is what releases them.
+            let mut config = working;
+            config.save_dirty().await?;
+            commit.publish(revision, config)?;
+            drop(commit);
+            let _ = completed_tx.send(());
+            Ok::<(), anyhow::Error>(())
+        }));
+        let requester = zeroclaw_spawn::spawn!(async move {
+            let _ = job.await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_paused())
+            .await
+            .expect("retained commit reaches the post-rename window");
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        gate.release();
+
+        // Observe this retained task after its guard and lease are released;
+        // another authority may immediately acquire the shared writer mutex.
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed_rx)
+            .await
+            .expect("cancelled requester must not abandon the dispatched commit")
+            .expect("retained commit must signal completion");
+        assert_eq!(authority.published_revision(), revision);
+        assert_eq!(authority.live_handle().read().gateway.host, "0.0.0.0");
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reload_drain_waits_for_admitted_non_agent_config_commit() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        // An ordinary (non-agent, non-destructive) config commit is
+        // admitted and held mid-flight while the generation closes.
+        let commit = authority.begin_config_commit().await.unwrap();
+        authority.close_agent_lifecycle();
+
+        let mut drain = std::pin::pin!(authority.drain_agent_lifecycle_retaining_ownership());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err(),
+            "drain must wait for the admitted config commit"
+        );
+
+        // The admitted commit still publishes: closing suppresses new
+        // admission, not an already-admitted publication.
+        let revision = commit.next_revision().unwrap();
+        commit.publish(revision, Config::default()).unwrap();
+        drop(commit);
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("drain completes once the admitted commit finishes");
     }
 
     #[test]
@@ -1180,8 +1497,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selection_during_delete_cannot_be_used_after_recreation() {
+    #[tokio::test]
+    async fn selection_during_delete_cannot_be_used_after_recreation() {
         let mut config = Config::default();
         config.agents.insert("alpha".into(), Default::default());
         let authority = LiveConfigAuthority::new(config);
@@ -1194,11 +1511,14 @@ mod tests {
                 AgentAdmissionError::Deleting { .. }
             ))
         ));
-        authority
-            .config()
-            .write()
-            .agents
-            .insert("new".into(), Default::default());
+        // A config publication adds a new alias; the previously captured
+        // selection was taken against the old publication and must not
+        // admit the new alias.
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut published = commit.current_config();
+        published.agents.insert("new".into(), Default::default());
+        let revision = commit.next_revision().unwrap();
+        commit.publish(revision, published).unwrap();
         assert!(matches!(
             selection.resolve_and_admit("new"),
             Err(AgentExecutionError::UnknownAlias { .. })
@@ -1441,8 +1761,10 @@ mod tests {
             ..Config::default()
         };
         let authority = LiveConfigAuthority::new_owned(config).unwrap();
-        let capability =
-            AgentExecutionCapability::from_parts(authority.config(), authority.agent_lifecycle());
+        let capability = AgentExecutionCapability::from_parts(
+            authority.live_handle(),
+            authority.agent_lifecycle(),
+        );
         drop(authority);
 
         assert!(matches!(

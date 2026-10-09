@@ -134,5 +134,5 @@ cargo tauri build          # native build on each platform
 ```yaml
 # Suggested when #6501 lands — run all three at minimum on cargo check
 matrix:
-  os: [macos-14, ubuntu-22.04, windows-2022]
+  os: [macos-15, ubuntu-22.04, windows-2022]
 ```
