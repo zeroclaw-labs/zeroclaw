@@ -63,6 +63,22 @@ impl PendingComponents {
         (entry.created.elapsed() < COMPONENT_TTL).then_some(entry.intent)
     }
 
+    /// Consume a live intent only when the caller's synchronous predicate
+    /// matches. This preserves a registered component when an async
+    /// destination check rejects the click.
+    pub(crate) fn take_if(
+        &mut self,
+        custom_id: &str,
+        predicate: impl FnOnce(&ComponentIntent) -> bool,
+    ) -> Option<ComponentIntent> {
+        self.sweep();
+        let matches = self
+            .entries
+            .get(custom_id)
+            .is_some_and(|entry| predicate(&entry.intent));
+        matches.then(|| self.take(custom_id)).flatten()
+    }
+
     fn sweep(&mut self) {
         self.entries
             .retain(|_, e| e.created.elapsed() < COMPONENT_TTL);

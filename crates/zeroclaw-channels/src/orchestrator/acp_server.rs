@@ -106,6 +106,7 @@ impl Default for AcpServerConfig {
 
 struct Session {
     agent: Agent,
+    _lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentSessionLease,
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
@@ -121,13 +122,14 @@ struct Session {
 
 enum ConfigSource {
     Standalone(Box<Config>),
-    Live(Arc<parking_lot::RwLock<Config>>),
+    Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
 pub struct AcpServer {
-    /// The sole authority for `Config`-backed settings. Standalone ACP owns an
-    /// immutable config; gateway ACP resolves the shared daemon config.
+    /// The sole authority for `Config`-backed settings. Managed stdio and
+    /// gateway ACP resolve their shared authority's config.
     config_source: ConfigSource,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     acp_config: AcpServerConfig,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
@@ -169,10 +171,28 @@ pub struct AcpServer {
 }
 
 impl AcpServer {
+    /// Create a stdio server retaining the caller's config and lifecycle authority.
+    pub fn new_stdio_with_authority(
+        authority: &zeroclaw_runtime::LiveConfigAuthority,
+        acp_config: AcpServerConfig,
+        store: Option<Arc<AcpSessionStore>>,
+    ) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(
+            ConfigSource::Live(authority.live_handle()),
+            authority.agent_lifecycle(),
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            store,
+        )
+    }
+
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             Some(writer_rx),
@@ -187,6 +207,7 @@ impl AcpServer {
     ) -> Self {
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             None,
@@ -202,6 +223,7 @@ impl AcpServer {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             Some(writer_rx),
@@ -217,6 +239,7 @@ impl AcpServer {
     ) -> Self {
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             None,
@@ -229,12 +252,14 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Live(live_config),
+            agent_lifecycle,
             acp_config,
             writer_tx,
             None,
@@ -247,13 +272,15 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer_and_store(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         store: Arc<AcpSessionStore>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Live(live_config),
+            agent_lifecycle,
             acp_config,
             writer_tx,
             None,
@@ -263,6 +290,7 @@ impl AcpServer {
 
     fn with_writer(
         config_source: ConfigSource,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
@@ -270,6 +298,7 @@ impl AcpServer {
     ) -> Self {
         Self {
             config_source,
+            agent_lifecycle,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -317,8 +346,8 @@ impl AcpServer {
     ) -> Result<Agent> {
         let Some(store) = self.store.as_ref() else {
             return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-                    Arc::clone(live_config),
+                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
+                    live_config.clone(),
                     agent_alias,
                     Some(workspace_dir),
                     enable_mcp,
@@ -327,6 +356,10 @@ impl AcpServer {
                     self.sop_engine.clone(),
                     self.sop_audit.clone(),
                     self.canvas_store.clone(),
+                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                        live_config.clone(),
+                        self.agent_lifecycle.clone(),
+                    )),
                 )
                 .await
             } else {
@@ -345,8 +378,12 @@ impl AcpServer {
             };
         };
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-                Arc::clone(live_config),
+            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                live_config.clone(),
+                self.agent_lifecycle.clone(),
+            );
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+                live_config.clone(),
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
@@ -357,6 +394,7 @@ impl AcpServer {
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
                 Arc::clone(store),
+                Some(execution_capability),
             )
             .await
         } else {
@@ -761,6 +799,25 @@ impl AcpServer {
         }
     }
 
+    fn agent_admission_error(
+        error: zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    ) -> RpcError {
+        let message = match error {
+            zeroclaw_runtime::live_config_authority::AgentAdmissionError::Deleting { alias }
+            | zeroclaw_runtime::live_config_authority::AgentAdmissionError::StaleGeneration {
+                alias,
+            } => format!("Agent `{alias}` changed while the session was being created"),
+            zeroclaw_runtime::live_config_authority::AgentAdmissionError::GenerationClosing => {
+                "Agent sessions are unavailable while the daemon reloads".to_string()
+            }
+        };
+        RpcError {
+            code: INVALID_PARAMS,
+            message,
+            data: None,
+        }
+    }
+
     /// Alias a new session on this connection would use when the client does
     /// not pass an explicit `agentAlias`: the connection-scoped default
     /// (`?agent=`), then `[acp].default_agent`, then the sole configured
@@ -839,6 +896,10 @@ impl AcpServer {
                 data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
+        let admission = self
+            .agent_lifecycle
+            .reserve_admission(agent_alias.clone())
+            .map_err(Self::agent_admission_error)?;
 
         // Default workspace is the per-agent directory. An explicit
         // `cwd`/`workspaceDir`/`workspace_dir` is the session's file-access
@@ -1000,8 +1061,13 @@ impl AcpServer {
             let sid = session_id.clone();
             let alias = agent_alias.clone();
             let wsd = workspace_dir.clone();
+            // The orchestrator ACP transport (CLI/IDE-native) carries no
+            // authenticated gateway principal, so these sessions are stamped
+            // with a NULL owner -- visible only to unscoped connections, never
+            // to a scoped gateway principal (RFC 7141 F2).
             let created =
-                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd)).await;
+                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd, None))
+                    .await;
             let error = match created {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e.to_string()),
@@ -1017,6 +1083,18 @@ impl AcpServer {
             }
         }
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                if let Some(store) = &self.store {
+                    let store = Arc::clone(store);
+                    let sid = session_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || store.delete_session(&sid)).await;
+                }
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // Atomically insert and release the reservation.
         {
@@ -1027,6 +1105,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
                     model_provider: config
@@ -1182,6 +1261,16 @@ impl AcpServer {
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
+        let admission = match self
+            .agent_lifecycle
+            .reserve_admission(restore_alias.clone())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1311,6 +1400,13 @@ impl AcpServer {
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1324,6 +1420,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -1498,6 +1595,16 @@ impl AcpServer {
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
+        let admission = match self
+            .agent_lifecycle
+            .reserve_admission(restore_alias.clone())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1586,6 +1693,13 @@ impl AcpServer {
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1599,6 +1713,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -3478,6 +3593,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         TurnEvent::ApprovalRequest { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
             token_budget,
@@ -3486,10 +3602,12 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             tokens_before_source,
             tokens_after_source,
             unsatisfiable_floor,
+            retained_context: _,
         } => {
             let mut params = serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
+                "droppedTurns": dropped_turns,
                 "keptTurns": kept_turns,
                 "reason": reason,
             });
@@ -3728,6 +3846,18 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    fn valid_1x1_png() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        bytes.into_inner()
+    }
+
     struct RecordingNativeProvider {
         requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
     }
@@ -3874,7 +4004,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-acp-usage-order";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
@@ -5102,7 +5237,12 @@ mod tests {
 
         let session_id = "sess-restore-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5183,7 +5323,12 @@ mod tests {
 
         let session_id = "sess-restore-missing-config-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5223,7 +5368,12 @@ mod tests {
 
         let session_id = "sess-resume-disabled-owner";
         store
-            .create_session(session_id, "agent-alpha", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "agent-alpha",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5262,7 +5412,12 @@ mod tests {
 
         let session_id = "sess-resume-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -6069,6 +6224,7 @@ mod tests {
             "restored-session",
             &TurnEvent::HistoryTrimmed {
                 dropped_messages: 12,
+                dropped_turns: 4,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
                 token_budget: Some(500_000),
@@ -6077,6 +6233,7 @@ mod tests {
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 unsatisfiable_floor: None,
+                retained_context: None,
             },
         )
         .expect("history trim must produce an ACP notification");
@@ -6088,6 +6245,7 @@ mod tests {
             serde_json::json!({
                 "sessionId": "restored-session",
                 "droppedMessages": 12,
+                "droppedTurns": 4,
                 "keptTurns": 3,
                 "reason": "message limit",
                 "tokenBudget": 500_000,
@@ -6576,6 +6734,43 @@ mod tests {
         assert!(server.sessions.lock().await.contains_key(session_id));
     }
 
+    #[tokio::test]
+    async fn published_session_blocks_delete_until_close_releases_lease() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+        let lifecycle = server.agent_lifecycle.clone();
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must publish");
+        let session_id = result["sessionId"].as_str().unwrap();
+
+        assert_eq!(lifecycle.live_session_count("test-agent"), 1);
+        assert!(matches!(
+            lifecycle.begin_delete("test-agent"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::LiveSessions {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must release lifecycle lease");
+        assert_eq!(lifecycle.live_session_count("test-agent"), 0);
+        assert!(lifecycle.begin_delete("test-agent").is_ok());
+    }
+
     fn make_test_config(cwd: &std::path::Path) -> Config {
         let mut cfg = Config {
             data_dir: cwd.to_path_buf(),
@@ -6609,16 +6804,19 @@ mod tests {
     #[test]
     fn gateway_backed_server_initialize_uses_reloaded_config() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Arc::new(parking_lot::RwLock::new(make_test_config(cwd.path())));
+        // The server's live view is the read-only handle; keep the storage
+        // owner on the side so the test can publish a "reloaded" pair.
+        let live = zeroclaw_config::live::LiveConfig::new(make_test_config(cwd.path()));
         let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
         let server = AcpServer::new_with_live_config_and_writer(
-            Arc::clone(&config),
+            live.handle(),
+            Default::default(),
             AcpServerConfig::default(),
             writer_tx,
         );
 
-        config
-            .write()
+        let mut reloaded = live.snapshot();
+        reloaded
             .providers
             .models
             .anthropic
@@ -6626,6 +6824,8 @@ mod tests {
             .unwrap()
             .base
             .model = Some("reloaded-model".to_string());
+        live.publish(live.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         assert_eq!(
             server.handle_initialize(&serde_json::json!({})).unwrap()["_meta"]["zeroclaw"]["defaultModel"],
@@ -6875,7 +7075,12 @@ mod tests {
 
         let session_id = "sess-load-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -6943,7 +7148,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-trimmed-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -6969,7 +7179,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7018,14 +7228,20 @@ mod tests {
         // `dropped_messages` from the crumb-aware restore trim counts only
         // real messages, but the persisted leading breadcrumb is still a row
         // of the seed vector. The replay offset must skip that crumb row too:
-        // with [crumb, old turn, new turn] and one old turn dropped, replay
-        // must begin at the new turn, not at the old turn's assistant reply.
+        // with [crumb, old turn, new turn], a one-turn cap drops the old
+        // turn whole, and replay must begin at the new turn, not at the old
+        // turn's assistant reply.
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-crumb-replay";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let crumb = ConversationMessage::Chat(ChatMessage::user(
             zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
@@ -7058,7 +7274,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7119,7 +7335,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-failed-turn-persist";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // User prompt + a completed tool call/result that was already shown to
@@ -7300,7 +7521,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-failed-turn-incomplete-tool";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // This is the durable shape left by a failure after the model emitted
@@ -7534,7 +7760,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "same-shape-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let before = vec![
             ConversationMessage::Chat(ChatMessage::user(
@@ -7546,12 +7777,14 @@ mod tests {
         store
             .replace_messages_and_breadcrumb(session_id, &before, true)
             .unwrap();
+        // A one-turn cap: the new prompt's turn displaces the old turn whole,
+        // leaving the breadcrumb and the new exchange.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -7606,7 +7839,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-load-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7671,7 +7909,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-resume-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7746,7 +7989,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-replace-not-append";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let old_turn = vec![
@@ -7981,7 +8229,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-resume-sanitize";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         // A failed turn left an unmatched native call...
         store
@@ -8077,7 +8330,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-replay-vs-seed";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8171,7 +8429,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-rejected-image";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8260,18 +8523,19 @@ mod tests {
         // attachment and renders the marker localized at projection time.
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("cross-locale.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-locale-failed-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8463,11 +8727,7 @@ mod tests {
 
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("rejected-live.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -8568,7 +8828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_image_with_prompt_tool_results_degrades_media_on_both_paths() {
+    async fn failed_image_with_tool_result_carrier_degrades_media_on_both_paths() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         // A prompt-mode tool round appends its results as a user-role
@@ -8586,15 +8846,20 @@ mod tests {
         // ── Phase A: restore path ────────────────────────────────────
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("carrier-rejected.png");
-        let file_bytes = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        std::fs::write(&image_path, file_bytes).unwrap();
+        let file_bytes = valid_1x1_png();
+        std::fs::write(&image_path, &file_bytes).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-carrier-failed-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8754,7 +9019,7 @@ mod tests {
 
         let live_cwd = tempfile::tempdir().unwrap();
         let live_image = live_cwd.path().join("carrier-live.png");
-        std::fs::write(&live_image, file_bytes).unwrap();
+        std::fs::write(&live_image, &file_bytes).unwrap();
         let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
         let tool_call_response = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": {}}}}}\n</tool_call>",
@@ -8889,7 +9154,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-trim-repair-alignment";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8921,13 +9191,13 @@ mod tests {
 
         // The cap retains only the newer turn: after repair the seed body is
         // [older user, older failure sentinel, newer user, newer assistant],
-        // and trimming drops the first two rows.
+        // two complete turns, and a one-turn cap drops the older one whole.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -9282,7 +9552,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cancelled-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -10020,7 +10295,12 @@ mod tests {
         // Create and load the session once to put it in memory
         let session_id = "sess-already-active";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         server
             .handle_session_load(&serde_json::json!({
@@ -10073,7 +10353,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-load";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -10116,7 +10396,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-resume";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -10172,7 +10452,12 @@ mod tests {
 
         let session_id = "sess-resume-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -10220,7 +10505,12 @@ mod tests {
 
         let session_id = "sess-resume-plan";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         // A durable plan exists from a prior turn.
         store
@@ -10356,7 +10646,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -10400,7 +10690,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -10443,7 +10733,12 @@ mod tests {
 
         let session_id = "sess-load-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // Drop the schema via a second connection to force a "no such table"
@@ -10500,7 +10795,12 @@ mod tests {
 
         let session_id = "sess-resume-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let db_path = cwd.path().join("sessions/acp-sessions.db");

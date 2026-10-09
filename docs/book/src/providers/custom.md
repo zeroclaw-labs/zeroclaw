@@ -12,7 +12,7 @@ If the service speaks OpenAI chat-completions, this is a config-only change. The
 
 This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
-For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text:
+For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text. Tool images are declared in an `attachments` array on the native tool-result carrier, so omitting them never edits the result text. This policy governs the native `role = "tool"` carrier's `attachments` array only; prompt-mode tool results (the count-line carrier delivered in a user message) resolve their declared images through a separate path and are unaffected by the setting. To opt in:
 
 ```toml
 [providers.models.custom.gateway]

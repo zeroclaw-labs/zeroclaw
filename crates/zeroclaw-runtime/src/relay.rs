@@ -35,6 +35,9 @@ use zeroclaw_relay_proto::{
     ConnWindow, Control, INITIAL_WINDOW, MAX_CONTROL_FRAME, MAX_DATA_PAYLOAD, PEER_HINT_ENROLL,
     SUBPROTOCOL, TokenBucket, decode_data, encode_data,
 };
+/// The node-id rule a relay enforces at registration, for callers that persist a
+/// node-id (such as `relay claim`) and must not save one the relay refuses.
+pub use zeroclaw_relay_proto::{MAX_NODE_ID_LEN, is_valid_node_id};
 
 /// What the demux loop routes to a per-conn `bridge_conn` task: inbound inner
 /// bytes, plus the credit-window control frames (forwarded by the relay) that
@@ -182,6 +185,37 @@ pub struct RelayBridgeConfig {
 /// key 0600). This is the daemon's stable rendezvous identity, separate from the
 /// ZeroClaw CA: the relay binds the node-id to this key and an allowlist keys on
 /// its fingerprint.
+/// Decode a registration `Challenge.nonce`, refusing anything but a fixed-size
+/// nonce.
+///
+/// The registration key is NOT single-purpose: it also signs the
+/// `zeroclaw relay claim` ownership proof. A signer that will put its signature
+/// on arbitrary relay-supplied bytes is therefore a signing oracle - a hostile
+/// relay the daemon is configured to dial could send a complete tagged claim
+/// message as the challenge and collect a valid proof over its own token,
+/// having already learned the public key (and so the fingerprint) from `Hello`.
+///
+/// Pinning the length to [`zeroclaw_relay_proto::REGISTRATION_NONCE_LEN`] makes
+/// a challenge structurally incapable of being any longer tagged message, which
+/// is the cheap and compatible repair: a conforming relay already sends exactly
+/// this size. Note this protects THIS daemon version - proofs obtained from
+/// older, unrestricted daemons cannot be invalidated retroactively.
+fn decode_registration_challenge(nonce_b64: &str) -> Result<Vec<u8>> {
+    let nonce = B64
+        .decode(nonce_b64.as_bytes())
+        .context("relay challenge nonce not base64")?;
+    if nonce.len() != zeroclaw_relay_proto::REGISTRATION_NONCE_LEN {
+        anyhow::bail!(
+            "relay sent a {}-byte registration challenge; exactly {} bytes are required. \
+             Refusing to sign relay-chosen data with the registration key, which also signs \
+             this daemon's relay-claim ownership proof.",
+            nonce.len(),
+            zeroclaw_relay_proto::REGISTRATION_NONCE_LEN
+        );
+    }
+    Ok(nonce)
+}
+
 pub fn ensure_signing_key(data_dir: &std::path::Path) -> Result<Vec<u8>> {
     use std::io::Write;
 
@@ -564,6 +598,25 @@ async fn serve_once(
     serve_established(cfg, cancel, ws).await
 }
 
+/// Parse `relay_host` the way the connection path consumes it: as the outer
+/// TLS server name, and as the host of the `wss://` registration URI.
+///
+/// Enrollment calls this before persisting a claimed host, so a value either
+/// consumer would reject is refused up front instead of surfacing as
+/// `invalid relay host` at registration, after the claim reported success.
+pub fn relay_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+    let invalid = || anyhow::Error::msg(format!("invalid relay host '{host}'"));
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid())?;
+    // A value such as `relay/evil` parses as a URI whose host is only `relay`,
+    // so a successful parse is not enough: the parsed host must be the input.
+    let uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{host}/").parse().map_err(|_| invalid())?;
+    if uri.host() != Some(host) {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
 /// The entire outbound setup for one link: TCP connect, outer TLS, the relay
 /// WebSocket upgrade, and the signed `Hello` -> `Challenge` -> `Register` ->
 /// `Registered` exchange. Kept as ONE future so the caller can impose a single
@@ -594,8 +647,7 @@ async fn connect_and_register(
     let tcp = TcpStream::connect(&cfg.relay_addr)
         .await
         .with_context(|| format!("connecting to relay {}", cfg.relay_addr))?;
-    let server_name = rustls::pki_types::ServerName::try_from(cfg.relay_host.clone())
-        .map_err(|_| anyhow::Error::msg(format!("invalid relay host '{}'", cfg.relay_host)))?;
+    let server_name = relay_server_name(&cfg.relay_host)?;
     let tls = connector
         .connect(server_name, tcp)
         .await
@@ -636,9 +688,7 @@ async fn connect_and_register(
     }))
     .await?;
     let nonce = match next_control(&mut ws).await {
-        Some(Control::Challenge { nonce }) => B64
-            .decode(nonce.as_bytes())
-            .context("relay challenge nonce not base64")?,
+        Some(Control::Challenge { nonce }) => decode_registration_challenge(&nonce)?,
         Some(Control::Error { code, msg }) => {
             anyhow::bail!("relay refused registration: {code}: {msg}")
         }
@@ -1365,6 +1415,58 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod registration_challenge_tests {
+    use super::*;
+
+    /// The normal handshake is unaffected: a conforming relay's 32-byte nonce
+    /// decodes and is signed as before.
+    #[test]
+    fn a_conforming_nonce_is_accepted() {
+        let nonce = [7u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
+        let decoded = decode_registration_challenge(&B64.encode(nonce))
+            .expect("a conforming 32-byte nonce must be accepted");
+        assert_eq!(decoded, nonce);
+    }
+
+    /// The attack this bound exists to stop: a hostile relay sends a complete
+    /// tagged CLAIM message as the challenge, hoping the daemon signs it with
+    /// the same key and hands back a valid ownership proof for the relay's own
+    /// claim token. It must be refused before anything is signed.
+    #[test]
+    fn a_claim_shaped_challenge_is_refused() {
+        // Fixed claim wire fixture; runtime does not depend on the CLI's proof builder.
+        let hostile = b"zerorelay-claim-v1\nattacker-controlled-token\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_ne!(
+            hostile.len(),
+            zeroclaw_relay_proto::REGISTRATION_NONCE_LEN,
+            "the attack payload must not coincidentally be nonce-sized"
+        );
+        let err = decode_registration_challenge(&B64.encode(hostile))
+            .expect_err("a claim-shaped challenge must never be signed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("registration challenge") && msg.contains("Refusing to sign"),
+            "the refusal should explain what it is protecting: {msg}"
+        );
+    }
+
+    /// Any other length is refused too - the bound is exact, not a maximum, so
+    /// a shorter message cannot be smuggled either.
+    #[test]
+    fn off_size_challenges_are_refused() {
+        for len in [0usize, 1, 31, 33, 64, 128] {
+            let nonce = vec![0u8; len];
+            assert!(
+                decode_registration_challenge(&B64.encode(&nonce)).is_err(),
+                "a {len}-byte challenge must be refused"
+            );
+        }
+        // Still rejects non-base64 rather than silently signing garbage.
+        assert!(decode_registration_challenge("not base64!!").is_err());
     }
 }
 
@@ -2155,5 +2257,41 @@ mod bridge_classification_race_tests {
         );
 
         let _held = dialer.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod relay_server_name_tests {
+    use super::relay_server_name;
+
+    #[test]
+    fn accepts_hostnames_and_ipv4() {
+        for host in [
+            "relay.example",
+            "relay",
+            "192.0.2.10",
+            "relay-1.eu.example.com",
+        ] {
+            assert!(relay_server_name(host).is_ok(), "{host} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_hosts_either_consumer_would_refuse() {
+        for host in [
+            "",
+            "relay/evil",
+            "relay?x",
+            "relay#x",
+            "user@relay",
+            "[2001:db8::1]",
+            "relay example",
+            "relay..example",
+        ] {
+            assert!(
+                relay_server_name(host).is_err(),
+                "{host:?} should be refused"
+            );
+        }
     }
 }

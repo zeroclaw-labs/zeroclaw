@@ -85,9 +85,11 @@ The manifest declares two orthogonal things:
   channel adapters receive their own schema-materialized, validated public
   config and can
   resolve schema-designated secrets in authorized service calls) and
-  `http_client` have behavioral effect. The HTTP permission is the necessary
-  grant for adapters that implement outbound `wasi:http`: tool and channel
-  enable that surface, while memory intentionally does not yet.
+  `http_client`, `state_read`, and `state_write` have behavioral effect. The
+  HTTP permission is the necessary grant for adapters that implement outbound
+  `wasi:http`: tool and channel enable that surface, while memory intentionally
+  does not yet. The state permissions gate encrypted durable state owned by the
+  exact package, capability, and binding.
   `config_read` must be paired with the manifest's `config_schema`; either one
   without the other is rejected. The filesystem and memory-access permissions
   are accepted by the schema but not yet backed by host functions, so declaring
@@ -103,8 +105,8 @@ version) plus its primary interface:
 
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
-| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` |
-| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, and host-fed `inbound` |
+| `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; imports scoped `secrets` and durable `state` |
+| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; imports scoped `config`, `secrets`, durable `state`, and host-fed `inbound` |
 | `memory-plugin` | `memory`: store, recall, get, forget, plus {{#include ../_snippets/plugin-memory-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call |
 
 The channel and memory worlds use **capability flags**: a bitmask the host
@@ -113,6 +115,23 @@ reads once at load time (`get-channel-capabilities` /
 default and never calls the plugin's export. This is how the WIT contract
 stays additive: a new optional method is a new flag plus a new function, never
 a break.
+
+### Checking that a plugin still loads here
+
+`wit/v0` is experimental, so a plugin built against a vendored copy that has
+drifted from this host compiles cleanly and then fails to instantiate.
+`zeroclaw plugin install` refuses such a plugin, but that gate cannot help one
+installed before the gate existed, installed with `--no-verify`, or left in
+place across a host upgrade. `zeroclaw plugin info <name>` always runs the same
+instantiation check the daemon runs at startup and prints the verdict, the full
+wasmtime cause chain, and the rebuild hint; it exits non-zero when the plugin
+does not load, so a script can branch on it. `zeroclaw plugin list --verify`
+runs the check for every installed package and annotates each row with the
+verdict, or with the first line of the cause when it fails. Plain
+`zeroclaw plugin list` is unchanged and still costs only a directory read,
+because verifying compiles and instantiates every component. A skill bundle
+ships no component, so it is reported as not applicable rather than as a
+failure.
 
 ## Execution model
 
@@ -247,6 +266,23 @@ channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
 
+Tool and channel components can request `state_read` and/or `state_write` for
+the `state` import. The host, not the guest, supplies the admitted package,
+capability, and binding namespace. Portable logical keys address authenticated
+byte values within that exact instance. Reads return a revision; create,
+replace, and delete operations use exact compare-and-swap revisions. Durable
+rows live as `enc2:` ciphertext behind keyed blind indexes in
+`data/plugin-state.db`, using the install `.secret_key`. Fixed quotas and any
+key, storage, or integrity failure fail closed.
+
+State belongs to the instance identity (package name, capability, binding), the
+same identity its config entry uses, not to a publisher. `zeroclaw plugin remove`
+keeps both, so an upgrade (remove, then install) keeps its state. It also means a
+different package installed later under the same name inherits that instance's
+state and configured secrets. Before installing an unrelated plugin under a
+removed plugin's name, delete its `[[plugins.entries]]` row and treat its state
+as readable by the newcomer.
+
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
 schema matching the current values, update tool/channel guests to deserialize
@@ -277,6 +313,146 @@ canonical host field list and defaults are in the
 [Config reference](../reference/config.md); `zeroclaw config list` shows the live
 stored values.
 
+## Declaring and granting egress
+
+A plugin's network reach is two separate facts, and only one of them is yours:
+
+- The **declaration** is the manifest's `[egress]` table (`hosts = [...]`): the
+  destinations the author says the plugin needs. It is part of the canonical
+  manifest bytes, so a signed manifest covers it. It grants nothing. An
+  unsigned component that writes its own `[egress]` table still reaches
+  nothing.
+- The **grant** is `plugins.entries.<instance-key>.egress_hosts` on the
+  instance's own `zpi1_…` row, with the narrower `egress_allow_private`
+  carveout beside it. This is the list the host enforces, read from live config
+  on each request, so your edit applies without restarting the plugin.
+
+On this release the grant alone governs. The host checks a destination against
+`egress_hosts` and does not additionally require it to appear in the manifest,
+so a declaration neither grants a host nor bounds a grant you authored. The
+declaration's job here is to seed and to diff, described below. Narrowing
+effective reach to the intersection of declaration and grant is later rollout
+work tracked in
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+An empty `egress_hosts` is the default and means no network reach at all: a
+transport permission such as `http_client` grants the surface, this field
+grants the destinations. Entries are exact hosts (`api.example.com`,
+`10.0.0.5`) or explicit suffix patterns (`*.example.com`, which matches
+subdomains but not the apex, so list the apex separately when you need it).
+Ports are not part of an entry, granting a host grants every port on it, and
+there is no `*` meaning "anywhere".
+
+`egress_hosts` is deliberately a plaintext sibling of the encrypted `config`
+map rather than a key inside it. The allowlist is the thing an operator audits,
+so it stays readable in the same file being audited while the secrets beside it
+remain `enc2:…`.
+
+### What install and list do
+
+`zeroclaw plugin install` is the one moment the two sides are reconciled
+without you typing anything:
+
+- For a row it **creates**, it seeds the declaration into `egress_hosts`,
+  prints each destination it granted, and prints the `zeroclaw config set`
+  command that edits the grant later.
+- For a row that **already exists** (an upgrade, a reinstall, or a row you
+  authored), it changes nothing. It prints the difference instead: destinations
+  the manifest declares that the row does not grant, destinations the row
+  grants that the manifest no longer declares, and the exact command that
+  applies the addition. A package update therefore cannot widen its own network
+  reach; you apply the difference deliberately.
+- A reinstall that finds an unsupported **pre-1.0 package-name row** refuses
+  before creating a canonical row and prints the same ordered update steps as
+  `plugin list`. Like `plugin list`, it reports a deployment-wide refusal (a
+  malformed `security.nat64_prefixes`, a zero
+  `plugins.limits.max_connections_per_instance`) once, on its own, and prints
+  no row steps that could not take effect until that is fixed. The failed
+  install rolls back before it announces anything, and the old `config`,
+  `egress_hosts`, and `egress_allow_private` values remain untouched until you
+  update the beta configuration and retry.
+
+The printed command carries the union of the existing grant and the
+declaration, because `zeroclaw config set` replaces a list rather than
+appending to it. Running it as printed adds the declared destinations without
+dropping a host you authored yourself.
+
+Every printed command also begins with `zeroclaw --config-dir '<dir>'`, naming
+the configuration directory it was computed against. `--config-dir` (and the
+`ZEROCLAW_CONFIG_DIR` it sets) only affects the process you pass it to, so a
+command copied out of `zeroclaw --config-dir /srv/a plugin list` would
+otherwise act on whichever configuration your shell resolves by default. The
+`zpi1_…` row key names the package, capability and binding but not the
+profile, so that command would replace a different profile's allowlist with a
+list computed from this one. The directory and the host list are each quoted
+as one literal argument, so nothing a manifest declares can be expanded or
+substituted by your shell; paste the command as printed.
+
+The quoting follows the shell of the platform the command was printed on. On
+Linux and macOS it is the POSIX single-quoted form (`sh`, `bash`, `zsh`,
+`fish`), where an embedded quote is written `'\''`. On Windows, ZeroClaw
+cannot tell whether you are in `cmd.exe` or PowerShell, so it prints the one
+form both pass literally: each value in double quotes, which is correct to
+paste into either shell as long as the value contains nothing either shell
+expands inside double quotes. An ordinary host list and an ordinary profile
+path, spaces included, always qualify. When a value does not (it contains `"`,
+`%`, `!`, `$` or a backtick, or ends in a backslash; `$(id).example.com` is the
+shape a hostile manifest would declare), the whole line is printed instead as
+the marker `# PowerShell only, cmd.exe cannot pass this value literally:`
+followed by a space and the PowerShell form, where an embedded quote is
+doubled (`''`). Pasted whole, that
+line runs nothing in either shell (`cmd.exe` cannot run `#`, and PowerShell
+reads it as a comment); copy the command after the marker into PowerShell
+alone. `cmd.exe` has no quoting that keeps such a value literal (`%name%`
+expands inside its double quotes, and a single quote is an ordinary character
+there), so it is never trusted with one.
+
+`zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
+for every installed plugin holding `http_client`, one line naming the
+destinations it declares that its row does not grant, since requests there are
+denied, plus the command that closes the gap. The reverse is never flagged. A
+grant with no matching declaration is a first-class path, not a finding: the
+plugin whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) cannot have that host declared by its author, so you author it.
+
+When the instance's row still carries a pre-1.0 key (a package name rather than
+the `zpi1_…` key), `plugin list` always prints the rename described above,
+because the runtime resolves a grant by the `zpi1_…` key alone: whatever that
+row grants is not in effect, and requests are denied, until it is renamed. If
+the row's grant already covers everything the manifest declares, the rename is
+the whole instruction: no `zeroclaw config set` is offered, since it would
+only replace a list you already have right. If the declaration still names
+destinations the row does not grant, the rename is step one and the grant
+command is step two, and that command carries the row's existing grant forward
+so it revokes nothing you authored. Dotted `plugins.entries.<key>.…` paths
+only resolve rows already present in live config, so running the grant command
+before the rename fails with `Unknown property`; applying the printed steps in
+the printed order works. `plugin list` diagnoses this and never edits your
+config itself.
+
+`plugin list` judges a row with the same policy constructor the runtime uses
+at request time, so its verdict is the runtime's. If the runtime would refuse
+the row (a single-label wildcard such as `*.com`, an entry with boundary
+whitespace, or an `egress_allow_private` carve-out no granted host covers), the
+config loader only warns about it, but the runtime refuses the whole allowlist
+and denies every request. `plugin list` prints the runtime's reason and a grant
+command built only from the entries the runtime accepts; on a pre-1.0 row that
+command follows the rename, and the rename is never offered alone for a row the
+runtime would refuse. The printed command replaces `egress_hosts` only. If a
+private carve-out would still be refused afterwards, the report says so and
+names the row's `egress_allow_private` path, since that has to be fixed by
+hand. A refusal that is not about the row at all, a malformed
+`security.nat64_prefixes` or a zero `plugins.limits.max_connections_per_instance`,
+refuses every plugin's policy alike; `plugin list` reports it once, naming
+those two paths, prints no per-plugin lines until it is fixed, and never
+offers a per-plugin grant repair for it. `plugin install` reports an existing
+row with the same verdict, in the same words, so install and list never
+disagree about whether a grant is usable.
+
+Channel-only packages are silent on both surfaces until the alias-aware key
+path above lands, because no instance row can yet be derived to compare
+against.
+
 ## Where the trust boundary actually is
 
 The sandbox bounds what a loaded plugin can do; the signature policy bounds
@@ -306,6 +482,32 @@ to a locally installed CA, such as an enterprise MDM root or a private PKI,
 therefore works for plugins exactly as it already works for provider requests.
 Verification itself is unchanged: chain building and hostname matching stay in
 force, and the egress policy still decides which destinations a guest may reach.
+
+Sockets and WebSocket connections start from the same roots. A plugin that must
+reach a service behind a private CA, or present a client certificate, names a
+TLS profile the operator configured on its instance:
+
+```toml
+[[plugins.entries]]
+name = "zpi1_…"                       # the instance key
+egress_hosts = ["imap.corp.example.com"]
+
+[[plugins.entries.tls_profiles]]
+name = "corp"
+hosts = ["imap.corp.example.com"]     # must be inside egress_hosts
+system_roots = false                  # trust only the CA below
+custom_ca_secret = "corp_ca"          # x-secret properties of the plugin's
+client_certificate_secret = "cert"    # config schema holding PEM material
+client_private_key_secret = "key"
+```
+
+A profile chooses certificates only. Its `hosts` must each be granted by
+`egress_hosts`, which config validation checks, and a request that names it
+still passes the ordinary grant first. The certificate material stays in the
+instance's encrypted config; the profile fields are just the property names.
+The host reads that material when it builds a connection, and the plugin cannot:
+`secrets.get` refuses any property a profile names, so a client private key
+never enters the guest.
 
 Those roots are read once per process. Rewriting the certificate file at the same
 path, or changing the operating system store, does not reach a running daemon;

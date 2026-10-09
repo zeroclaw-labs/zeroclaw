@@ -27,8 +27,7 @@ body:
         may reclassify an RFC that does not meet the trigger, which routes the work rather than
         rejecting it.
 
-        Scope and ratification rules: [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496)
-        (FND-003 Rev. 15). Security vulnerabilities must be reported privately, never as a public RFC.
+        Scope and ratification rules: [RFC process](https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/contributing/rfcs.md) and [FND-003](https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/foundations/fnd-003-governance.md), currently updated by [#10549](https://github.com/zeroclaw-labs/zeroclaw/issues/10549). Security vulnerabilities must be reported privately, never as a public RFC.
 
   - type: dropdown
     id: trigger

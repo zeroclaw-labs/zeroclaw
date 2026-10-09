@@ -257,6 +257,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_turn_notice_falls_back_without_reusing_localized_message_units() {
+        let english = include_str!("../locales/en/zerocode.ftl");
+        for (locale, source) in [
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundles = FtlBundles {
+                english: build_ftl_bundle(english, "en"),
+                disk: Some(build_ftl_bundle(source, locale)),
+            };
+            let args = [
+                ("reason", "limit"),
+                ("dropped", "2"),
+                ("kept", "1"),
+                ("dropped-kind", "other"),
+                ("kept-kind", "one"),
+            ];
+            let turns = bundles
+                .format("zc-chat-history-trimmed-turns", &args)
+                .unwrap();
+            assert!(turns.contains("older turns dropped"), "{locale}: {turns}");
+            assert!(turns.contains("turn kept"), "{locale}: {turns}");
+            let old_key = "zc-chat-history-trimmed";
+            assert_eq!(
+                bundles.format(old_key, &args),
+                format_ftl_message(bundles.disk.as_ref().unwrap(), old_key, &args),
+                "legacy message units should remain localized for {locale}",
+            );
+        }
+    }
+
+    #[test]
     fn cached_bundles_format_fresh_arguments_and_preserve_fallback() {
         let bundles = FtlBundles {
             english: build_ftl_bundle(
@@ -601,6 +635,36 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("sidebar picker error must format for {locale}"));
             assert!(picker_error.contains("socket closed"));
+        }
+    }
+
+    #[test]
+    fn missing_completion_hint_fits_default_queue_dock_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            for chord in ["Alt+p", "Option+p"] {
+                let hint = format_ftl_message(
+                    &bundle,
+                    "zc-queue-missing-completion-ghost",
+                    &[("key", chord)],
+                )
+                .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(hint.contains(chord), "{locale}: {hint}");
+                assert!(
+                    hint.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {hint}",
+                    hint.width()
+                );
+            }
         }
     }
 

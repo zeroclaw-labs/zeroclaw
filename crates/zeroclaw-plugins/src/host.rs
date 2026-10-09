@@ -196,7 +196,10 @@ impl PluginHost {
             // directory symlink supplied at the discovery root: it would make
             // an external package appear local before its manifest and payload
             // confinement checks begin.
-            if entry.file_type()?.is_dir() {
+            // Dot-prefixed directories are never packages: they include the
+            // staging directories `install_admitted` builds a package in.
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            if entry.file_type()?.is_dir() && !hidden {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
@@ -293,8 +296,15 @@ impl PluginHost {
     }
 
     /// List all discovered plugins.
+    ///
+    /// Sorted by package name so the listing is stable across runs: the loaded
+    /// set is a hash map, and an operator diffing two `plugin list` outputs, or a
+    /// script reading the verified rows, needs the order to mean nothing.
     pub fn list_plugins(&self) -> Vec<PluginInfo> {
-        self.loaded.values().map(plugin_info_from_loaded).collect()
+        let mut plugins: Vec<PluginInfo> =
+            self.loaded.values().map(plugin_info_from_loaded).collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        plugins
     }
 
     /// Get info about a specific plugin.
@@ -306,6 +316,16 @@ impl PluginHost {
     #[must_use]
     pub fn manifest(&self, name: &str) -> Option<&PluginManifest> {
         self.loaded.get(name).map(|plugin| &plugin.manifest)
+    }
+
+    /// The exact component bytes admitted for an installed plugin: the bytes
+    /// the daemon compiles, so a load check against them checks what will run.
+    /// `None` for an unknown plugin and for a skill-only plugin that ships no
+    /// WASM.
+    pub fn admitted_component(&self, name: &str) -> Option<&AdmittedComponent> {
+        self.loaded
+            .get(name)
+            .and_then(|plugin| plugin.component.as_ref())
     }
 
     /// Install a plugin from a directory path. Returns the installed
@@ -401,25 +421,34 @@ impl PluginHost {
         if dest_dir.exists() {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
-        std::fs::create_dir_all(&dest_dir)?;
 
-        // Persist the exact manifest and payload generations admitted above.
-        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml.as_bytes())?;
-        if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component.as_ref()) {
-            let dest = dest_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, component.bytes())?;
+        // Build the package in a staging directory and rename it into place,
+        // so a failed write (disk full, an unreadable skill file, an
+        // interrupted process) never leaves a half-written package under the
+        // real name: that would block every retry with `AlreadyLoaded` while
+        // discovery skips it, leaving nothing `plugin remove` can find.
+        // Discovery ignores dot-prefixed directories, so a staging directory
+        // stranded by a crash is never loaded either.
+        std::fs::create_dir_all(&self.plugins_dir)?;
+        let staging = self.plugins_dir.join(format!(
+            ".{}.installing-{}",
+            manifest.name,
+            std::process::id()
+        ));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
         }
-
-        // Copy skills/ subtree for skill-capable plugins.
-        if manifest.capabilities.contains(&PluginCapability::Skill) {
-            let src_skills = source_dir.join(SKILLS_SUBDIR);
-            let dest_skills = dest_dir.join(SKILLS_SUBDIR);
-            if src_skills.is_dir() {
-                copy_dir_recursive(&src_skills, &dest_skills)?;
-            }
+        let staged = write_package(
+            &staging,
+            &manifest,
+            &manifest_toml,
+            &source_dir,
+            component.as_ref(),
+        )
+        .and_then(|()| std::fs::rename(&staging, &dest_dir).map_err(PluginError::from));
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
         }
 
         let installed_name = manifest.name.clone();
@@ -569,25 +598,45 @@ fn admit_component(
         .transpose()
 }
 
-/// Resolve a manifest executable without allowing traversal or symlink
-/// indirection outside the package. This validates the pathname used for the
-/// one admission read; it does not make later namespace substitutions safe.
-/// A payload path that passed package confinement, carried with the canonical
-/// package root and its directory identity from admission time.
+/// A payload that passed package confinement: the canonical package root, the
+/// payload's path below it (normal components only), and, on Unix, the root
+/// directory held open since confinement.
+///
+/// On Unix that open root is the source of truth for every later open: the
+/// payload is reached by walking `relative` down from it, never by resolving an
+/// absolute pathname again. `root` is kept for messages and to refuse a package
+/// root that was moved or replaced after confinement. Other platforms carry the
+/// root's identity instead and check by pathname; see [`read_stable_file`].
 pub(crate) struct ConfinedPayload {
     root: PathBuf,
+    relative: PathBuf,
+    #[cfg(unix)]
+    root_dir: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
     root_handle: same_file::Handle,
-    path: PathBuf,
 }
 
+/// Resolve a manifest executable without allowing traversal or symlink
+/// indirection outside the package.
+///
+/// On Unix the canonical package root is opened once, here, and the returned
+/// [`ConfinedPayload`] holds that handle; the path below it is checked with
+/// no-follow opens relative to it, so a component that is a symlink is refused
+/// rather than followed. Elsewhere the checks go by pathname.
 fn resolve_confined_wasm_path(
     plugin_dir: &Path,
     relative: &str,
 ) -> Result<ConfinedPayload, PluginError> {
-    let relative = Path::new(relative);
+    let requested = Path::new(relative);
+    // Normal components only: a `.` names nothing, and `..`, root, and prefix
+    // components are refused below.
+    let relative: PathBuf = requested
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect();
     if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
+        || requested.is_absolute()
+        || requested.components().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -596,29 +645,100 @@ fn resolve_confined_wasm_path(
     {
         return Err(PluginError::InvalidManifest(format!(
             "wasm_path must be a confined relative path (got {})",
-            relative.display()
+            requested.display()
         )));
     }
 
-    let root = std::fs::canonicalize(plugin_dir)?;
+    confine_payload(std::fs::canonicalize(plugin_dir)?, relative)
+}
+
+/// Open the canonical package root and check, relative to that handle and
+/// without following a symlink, that `relative` names a regular file below it.
+#[cfg(unix)]
+fn confine_payload(root: PathBuf, relative: PathBuf) -> Result<ConfinedPayload, PluginError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use rustix::io::Errno;
+
+    let root_dir = rustix::fs::openat(
+        rustix::fs::CWD,
+        root.as_path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| match errno {
+        // `root` was canonical a moment ago, so a symlink or non-directory
+        // there now is a replaced root.
+        Errno::LOOP | Errno::NOTDIR => PluginError::InvalidManifest(format!(
+            "plugin package root changed during confinement: {}",
+            root.display()
+        )),
+        other => PluginError::Io(other.into()),
+    })?;
+    #[cfg(test)]
+    payload_step(PayloadStep::AfterRootOpen);
+
+    let confined = ConfinedPayload {
+        root,
+        relative,
+        root_dir,
+    };
+    let missing = |walked: &Path| {
+        PluginError::NotFound(format!(
+            "WASM file not found: {}",
+            confined.root.join(walked).display()
+        ))
+    };
+    let (parent, leaf) = confined.open_payload_parent(|errno, walked| match errno {
+        Errno::NOENT => missing(walked),
+        // A symlink or non-directory where a directory is expected fails the
+        // no-follow directory open with ENOTDIR (ELOOP on older Linux kernels).
+        Errno::LOOP | Errno::NOTDIR => PluginError::InvalidManifest(format!(
+            "wasm_path contains a symlink or non-directory component: {}",
+            confined.relative.display()
+        )),
+        other => PluginError::Io(other.into()),
+    })?;
+    let leaf_stat =
+        rustix::fs::statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| {
+            if errno == Errno::NOENT {
+                missing(&confined.relative)
+            } else {
+                PluginError::Io(errno.into())
+            }
+        })?;
+    match FileType::from_raw_mode(leaf_stat.st_mode) {
+        FileType::RegularFile => Ok(confined),
+        FileType::Symlink => Err(PluginError::InvalidManifest(format!(
+            "wasm_path contains a symlink: {}",
+            confined.relative.display()
+        ))),
+        _ => Err(PluginError::InvalidManifest(format!(
+            "WASM payload is not a regular file: {}",
+            confined.root.join(&confined.relative).display()
+        ))),
+    }
+}
+
+/// Check by pathname that `relative` names a regular file below the canonical
+/// root with no symlink on the way, and record the root's identity.
+#[cfg(not(unix))]
+fn confine_payload(root: PathBuf, relative: PathBuf) -> Result<ConfinedPayload, PluginError> {
     let root_handle = same_file::Handle::from_path(&root)?;
     let mut candidate = root.clone();
-    for component in relative.components() {
-        if let Component::Normal(segment) = component {
-            candidate.push(segment);
-            let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    PluginError::NotFound(format!("WASM file not found: {}", candidate.display()))
-                } else {
-                    PluginError::Io(error)
-                }
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(PluginError::InvalidManifest(format!(
-                    "wasm_path contains a symlink: {}",
-                    relative.display()
-                )));
+    for segment in &relative {
+        candidate.push(segment);
+        let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PluginError::NotFound(format!("WASM file not found: {}", candidate.display()))
+            } else {
+                PluginError::Io(error)
             }
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PluginError::InvalidManifest(format!(
+                "wasm_path contains a symlink: {}",
+                relative.display()
+            )));
         }
     }
 
@@ -637,9 +757,45 @@ fn resolve_confined_wasm_path(
     }
     Ok(ConfinedPayload {
         root,
+        relative,
         root_handle,
-        path: resolved,
     })
+}
+
+#[cfg(unix)]
+impl ConfinedPayload {
+    /// Walk the directories of `relative` down from the retained root, opening
+    /// each relative to the one before without following a symlink, and return
+    /// the payload's parent directory and file name. `on_error` maps a failed
+    /// open, given the part of `relative` walked so far.
+    fn open_payload_parent(
+        &self,
+        on_error: impl Fn(rustix::io::Errno, &Path) -> PluginError,
+    ) -> Result<(std::os::fd::OwnedFd, &std::ffi::OsStr), PluginError> {
+        use rustix::fs::{Mode, OFlags};
+
+        let leaf = self.relative.file_name().ok_or_else(|| {
+            PluginError::InvalidManifest(format!(
+                "wasm_path must name a file (got {})",
+                self.relative.display()
+            ))
+        })?;
+        let mut dir = self.root_dir.try_clone()?;
+        let mut walked = PathBuf::new();
+        for segment in self.relative.parent().into_iter().flat_map(Path::iter) {
+            walked.push(segment);
+            dir = rustix::fs::openat(
+                &dir,
+                segment,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|errno| on_error(errno, &walked))?;
+            #[cfg(test)]
+            payload_step(PayloadStep::AfterDir(walked.components().count()));
+        }
+        Ok((dir, leaf))
+    }
 }
 
 /// Largest executable payload admission will read into memory.
@@ -651,39 +807,28 @@ fn resolve_confined_wasm_path(
 /// a single malformed or hostile package from exhausting memory.
 const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Read a payload anchored to the package root that admitted it. This keeps
-/// the checked admission read tied to that root; it does not claim to close
-/// every filesystem namespace race.
+/// Read a confined payload, bounded by [`MAX_COMPONENT_BYTES`].
+///
+/// On Unix every open descends from the package root handle retained at
+/// confinement and never follows a symlink, so every object read is reached
+/// through real directories below that root as they stand at each open: a
+/// symlink or non-directory the walk meets is refused, a directory moved away
+/// after the walk passed it is never consulted, and a directory renamed into
+/// place before the walk reaches it is traversed like any other directory
+/// below the root. The root pathname is looked at only to refuse a package
+/// whose root no longer names the directory the payload came from. The payload
+/// is opened non-blocking and must be a regular file, so a FIFO or device fails
+/// at once.
+///
+/// Other platforms open the absolute pathname and then compare the root
+/// identity, each component's link status, and the opened file's identity with
+/// what the pathname names. That refuses a replacement still in place when the
+/// checks run, but the lookup is not atomic, and the open itself does not guard
+/// against a FIFO.
 pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, PluginError> {
-    let ConfinedPayload {
-        root,
-        root_handle,
-        path,
-    } = confined;
+    let path = confined.root.join(&confined.relative);
+    let file = open_confined_payload(confined, &path)?;
 
-    let swapped = || {
-        PluginError::InvalidManifest(format!(
-            "WASM payload path changed after confinement check: {}",
-            path.display()
-        ))
-    };
-
-    let relative = path.strip_prefix(root).map_err(|_| {
-        PluginError::InvalidManifest(format!(
-            "WASM payload escaped its package root {}: {}",
-            root.display(),
-            path.display()
-        ))
-    })?;
-
-    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(PluginError::InvalidManifest(format!(
-            "WASM payload is not a regular file: {}",
-            path.display()
-        )));
-    }
-
-    let file = std::fs::File::open(path)?;
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
         return Err(PluginError::InvalidManifest(format!(
@@ -700,29 +845,6 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
         )));
     }
 
-    let opened = same_file::Handle::from_file(file.try_clone()?)?;
-    if same_file::Handle::from_path(root)? != *root_handle {
-        return Err(PluginError::InvalidManifest(format!(
-            "plugin package root changed after confinement check: {}",
-            root.display()
-        )));
-    }
-
-    let mut prefix = root.clone();
-    for component in relative.components() {
-        let Component::Normal(segment) = component else {
-            return Err(swapped());
-        };
-        prefix.push(segment);
-        if std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
-            return Err(swapped());
-        }
-    }
-
-    if opened != same_file::Handle::from_path(path)? {
-        return Err(swapped());
-    }
-
     // Bound the read, not just the stat above: the payload can grow between the
     // size check and this read. Taking one byte past the limit makes an
     // oversized payload detectable without retaining more than that.
@@ -737,6 +859,143 @@ pub(crate) fn read_stable_file(confined: &ConfinedPayload) -> Result<Vec<u8>, Pl
         )));
     }
     Ok(bytes)
+}
+
+/// Open the payload from the root handle retained at confinement: walk down
+/// without following a symlink, open the payload itself non-blocking, then
+/// check that the root pathname still names the directory it was read from.
+/// `path` is for messages only.
+#[cfg(unix)]
+fn open_confined_payload(
+    confined: &ConfinedPayload,
+    path: &Path,
+) -> Result<std::fs::File, PluginError> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::io::Errno;
+
+    // A symlink or non-directory where confinement found a directory fails the
+    // no-follow directory open with ENOTDIR (ELOOP on older Linux kernels); a
+    // symlink in place of the payload fails its no-follow open with ELOOP.
+    let substituted = |errno: Errno| match errno {
+        Errno::LOOP | Errno::NOTDIR => PluginError::InvalidManifest(format!(
+            "WASM payload path changed after confinement check: {}",
+            path.display()
+        )),
+        other => PluginError::Io(other.into()),
+    };
+
+    let (parent, leaf) = confined.open_payload_parent(|errno, _walked| substituted(errno))?;
+    #[cfg(test)]
+    payload_step(PayloadStep::BeforeLeafOpen);
+    // Non-blocking, so a FIFO or device fails the regular-file check instead of
+    // blocking here; `NOCTTY` keeps a terminal from becoming the controlling one.
+    let payload = rustix::fs::openat(
+        &parent,
+        leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(substituted)?;
+    #[cfg(test)]
+    payload_step(PayloadStep::AfterLeafOpen);
+
+    // The payload came from the directory held since confinement, whatever the
+    // root pathname names now. A package whose root was moved or replaced
+    // meanwhile is refused rather than admitted under a name that now means
+    // another tree.
+    let held = rustix::fs::fstat(&confined.root_dir).map_err(std::io::Error::from)?;
+    let named = rustix::fs::statat(
+        rustix::fs::CWD,
+        confined.root.as_path(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(std::io::Error::from)?;
+    if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin package root changed after confinement check: {}",
+            confined.root.display()
+        )));
+    }
+    Ok(std::fs::File::from(payload))
+}
+
+/// Open the payload by its absolute pathname, then compare what was opened with
+/// the confined root and with what the pathname names.
+#[cfg(not(unix))]
+fn open_confined_payload(
+    confined: &ConfinedPayload,
+    path: &Path,
+) -> Result<std::fs::File, PluginError> {
+    let swapped = || {
+        PluginError::InvalidManifest(format!(
+            "WASM payload path changed after confinement check: {}",
+            path.display()
+        ))
+    };
+
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "WASM payload is not a regular file: {}",
+            path.display()
+        )));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    if same_file::Handle::from_path(&confined.root)? != confined.root_handle {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin package root changed after confinement check: {}",
+            confined.root.display()
+        )));
+    }
+
+    let mut prefix = confined.root.clone();
+    for segment in &confined.relative {
+        prefix.push(segment);
+        if std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+            return Err(swapped());
+        }
+    }
+
+    if opened != same_file::Handle::from_path(path)? {
+        return Err(swapped());
+    }
+    Ok(file)
+}
+
+/// A boundary between two filesystem operations of payload admission, where a
+/// test can rearrange the package tree.
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadStep {
+    /// Confinement opened the package root.
+    AfterRootOpen,
+    /// A walk opened the directory this many components below the root.
+    AfterDir(usize),
+    /// The read is about to open the payload.
+    BeforeLeafOpen,
+    /// The read opened the payload.
+    AfterLeafOpen,
+}
+
+/// What a test runs at each [`PayloadStep`].
+#[cfg(all(test, unix))]
+type PayloadStepHook = Box<dyn FnMut(PayloadStep)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Called at every [`PayloadStep`] reached on this thread, when set.
+    static PAYLOAD_STEP_HOOK: std::cell::RefCell<Option<PayloadStepHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn payload_step(step: PayloadStep) {
+    PAYLOAD_STEP_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
 }
 
 /// Validate manifest shape: `wasm_path` is required unless the plugin's only
@@ -827,6 +1086,16 @@ fn validate_manifest_shape(
 /// frontmatter declares the agentskills.io-required `name` and `description`.
 fn validate_skill_bundle(plugin_name: &str, plugin_dir: &Path) -> Result<(), PluginError> {
     let skills_dir = plugin_dir.join(SKILLS_SUBDIR);
+    // Like a package root, the skills root is an admission boundary: a
+    // symlink here would let the bundle validated and later copied live
+    // outside the package.
+    if std::fs::symlink_metadata(&skills_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(PluginError::InvalidManifest(format!(
+            "skill plugin '{}' has a symlinked `skills/` directory at {}; package the skills in place",
+            plugin_name,
+            skills_dir.display()
+        )));
+    }
     if !skills_dir.is_dir() {
         return Err(PluginError::InvalidManifest(format!(
             "skill plugin '{}' is missing `skills/` directory at {}",
@@ -916,6 +1185,37 @@ fn validate_skill_md_frontmatter(plugin_name: &str, skill_md: &Path) -> Result<(
     Ok(())
 }
 
+/// Write an admitted package into `dir`: the exact manifest and component
+/// bytes admission read, plus the `skills/` subtree of a skill-capable package.
+fn write_package(
+    dir: &Path,
+    manifest: &PluginManifest,
+    manifest_toml: &str,
+    source_dir: &Path,
+    component: Option<&AdmittedComponent>,
+) -> Result<(), PluginError> {
+    std::fs::create_dir(dir)?;
+
+    // Persist the exact manifest and payload generations admitted above.
+    std::fs::write(dir.join("manifest.toml"), manifest_toml.as_bytes())?;
+    if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component) {
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, component.bytes())?;
+    }
+
+    // Copy skills/ subtree for skill-capable plugins.
+    if manifest.capabilities.contains(&PluginCapability::Skill) {
+        let src_skills = source_dir.join(SKILLS_SUBDIR);
+        if src_skills.is_dir() {
+            copy_dir_recursive(&src_skills, &dir.join(SKILLS_SUBDIR))?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -965,6 +1265,35 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loaded set is a hash map; the listing must not inherit its order.
+    #[test]
+    fn list_plugins_is_sorted_by_name_regardless_of_discovery_order() {
+        let dir = tempdir().unwrap();
+        for name in ["zeta-plugin", "mid-plugin", "alpha-plugin"] {
+            let plugin_dir = dir.path().join("plugins").join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    r#"
+name = "{name}"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#
+                ),
+            )
+            .unwrap();
+            // Discovery admits the declared component, so it has to exist.
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let names: Vec<String> = host.list_plugins().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["alpha-plugin", "mid-plugin", "zeta-plugin"]);
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -1840,6 +2169,88 @@ capabilities = ["tool"]
         );
     }
 
+    /// An install that fails part-way leaves nothing under the package name and
+    /// no staging directory, so the retry after the cause is fixed succeeds
+    /// instead of hitting `AlreadyLoaded` on a half-written package. The
+    /// failure is real: admission reads only each skill's `SKILL.md`, so an
+    /// unreadable extra file passes admission and fails the copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_install_leaves_nothing_behind_and_the_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), "half", &["alpha"]);
+        let source_dir = source.path().join("half");
+        let unreadable = source_dir.join("skills/alpha/notes.txt");
+        std::fs::write(&unreadable, "extra").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&unreadable).is_ok() {
+            // Running as root: permissions cannot make the copy fail.
+            return;
+        }
+
+        let admitted = host.admit_source(source_dir.to_str().unwrap()).unwrap();
+        assert!(host.install_admitted(admitted).is_err());
+        let left: Vec<_> = std::fs::read_dir(plugins.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "a failed install left {left:?} behind");
+        assert!(host.get_plugin("half").is_none());
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let admitted = host.admit_source(source_dir.to_str().unwrap()).unwrap();
+        assert_eq!(host.install_admitted(admitted).unwrap(), "half");
+        assert!(plugins.path().join("half/skills/alpha/notes.txt").is_file());
+    }
+
+    /// A staging directory stranded by a crash is never discovered as a
+    /// package, even though it holds a complete manifest.
+    #[test]
+    fn discovery_skips_a_stranded_staging_directory() {
+        let plugins = tempdir().unwrap();
+        let staging = plugins.path().join(".stranded.installing-4242");
+        std::fs::create_dir_all(&staging).unwrap();
+        write_tool_source(&staging, "stranded", b"\0asm");
+
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    /// A symlinked `skills/` root is refused at admission, like a symlinked
+    /// package root: the bundle validated and then copied must live inside
+    /// the package.
+    #[cfg(unix)]
+    #[test]
+    fn admit_source_refuses_a_symlinked_skills_root() {
+        use std::os::unix::fs::symlink;
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        write_skill_bundle_plugin(external.path(), "ext", &["alpha"]);
+        write_skill_bundle_plugin(source.path(), "linked", &["alpha"]);
+        let source_dir = source.path().join("linked");
+        std::fs::remove_dir_all(source_dir.join("skills")).unwrap();
+        symlink(
+            external.path().join("ext/skills"),
+            source_dir.join("skills"),
+        )
+        .unwrap();
+
+        let err = host
+            .admit_source(source_dir.to_str().unwrap())
+            .expect_err("a symlinked skills root must be refused");
+        assert!(
+            err.to_string().contains("symlinked"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A `wasm_path` that is a symlink is refused: the component must be a
     /// regular file inside the source, so the bytes admitted are the bytes at
     /// that path and not whatever the link points at by the time of the read.
@@ -2134,6 +2545,221 @@ capabilities = ["tool"]
             "intermediate-directory swap admitted attacker bytes"
         );
         assert!(matches!(read, Err(PluginError::InvalidManifest(_))));
+    }
+
+    /// Move the directory at `path` to `aside` and put a symlink to
+    /// `replacement` in its place.
+    #[cfg(unix)]
+    fn swap_in(path: &Path, aside: &Path, replacement: &Path) {
+        std::fs::rename(path, aside).unwrap();
+        std::os::unix::fs::symlink(replacement, path).unwrap();
+    }
+
+    /// Undo `swap_in`.
+    #[cfg(unix)]
+    fn swap_back(path: &Path, aside: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::rename(aside, path).unwrap();
+    }
+
+    /// Run `admit` with `hook` called at every payload admission step reached
+    /// on this thread.
+    #[cfg(unix)]
+    fn with_payload_steps<T>(
+        hook: impl FnMut(PayloadStep) + 'static,
+        admit: impl FnOnce() -> T,
+    ) -> T {
+        PAYLOAD_STEP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let admitted = admit();
+        PAYLOAD_STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
+        admitted
+    }
+
+    /// The package root is replaced by a symlink to an attacker tree during
+    /// admission. Confinement opened the root before the swap and every later
+    /// open descends from that handle, so admission refuses the moved root or
+    /// reads the original payload; it never reads the attacker's. A payload in
+    /// the root and one below a directory are both covered, so resolving the
+    /// root, a directory, or the payload by pathname during the read fails here.
+    #[cfg(unix)]
+    #[test]
+    fn payload_read_survives_root_replacement_between_steps() {
+        for relative in ["plugin.wasm", "nested/plugin.wasm"] {
+            let root = tempdir().unwrap();
+            let package = root.path().join("plugins").join("pkg");
+            let aside = root.path().join("plugins").join("pkg-moved");
+            let attacker = root.path().join("attacker");
+            for (tree, contents) in [
+                (&package, "admitted component"),
+                (&attacker, "attacker component"),
+            ] {
+                let payload = tree.join(relative);
+                std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                std::fs::write(payload, contents).unwrap();
+            }
+
+            // Replaced right after confinement opened the root, and left that
+            // way: the walks still reach the original payload, and the read
+            // refuses a root the pathname no longer names.
+            let mut swap = Some((package.clone(), aside.clone(), attacker.clone()));
+            let read = with_payload_steps(
+                move |step| {
+                    if step == PayloadStep::AfterRootOpen
+                        && let Some((package, aside, attacker)) = swap.take()
+                    {
+                        swap_in(&package, &aside, &attacker);
+                    }
+                },
+                || {
+                    resolve_confined_wasm_path(&package, relative)
+                        .and_then(|confined| read_stable_file(&confined))
+                },
+            );
+            assert!(
+                matches!(read, Err(PluginError::InvalidManifest(_))),
+                "{relative}: a root replaced mid-admission was admitted: {read:?}"
+            );
+            swap_back(&package, &aside);
+
+            // Replaced after confinement and before the read starts, and
+            // restored once the payload is open, so every check after the open
+            // sees the original root. Resolving the root, a directory, or the
+            // payload by pathname during the read would reach the attacker
+            // tree; the walk from the retained root reads the admitted file.
+            let confined = resolve_confined_wasm_path(&package, relative).unwrap();
+            swap_in(&package, &aside, &attacker);
+            let read = with_payload_steps(
+                move |step| {
+                    if step == PayloadStep::AfterLeafOpen {
+                        swap_back(&package, &aside);
+                    }
+                },
+                || read_stable_file(&confined),
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&read.unwrap()),
+                "admitted component",
+                "{relative}"
+            );
+        }
+    }
+
+    /// A directory between the root and the payload is replaced by a symlink
+    /// to an attacker tree during admission. The walks open each directory
+    /// without following a symlink, so a symlink the walk reaches is refused,
+    /// and a replacement made after the walk passed is never consulted: the
+    /// payload is opened from the directory the walk already holds.
+    #[cfg(unix)]
+    #[test]
+    fn payload_read_survives_intermediate_replacement_between_steps() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        let nested = package.join("nested");
+        let aside = package.join("nested-moved");
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&attacker).unwrap();
+        std::fs::write(nested.join("plugin.wasm"), b"admitted component").unwrap();
+        std::fs::write(attacker.join("plugin.wasm"), b"attacker component").unwrap();
+
+        // Replaced once confinement's walk has opened `nested`, and left that
+        // way: confinement finishes from the directory it holds, and the read's
+        // walk refuses the symlink it then finds at `nested`.
+        let mut swap = Some((nested.clone(), aside.clone(), attacker.clone()));
+        let read = with_payload_steps(
+            move |step| {
+                if step == PayloadStep::AfterDir(1)
+                    && let Some((nested, aside, attacker)) = swap.take()
+                {
+                    swap_in(&nested, &aside, &attacker);
+                }
+            },
+            || {
+                resolve_confined_wasm_path(&package, "nested/plugin.wasm")
+                    .and_then(|confined| read_stable_file(&confined))
+            },
+        );
+        assert!(
+            matches!(read, Err(PluginError::InvalidManifest(_))),
+            "a directory replaced mid-admission was followed: {read:?}"
+        );
+        swap_back(&nested, &aside);
+
+        // Replaced after the read's walk opened `nested`, and restored once the
+        // payload is open: the open is relative to the directory the walk
+        // holds, so it reads the admitted file while the pathname names the
+        // attacker's.
+        let confined = resolve_confined_wasm_path(&package, "nested/plugin.wasm").unwrap();
+        let read = with_payload_steps(
+            move |step| match step {
+                PayloadStep::AfterDir(1) => swap_in(&nested, &aside, &attacker),
+                PayloadStep::AfterLeafOpen => swap_back(&nested, &aside),
+                _ => {}
+            },
+            || read_stable_file(&confined),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&read.unwrap()),
+            "admitted component"
+        );
+    }
+
+    /// A FIFO swapped in for the payload after every check that precedes the
+    /// open fails the read at once instead of blocking admission on a writer
+    /// that never comes: the payload is opened non-blocking and must be a
+    /// regular file. Confinement refuses a FIFO that is already in place.
+    #[cfg(unix)]
+    #[test]
+    fn payload_read_fails_fast_on_a_fifo() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let payload = package.join("plugin.wasm");
+        std::fs::write(&payload, b"admitted component").unwrap();
+        let confined = resolve_confined_wasm_path(&package, "plugin.wasm").unwrap();
+
+        let fifo = payload.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let read = with_payload_steps(
+                move |step| {
+                    if step == PayloadStep::BeforeLeafOpen {
+                        std::fs::remove_file(&fifo).unwrap();
+                        assert!(
+                            std::process::Command::new("mkfifo")
+                                .arg(&fifo)
+                                .status()
+                                .unwrap()
+                                .success()
+                        );
+                    }
+                },
+                || read_stable_file(&confined),
+            );
+            sender.send(read).unwrap();
+        });
+        let read = match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(read) => read,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("a FIFO in place of the payload blocked the read")
+            }
+            // The reader panicked before sending (in the hook, say): report
+            // that failure rather than a blocked read.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::panic::resume_unwind(
+                reader
+                    .join()
+                    .expect_err("the reader sends before it returns"),
+            ),
+        };
+        assert!(
+            matches!(&read, Err(PluginError::InvalidManifest(message)) if message.contains("not a regular file")),
+            "{read:?}"
+        );
+
+        assert!(matches!(
+            resolve_confined_wasm_path(&package, "plugin.wasm"),
+            Err(PluginError::InvalidManifest(_))
+        ));
     }
 
     #[test]

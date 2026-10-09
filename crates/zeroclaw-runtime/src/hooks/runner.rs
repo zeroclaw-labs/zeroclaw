@@ -50,12 +50,54 @@ impl HookRunner {
     }
 
     pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
+        Self::from_config_with_nat64_prefixes(hooks, &[])
+    }
+
+    pub fn from_root_config(config: &zeroclaw_config::schema::Config) -> Self {
+        let nat64_prefixes = if config.hooks.builtin.webhook_audit.enabled {
+            match zeroclaw_infra::net_guard::parse_nat64_prefixes(
+                &config.security.nat64_prefixes,
+                "security.nat64_prefixes",
+            ) {
+                Ok(prefixes) => prefixes,
+                Err(error) => {
+                    let mut runner = Self::new();
+                    if config.hooks.builtin.command_logger {
+                        runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
+                    }
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "hook": "webhook-audit",
+                                "error": error.to_string(),
+                            })),
+                        "webhook-audit network policy is invalid; hook disabled"
+                    );
+                    return runner;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        Self::from_config_with_nat64_prefixes(&config.hooks, &nat64_prefixes)
+    }
+
+    fn from_config_with_nat64_prefixes(
+        hooks: &zeroclaw_config::schema::HooksConfig,
+        nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+    ) -> Self {
         let mut runner = Self::new();
         if hooks.builtin.command_logger {
             runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
         }
         if hooks.builtin.webhook_audit.enabled {
-            match super::builtin::WebhookAuditHook::new(hooks.builtin.webhook_audit.clone()) {
+            match super::builtin::WebhookAuditHook::new_with_nat64_prefixes(
+                hooks.builtin.webhook_audit.clone(),
+                nat64_prefixes,
+            ) {
                 Ok(hook) => runner.register(Box::new(hook)),
                 Err(error) => {
                     ::zeroclaw_log::record!(
@@ -1517,6 +1559,20 @@ mod tests {
 
         let runner = HookRunner::from_config(&config);
         let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
+
+        assert_eq!(names, vec!["command-logger"]);
+    }
+
+    #[test]
+    fn from_root_config_skips_webhook_when_nat64_policy_is_invalid() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.hooks.builtin.command_logger = true;
+        config.hooks.builtin.webhook_audit.enabled = true;
+        config.hooks.builtin.webhook_audit.url = "https://audit.example.com/hook".to_string();
+        config.security.nat64_prefixes = vec!["not-a-prefix".to_string()];
+
+        let runner = HookRunner::from_root_config(&config);
+        let names: Vec<&str> = runner.handlers.iter().map(|hook| hook.name()).collect();
 
         assert_eq!(names, vec!["command-logger"]);
     }

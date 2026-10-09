@@ -3,7 +3,7 @@
 use super::AppState;
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, Utc};
@@ -328,22 +328,7 @@ impl PairingStore {
     }
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-}
-
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
-    if state.pairing.require_pairing() {
-        let token = extract_bearer(headers).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
-    }
-    Ok(())
-}
+use crate::api::{extract_bearer_token, require_auth};
 
 /// POST /api/pairing/initiate — initiate a new pairing session
 pub async fn initiate_pairing(
@@ -457,13 +442,7 @@ pub async fn submit_pairing_enhanced(
                         .into_response();
                 }
             }
-            if let Err(e) = super::persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            if let Err(e) = super::persist_pairing_tokens(&state).await {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -583,13 +562,7 @@ pub async fn revoke_device(
 
     state.pairing.revoke_token_hash(&token_hash);
 
-    if let Err(e) = super::persist_pairing_tokens(
-        state.config.clone(),
-        &state.pairing,
-        state.config_write_lock.clone(),
-    )
-    .await
-    {
+    if let Err(e) = super::persist_pairing_tokens(&state).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -616,7 +589,7 @@ pub async fn update_my_capabilities(
         return e.into_response();
     }
 
-    let token = match extract_bearer(&headers) {
+    let token = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
     };
@@ -692,13 +665,7 @@ pub async fn rotate_token(
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(
-        state.config.clone(),
-        &state.pairing,
-        state.config_write_lock.clone(),
-    )
-    .await
-    {
+    if let Err(e) = super::persist_pairing_tokens(&state).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -823,10 +790,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
-        {
-            let mut cfg = state.config.write();
-            cfg.config_path = blocker.join("config.toml");
-        }
+        state.publish_test_config(|cfg| cfg.config_path = blocker.join("config.toml"));
 
         let code = state
             .pairing

@@ -5,34 +5,84 @@ use crate::agent::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext, TurnUsage,
     tool_loop_cost_tracking_context_for_agent,
 };
+use crate::control_plane::{
+    ControlPlaneHandle, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    control_plane as global_control_plane,
+};
 use crate::cron::scheduler::deliver_announcement;
+use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
+use futures_util::FutureExt;
 use parking_lot::Mutex;
 use serde_json::json;
+use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+
+const PEER_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
+const PEER_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct PeerInboxTask {
+    id: String,
+    owner_pid: u32,
+    owner_boot_id: String,
+}
 
 /// Send a message to a peer on a shared channel. Bound to a single
 /// calling agent's alias; the tool validates every send against that
 /// agent's resolved peer set.
 pub struct SendMessageToPeerTool {
     config: Arc<Config>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     sender_alias: String,
     description: String,
+    task_control_plane: Option<ControlPlaneHandle>,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
+        Self::new_with_live_config_and_capability(config, sender_alias, None, None)
+    }
+
+    pub fn new_with_capability(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Self {
+        Self::new_with_live_config_and_capability(config, sender_alias, None, execution_capability)
+    }
+
+    pub(crate) fn new_with_live_config_and_capability(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Self {
         let sender_alias = sender_alias.into();
         let description = build_description();
         Self {
             config,
+            live_config,
             sender_alias,
             description,
+            task_control_plane: None,
+            execution_capability,
         }
+    }
+
+    pub fn with_control_plane(mut self, handle: ControlPlaneHandle) -> Self {
+        self.task_control_plane = Some(handle);
+        self
     }
 }
 
@@ -187,12 +237,89 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
-            let cfg = Arc::clone(&self.config);
+            let admission = self
+                .execution_capability
+                .as_ref()
+                .map(|capability| capability.resolve_and_admit(&canonical))
+                .transpose()?;
+            let cfg = admission
+                .as_ref()
+                .map(AgentExecutionAdmission::config)
+                .unwrap_or_else(|| Arc::clone(&self.config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
+            let turn_recipient_alias = recipient_alias.clone();
             let body = message.clone();
+            let live_config = self.live_config.clone();
+            let control_plane = self
+                .task_control_plane
+                .clone()
+                .or_else(|| global_control_plane().cloned());
+            let control_plane = match control_plane {
+                Some(handle) => handle,
+                None => match crate::control_plane::non_daemon_control_plane(&cfg.data_dir).await {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(crate::i18n::get_required_cli_string_with_args(
+                                "peer-delivery-control-plane-unavailable",
+                                &[("error", &format!("{error:#}"))],
+                            )),
+                        });
+                    }
+                },
+            };
+            let task_store = Arc::clone(&control_plane.store);
+            let task = match admit_peer_inbox_task(
+                Some(task_store.as_ref()),
+                &control_plane.boot_id,
+                &sender,
+                &recipient_alias,
+                &channel,
+                || {},
+            )
+            .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "sender": sender,
+                                "recipient": recipient_alias,
+                                "channel": channel,
+                                "error": format!("{error:#}"),
+                            })),
+                        "peer-message durable registration failed"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string_with_args(
+                            "peer-delivery-registration-failed",
+                            &[("error", &format!("{error:#}"))],
+                        )),
+                    });
+                }
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": &task.id,
+                        "sender": &sender,
+                        "recipient": &recipient_alias,
+                        "channel": &channel,
+                    })),
+                "peer-message accepted for in-process delivery"
+            );
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message_shared` below — a detached
+            // `cfg` moves into the recipient turn below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -200,26 +327,55 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
+            let task_id = task.id.clone();
+            let task_owner_pid = task.owner_pid;
+            let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
-                // Keep the large turn future out of the nested cost-scope wrappers.
-                let turn = Box::pin(crate::agent::loop_::process_message_shared(
-                    cfg,
-                    &recipient_alias,
-                    &body,
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                ));
-                if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
+                // Keep the admitted recipient turn out of the cost-scope wrappers.
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
+                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                        cfg,
+                        live_config,
+                        &turn_recipient_alias,
+                        &body,
+                        None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                        admission,
+                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                            sender_alias: sender.clone(),
+                        }),
+                    ),
+                );
+                let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
+                if let Err(error) = settle_peer_inbox_task(
+                    task_store.as_ref(),
+                    &PeerInboxTask {
+                        id: task_id.clone(),
+                        owner_pid: task_owner_pid,
+                        owner_boot_id: task_owner_boot_id.clone(),
+                    },
+                    result,
+                )
+                .await
                 {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": format!("{}", e)})), "peer-message in-process delivery failed");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "sender": sender,
+                                "recipient": recipient_alias,
+                                "error": format!("{error:#}"),
+                            })),
+                        "peer-message terminal settlement failed"
+                    );
                 }
             });
 
             return Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "accepted for in-process delivery to peer agent {canonical:?} (recipient runs detached; observe its agent loop for the actual outcome)"
-                ).into(),
+                output: peer_acceptance_output(&canonical, &task.id).into(),
                 error: None,
             });
         }
@@ -236,6 +392,161 @@ impl Tool for SendMessageToPeerTool {
                 error: Some(format!("delivery failed: {e:#}")),
             }),
         }
+    }
+}
+
+fn peer_acceptance_output(recipient_alias: &str, task_id: &str) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "peer-delivery-accepted",
+        &[("recipient", recipient_alias), ("task_id", task_id)],
+    )
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
+async fn run_peer_turn_with_panic_recovery<F>(
+    cost_ctx: Option<ToolLoopCostTrackingContext>,
+    turn_usage: Option<Arc<Mutex<TurnUsage>>>,
+    inner: F,
+) -> Result<String>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    match AssertUnwindSafe(deliver_peer_turn_with_cost_scope(
+        cost_ctx, turn_usage, inner,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(result) => result,
+        Err(payload) => Err(anyhow::Error::msg(format!(
+            "peer recipient turn panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
+    }
+}
+
+async fn admit_peer_inbox_task<F>(
+    registry: Option<&dyn TaskRegistry>,
+    owner_boot_id: &str,
+    sender_alias: &str,
+    recipient_alias: &str,
+    channel: &str,
+    dispatch: F,
+) -> Result<PeerInboxTask>
+where
+    F: FnOnce(),
+{
+    let registry = registry.ok_or_else(|| {
+        anyhow::Error::msg("in-process peer delivery requires an available durable task store")
+    })?;
+    let task = PeerInboxTask {
+        id: uuid::Uuid::new_v4().to_string(),
+        owner_pid: std::process::id(),
+        owner_boot_id: owner_boot_id.to_string(),
+    };
+    registry
+        .create(TaskRecord {
+            id: task.id.clone(),
+            kind: TaskKind::PeerInbox,
+            agent: recipient_alias.to_string(),
+            status: TaskStatus::Running,
+            owner_pid: task.owner_pid,
+            owner_boot_id: task.owner_boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(channel.to_string()),
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some(sender_alias.to_string()),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        })
+        .await?;
+    dispatch();
+    Ok(task)
+}
+
+async fn settle_peer_inbox_task(
+    registry: &dyn TaskRegistry,
+    task: &PeerInboxTask,
+    result: Result<String>,
+) -> Result<bool> {
+    let (status, output, error) = match result {
+        Ok(response) => (TaskStatus::Completed, Some(response), None),
+        Err(error) => (TaskStatus::Failed, None, Some(format!("{error:#}"))),
+    };
+
+    let mut failures = 0_u32;
+    loop {
+        match registry
+            .transition_terminal_if_owner(
+                &task.id,
+                task.owner_pid,
+                &task.owner_boot_id,
+                status,
+                output.clone(),
+                error.clone(),
+            )
+            .await
+        {
+            Ok(won) => {
+                if failures > 0 {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": &task.id,
+                                "attempts": failures + 1,
+                                "transition_won": won,
+                            })),
+                        "peer-message terminal transition recovered"
+                    );
+                }
+                if won {
+                    return Ok(true);
+                }
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({ "task_id": &task.id })),
+                    "peer-message terminal winner already recorded"
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures.is_power_of_two() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": &task.id,
+                                "attempt": failures,
+                                "error": format!("{error:#}"),
+                            })),
+                        "peer-message terminal transition will retry"
+                    );
+                }
+            }
+        }
+
+        let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+        let delay = PEER_SETTLEMENT_RETRY_DELAY
+            .saturating_mul(multiplier)
+            .min(PEER_SETTLEMENT_MAX_RETRY_DELAY);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -470,8 +781,331 @@ fn format_prompt_list(values: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::control_plane::{SqliteTaskStore, TaskSnapshot};
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::schema::AliasedAgentConfig;
+
+    struct MockRegistry {
+        create_error: bool,
+        created: Mutex<Vec<TaskRecord>>,
+        terminal_failures: Mutex<usize>,
+        terminal_winner: bool,
+        terminal_calls: AtomicUsize,
+    }
+
+    impl MockRegistry {
+        fn accepting() -> Self {
+            Self {
+                create_error: false,
+                created: Mutex::new(Vec::new()),
+                terminal_failures: Mutex::new(0),
+                terminal_winner: true,
+                terminal_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn rejecting() -> Self {
+            Self {
+                create_error: true,
+                ..Self::accepting()
+            }
+        }
+
+        fn retrying_terminal_settlement(failures: usize) -> Self {
+            Self {
+                terminal_failures: Mutex::new(failures),
+                ..Self::accepting()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskRegistry for MockRegistry {
+        async fn create(&self, rec: TaskRecord) -> anyhow::Result<()> {
+            if self.create_error {
+                anyhow::bail!("mock registration failure");
+            }
+            self.created.lock().push(rec);
+            Ok(())
+        }
+
+        async fn heartbeat(&self, _id: &str, _owner_boot_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: TaskStatus,
+            _output: Option<String>,
+            _error: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn transition_terminal_if_owner(
+            &self,
+            _id: &str,
+            _owner_pid: u32,
+            _owner_boot_id: &str,
+            _status: TaskStatus,
+            _output: Option<String>,
+            _error: Option<String>,
+        ) -> anyhow::Result<bool> {
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            let mut failures = self.terminal_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                anyhow::bail!("mock transient settlement failure");
+            }
+            Ok(self.terminal_winner)
+        }
+
+        async fn claim_owner(
+            &self,
+            _id: &str,
+            _owner_pid: u32,
+            _owner_boot_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>> {
+            Ok(self
+                .created
+                .lock()
+                .iter()
+                .find(|task| task.id == id)
+                .cloned())
+        }
+
+        async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_by_agent(&self, _agent: &str) -> anyhow::Result<Vec<TaskRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn reconcile_lost(&self, _id: &str, _now_boot_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    fn task_for_settlement(task_id: &str) -> PeerInboxTask {
+        PeerInboxTask {
+            id: task_id.to_string(),
+            owner_pid: 7,
+            owner_boot_id: "boot-test".to_string(),
+        }
+    }
+
+    fn snapshot_status(snapshot: TaskSnapshot) -> (TaskStatus, Option<String>, Option<String>) {
+        (snapshot.task.status, snapshot.output, snapshot.error)
+    }
+
+    #[tokio::test]
+    async fn peer_inbox_admission_fails_closed_before_dispatch() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_unavailable = Arc::clone(&dispatches);
+        let error = admit_peer_inbox_task(
+            None,
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            move || {
+                dispatches_for_unavailable.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("missing control plane must reject delivery");
+        assert!(error.to_string().contains("available durable task store"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+
+        let registry = MockRegistry::rejecting();
+        let dispatches_for_failure = Arc::clone(&dispatches);
+        let error = admit_peer_inbox_task(
+            Some(&registry),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            move || {
+                dispatches_for_failure.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("registration failure must reject delivery");
+        assert!(error.to_string().contains("mock registration failure"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_inbox_registration_precedes_dispatch_and_stamps_minimal_identity() {
+        let registry = MockRegistry::accepting();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_for_callback = Arc::clone(&dispatches);
+        let task = admit_peer_inbox_task(
+            Some(&registry),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {
+                assert_eq!(registry.created.lock().len(), 1);
+                dispatches_for_callback.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("registration should succeed");
+
+        let created = registry.created.lock();
+        let record = created.first().expect("registration record");
+        assert_eq!(record.id, task.id);
+        assert_eq!(record.kind, TaskKind::PeerInbox);
+        assert_eq!(record.status, TaskStatus::Running);
+        assert_eq!(record.agent, "recipient");
+        assert_eq!(record.principal_id.as_deref(), Some("sender"));
+        assert_eq!(record.originator_route.as_deref(), Some("telegram.prod"));
+        assert!(record.parent_id.is_none());
+        assert!(record.idem_key.is_none());
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_inbox_terminal_success_and_failure_are_canonical() {
+        let store = SqliteTaskStore::new_in_memory().expect("store");
+        let success_task = admit_peer_inbox_task(
+            Some(&store),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("registration");
+        assert!(
+            settle_peer_inbox_task(&store, &success_task, Ok("response".into()))
+                .await
+                .expect("success settlement")
+        );
+        let success = store
+            .get_snapshot(&success_task.id)
+            .await
+            .expect("snapshot")
+            .expect("task");
+        assert_eq!(
+            snapshot_status(success),
+            (TaskStatus::Completed, Some("response".into()), None)
+        );
+
+        let failure_task = admit_peer_inbox_task(
+            Some(&store),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("registration");
+        assert!(
+            settle_peer_inbox_task(
+                &store,
+                &failure_task,
+                Err(anyhow::Error::msg("recipient failed")),
+            )
+            .await
+            .expect("failure settlement")
+        );
+        let failure = store
+            .get_snapshot(&failure_task.id)
+            .await
+            .expect("snapshot")
+            .expect("task");
+        assert_eq!(
+            snapshot_status(failure),
+            (TaskStatus::Failed, None, Some("recipient failed".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_recipient_panic_settles_failed() {
+        let store = SqliteTaskStore::new_in_memory().expect("store");
+        let task = admit_peer_inbox_task(
+            Some(&store),
+            "boot-test",
+            "sender",
+            "recipient",
+            "telegram.prod",
+            || {},
+        )
+        .await
+        .expect("registration");
+        let result = run_peer_turn_with_panic_recovery(None, None, async {
+            panic!("synthetic recipient panic");
+        })
+        .await;
+        assert!(result.is_err(), "panic must become a failed turn result");
+
+        assert!(
+            settle_peer_inbox_task(&store, &task, result)
+                .await
+                .expect("panic settlement")
+        );
+        let snapshot = store
+            .get_snapshot(&task.id)
+            .await
+            .expect("snapshot")
+            .expect("task");
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert!(snapshot.output.is_none());
+        assert!(snapshot.error.as_deref().is_some_and(|error| {
+            error.contains("peer recipient turn panicked: synthetic recipient panic")
+        }));
+    }
+
+    #[tokio::test]
+    async fn peer_inbox_terminal_settlement_retries_transient_store_errors() {
+        let registry = MockRegistry::retrying_terminal_settlement(4);
+        let settled = settle_peer_inbox_task(
+            &registry,
+            &task_for_settlement("task-retry"),
+            Ok("response".into()),
+        )
+        .await
+        .expect("fifth settlement attempt should succeed");
+        assert!(settled);
+        assert_eq!(registry.terminal_calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn peer_inbox_terminal_winner_is_preserved_when_cas_loses() {
+        let mut registry = MockRegistry::accepting();
+        registry.terminal_winner = false;
+        let settled = settle_peer_inbox_task(
+            &registry,
+            &task_for_settlement("task-winner"),
+            Err(anyhow::Error::msg("recipient failed")),
+        )
+        .await
+        .expect("losing CAS is not a settlement error");
+        assert!(!settled);
+        assert_eq!(registry.terminal_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn peer_acceptance_output_exposes_the_registered_task_id() {
+        let task_id = "task-123";
+        assert_eq!(
+            peer_acceptance_output("recipient", task_id),
+            "accepted for in-process delivery to peer agent \"recipient\" (task_id=task-123)"
+        );
+    }
 
     #[test]
     fn description_stays_channel_agnostic() {
@@ -896,6 +1530,7 @@ mod tests {
     async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
     {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
+        use crate::control_plane::ControlPlaneHandle;
         use crate::cost::CostTracker;
         use axum::{Json, Router, extract::State, routing::post};
         use std::collections::HashMap;
@@ -907,26 +1542,39 @@ mod tests {
         // OpenAI-compatible client (`factory::build_ollama_compat_provider`),
         // not the native `/api/chat` wire format, so the fake stands in at
         // the OpenAI-compatible `/v1/chat/completions` boundary.
-        type RequestCount = Arc<Mutex<u32>>;
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
         async fn capture_chat(
-            State(count): State<RequestCount>,
+            State(state): State<RequestState>,
             Json(_body): Json<serde_json::Value>,
         ) -> Json<serde_json::Value> {
-            *count.lock() += 1;
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
             Json(serde_json::json!({
                 "choices": [{"message": {"content": "peer turn complete"}}],
                 "usage": {"prompt_tokens": 1_000, "completion_tokens": 200}
             }))
         }
 
-        let request_count: RequestCount = Arc::new(Mutex::new(0));
+        let request_count = Arc::new(Mutex::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock provider listener should bind");
         let mock_addr = listener.local_addr().expect("mock provider addr");
         let app = Router::new()
             .route("/v1/chat/completions", post(capture_chat))
-            .with_state(request_count.clone());
+            .with_state(RequestState {
+                count: request_count.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            });
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app)
                 .await
@@ -993,7 +1641,17 @@ mod tests {
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
 
-        let tool = SendMessageToPeerTool::new(Arc::new(config.clone()), "sender");
+        let control_plane = ControlPlaneHandle::open(workspace.path())
+            .expect("isolated control plane should initialize");
+        let task_store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let lifecycle = authority.agent_lifecycle();
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::new(config.clone()),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .with_control_plane(control_plane);
         let result = tool
             .execute(json!({
                 "channel": "telegram.prod",
@@ -1006,6 +1664,29 @@ mod tests {
             result.success,
             "execute should accept the send for in-process delivery: {result:?}"
         );
+        assert!(
+            result.output.contains("task_id="),
+            "accepted in-process delivery must expose its durable task id: {result:?}"
+        );
+        let task_id = result
+            .output
+            .split_once("task_id=")
+            .and_then(|(_, value)| value.strip_suffix(')'))
+            .map(str::to_string)
+            .expect("accepted output must contain a durable task id");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("recipient reaches paused provider");
+        drop(tool);
+        drop(authority);
+        assert!(
+            matches!(
+                lifecycle.begin_delete("recipient"),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ),
+            "detached peer retains admission after its caller is dropped"
+        );
+        release.notify_one();
 
         // `execute()` already resolved the recipient's cost context off the
         // process-global tracker (synchronously, before the detached spawn).
@@ -1036,6 +1717,28 @@ mod tests {
              recipient alias; if this fires, execute() is no longer threading the \
              cost-tracking scope into the spawned process_message future",
         );
+
+        let terminal_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = task_store
+                    .get_snapshot(&task_id)
+                    .await
+                    .expect("peer task snapshot should be queryable")
+                    .expect("accepted task should remain in the control plane");
+                if snapshot.task.status.is_terminal() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer task should reach a terminal state");
+        assert_eq!(terminal_snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(
+            terminal_snapshot.output.as_deref(),
+            Some("peer turn complete")
+        );
+        assert!(terminal_snapshot.error.is_none());
 
         // (1) Usage lands on the recipient alias in the per-agent ledger,
         // through the REAL tool boundary end to end - not just the helper.
@@ -1089,6 +1792,14 @@ mod tests {
              process-wide daily budget, blocking an unrelated agent's next call"
         );
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while lifecycle.active_turn_count("recipient") != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recipient finishes persistence and releases admission");
+        assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
     }
 }

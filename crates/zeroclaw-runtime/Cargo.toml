@@ -78,6 +78,7 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
+toml_edit = "0.25"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
 urlencoding = "2.1"
@@ -89,9 +90,9 @@ zeroclaw-macros.workspace = true
 
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
-opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 # Optional deps for specific features
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -131,6 +132,8 @@ sandbox-bubblewrap = []
 test-util = []
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -43,18 +43,20 @@
 //! request, and that request is authorized on its own from scratch.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
+use hyper::body::{Body, Bytes, Frame};
 use hyper::header::HOST;
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout, timeout_at};
-use wasmtime_wasi_http::p2::{
-    WasiHttpHooks,
-    bindings::http::types::ErrorCode,
-    body::HyperOutgoingBody,
-    types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
-};
+use tokio::time::{Instant, Sleep, timeout, timeout_at};
+use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks};
 use zeroclaw_infra::net_guard::NetworkGuardError;
 
 use crate::egress::{
@@ -103,19 +105,25 @@ fn dns_failure() -> ErrorCode {
     )
 }
 
-/// Emit the structured denial event that attributes the attempt to the exact
-/// instance. The destination host and the boundary's reason are recorded
-/// host-side — the operator needs both to seed a grant — while only the guest's
-/// error is masked.
+/// Wrap `value` as one POSIX single-quoted shell word. An apostrophe inside
+/// closes the quoted run, contributes a backslash-escaped apostrophe outside
+/// it, and reopens the run, so the word stays one argument with the original
+/// bytes. This is the quoting `shell_escape` in `zeroclaw-runtime`'s
+/// `coding_cli_executor` applies to generated commands.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `existing` with `host` appended when it is not already there, rendered as
-/// the single-quoted JSON list `config set` takes. `config set` replaces the
-/// whole list, so a remedy has to carry every entry the operator already has.
+/// one single-quoted shell argument carrying the JSON list `config set` takes.
+/// `config set` replaces the whole list, so a remedy has to carry every entry
+/// the operator already has.
 fn list_with(existing: &[String], host: &str) -> String {
     let mut list: Vec<&str> = existing.iter().map(String::as_str).collect();
     if !list.contains(&host) {
         list.push(host);
     }
-    format!("'{}'", serde_json::Value::from(list))
+    shell_quote(&serde_json::Value::from(list).to_string())
 }
 
 /// The operator-facing next step for a missing grant: the exact command that
@@ -194,6 +202,10 @@ fn egress_remedy(
     }
 }
 
+/// Emit the structured denial event that attributes the attempt to the exact
+/// instance. The destination host and the boundary's reason are recorded
+/// host-side — the operator needs both to seed a grant — while only the guest's
+/// error is masked.
 fn record_denial(id: &PluginInstanceId, host: &str, reason: &str, remedy: Option<String>) {
     ::zeroclaw_log::record!(
         WARN,
@@ -399,12 +411,22 @@ fn trust_environment() -> TrustEnvironment {
 /// short one must not be able to cancel the store read that the *next* request
 /// needs. What a timeout cancels here is the waiter, never the work.
 struct TrustSlot {
-    ready: tokio::sync::watch::Receiver<Option<Arc<rustls::ClientConfig>>>,
+    ready: tokio::sync::watch::Receiver<Option<TrustMaterial>>,
     /// Held for its `Drop` alone. [`wasmtime_wasi::runtime::spawn_blocking`]
     /// hands back a handle that aborts its task when dropped, so letting this
     /// fall at the end of the miss branch would abort the very assembly the
     /// waiters are about to await.
     _assembly: wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+}
+
+/// One assembled trust decision: the client configuration plugin HTTPS dials
+/// with, and the root store it was built from. The roots travel with the
+/// configuration so TLS-profile transports extend exactly the trust plugin
+/// HTTPS already has, never a second, separately assembled set.
+#[derive(Clone)]
+struct TrustMaterial {
+    config: Arc<rustls::ClientConfig>,
+    roots: Arc<rustls::RootCertStore>,
 }
 
 /// Test-only delay injected ahead of the store read.
@@ -462,6 +484,30 @@ static ASSEMBLY_DELAY: std::sync::Mutex<Option<std::time::Duration>> = std::sync
 /// the assembly lands, and [`ErrorCode::TlsProtocolError`] when the assembly
 /// task itself died without producing a configuration.
 async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.config)
+}
+
+/// The root store plugin HTTPS verifies against: the bundled program plus this
+/// machine's store, from the same cached assembly as [`plugin_tls_config`].
+///
+/// TLS-profile transports start from this store when a profile keeps system
+/// roots, so a socket, a WebSocket, and an HTTPS request from one plugin trust
+/// the same authorities.
+///
+/// # Errors
+///
+/// As [`plugin_tls_config`].
+pub(crate) async fn plugin_trust_roots(
+    deadline: Instant,
+) -> Result<Arc<rustls::RootCertStore>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.roots)
+}
+
+async fn plugin_trust_material(deadline: Instant) -> Result<TrustMaterial, ErrorCode> {
     static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, TrustSlot>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -480,8 +526,8 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
             // must not inherit an unrelated panic.
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(slot) = guard.get(&key) {
-            if let Some(config) = slot.ready.borrow().clone() {
-                return Ok(config);
+            if let Some(material) = slot.ready.borrow().clone() {
+                return Ok(material);
             }
             slot.ready.clone()
         } else {
@@ -498,14 +544,15 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
                 }
                 let anchors = build_trust_anchors();
                 record_trust_anchors(&anchors);
+                let roots = Arc::new(anchors.store);
                 let config = Arc::new(
                     rustls::ClientConfig::builder()
-                        .with_root_certificates(anchors.store)
+                        .with_root_certificates(Arc::clone(&roots))
                         .with_no_client_auth(),
                 );
                 // The slot keeps a receiver alive for the life of the process,
                 // so this send lands whether or not anyone is still waiting.
-                let _ = sender.send(Some(config));
+                let _ = sender.send(Some(TrustMaterial { config, roots }));
             });
             guard.insert(
                 key.clone(),
@@ -613,24 +660,121 @@ impl PluginEgressHooks {
     }
 }
 
+/// The timeout `wasi:http` applies to a stage the guest set no timeout for.
+///
+/// Through wasmtime 47 the `wasi:http` layer filled this in before calling the
+/// hooks; from 48 it hands the guest's `request-options` over as they are and
+/// leaves every timeout to the send path. Keeping the same value here is what
+/// keeps a request with no options bounded exactly as it was.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The three per-request timeouts, with [`DEFAULT_HTTP_TIMEOUT`] for any the
+/// guest did not set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SendTimeouts {
+    connect: Duration,
+    first_byte: Duration,
+    between_bytes: Duration,
+}
+
+impl SendTimeouts {
+    fn from_options(options: Option<RequestOptions>) -> Self {
+        let options = options.unwrap_or_default();
+        Self {
+            connect: options.connect_timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
+            first_byte: options.first_byte_timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
+            between_bytes: options
+                .between_bytes_timeout
+                .unwrap_or(DEFAULT_HTTP_TIMEOUT),
+        }
+    }
+}
+
+/// A response from the pinned send path, and the task driving its connection.
+///
+/// The worker holds the instance's connection slot for as long as the
+/// connection is open; dropping the handle aborts it and frees the slot.
+struct SentResponse {
+    response: hyper::Response<WasiBody>,
+    worker: AbortOnDropJoinHandle<()>,
+}
+
+impl std::fmt::Debug for SentResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SentResponse")
+            .field("status", &self.response.status())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The outcome of one guest request, before `wasi:http`'s error type.
+type SendOutcome = Pin<Box<dyn Future<Output = Result<SentResponse, ErrorCode>> + Send>>;
+
+/// The connection task `wasi:http` keeps alive while the response body is read.
+type ConnectionIo = Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>;
+
 impl WasiHttpHooks for PluginEgressHooks {
+    /// Replaces wasmtime's default send, which connects wherever the guest
+    /// asks. Every error is one of `wasi:http`'s own codes, so a guest sees
+    /// exactly the value [`Self::dispatch`] chose.
     fn send_request(
         &mut self,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::p2::HttpResult<HostFutureIncomingResponse> {
+        request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        _response_errors: Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>,
+    ) -> Box<
+        dyn Future<Output = wasmtime_wasi_http::Result<(hyper::Response<WasiBody>, ConnectionIo)>>
+            + Send,
+    > {
+        let outcome = self.dispatch(request, SendTimeouts::from_options(options));
+        Box::new(async move {
+            let SentResponse { response, worker } =
+                outcome.await.map_err(wasmtime_wasi_http::Error::from)?;
+            // The worker drives the hyper connection that streams this
+            // response's body, and it holds the instance's connection slot.
+            // `wasi:http` spawns the returned future and keeps it for as long
+            // as the response lives, which is what wasmtime 47's response kept
+            // the worker for. Dropping it here would abort the connection
+            // right after the headers and free the slot early.
+            let io: ConnectionIo = Box::new(async move {
+                worker.await;
+                Ok(())
+            });
+            Ok((response, io))
+        })
+    }
+}
+
+impl PluginEgressHooks {
+    /// Everything decided before any I/O: the endpoint, the deny-by-default
+    /// check, and the egress request. What needs the network is left to the
+    /// returned future, which `wasi:http` drives.
+    fn dispatch(
+        &mut self,
+        request: hyper::Request<WasiBody>,
+        timeouts: SendTimeouts,
+    ) -> SendOutcome {
+        fn ready(error: ErrorCode) -> SendOutcome {
+            Box::pin(std::future::ready(Err(error)))
+        }
+
+        // `wasi:http` has already refused every scheme but these two, so this
+        // only restates that a request is either plain HTTP or TLS.
+        let use_tls = match request.uri().scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
+            _ => return ready(ErrorCode::HttpProtocolError),
+        };
         let Some(authority) = request.uri().authority().cloned() else {
-            return Ok(HostFutureIncomingResponse::ready(Ok(Err(
-                ErrorCode::HttpRequestUriInvalid,
-            ))));
+            return ready(ErrorCode::HttpRequestUriInvalid);
         };
         // One endpoint for the grant check, the dial, and the `Host` header.
         // An authority that cannot name exactly one is a malformed URI, and is
         // reported as such rather than as a policy denial: nothing about the
         // host's network is disclosed by telling a guest its own URI is bad.
-        let (host, port) = match authority_endpoint(&authority, config.use_tls) {
+        let (host, port) = match authority_endpoint(&authority, use_tls) {
             Ok(endpoint) => endpoint,
-            Err(error) => return Ok(HostFutureIncomingResponse::ready(Ok(Err(error)))),
+            Err(error) => return ready(error),
         };
 
         // Deny by default, before anything is spawned and before any name is
@@ -645,7 +789,7 @@ impl WasiHttpHooks for PluginEgressHooks {
                 "no egress policy granted for this instance",
                 None,
             );
-            return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
+            return ready(denied());
         };
 
         // `encrypted` is the confidentiality mode, not a second permission axis:
@@ -654,9 +798,7 @@ impl WasiHttpHooks for PluginEgressHooks {
         // boundary re-checks.
         let egress_request = match EgressRequest::new(
             self.scope.clone(),
-            EgressTransport::Http {
-                encrypted: config.use_tls,
-            },
+            EgressTransport::Http { encrypted: use_tls },
             &host,
             port,
         ) {
@@ -665,24 +807,28 @@ impl WasiHttpHooks for PluginEgressHooks {
             // reaches DNS. The guest still sees only the masked denial.
             Err(error) => {
                 record_denial(self.scope.id(), &host, &error.to_string(), None);
-                return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
+                return ready(denied());
             }
         };
 
         let id = self.scope.id().clone();
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(send(request, config, egress_request, service, id).await)
-        });
-        Ok(HostFutureIncomingResponse::pending(handle))
+        Box::pin(send(
+            request,
+            use_tls,
+            timeouts,
+            egress_request,
+            service,
+            id,
+        ))
     }
 }
 
 /// The host-owned pinned send path.
 ///
-/// This mirrors the mechanics of `wasmtime_wasi_http::p2::default_send_request_handler`
+/// This mirrors the mechanics of `wasmtime_wasi_http::default_send_request`
 /// — same `Host` header fill-in, same first-byte and between-bytes timeouts,
 /// same origin-form URI rewrite before `send_request`, same hyper http1
-/// handshake and worker task — with two deliberate differences.
+/// handshake and connection task — with two deliberate differences.
 ///
 /// The first is the point of the module: its single `TcpStream::connect(authority)`
 /// (which resolves and connects in one unobservable step) becomes **authorize,
@@ -694,12 +840,13 @@ impl WasiHttpHooks for PluginEgressHooks {
 /// handshake, because a host that leases a scarce connection slot to a guest
 /// cannot let the peer decide how long to hold it.
 async fn send(
-    mut request: hyper::Request<HyperOutgoingBody>,
-    config: OutgoingRequestConfig,
+    mut request: hyper::Request<WasiBody>,
+    use_tls: bool,
+    timeouts: SendTimeouts,
     egress_request: EgressRequest,
     service: EgressHostService,
     id: PluginInstanceId,
-) -> Result<IncomingResponse, ErrorCode> {
+) -> Result<SentResponse, ErrorCode> {
     use http_body_util::BodyExt;
 
     // The authority is safe to name on the wire because [`authority_endpoint`]
@@ -740,7 +887,7 @@ async fn send(
     // enforce, and it must not become a panic in a host function on a guest's
     // say-so. A nonsense timeout gets the timeout error it asked for, closed
     // and immediate.
-    let Some(deadline) = Instant::now().checked_add(config.connect_timeout) else {
+    let Some(deadline) = Instant::now().checked_add(timeouts.connect) else {
         return Err(ErrorCode::ConnectionTimeout);
     };
 
@@ -808,7 +955,7 @@ async fn send(
     //
     // See `plugin_tls_config` for why both root sets, and for what stays
     // unchanged about verification itself.
-    let tls_config = if config.use_tls {
+    let tls_config = if use_tls {
         Some(plugin_tls_config(deadline).await?)
     } else {
         None
@@ -848,20 +995,81 @@ async fn send(
         .build()
         .map_err(|_| ErrorCode::HttpRequestUriInvalid)?;
 
-    let resp = timeout(config.first_byte_timeout, sender.send_request(request))
+    let response = timeout(timeouts.first_byte, sender.send_request(request))
         .await
         .map_err(|_| ErrorCode::ConnectionReadTimeout)?
         .map_err(|_| ErrorCode::HttpProtocolError)?
         .map(|body| {
-            body.map_err(|_| ErrorCode::HttpProtocolError)
-                .boxed_unsync()
+            BetweenBytesTimeout::new(
+                body.map_err(|_| wasmtime_wasi_http::Error::HttpProtocolError)
+                    .boxed_unsync(),
+                timeouts.between_bytes,
+            )
+            .boxed_unsync()
         });
 
-    Ok(IncomingResponse {
-        resp,
-        worker: Some(worker),
-        between_bytes_timeout: config.between_bytes_timeout,
-    })
+    Ok(SentResponse { response, worker })
+}
+
+/// A response body that fails with `connection-read-timeout` when no frame
+/// arrives within the between-bytes timeout.
+///
+/// Through wasmtime 47 `wasi:http` wrapped every response body in exactly this;
+/// from 48 the timeout belongs to the send path. The timing is the same as it
+/// was: the clock starts when a frame is asked for and restarts after each
+/// frame, so a guest that reads slowly is never timed out for its own pace.
+struct BetweenBytesTimeout {
+    inner: WasiBody,
+    between_bytes: Duration,
+    timer: Pin<Box<Sleep>>,
+    restart_timer: bool,
+}
+
+impl BetweenBytesTimeout {
+    fn new(inner: WasiBody, between_bytes: Duration) -> Self {
+        Self {
+            inner,
+            between_bytes,
+            timer: Box::pin(wasmtime_wasi::runtime::with_ambient_tokio_runtime(|| {
+                tokio::time::sleep(Duration::ZERO)
+            })),
+            restart_timer: true,
+        }
+    }
+}
+
+impl Body for BetweenBytesTimeout {
+    type Data = Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.restart_timer {
+            // `between_bytes` is the guest's own number, so a duration the
+            // clock cannot represent means no deadline rather than a panic,
+            // as tokio's `timeout` treats one on the first-byte stage.
+            let deadline = Instant::now()
+                .checked_add(this.between_bytes)
+                .unwrap_or_else(far_future);
+            this.timer.as_mut().reset(deadline);
+            this.restart_timer = false;
+        }
+        if this.timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)));
+        }
+        let frame = Pin::new(&mut this.inner).poll_frame(cx);
+        this.restart_timer = frame.is_ready();
+        frame
+    }
+}
+
+/// A deadline far enough away that it never fires, as tokio uses for a
+/// duration it cannot add to now.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
 
 /// Dial the pinned addresses in order and return the first connection that
@@ -913,8 +1121,8 @@ async fn handshake<S>(
     authorized: AuthorizedEgress,
 ) -> Result<
     (
-        hyper::client::conn::http1::SendRequest<HyperOutgoingBody>,
-        wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+        hyper::client::conn::http1::SendRequest<WasiBody>,
+        AbortOnDropJoinHandle<()>,
     ),
     ErrorCode,
 >
@@ -1005,6 +1213,102 @@ mod tests {
             remedy.contains("config set"),
             "remedy must be a runnable config-set command: {remedy}"
         );
+    }
+
+    /// A grant with no quoting-sensitive characters keeps the exact command the
+    /// remedy has always printed. Only entries that need escaping change.
+    #[test]
+    fn a_remedy_for_plain_grants_keeps_the_command_unchanged() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["docs.example.com".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"docs.example.com\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The serialized list was wrapped in single quotes without escaping the
+    /// apostrophes inside it, so a grant like `o'brien.example` closed the
+    /// quoted run early and left the operator with an unterminated quote. The
+    /// grant grammar now rejects such an entry before it reaches a policy, so
+    /// none should arrive here; the command must still be one shell word for
+    /// whatever list it is handed, rather than relying on a grammar elsewhere
+    /// to keep it well-formed.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_is_one_shell_argument() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["o'brien.example".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"o'\\''brien.example\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The same command read back the way a POSIX shell reads it has to carry
+    /// the list `config set` replaces, apostrophe and all. Whether that list
+    /// then builds a policy is the grant grammar's call, not the quoting's:
+    /// the shell must hand `config set` the operator's list byte for byte so
+    /// the grammar is what judges it, not a truncated copy.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_round_trips() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let existing = vec![
+            "docs.example.com".to_string(),
+            "o'brien.example".to_string(),
+        ];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let written = remedy_list(&remedy);
+        assert_eq!(
+            written,
+            vec![
+                "docs.example.com".to_string(),
+                "o'brien.example".to_string(),
+                "new.example.com".to_string()
+            ],
+            "{remedy}"
+        );
+    }
+
+    /// The escape sequence is data, not syntax: a grant that already contains
+    /// `'\''`, adjacent apostrophes or a trailing one must survive unchanged
+    /// rather than being escaped a second time.
+    #[test]
+    fn a_grant_containing_the_escape_sequence_round_trips() {
+        for value in [
+            "a'\\''b.example",
+            "o''brien.example",
+            "trailing'",
+            "'leading",
+        ] {
+            let quoted = shell_quote(value);
+            assert_eq!(shell_argument(&quoted), value, "{quoted}");
+        }
     }
 
     /// The remedy names the field each refusal actually needs, and is absent
@@ -1123,11 +1427,41 @@ mod tests {
         assert!(remedy.contains("egress_allow_private"), "{remedy}");
     }
 
-    /// The list a remedy command would write, parsed back out of it.
+    /// The list a remedy command would hand to `config set`, read off the
+    /// command the way a POSIX shell would read it.
     fn remedy_list(remedy: &str) -> Vec<String> {
-        let start = remedy.rfind(" '").expect("remedy ends in a quoted list") + 2;
-        let end = remedy.rfind('\'').expect("the list is single-quoted");
-        serde_json::from_str(&remedy[start..end]).expect("the list is JSON")
+        let argument = remedy
+            .split_once("config set ")
+            .and_then(|(_, tail)| tail.split_once(' '))
+            .map(|(_, argument)| argument)
+            .unwrap_or_else(|| panic!("no config-set argument in the remedy: {remedy}"));
+        serde_json::from_str(&shell_argument(argument)).expect("the list is JSON")
+    }
+
+    /// Resolve one single-quoted shell argument. [`shell_quote`] emits a quoted
+    /// run, and for an apostrophe it splices out to a backslash-escaped quote
+    /// and back in; anything else after a closing quote is an unterminated
+    /// quote, which is exactly the defect here, so this fails loudly there
+    /// instead of quietly decoding a truncated list.
+    fn shell_argument(raw: &str) -> String {
+        let mut out = String::new();
+        let mut rest = raw
+            .strip_prefix('\'')
+            .unwrap_or_else(|| panic!("the argument must open with a quote: {raw}"));
+        loop {
+            let end = rest
+                .find('\'')
+                .unwrap_or_else(|| panic!("unterminated quote in the argument: {raw}"));
+            out.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+            if rest.is_empty() {
+                return out;
+            }
+            rest = rest
+                .strip_prefix("\\''")
+                .unwrap_or_else(|| panic!("text after the closing quote in the argument: {raw}"));
+            out.push('\'');
+        }
     }
 
     /// `config set` replaces a whole list, so a remedy that printed only the
@@ -1251,7 +1585,7 @@ mod tests {
         }
     }
 
-    fn request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
+    fn request(uri: &str) -> hyper::Request<WasiBody> {
         let body = http_body_util::Empty::<hyper::body::Bytes>::new()
             .map_err(|_| unreachable!("an empty body cannot fail"))
             .boxed_unsync();
@@ -1261,19 +1595,23 @@ mod tests {
             .expect("valid fixture request")
     }
 
-    fn config() -> OutgoingRequestConfig {
-        OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(1),
-            first_byte_timeout: Duration::from_secs(1),
-            between_bytes_timeout: Duration::from_secs(1),
+    fn config() -> SendTimeouts {
+        SendTimeouts {
+            connect: Duration::from_secs(1),
+            first_byte: Duration::from_secs(1),
+            between_bytes: Duration::from_secs(1),
         }
     }
 
-    fn denial(response: HostFutureIncomingResponse) -> ErrorCode {
-        match response {
-            HostFutureIncomingResponse::Ready(Ok(Err(code))) => code,
-            other => panic!("expected a synchronous denial, got: {other:?}"),
+    /// The error of a request answered before any I/O. It is polled once, on a
+    /// thread with no async runtime: an outcome that needed a timer, a socket or
+    /// a lookup could not resolve there.
+    fn denial(mut outcome: SendOutcome) -> ErrorCode {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match outcome.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(code)) => code,
+            Poll::Ready(Ok(sent)) => panic!("expected a synchronous denial, got: {sent:?}"),
+            Poll::Pending => panic!("expected a synchronous denial, got a pending send"),
         }
     }
 
@@ -1288,9 +1626,7 @@ mod tests {
             "http://127.0.0.1:9/",
             "http://api.internal/",
         ] {
-            let response = hooks
-                .send_request(request(uri), config())
-                .expect("a denial is a guest-visible error, never a trap");
+            let response = hooks.dispatch(request(uri), config());
             assert!(
                 matches!(denial(response), ErrorCode::InternalError(Some(message)) if message == DENIED_MESSAGE),
                 "{uri} must be denied without a granted policy"
@@ -1307,9 +1643,7 @@ mod tests {
                 |_| EgressPolicy::new(&["example.com".to_string()], &[], &[], 4),
             ));
         let mut hooks = hooks(Some(service));
-        let response = hooks
-            .send_request(request("http://exa_mple.com/"), config())
-            .expect("a denial is a guest-visible error, never a trap");
+        let response = hooks.dispatch(request("http://exa_mple.com/"), config());
         assert!(matches!(
             denial(response),
             ErrorCode::InternalError(Some(message)) if message == DENIED_MESSAGE
@@ -1401,9 +1735,7 @@ mod tests {
                 |_| EgressPolicy::new(&["api.example".to_string()], &[], &[], 4),
             ));
         let mut hooks = hooks(Some(service));
-        let response = hooks
-            .send_request(request("http://api.example./"), config())
-            .expect("a malformed URI is a guest-visible error, never a trap");
+        let response = hooks.dispatch(request("http://api.example./"), config());
         assert!(
             matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
             "a trailing-dot authority must be refused as a malformed URI"
@@ -1428,9 +1760,7 @@ mod tests {
             "http://user@example.com/",
             "http://user:pass@example.com:8443/",
         ] {
-            let response = hooks
-                .send_request(request(uri), config())
-                .expect("a malformed URI is a guest-visible error, never a trap");
+            let response = hooks.dispatch(request(uri), config());
             assert!(
                 matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
                 "{uri} must be refused as a malformed URI"
@@ -1459,7 +1789,7 @@ mod tests {
     /// The connect budget arrives from the guest: `wasi:http`'s
     /// `request-options.set-connect-timeout` reaches `connect_timeout`
     /// unclamped, and `WasiHttpHooks::send_request` accepts whatever
-    /// `OutgoingRequestConfig` it is handed. A duration the monotonic clock
+    /// timeouts it is handed. A duration the monotonic clock
     /// cannot represent must therefore fail closed here rather than panic
     /// inside a host function.
     ///
@@ -1470,20 +1800,13 @@ mod tests {
     #[tokio::test]
     async fn an_unrepresentable_connect_budget_fails_closed_instead_of_panicking() {
         let mut hooks = hooks(Some(loopback_service()));
-        let config = OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::MAX,
-            first_byte_timeout: Duration::from_secs(1),
-            between_bytes_timeout: Duration::from_secs(1),
+        let config = SendTimeouts {
+            connect: Duration::MAX,
+            first_byte: Duration::from_secs(1),
+            between_bytes: Duration::from_secs(1),
         };
 
-        let response = hooks
-            .send_request(request("http://127.0.0.1:1/"), config)
-            .expect("a nonsense timeout is a guest-visible error, never a trap");
-        let HostFutureIncomingResponse::Pending(handle) = response else {
-            panic!("a granted destination is dialed asynchronously");
-        };
-        let outcome = handle.await.expect("the send task must not trap");
+        let outcome = hooks.dispatch(request("http://127.0.0.1:1/"), config).await;
         assert!(
             matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
             "an unrepresentable connect budget must fail closed, got: {outcome:?}"
@@ -1526,13 +1849,9 @@ mod tests {
             )
             .expect("the first connection takes the instance's only slot");
 
-        let response = hooks
-            .send_request(request(&format!("http://127.0.0.1:{port}/")), config())
-            .expect("a full budget is a guest-visible error, never a trap");
-        let HostFutureIncomingResponse::Pending(handle) = response else {
-            panic!("a granted destination is authorized asynchronously");
-        };
-        let outcome = handle.await.expect("the send task must not trap");
+        let outcome = hooks
+            .dispatch(request(&format!("http://127.0.0.1:{port}/")), config())
+            .await;
         assert!(
             matches!(outcome, Err(ErrorCode::ConnectionLimitReached)),
             "a full instance budget must be reported as such, got: {outcome:?}"
@@ -1583,11 +1902,10 @@ mod tests {
         let mut hooks = hooks(Some(service.clone()));
         let instance = hooks.scope.id().clone();
         let budget = Duration::from_millis(250);
-        let config = OutgoingRequestConfig {
-            use_tls: true,
-            connect_timeout: budget,
-            first_byte_timeout: Duration::from_secs(1),
-            between_bytes_timeout: Duration::from_secs(1),
+        let config = SendTimeouts {
+            connect: budget,
+            first_byte: Duration::from_secs(1),
+            between_bytes: Duration::from_secs(1),
         };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1596,13 +1914,9 @@ mod tests {
             .expect("a test runtime");
         let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
-            let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
-                .expect("a stalled peer is a guest-visible error, never a trap");
-            let HostFutureIncomingResponse::Pending(handle) = response else {
-                panic!("an authorized destination is dialed asynchronously");
-            };
-            handle.await.expect("the send task must not trap")
+            hooks
+                .dispatch(request(&format!("https://127.0.0.1:{port}/")), config)
+                .await
         });
         let elapsed = started.elapsed();
 
@@ -1741,6 +2055,172 @@ mod tests {
         (address, hits)
     }
 
+    /// A loopback peer that answers with a response head and the first two of
+    /// ten body bytes, then holds every connection open without another byte.
+    fn stalling_body_listener() -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let port = listener.local_addr().expect("loopback address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab");
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+            }
+        });
+        port
+    }
+
+    /// A guest that sets no timeout gets the one `wasi:http` applied for it
+    /// through wasmtime 47, stage by stage.
+    #[test]
+    fn unset_timeouts_default_to_what_wasi_http_applied_before() {
+        let default = Duration::from_secs(600);
+        assert_eq!(
+            SendTimeouts::from_options(None),
+            SendTimeouts {
+                connect: default,
+                first_byte: default,
+                between_bytes: default,
+            }
+        );
+        let connect_only = RequestOptions {
+            connect_timeout: Some(Duration::from_secs(2)),
+            ..RequestOptions::default()
+        };
+        assert_eq!(
+            SendTimeouts::from_options(Some(connect_only)),
+            SendTimeouts {
+                connect: Duration::from_secs(2),
+                first_byte: default,
+                between_bytes: default,
+            }
+        );
+    }
+
+    /// A response body that stops arriving fails with `connection-read-timeout`
+    /// after the between-bytes timeout, as `wasi:http` did itself through
+    /// wasmtime 47. From 48 this timeout lives in the send path, so without it a
+    /// peer could hold a guest's read, and the instance's connection slot, open
+    /// for as long as it liked.
+    #[tokio::test]
+    async fn a_response_body_that_stalls_between_frames_times_out() {
+        let port = stalling_body_listener();
+        let mut hooks = hooks(Some(loopback_service()));
+        let timeouts = SendTimeouts {
+            connect: Duration::from_secs(5),
+            first_byte: Duration::from_secs(5),
+            between_bytes: Duration::from_millis(200),
+        };
+        let SentResponse {
+            response,
+            worker: _connection,
+        } = hooks
+            .dispatch(request(&format!("http://127.0.0.1:{port}/")), timeouts)
+            .await
+            .expect("the response head arrives");
+        let mut body = response.into_body();
+
+        let first = body
+            .frame()
+            .await
+            .expect("a first frame")
+            .expect("the bytes the peer did send");
+        assert_eq!(first.into_data().expect("a data frame"), "ab");
+
+        let started = std::time::Instant::now();
+        let stalled = body
+            .frame()
+            .await
+            .expect("a stalled body ends in an error, not end-of-body");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                stalled,
+                Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)
+            ),
+            "a stalled body must time out between bytes, got: {stalled:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(3),
+            "the timeout must fire on the between-bytes budget, took {elapsed:?}"
+        );
+    }
+
+    /// Through the hook `wasi:http` actually calls, the connection task handed
+    /// back holds the instance's connection slot for as long as `wasi:http`
+    /// keeps it, which is while the response body is being read, and dropping
+    /// it frees the slot.
+    #[tokio::test]
+    async fn the_connection_task_holds_the_slot_until_wasi_http_drops_it() {
+        let port = stalling_body_listener();
+        let uri = format!("http://127.0.0.1:{port}/");
+        // One connection slot for the instance.
+        let mut hooks = hooks(Some(loopback_service()));
+
+        let (response, io) =
+            Pin::from(hooks.send_request(request(&uri), None, Box::new(async { Ok(()) })))
+                .await
+                .expect("a granted loopback destination answers");
+        assert!(
+            matches!(
+                hooks.dispatch(request(&uri), config()).await,
+                Err(ErrorCode::ConnectionLimitReached)
+            ),
+            "the open connection must still hold the only slot"
+        );
+
+        drop(response);
+        drop(io);
+        // Aborting the connection task takes effect on the runtime's next turn.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match hooks.dispatch(request(&uri), config()).await {
+                Ok(_) => break,
+                Err(ErrorCode::ConnectionLimitReached) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("the slot must be free once the task is dropped, got: {other:?}"),
+            }
+        }
+    }
+
+    /// `wasi:http` receives exactly the codes the hook chose. The denial is
+    /// answered before any I/O, so it resolves on its first poll with no async
+    /// runtime at all.
+    #[test]
+    fn wasi_http_receives_the_error_codes_the_hook_chose() {
+        let mut hooks = hooks(None);
+        let mut sent = Pin::from(hooks.send_request(
+            request("http://example.com/"),
+            None,
+            Box::new(async { Ok(()) }),
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(Err(error)) = sent.as_mut().poll(&mut cx) else {
+            panic!("a store without an egress service must be refused on the first poll");
+        };
+        assert!(
+            matches!(&error, wasmtime_wasi_http::Error::InternalError(Some(message)) if message == DENIED_MESSAGE),
+            "the masked denial must reach wasi:http unchanged, got: {error:?}"
+        );
+        assert!(matches!(
+            wasmtime_wasi_http::Error::from(dns_failure()),
+            wasmtime_wasi_http::Error::DnsError { rcode: Some(ref rcode), info_code: Some(0) }
+                if rcode == "address not available"
+        ));
+        assert!(matches!(
+            wasmtime_wasi_http::Error::from(connection_limit_reached()),
+            wasmtime_wasi_http::Error::ConnectionLimitReached
+        ));
+    }
+
     /// The pin holds across a changing resolver: the hook dials only the address
     /// set validated during authorization, never a later resolution.
     ///
@@ -1758,6 +2238,15 @@ mod tests {
     /// The request port matches A's port so the pinned answer passes the
     /// resolved-address port check, and the host is a public name so nothing but
     /// the pin selects which loopback endpoint is reached.
+    ///
+    /// The name is under the reserved `.invalid` TLD (RFC 6761), which no
+    /// resolver can answer. That covers the other way to regress: dialing by
+    /// name (`TcpStream::connect((host, port))`), which re-resolves through the
+    /// system resolver and never reaches the test resolver at all. With a real
+    /// name that mutation would fail only if live DNS happened not to return
+    /// listener A. Under `.invalid` it fails on every machine, online or not.
+    /// The resolver's call count then pins the other half: `authorize` resolves
+    /// exactly once.
     #[tokio::test]
     async fn the_hook_dials_only_the_pinned_answer_not_a_later_resolution() {
         let (pinned, pinned_hits) = counting_http_listener();
@@ -1767,8 +2256,9 @@ mod tests {
         // the one `authorize` pins — is A; any later resolution is B. The switch
         // is a deterministic counter, so nothing depends on DNS or address order.
         let calls = Arc::new(AtomicUsize::new(0));
+        let resolutions = Arc::clone(&calls);
         let resolver = move |_host: &str, _port: u16| {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if resolutions.fetch_add(1, Ordering::SeqCst) == 0 {
                 vec![pinned]
             } else {
                 vec![rebind]
@@ -1780,8 +2270,8 @@ mod tests {
                 // lets its (loopback) resolved address pass the class check —
                 // the same carveout every loopback destination here needs.
                 EgressPolicy::new(
-                    &["rebind.example.com".to_string()],
-                    &["rebind.example.com".to_string()],
+                    &["rebind.invalid".to_string()],
+                    &["rebind.invalid".to_string()],
                     &[],
                     4,
                 )
@@ -1790,16 +2280,12 @@ mod tests {
         );
         let mut hooks = hooks(Some(service));
 
-        let response = hooks
-            .send_request(
-                request(&format!("http://rebind.example.com:{}/", pinned.port())),
+        let outcome = hooks
+            .dispatch(
+                request(&format!("http://rebind.invalid:{}/", pinned.port())),
                 config(),
             )
-            .expect("an authorized destination is dialed asynchronously");
-        let HostFutureIncomingResponse::Pending(handle) = response else {
-            panic!("an authorized destination is dialed asynchronously");
-        };
-        let outcome = handle.await.expect("the send task must not trap");
+            .await;
 
         assert!(
             outcome.is_ok(),
@@ -1815,6 +2301,11 @@ mod tests {
             0,
             "a re-resolved answer must never be dialed: the pin is the only \
              address set the hook may use"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the name must be resolved exactly once, by authorization"
         );
     }
 
@@ -2025,31 +2516,26 @@ ok",
         (address, completed)
     }
 
-    fn tls_config() -> OutgoingRequestConfig {
-        OutgoingRequestConfig {
-            use_tls: true,
-            connect_timeout: Duration::from_secs(5),
-            first_byte_timeout: Duration::from_secs(5),
-            between_bytes_timeout: Duration::from_secs(5),
+    fn tls_config() -> SendTimeouts {
+        SendTimeouts {
+            connect: Duration::from_secs(5),
+            first_byte: Duration::from_secs(5),
+            between_bytes: Duration::from_secs(5),
         }
     }
 
     /// Drive one authorized HTTPS request to a loopback port and return what
     /// the guest would have received.
-    fn https_outcome(port: u16) -> Result<IncomingResponse, ErrorCode> {
+    fn https_outcome(port: u16) -> Result<SentResponse, ErrorCode> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("a test runtime");
         runtime.block_on(async move {
             let mut hooks = hooks(Some(loopback_service()));
-            let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), tls_config())
-                .expect("an authorized destination is dialed asynchronously");
-            let HostFutureIncomingResponse::Pending(handle) = response else {
-                panic!("an authorized destination is dialed asynchronously");
-            };
-            handle.await.expect("the send task must not trap")
+            hooks
+                .dispatch(request(&format!("https://127.0.0.1:{port}/")), tls_config())
+                .await
         })
     }
 
@@ -2316,11 +2802,10 @@ ok",
         let mut hooks = hooks(Some(service.clone()));
         let instance = hooks.scope.id().clone();
         let budget = Duration::from_millis(150);
-        let config = OutgoingRequestConfig {
-            use_tls: true,
-            connect_timeout: budget,
-            first_byte_timeout: Duration::from_secs(1),
-            between_bytes_timeout: Duration::from_secs(1),
+        let config = SendTimeouts {
+            connect: budget,
+            first_byte: Duration::from_secs(1),
+            between_bytes: Duration::from_secs(1),
         };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2329,13 +2814,9 @@ ok",
             .expect("a test runtime");
         let (outcome, elapsed) = runtime.block_on(async move {
             let started = std::time::Instant::now();
-            let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
-                .expect("an authorized destination is dialed asynchronously");
-            let HostFutureIncomingResponse::Pending(handle) = response else {
-                panic!("an authorized destination is dialed asynchronously");
-            };
-            let outcome = handle.await.expect("the send task must not trap");
+            let outcome = hooks
+                .dispatch(request(&format!("https://127.0.0.1:{port}/")), config)
+                .await;
             (outcome, started.elapsed())
         });
 

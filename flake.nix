@@ -68,6 +68,7 @@
                 [ "--features" (pkgs.lib.concatStringsSep "," features) ];
             doCheck = false;
             buildInputs = [ pkgs.stdenv.cc.cc ];
+            meta = { mainProgram = pname; };
           };
         # >>> end generated:flake-packages <<<
         webPkgs = pkgs.callPackage ./nix/web.nix { inherit rustToolchain; };

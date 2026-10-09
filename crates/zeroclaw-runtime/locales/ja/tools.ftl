@@ -1,4 +1,4 @@
-tool-backup = ワークスペースバックアップの作成、一覧表示、検証、復元
+tool-backup = 共有データディレクトリのバックアップを作成、一覧表示、検証、復元
 tool-browser = プラグイン可能なバックエンド（agent-browser、rust-native、computer_use）を使用したWeb/ブラウザオートメーション。DOMアクションに加えて、オプションのOSレベルアクション（mouse_move、mouse_click、mouse_drag、key_type、key_press、screen_capture）をコンピュータユースサイドカー経由でサポート。'snapshot'を使用して対話的要素をref（@e1、@e2）にマップします。openアクション向けにbrowser.allowed_domainsを強制します。
 tool-browser-delegate = ブラウザ対応CLIへのブラウザベースのタスクの委譲。Teams、Outlook、Jira、Confluenceなどのウェブアプリケーションと相互作用するため
 tool-browser-open = 承認されたHTTPS URLをシステムブラウザで開く。セキュリティ制約：許可リストのみのドメイン、ローカル/プライベートホストなし、スクレイピングなし。
@@ -34,7 +34,7 @@ tool-cron-remove = IDでcronジョブを削除
 tool-cron-run = cronジョブを即座に強制実行し、実行履歴を記録
 tool-cron-runs = cronジョブの最近の実行履歴を一覧表示
 tool-cron-update = 既存のcronジョブにパッチを適用（スケジュール、コマンド、プロンプト、有効、配信、モデル等）
-tool-data-management = ワークスペースデータ保持、削除、ストレージ統計
+tool-data-management = 共有データディレクトリの保持プレビューとストレージ統計
 tool-delegate = 特殊なエージェントへの小タスクの委譲。用途：異なるモデルから利益を得られるタスク（例：高速要約、深い推論、コード生成）。サブエージェントはデフォルトで単一のプロンプトを実行します。agentic=trueでは、フィルタ済みツール呼び出しループで反復できます。
 tool-file-edit = 完全一致する文字列を新しいコンテンツに置き換えてファイルを編集
 tool-file-download = 設定済みのリモートエンドポイントからファイルをダウンロードし、エージェントのワークスペースに書き込みます。取得するドキュメントの識別子とワークスペース相対の宛先パスを指定します。エンドポイントURLはホスト設定で固定されており、モデルが制御することはありません。バイトは直接ディスクにストリーミングされ、モデルのコンテキストには読み込まれません。HTTPステータス、書き込まれたバイト数、宛先パスを返します。
@@ -99,7 +99,7 @@ tool-project-intel = プロジェクト配信インテリジェンス：ステ�
 tool-proxy-config = ZeroClawプロキシ設定を管理（スコープ：environment | zeroclaw | services）。ランタイムおよびプロセス環境アプリケーション含む
 tool-pushover = Pushover通知をデバイスに送信します。.envファイルにPUSHOVER_TOKENおよびPUSHOVER_USER_KEYが必要。
 tool-schedule = スケジュール済みシェルのみのタスクを管理します。アクション：create/add/once/list/get/cancel/remove/pause/resume。警告：このツールは、出力がログに記録されるのみで、チャネルに配信されないシェルジョブを作成します。Discord/Telegram/Slack/Matrixにスケジュール済みメッセージを送信するには、job_type='agent'とdelivery配信設定（例：{"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}）付きのcron_addツールを使用してください。
-tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。ファイルパスと基数64エンコード済みPNGデータを返します。
+tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。保存先のファイルパスを返します。
 tool-browser-screenshot-error-path-not-allowed = スクリーンショットのパス「{ $path }」はワークスペースの許可リストに含まれていません
 tool-browser-screenshot-error-parent-not-exist = スクリーンショットのパス「{ $path }」の親ディレクトリ「{ $parent }」が存在しません
 tool-browser-screenshot-error-path-outside-workspace = スクリーンショットのパス「{ $path }」は「{ $canonical }」に解決されますが、ワークスペース外です

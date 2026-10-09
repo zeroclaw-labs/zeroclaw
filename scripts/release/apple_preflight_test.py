@@ -12,6 +12,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -96,8 +97,14 @@ class PreflightTest(unittest.TestCase):
         env = self.env | values | {"PREFLIGHT_TEST_RESPONSES": json.dumps(responses)}
         output = io.StringIO()
         # Clear inherited credentials and all other Apple/Tauri configuration.
+        # Patch the helper's own `time` binding, not the shared `time` module:
+        # subprocess.run() also calls time.sleep() while it waits to reap the
+        # fake xcrun on some interpreters, and patching the module globally
+        # recorded that as a retry delay whenever the child exited late.
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(output), \
-                contextlib.redirect_stderr(output), mock.patch.object(self.helper.time, "sleep") as sleep:
+                contextlib.redirect_stderr(output), \
+                mock.patch.object(self.helper, "time", spec=time) as fake_time:
+            sleep = fake_time.sleep
             code = self.helper.main()
         log = output.getvalue()
         for value in values.values():
