@@ -388,6 +388,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_non_core() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "daily1".into(),
             content: "User prefers Rust".into(),
@@ -415,6 +416,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_already_superseded() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "old_pref".into(),
             content: "User prefers Rust for systems work".into(),
@@ -443,6 +445,7 @@ mod tests {
     #[test]
     fn conflict_detection_identical_content_not_flagged() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "pref".into(),
             content: "User prefers Rust".into(),
@@ -1054,6 +1057,7 @@ mod tests {
     #[test]
     fn memory_entry_serde_roundtrip_with_new_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "test-id".into(),
             key: "test-key".into(),
             content: "test content".into(),

@@ -197,6 +197,42 @@ pub struct CronRun {
     pub status: String,
     pub output: Option<String>,
     pub duration_ms: Option<i64>,
+    /// Execution axis of the separated run-outcome triple (`ok | error`).
+    /// `None` on rows recorded before the triple existed.
+    #[serde(default)]
+    pub execution: Option<String>,
+    /// Delivery axis (`not_required | delivered | failed | skipped`).
+    /// `None` on rows recorded before the triple existed.
+    #[serde(default)]
+    pub delivery: Option<String>,
+    /// Persistence axis (`not_bound | persisted | failed`). `None` on rows
+    /// recorded before the triple existed.
+    #[serde(default)]
+    pub persistence: Option<String>,
+    /// The initiating principal stamped at dispatch, verbatim — immune to
+    /// later job renames or owner changes. `None` on rows recorded before
+    /// provenance existed.
+    #[serde(default)]
+    pub principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+    /// The executing agent's canonical alias at time of action. `None` on
+    /// rows recorded before provenance existed.
+    #[serde(default)]
+    pub executing_agent: Option<String>,
+    /// The job's `source` (`imperative` / `declarative`) at time of action;
+    /// keeps a run row retained past its job's deletion reachable by the
+    /// cleanup that owns that id space. `None` on rows recorded before
+    /// provenance existed.
+    #[serde(default)]
+    pub job_source: Option<String>,
+    /// Durable CURRENT cleanup owner: stamped as the executing agent at
+    /// insert and re-pointed by agent renames, unlike the immutable
+    /// `executing_agent` historical fact. Owner-scoped deletion and
+    /// authorized retained-row reads key on this. How a `None` (pre-column
+    /// row) resolves — live-job fallback or quarantine — is owned by the
+    /// store's read/upgrade paths; see `list_runs_for_agent` and
+    /// `initialize_schema` in `cron::store`.
+    #[serde(default)]
+    pub owner_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

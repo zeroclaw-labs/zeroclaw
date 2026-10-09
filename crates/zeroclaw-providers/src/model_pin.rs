@@ -77,6 +77,11 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, _model: &str) -> bool {
+        self.inner
+            .supports_exact_request_replay(request, &self.pinned_model)
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
     }
@@ -280,6 +285,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            model == "pinned-model" && request.tools.is_none()
+        }
+
         fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: model == "pinned-model",
@@ -333,6 +342,32 @@ mod tests {
     }
 
     struct AccountedLeaf;
+
+    #[test]
+    fn exact_replay_uses_pinned_model_and_preserves_request_restrictions() {
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        for (pin, expected) in [("pinned-model", true), ("other-model", false)] {
+            let provider = ModelPinnedProvider::builder("pinned")
+                .pinned_model(pin)
+                .inner(Box::new(ModelAwareCapabilityProvider))
+                .build();
+            assert_eq!(
+                provider.supports_exact_request_replay(request, "ignored-model"),
+                expected
+            );
+            assert!(!provider.supports_exact_request_replay(
+                ChatRequest {
+                    tools: Some(&[]),
+                    ..request
+                },
+                "pinned-model"
+            ));
+        }
+    }
 
     impl zeroclaw_api::attribution::Attributable for AccountedLeaf {
         fn role(&self) -> zeroclaw_api::attribution::Role {

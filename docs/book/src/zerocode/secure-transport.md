@@ -19,7 +19,11 @@ There are two TLS layers, and only one of them is the security boundary:
 - **Inner mTLS (the real boundary).** TLS 1.3 only, mutually authenticated. The
   client presents a daemon-issued certificate; the daemon presents its server
   leaf. This is the RPC plane. There is **no** server-only / unauthenticated path
-  on it - a client certificate is always required.
+  on it - a client certificate is always required. The certificate admits the
+  *device*; it is not an RPC credential. Every remote `initialize` must also
+  carry a bearer `auth_token` that identifies the *principal*, or the daemon
+  refuses it with `AUTH_REQUIRED` (`-32010`). See
+  [Bearer token](./remote.md#bearer-token-required-for-every-connection).
 - **Outer TLS (a metadata boundary).** When a relay is in the path, the relay
   terminates an outer TLS + WebSocket session and forwards opaque ciphertext. It
   never holds a key that can read the inner RPC. On the direct topology there is
@@ -125,9 +129,16 @@ caches, under `<config-dir>/tls/`:
 | `ca.crt` | Daemon CA chain, pinned for the RPC plane | default umask |
 | `profile.json` | Cached `device_id`, `not_after`, relay profile | default umask |
 
-Every later run is zero-config (`zerocode --connect wss://<remote-host>:9781`,
-or just `zerocode` if `uri` is in config). The cert auto-renews at ~50% of its
-lifetime (~15 days) over the live mTLS session; a revoked cert cannot self-renew.
+Later runs reuse the cached certificate without enrolling again. The cert
+auto-renews at ~50% of its lifetime (~15 days) over the live mTLS session; a
+revoked cert cannot self-renew.
+
+Enrollment issues a certificate only, not a bearer token. Before the daemon
+accepts a session, pair with the gateway for a `zc_...` token and give it to
+zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
+[Bearer token](./remote.md#bearer-token-required-for-every-connection)). With the
+token in place, `zerocode --connect wss://<remote-host>:9781` (or just `zerocode`
+if `uri` is in config) needs no more flags.
 
 Enrollment endpoint defaults: `--enroll-host` defaults to `--connect`'s host;
 `--enroll-port` defaults to `9782`.
@@ -170,6 +181,9 @@ ca_cert_path     = "/abs/path/ca.crt"
 client_cert_path = "/abs/path/client.crt"
 client_key_path  = "/abs/path/client.key"
 ```
+
+Plain `zerocode` still needs a bearer token, from `ZEROCLAW_AUTH_TOKEN` or from
+`auth_token_file` / `auth_token` under `[connection.wss]`.
 
 > A certless client that reaches the WSS plane without enrolling gets an
 > actionable "enroll first" message (and the daemon logs the rejected
@@ -217,7 +231,9 @@ mode = "open"
 allow = []
 deny  = []
 # A public (non-loopback) relay MUST gate registration: set a shared secret here
-# (each daemon presents it via [relay] relay_token) or use mode = "allowlist".
+# (each daemon presents it via [relay] token) or use mode = "allowlist".
+# A relay that serves daemons enrolled with `zeroclaw relay claim` must use
+# mode = "allowlist" and leave relay_token unset (see 2d).
 # Otherwise an OPEN, tokenless relay on a public bind refuses to start, because
 # any daemon on the internet could register and squat unclaimed node-ids. (A
 # loopback bind for local development is exempt; a deliberate open public relay
@@ -256,6 +272,12 @@ control. `allowlist` mode keys on the daemon's registration pubkey fingerprint
 add fingerprints to `allow` (and reload with `kill -HUP <pid>`). A node-id is
 bound to its first registrant's pubkey, so a different key cannot hijack a live
 node-id (it gets `node_taken`).
+
+The relay checks `relay_token` before the allow list, in every mode. A relay that
+serves self-serve claims (2d) must therefore use `allowlist` with `relay_token`
+unset: a claim never delivers the shared token, so a claimed daemon would be
+refused with `forbidden: bad relay token`. The allow list already gates a public
+relay on its own, so the token adds nothing there.
 
 **Docker.** `apps/zerorelay/Dockerfile` runs distroless with
 `CMD ["--config", "/etc/zerorelay/relay.toml"]` and a shell-less
@@ -312,6 +334,44 @@ For a relay that authenticates daemons on the outer layer too, set the
 relay's `[admission].outer_client_auth = "required"` + `outer_client_ca`, and on
 the daemon `[relay].outer_client_cert` / `outer_client_key`. This is additive on
 the outer TLS and never touches the inner mTLS.
+
+### 2d. Self-serve enrollment with `zeroclaw relay claim`
+
+When the relay is run alongside a ZeroRelay control plane, an operator can enroll
+a daemon with a one-time claim token instead of editing the relay's allow list by
+hand. The control plane issues the token and prints the command to run on the
+daemon host:
+
+```sh
+zeroclaw relay claim <TOKEN> --control https://control.example.com
+```
+
+The daemon signs the claim with its existing registration key, so the fingerprint
+the control plane allow-lists is exactly the key the daemon registers with. On a
+verified success the control plane adds that fingerprint to the relay's allow
+list and reloads the relay, and the daemon writes `[relay]` `enabled`, `url`,
+`node_id`, and `relay_host`. Start or restart the daemon to register.
+
+Before claiming:
+
+- **The relay must admit by fingerprint alone.** Use `mode = "allowlist"` and
+  leave `relay_token` unset (see 2a). A claim does not deliver the shared token.
+- **Enable `[wss]`.** The relay refuses registration until the WSS listener is
+  enabled. A claim made without it is still saved, and takes effect on the next
+  start after `[wss]` is enabled.
+- **Configure trust for the relay's outer certificate first**, as in 2b
+  (`relay_ca_path`, `tofu`, or public roots). The claim writes only the four
+  fields above and leaves the rest of `[relay]` alone.
+- **Do not set the claim-managed fields through environment overrides.** If
+  `relay.enabled`, `relay.url`, `relay.node_id`, or `relay.relay_host` is
+  overridden, the claim refuses before sending anything, because the override
+  would discard the written values.
+
+`--control` must be `https`, or `http` on a loopback address. Redirects and
+proxies are disabled so the token cannot reach another origin. Every refusal says
+`no config was written`. A token is single-use: once the control plane accepts
+it, it is spent, even if the daemon then refuses the response (for example an
+unusable relay address). In that case, fix the cause and mint a new token.
 
 ---
 
@@ -457,6 +517,36 @@ enroll through it; daemon registration, zerocode clients, and the tunneled RPC
 plane are unaffected. The enrollment page itself carries the same trust note,
 and `zerorelay` logs a warning at startup while the frontdoor is on.
 
+#### Prefilled enrollment links
+
+To spare a phone user from typing a long node id, a link can carry the node id
+and the pairing code, and the page fills both fields when it loads:
+
+```text
+https://relay.example.com/#node=<node-id>&code=<pairing-code>
+https://relay.example.com/?node=<node-id>&code=<pairing-code>
+```
+
+Prefer the `#` form. A URL fragment is never sent to any server, so the pairing
+code stays out of reverse-proxy and CDN access logs; the `?` form is accepted
+too. The relay itself drops the query string before routing and never logs or
+reflects it, and serves the page with `cache-control: no-store` and
+`referrer-policy: no-referrer`.
+
+The page only fills the fields. It does not fetch the agent CA or submit
+anything: the user still presses **Fetch the agent CA** and confirms the
+short-auth-string. Values that do not match the node-id or pairing-code shape
+are ignored, and both parameters are removed from the address bar and the
+current history entry as soon as the page reads them, so a copied or bookmarked
+URL does not carry the code.
+
+The browser can still record the link as it was first opened in its own history
+database (Chrome does, for both the `?` and `#` forms); no page can rewrite that.
+What makes that copy harmless is the code itself: it is consumed by the first
+successful enrollment and expires ten minutes after it is minted, so the stored
+link is spent or dead. Treat a link that carries an unused code like the code
+itself, and prefer enrolling promptly after minting.
+
 ---
 
 ## Configuration reference
@@ -547,6 +637,9 @@ Subcommands: `healthcheck [--addr 127.0.0.1:8443]`, `status --file <path>`.
 | `direct_attempts` | `2` | - |
 | `direct_timeout_secs` | `3` | - |
 | `reprobe_secs` | `30` | - |
+| `auth_token` | (none) | `ZEROCLAW_AUTH_TOKEN` env (wins over both token keys) |
+| `auth_token_file` | (none) | - (wins over `auth_token`; must be owner-only) |
+| `auth_provider` | `native` (pairing token) | - (e.g. `oidc.<alias>`) |
 
 | `[connection.wss.tls]` key | Default | CLI override |
 |----------------------------|---------|--------------|

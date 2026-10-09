@@ -56,7 +56,26 @@ pub(crate) fn record_llm_failure(
     );
 }
 
+/// What the in-loop context-overflow recovery attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextRecovery {
+    /// The failure was not a context-window overflow.
+    NotOverflow,
+    /// History was trimmed; the provider call is worth retrying.
+    Recovered,
+    /// It was an overflow and there is nothing left to trim.
+    Unrecoverable,
+}
+
+impl ContextRecovery {
+    pub(crate) fn recovered(self) -> bool {
+        self == Self::Recovered
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_recover_context_overflow(
+    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
     iteration: usize,
@@ -64,11 +83,13 @@ pub(crate) async fn try_recover_context_overflow(
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // Owner-tracked breadcrumb provenance for `history` (see
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
     crumb_present: &mut bool,
-) -> bool {
+) -> ContextRecovery {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
             WARN,
@@ -93,6 +114,7 @@ pub(crate) async fn try_recover_context_overflow(
         // retry-sizing limitation itself predates this token-accounting
         // feature.
         let tokens_now = estimate_history_tokens(history);
+        let retention_before = super::retention_layout(history, *crumb_present);
         // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
@@ -118,6 +140,12 @@ pub(crate) async fn try_recover_context_overflow(
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
         }
         *history = recovered_history;
+        super::remap_memory_after_trim(
+            injected_memory_preamble,
+            retention_before,
+            history,
+            *crumb_present,
+        );
         if trimmed {
             ::zeroclaw_log::record!(
                 INFO,
@@ -147,6 +175,7 @@ pub(crate) async fn try_recover_context_overflow(
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                         dropped_messages,
+                        dropped_turns,
                         kept_turns,
                         reason: reason.clone(),
                         token_budget: reported_token_budget,
@@ -157,6 +186,11 @@ pub(crate) async fn try_recover_context_overflow(
                         ),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
+                        retained_context: Some(super::retained_context_snapshot(
+                            injected_memory_preamble,
+                            history,
+                            *crumb_present,
+                        )),
                     })
                     .await;
             }
@@ -165,8 +199,8 @@ pub(crate) async fn try_recover_context_overflow(
                 kept_turns,
                 reason,
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
                 token_budget: reported_token_budget,
                 tokens_before: Some(tokens_now as u64),
                 tokens_after: Some(tokens_after as u64),
@@ -174,7 +208,7 @@ pub(crate) async fn try_recover_context_overflow(
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                 unsatisfiable_floor: None,
             });
-            return true;
+            return ContextRecovery::Recovered;
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
@@ -203,8 +237,9 @@ pub(crate) async fn try_recover_context_overflow(
                 "Context overflow unrecoverable: only one turn left, cannot trim further"
             );
         }
+        return ContextRecovery::Unrecoverable;
     }
-    false
+    ContextRecovery::NotOverflow
 }
 
 #[cfg(test)]
@@ -212,6 +247,170 @@ mod tests {
     use super::*;
     use crate::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
+
+    #[tokio::test]
+    async fn retained_snapshot_tracks_injected_memory_across_retry_turn_trims() {
+        let preamble = "private recalled memory\n";
+        let genuine = format!("{preamble}genuine retry text");
+        let signature = serde_json::json!({"opaque_signature": "retain-this-signature"});
+        let call = zeroclaw_providers::ToolCall {
+            id: "listing-call".into(),
+            name: "glob_search".into(),
+            arguments: "{}".into(),
+            extra_content: Some(signature.clone()),
+        };
+        let mut history = vec![
+            ChatMessage::system("private system"),
+            ChatMessage::user("old ".repeat(4000)),
+            ChatMessage::assistant("old reply"),
+            ChatMessage::user(format!("{preamble}current request")),
+            ChatMessage::assistant("current progress"),
+            ChatMessage::assistant(crate::agent::loop_::build_native_assistant_history("", &[call], Some("private reasoning"))),
+            ChatMessage { role: "tool".into(), content: serde_json::json!({"tool_call_id": "listing-call", "content": "/tmp/listed-image.png"}).to_string() },
+            ChatMessage::user(genuine.clone()),
+        ];
+        let mut injected = Some(super::super::MemoryPreamble {
+            preamble: preamble.into(),
+            index: 3,
+        });
+        let mut crumb = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let error = anyhow::Error::msg("maximum context length exceeded");
+        assert_eq!(
+            super::try_recover_context_overflow(
+                &mut injected,
+                &mut history,
+                &error,
+                0,
+                Some(&tx),
+                None,
+                &NoopObserver,
+                limits(32_000),
+                None,
+                "test",
+                &mut crumb,
+            )
+            .await,
+            ContextRecovery::Recovered
+        );
+        let first = rx.try_recv().unwrap();
+        let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            retained_context: Some(first),
+            ..
+        } = first
+        else {
+            panic!("real trim must include its retained projection");
+        };
+        let json = serde_json::to_string(&first.retained_messages).unwrap();
+        assert!(!json.contains("private system"));
+        assert_eq!(json.matches("private recalled memory").count(), 1);
+        assert!(json.contains("genuine retry text"));
+        assert!(!json.contains("private reasoning"));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("typed-trim", "agent", "/tmp", None)
+            .unwrap();
+        store
+            .persist_retained_context_seed("typed-trim", &first.retained_messages, first.breadcrumb)
+            .unwrap();
+        drop(store);
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let retained = store
+            .load_session("typed-trim")
+            .unwrap()
+            .unwrap()
+            .retained_context
+            .unwrap();
+        assert!(retained.iter().any(|message| matches!(message,
+            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls { tool_calls, reasoning_content: None, .. }
+                if tool_calls[0].extra_content.as_ref() == Some(&signature))));
+        assert!(retained.iter().any(|message| matches!(message,
+            zeroclaw_api::model_provider::ConversationMessage::ToolResults(results)
+                if results[0].tool_name == "glob_search" && results[0].content == "/tmp/listed-image.png")));
+        // Internal retry feedback is a newer user boundary. A later trim may
+        // remove the injected message itself; never strip the same-looking
+        // genuine input that then occupies a nearby position.
+        assert_eq!(
+            super::try_recover_context_overflow(
+                &mut injected,
+                &mut history,
+                &error,
+                1,
+                Some(&tx),
+                None,
+                &NoopObserver,
+                limits(32_000),
+                None,
+                "test",
+                &mut crumb,
+            )
+            .await,
+            ContextRecovery::Recovered
+        );
+        let second = rx.try_recv().unwrap();
+        let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            retained_context: Some(second),
+            ..
+        } = second
+        else {
+            panic!("second trim must include its retained projection");
+        };
+        assert!(injected.is_none());
+        assert!(second.retained_messages.iter().any(|message| matches!(message,
+            zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content == genuine)));
+    }
+
+    // Keep the existing recovery tests focused on sizing; the test below
+    // calls the production seam with an explicit turn identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_recover_context_overflow(
+        injected_memory_preamble: &mut Option<super::super::MemoryPreamble>,
+        history: &mut Vec<ChatMessage>,
+        error: &anyhow::Error,
+        iteration: usize,
+        event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+        on_delta: Option<&tokio::sync::mpsc::Sender<super::super::events::DraftEvent>>,
+        observer: &dyn Observer,
+        context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+        crumb_present: &mut bool,
+    ) -> ContextRecovery {
+        super::try_recover_context_overflow(
+            injected_memory_preamble,
+            history,
+            error,
+            iteration,
+            event_tx,
+            on_delta,
+            observer,
+            context_limits,
+            None,
+            "test",
+            crumb_present,
+        )
+        .await
+    }
+
+    #[derive(Default)]
+    struct TrimObserver(std::sync::Mutex<Vec<ObserverEvent>>);
+
+    impl Observer for TrimObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.0.lock().expect("trim events lock").push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "trim-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn flush(&self) {}
+    }
 
     fn overflowing_history() -> Vec<ChatMessage> {
         let big = "x".repeat(4000);
@@ -221,6 +420,34 @@ mod tests {
             h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
         }
         h
+    }
+
+    #[tokio::test]
+    async fn recovery_observer_identifies_the_effective_turn() {
+        let mut history = overflowing_history();
+        let observer = TrimObserver::default();
+        let recovered = super::try_recover_context_overflow(
+            &mut None,
+            &mut history,
+            &anyhow::Error::msg("maximum context length exceeded"),
+            1,
+            None,
+            None,
+            &observer,
+            limits(32_000),
+            Some("effective-agent"),
+            "turn-1",
+            &mut false,
+        )
+        .await;
+        assert_eq!(recovered, ContextRecovery::Recovered);
+        let events = observer.0.lock().expect("trim events lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::HistoryTrimmed { agent_alias, turn_id, .. }
+                if agent_alias.as_deref() == Some("effective-agent")
+                    && turn_id.as_deref() == Some("turn-1")
+        )));
     }
 
     fn limits(context_token_budget: usize) -> zeroclaw_config::schema::ResolvedContextLimits {
@@ -244,6 +471,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -255,7 +483,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let delta = delta_rx
             .try_recv()
             .expect("context recovery must emit a lifecycle delta");
@@ -277,6 +509,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -288,7 +521,11 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "a non-overflow error must not report recovery");
+        assert_eq!(
+            recovered,
+            ContextRecovery::NotOverflow,
+            "a non-overflow error must not report recovery"
+        );
         assert!(
             delta_rx.try_recv().is_err(),
             "no lifecycle state may be emitted when compaction never ran"
@@ -313,6 +550,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -324,8 +562,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !recovered,
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
             "an overflow with a single turn cannot be recovered"
         );
         assert_eq!(
@@ -347,6 +586,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -358,7 +598,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         // The retried history must carry the model-visible breadcrumb after the
         // leading system messages, matching the turn-boundary contract.
         let breadcrumb_text = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
@@ -370,6 +614,7 @@ mod tests {
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
                 token_budget,
@@ -378,8 +623,10 @@ mod tests {
                 tokens_before_source,
                 tokens_after_source,
                 unsatisfiable_floor: _,
+                retained_context: _,
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
+                assert!(dropped_turns > 0, "must report dropped turns");
                 assert!(kept_turns >= 1, "must keep at least the current turn");
                 assert_eq!(
                     reason,
@@ -430,6 +677,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -441,7 +689,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -477,6 +729,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -488,7 +741,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed { token_budget, .. } => {
@@ -518,6 +775,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -529,8 +787,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !recovered,
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
             "single-turn floor overflow must not retry (no #5808 loop)"
         );
         assert!(
@@ -554,6 +813,7 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -565,7 +825,11 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "a non-overflow error must not trigger recovery");
+        assert_eq!(
+            recovered,
+            ContextRecovery::NotOverflow,
+            "a non-overflow error must not trigger recovery"
+        );
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
     }
 
@@ -595,6 +859,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let recovered = try_recover_context_overflow(
+            &mut None,
             &mut history,
             &err,
             1,
@@ -605,7 +870,11 @@ mod tests {
             &mut false,
         )
         .await;
-        assert!(!recovered, "floor-dominates overflow must not recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
+            "floor-dominates overflow must not recover"
+        );
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
         // deadline, tolerating `Lagged` from parallel broadcast traffic.

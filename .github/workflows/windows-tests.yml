@@ -247,7 +247,7 @@ jobs:
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --bin zeroclaw \
-              plugin_registry:: 2>&1 | tee "$plugin_cli_log"
+              plugin_registry:: plugins:: egress 2>&1 | tee "$plugin_cli_log"
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \

@@ -124,6 +124,7 @@ fn from_wit_category(cat: WitMemoryCategory) -> MemoryCategory {
 
 fn from_wit_entry(e: WitMemoryEntry) -> MemoryEntry {
     MemoryEntry {
+        principal_id: None,
         id: e.id,
         key: e.key,
         content: e.content,

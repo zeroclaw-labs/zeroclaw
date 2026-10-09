@@ -225,18 +225,90 @@ pub fn validate_only_with_surface(
     if ok { Ok(()) } else { Err(errors) }
 }
 
+/// Terminal outcome of one quickstart application.
+#[derive(Debug)]
+pub enum QuickstartApplyOutcome {
+    /// Config persisted (and published, when the caller completed the
+    /// staged apply as a config commit) and every personality file moved
+    /// into place.
+    Applied(AppliedAgent),
+    /// Config persisted and published, but a post-commit side effect
+    /// (personality-file installation) failed. The committed config is
+    /// NOT rolled back — the agent is valid without the files — and the
+    /// errors are reported truthfully so the operator can repair the
+    /// files.
+    CommittedWithSideEffectErrors {
+        agent: AppliedAgent,
+        errors: Vec<QuickstartError>,
+    },
+}
+
+/// One staged quickstart application: a validated, mutated working config
+/// plus its personality temp files, ready for the irreversible
+/// persist-and-publish phase. Created by [`stage_apply`]; completed either
+/// as a one-shot ([`complete_staged_apply`], for private-config callers
+/// like the CLI) or as an admitted config commit
+/// ([`complete_staged_apply_as_commit`], for the supervised transports).
+pub struct StagedQuickstartApply {
+    working: Box<Config>,
+    staged_files: Vec<StagedPersonalityWrite>,
+    applied: AppliedAgent,
+    surface: Surface,
+    started: std::time::Instant,
+}
+
 pub async fn apply(
     submission: BuilderSubmission,
     config: &mut Config,
-) -> Result<AppliedAgent, Vec<QuickstartError>> {
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
     apply_with_surface(submission, config, Surface::Web).await
 }
 
+/// One-shot quickstart application for callers that own a private
+/// `Config` with no supervised publication domain (the CLI). Persists the
+/// staged config and installs the personality files; there is no live
+/// publication to make, so a post-commit side-effect failure is reported
+/// without any publication semantics.
 pub async fn apply_with_surface(
     submission: BuilderSubmission,
     config: &mut Config,
     surface: Surface,
-) -> Result<AppliedAgent, Vec<QuickstartError>> {
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    apply_with_surface_checked(submission, config, surface, &|_| Ok(())).await
+}
+
+/// One-shot application with a policy compile check before persistence.
+pub async fn apply_with_surface_checked(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    staged_check: &(dyn Fn(&Config) -> Result<(), String> + Sync),
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let staged = stage_apply_checked(submission, config, surface, staged_check)?;
+    complete_staged_apply(staged).await
+}
+
+/// Validate one submission and stage it onto a working config clone:
+/// every mutation (provider, presets, channels, peer groups, agent,
+/// completion flag) plus personality-file staging to tempfiles. No
+/// irreversible work happens here — a rejected submission returns with
+/// nothing on disk changed, and dropping the returned staging (or never
+/// completing it) cleans up its temp files.
+pub fn stage_apply(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+) -> Result<StagedQuickstartApply, Vec<QuickstartError>> {
+    stage_apply_checked(submission, config, surface, &|_| Ok(()))
+}
+
+/// Compile the staged authorization policy before any persistent write.
+pub fn stage_apply_checked(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    staged_check: &(dyn Fn(&Config) -> Result<(), String> + Sync),
+) -> Result<StagedQuickstartApply, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
 
@@ -298,6 +370,29 @@ pub async fn apply_with_surface(
                 &[("err", &err.to_string())],
             )]
         })?;
+    // Quickstart shares the daemon's configuration source of truth. Validate
+    // the auth section before its first persistent write so an RPC response
+    // can never say a rejected policy was not saved after disk has changed.
+    config.validate_auth().map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err.to_string())],
+        )]
+    })?;
+    staged_check(config).map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err)],
+        )]
+    })?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -309,7 +404,70 @@ pub async fn apply_with_surface(
         "quickstart: completion flag flipped"
     );
 
-    let dirty_count = config.dirty_paths.len();
+    // The caller's config stays mutated exactly as the historical
+    // one-shot path left it; the staging carries its own copy into the
+    // irreversible phase.
+    Ok(StagedQuickstartApply {
+        working: Box::new(config.clone()),
+        staged_files,
+        applied,
+        surface,
+        started,
+    })
+}
+
+/// Persist one staged quickstart and install its personality files
+/// without a publication domain. A persistence failure returns with
+/// nothing committed; a personality failure returns
+/// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] because the
+/// config is already on disk.
+pub async fn complete_staged_apply(
+    mut staged: StagedQuickstartApply,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let ctx = RunCtx::new(staged.surface);
+    persist_staged_config(&mut staged, &ctx).await?;
+    finish_staged_apply(staged, &ctx).await
+}
+
+/// Complete one staged quickstart as an admitted, serialized config
+/// commit: persist the staged config, publish it under `revision` (the
+/// caller allocated it before any irreversible I/O), then move the
+/// staged personality files into place.
+///
+/// A pre-commit persistence failure returns `Err` with the previously
+/// published pair untouched. After the committed publication, a
+/// personality failure is reported through
+/// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] — the
+/// publication stands, the error is truthful — which is exactly the
+/// boundary the supervised transports must answer for.
+pub async fn complete_staged_apply_as_commit(
+    mut staged: StagedQuickstartApply,
+    commit: &crate::live_config_authority::ConfigCommit,
+    revision: zeroclaw_config::live::ConfigRevision,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let ctx = RunCtx::new(staged.surface);
+    persist_staged_config(&mut staged, &ctx).await?;
+    let published = staged.working.clone();
+    if let Err(error) = commit.publish(revision, *published) {
+        return Err(vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("failed to publish quickstart config: {error}"),
+            "cli-quickstart-error-publish-config",
+            &[("err", &error.to_string())],
+        )]);
+    }
+    finish_staged_apply(staged, &ctx).await
+}
+
+/// Persist the staged working config. Shared by the one-shot and
+/// commit-completion paths; logs the persist window on both.
+async fn persist_staged_config(
+    staged: &mut StagedQuickstartApply,
+    ctx: &RunCtx,
+) -> Result<(), Vec<QuickstartError>> {
+    let dirty_count = staged.working.dirty_paths.len();
     let write_started = std::time::Instant::now();
     ::zeroclaw_log::record!(
         DEBUG,
@@ -321,7 +479,7 @@ pub async fn apply_with_surface(
         ),
         "quickstart: persist start"
     );
-    let write_result = config.save_dirty().await;
+    let write_result = staged.working.save_dirty().await;
     let write_ms = write_started.elapsed().as_millis() as u64;
     match &write_result {
         Ok(_) => ::zeroclaw_log::record!(
@@ -354,24 +512,42 @@ pub async fn apply_with_surface(
     }
     write_result.map_err(|err| {
         vec![QuickstartError::for_surface(
-            Some(&ctx),
+            Some(ctx),
             QuickstartStep::Agent,
             "",
             format!("failed to persist config: {err}"),
             "cli-quickstart-error-persist-config",
             &[("err", &err.to_string())],
         )]
-    })?;
+    })
+}
 
-    // Config landed atomically — now move the staged personality files
-    // into place. Any failure here is reported but does not unwind the
-    // already-persisted config; the agent is valid without them.
+/// Move the staged personality files into place and produce the terminal
+/// outcome. Any failure here is reported but does not unwind the
+/// already-committed config; the agent is valid without the files.
+async fn finish_staged_apply(
+    staged: StagedQuickstartApply,
+    ctx: &RunCtx,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let StagedQuickstartApply {
+        working: _,
+        mut staged_files,
+        applied,
+        surface: _,
+        started,
+    } = staged;
     let mut commit_errors = Vec::new();
-    commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
+    commit_personality_files(
+        std::mem::take(&mut staged_files),
+        &mut commit_errors,
+        Some(ctx),
+    );
     if !commit_errors.is_empty() {
-        return Err(commit_errors);
+        return Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+            agent: applied,
+            errors: commit_errors,
+        });
     }
-
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -386,7 +562,7 @@ pub async fn apply_with_surface(
             )),
         "quickstart: apply complete"
     );
-    Ok(applied)
+    Ok(QuickstartApplyOutcome::Applied(applied))
 }
 
 pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<QuickstartStep>) {
@@ -1075,7 +1251,7 @@ fn apply_model_provider(
                     return None;
                 }
             };
-            if !section_has_alias(config, "providers.models", family, alias) {
+            if config.providers.models.find(family, alias).is_none() {
                 let path = format!("providers.models.{family}.{alias}");
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1164,7 +1340,12 @@ fn apply_model_provider(
                 ));
                 return None;
             }
-            if section_has_alias(config, "providers.models", provider_type, &choice.alias) {
+            if config
+                .providers
+                .models
+                .find(provider_type, &choice.alias)
+                .is_some()
+            {
                 let alias_ref = format!("{}.{}", provider_type, choice.alias);
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -2152,16 +2333,6 @@ fn split_ref(reference: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -> bool {
-    for probe_field in ["enabled", "model", "uri"] {
-        let probe = format!("{prefix}.{family}.{alias}.{probe_field}");
-        if config.get_prop(&probe).is_ok() {
-            return true;
-        }
-    }
-    false
-}
-
 fn storage_has_ref(config: &Config, reference: &str) -> bool {
     collect_aliased_refs(&config.storage)
         .iter()
@@ -2178,6 +2349,9 @@ pub async fn model_catalog(
     model_catalog_with_config(None, model_provider).await
 }
 
+/// Backward-compatible catalog projection for callers that intentionally treat
+/// discovery failure as an unavailable catalog. Configured-profile surfaces
+/// should call [`model_catalog_with_config_result`] to preserve actionable errors.
 pub async fn model_catalog_with_config(
     config: Option<&Config>,
     model_provider: &str,
@@ -2186,83 +2360,35 @@ pub async fn model_catalog_with_config(
     Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
     bool,
 ) {
-    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    let api_key = resolved
-        .as_ref()
-        .and_then(|(_family, _alias, base)| base.api_key.clone());
-    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
-    // deployments list from their own `/models` rather than the family default.
-    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
-        base.uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(ToString::to_string)
-    });
-    // `create_model_provider` and the chat-catalog ranker expect a bare family
-    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
-    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
-    // ourselves so a dotted selector still constructs.
-    let family: &str = resolved
-        .as_ref()
-        .map(|(family, _alias, _base)| *family)
-        .unwrap_or_else(|| {
-            model_provider
-                .split_once('.')
-                .map_or(model_provider, |(f, _)| f)
-        });
+    model_catalog_with_config_result(config, model_provider)
+        .await
+        .unwrap_or_default()
+}
 
-    let handle = zeroclaw_providers::create_model_provider_with_url(
-        family,
-        api_key.as_deref(),
-        api_url.as_deref(),
-    );
-    if let Ok(handle) = handle
-        && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
-            .list_models_with_pricing()
-            .await
-        && !models.is_empty()
-    {
-        let raw_pricing: std::collections::HashMap<
-            String,
-            zeroclaw_api::model_provider::ModelPricing,
-        > = models
-            .iter()
-            .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
-            .collect();
-        let ids = models.into_iter().map(|m| m.id).collect();
-        let Some(ids) = zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, ids)
-        else {
-            return (Vec::new(), None, false);
-        };
-        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
-            ids.iter()
-                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
-                .collect();
-        let pricing = if pricing.is_empty() {
-            None
-        } else {
-            Some(pricing)
-        };
-        return (ids, pricing, true);
-    }
-    match zeroclaw_providers::catalog::list_models_for_family(family).await {
-        Ok(models) if !models.is_empty() => (
-            zeroclaw_providers::catalog::sort_model_catalog_for_chat(family, models)
-                .unwrap_or_default(),
-            None,
-            true,
-        ),
-        _ => (Vec::new(), None, false),
-    }
+pub async fn model_catalog_with_config_result(
+    config: Option<&Config>,
+    model_provider: &str,
+) -> anyhow::Result<(
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+)> {
+    zeroclaw_providers::catalog::model_catalog_with_config_result(config, model_provider).await
+}
+
+pub(crate) fn model_listing_is_unsupported(error: &anyhow::Error) -> bool {
+    zeroclaw_providers::catalog::model_listing_is_unsupported(error)
 }
 
 /// `true` for model_provider families that need no remote credential.
 #[must_use]
 pub fn model_provider_is_local(model_provider: &str) -> bool {
+    let family = model_provider
+        .split_once('.')
+        .map_or(model_provider, |(family, _)| family);
     zeroclaw_providers::list_model_providers()
         .iter()
-        .find(|p| p.name == model_provider)
+        .find(|p| p.name == family)
         .is_some_and(|p| p.local)
 }
 
@@ -2271,7 +2397,7 @@ mod tests {
     use super::*;
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        SelectorChoice,
+        QuickstartPersonalityFile, SelectorChoice,
     };
     use zeroclaw_config::schema::Config;
 
@@ -2383,6 +2509,46 @@ mod tests {
                 "anthropic.omega".to_string(),
                 "openai.zeta".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn model_provider_alias_checks_preserve_existing_and_duplicate_behavior() {
+        let mut cfg = Config::default();
+        cfg.providers
+            .models
+            .openrouter
+            .insert("default".into(), Default::default());
+
+        let mut errors = Vec::new();
+        let existing = apply_model_provider(
+            &mut cfg,
+            &SelectorChoice::Existing("openrouter.default".into()),
+            &mut errors,
+            None,
+        );
+        assert_eq!(existing.as_deref(), Some("openrouter.default"));
+        assert!(errors.is_empty(), "existing alias errors: {errors:?}");
+
+        let duplicate = ModelProviderChoice {
+            provider_type: "openrouter".into(),
+            alias: "default".into(),
+            model: "openai/gpt-5.4".into(),
+            fields: std::collections::HashMap::new(),
+        };
+        let mut errors = Vec::new();
+        let fresh = apply_model_provider(
+            &mut cfg,
+            &SelectorChoice::Fresh(duplicate),
+            &mut errors,
+            None,
+        );
+        assert!(fresh.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("already exists")),
+            "duplicate alias errors: {errors:?}"
         );
     }
 
@@ -2925,6 +3091,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quickstart_apply_rejects_an_invalid_auth_policy_before_any_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        let errors = super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Err("authorization policy does not compile".to_string()),
+        )
+        .await
+        .expect_err("a rejected staged policy must refuse the apply");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("rejected before persistence")),
+            "{errors:?}"
+        );
+
+        let after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected policy must not reach disk before the caller is told nothing was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_still_persists_a_valid_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Ok(()),
+        )
+        .await
+        .expect("an accepted staged policy still applies");
+
+        let reloaded = reload(&dir);
+        assert!(
+            reloaded.agents.contains_key("bot"),
+            "the agent must persist"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
@@ -3262,6 +3487,35 @@ mod tests {
         assert_eq!(reloaded.channels.webhook.len(), 2);
     }
 
+    #[tokio::test]
+    async fn invalid_auth_config_is_rejected_before_quickstart_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.oidc.insert("broken".into(), Default::default());
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let errors = apply_with_surface(fresh_submission("bot"), &mut config, Surface::Cli)
+            .await
+            .expect_err("invalid auth must prevent Quickstart persistence");
+
+        assert!(errors.iter().any(|error| {
+            error.step == QuickstartStep::Agent
+                && error.message.contains("authorization config rejected")
+        }));
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            after, before,
+            "rejected auth config must not rewrite config.toml"
+        );
+        let reloaded: Config = toml::from_str(&after).unwrap();
+        assert!(!reloaded.agents.contains_key("bot"));
+    }
+
     /// A disabled webhook never starts a listener, so it must not block a new
     /// alias from taking the same port.
     #[test]
@@ -3596,6 +3850,51 @@ mod tests {
         assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 
+    #[test]
+    fn model_listing_unsupported_classification_preserves_typed_error_chain() {
+        let direct = anyhow::Error::new(zeroclaw_api::model_provider::ModelListingUnsupportedError);
+        assert!(model_listing_is_unsupported(&direct));
+
+        let wrapped =
+            anyhow::Error::new(zeroclaw_api::model_provider::ModelListingUnsupportedError)
+                .context("configured provider wrapper");
+        assert!(model_listing_is_unsupported(&wrapped));
+
+        let actionable = anyhow::Error::msg("HTTP 401 Unauthorized");
+        assert!(!model_listing_is_unsupported(&actionable));
+    }
+
+    #[tokio::test]
+    async fn configured_static_catalog_provider_preserves_typed_live_listing_boundary() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("bedrock", "static")
+            .expect("bedrock fixture profile");
+        let provider =
+            zeroclaw_providers::create_model_provider_from_ref(&config, "bedrock.static")
+                .expect("configured Bedrock provider should construct");
+        let error = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
+            .list_models_with_pricing()
+            .await
+            .expect_err("Bedrock intentionally has no live listing endpoint");
+
+        assert!(model_listing_is_unsupported(&error));
+        let (models_dev, openrouter) = zeroclaw_providers::catalog::catalog_source_for("bedrock")
+            .expect("Bedrock must have a canonical family catalog source");
+        assert_eq!(models_dev, Some("amazon-bedrock"));
+        assert_eq!(openrouter, None);
+    }
+
+    #[test]
+    fn model_provider_is_local_classifies_configured_refs_by_family() {
+        assert!(model_provider_is_local("hailo_ollama"));
+        assert!(model_provider_is_local("hailo_ollama.edge"));
+        assert!(model_provider_is_local("ollama.local"));
+        assert!(!model_provider_is_local("openai.primary"));
+    }
+
     #[tokio::test]
     async fn model_catalog_with_config_uses_native_endpoint_when_credentialed() {
         use wiremock::matchers::{method, path};
@@ -3628,7 +3927,9 @@ mod tests {
         );
 
         let (models, _pricing, live) =
-            model_catalog_with_config(Some(&config), "xai.default").await;
+            model_catalog_with_config_result(Some(&config), "xai.default")
+                .await
+                .expect("configured native catalog should succeed");
 
         assert!(live, "credentialed native listing must report live=true");
         assert!(
@@ -3640,15 +3941,17 @@ mod tests {
 
     #[tokio::test]
     async fn model_catalog_with_config_resolves_named_alias_endpoint() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
+            .and(header("x-route", "named-alias"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [{"id": "grok-named-alias-native"}]
             })))
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -3660,12 +3963,17 @@ mod tests {
                 base: zeroclaw_config::schema::ModelProviderConfig {
                     api_key: Some("xai-test-key".to_string()),
                     uri: Some(server.uri()),
+                    extra_headers: [("X-Route".to_string(), "named-alias".to_string())]
+                        .into_iter()
+                        .collect(),
                     ..Default::default()
                 },
             },
         );
 
-        let (models, _pricing, live) = model_catalog_with_config(Some(&config), "xai.prod").await;
+        let (models, _pricing, live) = model_catalog_with_config_result(Some(&config), "xai.prod")
+            .await
+            .expect("configured alias catalog should succeed");
 
         assert!(live);
         assert!(
@@ -3673,6 +3981,188 @@ mod tests {
             "dotted `<family>.<alias>` selector must resolve that alias's \
              configured endpoint; got {models:?}"
         );
+
+        let (bare_models, _pricing, bare_live) =
+            model_catalog_with_config_result(Some(&config), "prod")
+                .await
+                .expect("unique bare alias catalog should resolve canonically");
+        assert!(bare_live);
+        assert!(
+            bare_models.iter().any(|m| m == "grok-named-alias-native"),
+            "unique bare alias selector must resolve the same configured endpoint; \
+             got {bare_models:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_with_config_rejects_unknown_dotted_alias() {
+        let config = Config::default();
+        let error = model_catalog_with_config_result(Some(&config), "hailo_ollama.typo")
+            .await
+            .expect_err("unknown dotted aliases must fail before default provider construction");
+        assert!(
+            error.to_string().contains("does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_error_does_not_fall_back_to_public_family() {
+        const USER: &str = "catalog-user";
+        const PASSWORD: &str = "s3cr3t-password";
+        const SIGNATURE: &str = "signed-query-value";
+
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut endpoint = reqwest::Url::parse(&server.uri()).expect("fake server URL");
+        endpoint
+            .set_username(USER)
+            .expect("test URL should accept userinfo");
+        endpoint
+            .set_password(Some(PASSWORD))
+            .expect("test URL should accept password");
+        endpoint.set_query(Some(&format!("signature={SIGNATURE}")));
+
+        let mut config = Config::default();
+        config.providers.models.xai.insert(
+            "private".to_string(),
+            zeroclaw_config::schema::XaiModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("expired-key".to_string()),
+                    uri: Some(endpoint.to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let error = model_catalog_with_config_result(Some(&config), "xai.private")
+            .await
+            .expect_err("configured profile rejection must not become a public family catalog");
+        let error = error.to_string();
+        assert!(error.contains("catalog failed"));
+        for secret in [USER, PASSWORD, SIGNATURE] {
+            assert!(
+                !error.contains(secret),
+                "catalog error leaked {secret}: {error}"
+            );
+        }
+        assert!(
+            error.contains("127.0.0.1"),
+            "catalog error should retain a safe endpoint diagnostic: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_catalog_construction_error_redacts_key_excerpt() {
+        const SECRET: &str = "xai-syntheticSecretValue12345";
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "mismatch".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some(SECRET.to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let error = model_catalog_with_config_result(Some(&config), "openai.mismatch")
+            .await
+            .expect_err("mismatched credential prefix must reject provider construction")
+            .to_string();
+        assert!(error.contains("could not be constructed"), "{error}");
+        assert!(!error.contains("xai-"), "credential prefix leaked: {error}");
+        assert!(
+            !error.contains("synthetic"),
+            "credential excerpt leaked: {error}"
+        );
+        assert!(
+            error.contains("[REDACTED]"),
+            "redaction marker missing: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_empty_catalog_remains_authoritative() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "empty".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(server.uri()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let (models, pricing, live) =
+            model_catalog_with_config_result(Some(&config), "hailo_ollama.empty")
+                .await
+                .expect("reachable empty catalog is a valid configured-profile result");
+        assert!(models.is_empty());
+        assert!(pricing.is_none());
+        assert!(live);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_with_config_preserves_hailo_alias_headers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .and(header("x-route", "canary"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "qwen3:1.7b"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(server.uri()),
+                    extra_headers: [("X-Route".to_string(), "canary".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (models, _pricing, live) =
+            model_catalog_with_config_result(Some(&config), "hailo_ollama.edge")
+                .await
+                .expect("configured Hailo catalog should succeed");
+        assert!(live);
+        assert_eq!(models, vec!["qwen3:1.7b"]);
     }
 
     #[tokio::test]
@@ -3704,5 +4194,109 @@ mod tests {
         let result = fetch_quickstart_context_window("groq", &provider_config).await;
 
         assert_eq!(result, None, "slow enrichment should degrade to fallback");
+    }
+
+    /// Post-commit personality failure must not strand the committed
+    /// quickstart: the staged apply publishes the persisted config first,
+    /// then installs the personality files. When the install fails (the
+    /// destination exists as a directory, so the staged tempfile cannot
+    /// persist onto it), the outcome is
+    /// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] — the
+    /// publication stands (pair revision advanced, agent live, config on
+    /// disk) and the personality error is reported truthfully. Nothing is
+    /// rolled back to restore the files.
+    #[tokio::test]
+    async fn committed_quickstart_publishes_despite_personality_install_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let authority = crate::LiveConfigAuthority::new(config);
+        let published_before = authority.published_revision();
+
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut working = commit.current_config();
+
+        // Force the post-commit install to fail: the destination file
+        // exists as a directory, so `tempfile.persist` cannot land the
+        // staged personality write onto it.
+        let workspace = working.agent_workspace_dir("pfail");
+        std::fs::create_dir_all(workspace.join("IDENTITY.md"))
+            .expect("seed the personality-destination blocker");
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "primary".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "pfail".into(),
+                system_prompt: "You are a test assistant.".into(),
+                personality_file: None,
+                personality_files: vec![QuickstartPersonalityFile {
+                    filename: "IDENTITY.md".into(),
+                    content: "identity body".into(),
+                }],
+            },
+        };
+
+        // Staging is pure preparation: nothing on disk changes, so the
+        // destination blocker above survives into the commit phase.
+        let staged = stage_apply(submission, &mut working, Surface::Tui)
+            .expect("a valid submission must stage cleanly");
+        let revision = commit
+            .next_revision()
+            .expect("a fresh epoch must allocate a revision");
+
+        let outcome = complete_staged_apply_as_commit(staged, &commit, revision).await;
+        let (agent, errors) = match outcome {
+            Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors { agent, errors }) => {
+                (agent, errors)
+            }
+            other => panic!(
+                "a personality failure after the committed publication must be \
+                 reported as CommittedWithSideEffectErrors, got {other:?}"
+            ),
+        };
+        assert_eq!(agent.alias, "pfail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "personality_files"),
+            "the personality install failure must be reported truthfully: {errors:?}"
+        );
+
+        // The committed config is PUBLISHED despite the side-effect
+        // failure: the pair advanced and the agent is live.
+        let handle = authority.live_handle();
+        let (published, revision_after) = handle.snapshot_with_revision();
+        assert!(
+            revision_after.succeeds_within_epoch(&published_before),
+            "the publication must stand — the pair revision advanced"
+        );
+        assert!(
+            published.agents.contains_key("pfail"),
+            "the committed agent must be live in the published pair"
+        );
+        // ...and the committed config is on disk.
+        let raw =
+            std::fs::read_to_string(&config_path).expect("the committed config must be persisted");
+        assert!(
+            raw.contains("pfail"),
+            "the persisted config must carry the committed agent"
+        );
     }
 }

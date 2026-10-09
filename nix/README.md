@@ -71,6 +71,51 @@ After a `nixos-rebuild switch`:
 - `/var/lib/zeroclaw-me/config.toml` contains the rendered TOML, mode `0600`.
 - ZeroClaw is invoked as `${pkgs.zeroclaw}/bin/zeroclaw daemon`.
 
+## Web dashboard bundle
+
+The flake exposes the dashboard as `packages.zeroclaw-web` (built from
+`web/` via `nix/web.nix`: a pure-Rust `openapi-spec` derivation feeds the
+`buildNpmPackage` bundle, so the TypeScript client always matches the
+gateway's `build_spec()` contract). The module consumes it through
+`webUiPackage`:
+
+```nix
+# flake.nix (consuming configuration):
+# {
+#   inputs.zeroclaw.url = "github:zeroclaw-labs/zeroclaw";
+#   outputs = { self, nixpkgs, zeroclaw, ... }: { ... };
+# }
+{ config, pkgs, zeroclaw, system, ... }: {
+  nixpkgs.overlays = [
+    (final: prev: {
+      zeroclaw-web = zeroclaw.packages.${system}.zeroclaw-web;
+    })
+  ];
+
+  services.zeroclaw.instances.me = {
+    # ... settings, environmentFile ...
+    webUiPackage = pkgs.zeroclaw-web; # default when overlaid; null skips the package default
+  };
+}
+```
+
+When `webUiPackage` is set (and `settings.gateway.web_dist_dir` is unset),
+the module defaults `settings.gateway.web_dist_dir` to
+`${webUiPackage}/share/zeroclaw-web`. An explicit
+`settings.gateway.web_dist_dir` always wins over the bundle default;
+`webUiPackage = null` leaves the package-derived key unset (an explicit
+`web_dist_dir` still applies, and the gateway may still auto-detect existing
+assets — `null` only skips the package default, it does not force-disable
+the dashboard). The bundle lives in the world-readable `/nix/store`
+(no secrets), so no extra sandbox paths are needed.
+
+`extraConfig` is parsed as TOML and deep-merged over `settings`, so a raw
+`[gateway]` table there composes with the bundle default (or explicit
+`settings.gateway` keys) into a single valid table instead of conflicting.
+On conflicting scalars — lists are replaced, not appended — `extraConfig`
+wins. Malformed TOML fails evaluation; comments inside `extraConfig` are
+not preserved in the rendered output.
+
 ## Multi-instance usage
 
 The module is `attrsOf submodule`-shaped, so multiple instances on one host
@@ -95,13 +140,14 @@ instance creates it and the others set `createUser = false`.
 | Option | Type | Default | Purpose |
 |---|---|---|---|
 | `package` | `package` | `pkgs.zeroclaw` (via `mkPackageOption`) | Override for out-of-tree builds. |
+| `webUiPackage` | `nullOr package` | `pkgs.zeroclaw-web` (or `null` without overlay) | Dashboard bundle. `null` skips the package-derived `web_dist_dir` default. |
 | `user` | `str` | `"zeroclaw-<name>"` | System user. |
 | `group` | `str` | `"zeroclaw-<name>"` | System group. |
 | `createUser` | `bool` | `true` | Set `false` to bring your own user. |
 | `dataDir` | `path` | `"/var/lib/zeroclaw-<name>"` | State directory. Created via `systemd-tmpfiles` so any absolute path works (`/var/lib/...`, `/srv/...`, etc.). |
 | `settings` | `submodule { freeformType = (pkgs.formats.toml { }).type; }` | `{}` | Rendered to `${dataDir}/config.toml`. |
 | `environmentFile` | `nullOr path` | `null` | systemd `EnvironmentFile=`. Substituted into `settings` strings at start. |
-| `extraConfig` | `lines` | `""` | Raw TOML appended after rendered `settings` (escape hatch). |
+| `extraConfig` | `lines` | `""` | Raw TOML parsed and deep-merged over rendered `settings` (escape hatch; wins on conflict). |
 | `bindReadOnlyPaths` | `attrsOf path` | `{}` | `target → source` map → `BindReadOnlyPaths=`. |
 
 If you need to override a `serviceConfig` field (e.g. add `MemoryMax`),

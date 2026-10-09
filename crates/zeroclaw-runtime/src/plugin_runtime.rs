@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::webhook::PluginWebhookRegistryLease;
 use zeroclaw_config::schema::Config;
@@ -47,6 +46,30 @@ struct BuiltChannelCandidate {
 #[cfg(feature = "plugins-wasm")]
 pub(crate) struct PluginActivationPlan {
     admitted: Vec<PluginInstanceScope>,
+    /// Mirror candidates, deliberately kept OUT of `admitted`.
+    ///
+    /// Everything that constructs a guest reads `admitted` through
+    /// [`Self::scopes`]. A mirror is not constructible yet: the endpoint would
+    /// still be stamped `plugin`, the sender policy would still resolve
+    /// `channel_external_peers("plugin", alias)`, and the config resolver would
+    /// still hand it its `plugins.entries` row instead of
+    /// `channels.<provides>.<alias>`. Admitting one into `admitted` would build
+    /// a channel that cannot act as the alias it mirrors, register it under a
+    /// `plugin.<alias>` routing key it does not own, and consume an
+    /// explicit-priority instance slot that an auto-discovered tool or skill
+    /// would otherwise get.
+    ///
+    /// So the decision is recorded and nothing consumes it. When the config
+    /// feed, endpoint type, peer policy and native precedence land, these move
+    /// into `admitted` and back under the single `max_active_instances`
+    /// ceiling.
+    ///
+    /// `allow(dead_code)`: having no production reader is the invariant, not an
+    /// oversight. The test accessor is the only consumer, and the day this
+    /// field is read outside `#[cfg(test)]` is the day a mirror can be
+    /// constructed — which is the review gate this attribute marks.
+    #[allow(dead_code)]
+    mirrors: Vec<PluginInstanceScope>,
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -82,6 +105,7 @@ impl PluginActivationPlan {
         if !config.plugins.enabled {
             return Ok(Self {
                 admitted: Vec::new(),
+                mirrors: Vec::new(),
             });
         }
 
@@ -91,6 +115,8 @@ impl PluginActivationPlan {
             .map(|(manifest, _)| manifest.name.as_str())
             .collect();
         let mut candidates = Vec::new();
+        // Kept apart from `candidates` on purpose; see `Self::mirrors`.
+        let mut mirror_candidates: Vec<PluginInstanceScope> = Vec::new();
 
         for (binding, declaration) in &config.channels.plugin {
             if !declaration.enabled || !has_enabled_owner(config, binding) {
@@ -111,6 +137,132 @@ impl PluginActivationPlan {
                     manifest.permissions.iter().copied(),
                 )?,
             });
+        }
+
+        // Mirror candidates. A channel package whose manifest declares
+        // `provides = "<id>"` is a drop-in for that compiled-in channel, so it
+        // activates once per configured and enabled `[channels.<id>.<alias>]`
+        // rather than from a single `[channels.plugin.<alias>]` declaration.
+        // Canonical channel config stays the one home for those settings.
+        //
+        // These count as explicit: the aliases are operator-named in canonical
+        // config, so they take ceiling priority over auto-discovery exactly as
+        // an explicit plugin channel declaration does.
+        //
+        // Native-wins is NOT decided here. Whether a compiled-in channel of the
+        // same id exists is a build-feature fact owned by the channel
+        // orchestrator, which drops a mirror that collides with a live native
+        // alias. Admission only decides which mirrors are eligible at all.
+        let mirror_claims = mirror_claim_counts(host);
+        let channels_view = serde_json::to_value(&config.channels).ok();
+        for (manifest, _) in host.channel_plugin_details() {
+            let Some(provides) = manifest.provides.as_deref() else {
+                continue;
+            };
+            // `provides` must name a channel type this build actually knows.
+            //
+            // This is diagnostic, not load-bearing: an unknown id has no
+            // canonical config section, so it would admit nothing regardless.
+            // The value is the log line — a typo otherwise looks exactly like
+            // a plugin whose aliases are simply unconfigured, which is the
+            // kind of silence that costs an operator an afternoon.
+            // `plugin` is in V3_CHANNEL_TYPES, but it is the plugin family's
+            // own namespace, not a compiled-in channel to mirror. Allowing it
+            // would let any admitted package enumerate
+            // `[channels.plugin.<alias>]` declarations that name a DIFFERENT
+            // package and claim those aliases, because this pass keys on the
+            // alias and never reads the declaration's `package` field the way
+            // the explicit pass above does. That is a route takeover, not a
+            // mirror, so the family is refused outright.
+            if provides == PLUGIN_CHANNEL_FAMILY {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_reserved_channel_family",
+                        })),
+                    "A plugin may not mirror the reserved `plugin` channel family; refusing the mirror"
+                );
+                continue;
+            }
+            if !zeroclaw_config::schema::v2::V3_CHANNEL_TYPES.contains(&provides) {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_unknown_channel_id",
+                        })),
+                    "Plugin mirrors a channel id this build does not define; refusing the mirror"
+                );
+                continue;
+            }
+            // Two packages claiming one id is ambiguous, and the host will not
+            // pick a mirror on the operator's behalf: both fail closed.
+            if mirror_claims.get(provides).copied().unwrap_or_default() > 1 {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_ambiguous_provider",
+                        })),
+                    "More than one plugin mirrors this channel id; refusing every claimant"
+                );
+                continue;
+            }
+            // A mirror is fed the alias's canonical config, so without
+            // `config_read` it would run against an empty object and
+            // misbehave silently. Refuse it instead.
+            if !manifest
+                .permissions
+                .contains(&zeroclaw_plugins::PluginPermission::ConfigRead)
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "provides": provides,
+                            "error_key": "plugin_mirror_config_read_required",
+                        })),
+                    "Channel mirror requires config_read; refusing the mirror"
+                );
+                continue;
+            }
+            let Some(aliases) = channels_view
+                .as_ref()
+                .and_then(|channels| channels.get(provides))
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            for (alias, entry) in aliases {
+                let enabled = entry
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if !enabled {
+                    continue;
+                }
+                if !has_enabled_owner_ref(config, &format!("{provides}.{alias}")) {
+                    continue;
+                }
+                mirror_candidates.push(PluginInstanceScope::from_manifest(
+                    manifest,
+                    PluginCapability::Channel,
+                    alias,
+                    manifest.permissions.iter().copied(),
+                )?);
+            }
         }
 
         if config.plugins.auto_discover {
@@ -148,12 +300,27 @@ impl PluginActivationPlan {
                 .then_with(|| left.scope.id().binding().cmp(right.scope.id().binding()))
         });
 
+        // Mirrors are ordered by the same stable key so the recorded decision
+        // is deterministic, and bounded by the same configured number so a
+        // large install cannot record an unbounded set. They are counted
+        // separately from `admitted` because nothing constructs them: charging
+        // them against the shared ceiling would let an inert mirror displace a
+        // tool or skill that does run.
+        mirror_candidates.sort_by(|left, right| {
+            left.id()
+                .package()
+                .cmp(right.id().package())
+                .then_with(|| left.id().binding().cmp(right.id().binding()))
+        });
+        mirror_candidates.truncate(config.plugins.max_active_instances);
+
         Ok(Self {
             admitted: candidates
                 .into_iter()
                 .take(config.plugins.max_active_instances)
                 .map(|candidate| candidate.scope)
                 .collect(),
+            mirrors: mirror_candidates,
         })
     }
 
@@ -197,6 +364,22 @@ impl PluginActivationPlan {
         self.find(package, capability, binding).cloned()
     }
 
+    /// Mirror decisions recorded by this plan.
+    ///
+    /// Intentionally has no production consumer: see [`Self::mirrors`].
+    #[cfg(test)]
+    fn mirror_identities(&self) -> Vec<(String, String)> {
+        self.mirrors
+            .iter()
+            .map(|scope| {
+                (
+                    scope.id().package().to_string(),
+                    scope.id().binding().to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Admitted scopes of one capability, in the plan's enumeration order.
     pub(crate) fn scopes(
         &self,
@@ -214,7 +397,15 @@ impl PluginActivationPlan {
 /// deliver to, so an orphaned declaration is inert rather than half-live.
 #[cfg(feature = "plugins-wasm")]
 fn has_enabled_owner(config: &Config, binding: &str) -> bool {
-    let channel_ref = format!("plugin.{binding}");
+    has_enabled_owner_ref(config, &format!("plugin.{binding}"))
+}
+
+/// The same ownership rule addressed by full composite channel reference.
+///
+/// A mirror is routed as `<provides>.<alias>`, not `plugin.<alias>`, so it
+/// asks this directly rather than through the `plugin.` shorthand above.
+#[cfg(feature = "plugins-wasm")]
+fn has_enabled_owner_ref(config: &Config, channel_ref: &str) -> bool {
     config.agents.values().any(|agent| {
         agent.enabled
             && agent
@@ -222,6 +413,29 @@ fn has_enabled_owner(config: &Config, binding: &str) -> bool {
                 .iter()
                 .any(|configured| configured.as_str() == channel_ref)
     })
+}
+
+/// The plugin family's own channel namespace.
+///
+/// `[channels.plugin.<alias>]` declarations are bound to a package by their
+/// `package` field, so this family is never a mirror target.
+#[cfg(feature = "plugins-wasm")]
+const PLUGIN_CHANNEL_FAMILY: &str = "plugin";
+
+/// How many installed channel packages claim each mirrored channel id.
+///
+/// Counted across every channel package before any admission decision, so an
+/// ambiguous id is refused for all claimants rather than resolved by install
+/// order.
+#[cfg(feature = "plugins-wasm")]
+fn mirror_claim_counts(host: &PluginHost) -> HashMap<String, usize> {
+    let mut claims: HashMap<String, usize> = HashMap::new();
+    for (manifest, _) in host.channel_plugin_details() {
+        if let Some(provides) = manifest.provides.as_deref() {
+            *claims.entry(provides.to_string()).or_default() += 1;
+        }
+    }
+    claims
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -248,7 +462,10 @@ pub(crate) fn plugin_host(config: &Config) -> Result<Arc<PluginHost>, PluginErro
 }
 
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::PluginLimits {
+/// Materialize the configured store limits used by every plugin constructor.
+/// CLI load verification uses this same resolver so its result cannot diverge
+/// from the limits applied when the daemon later constructs the plugin.
+pub fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::PluginLimits {
     zeroclaw_plugins::component::PluginLimits {
         call_fuel: config.plugins.limits.call_fuel,
         max_memory_bytes: config
@@ -278,7 +495,7 @@ fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
 #[cfg(feature = "plugins-wasm")]
 fn channel_sender_authorizer(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: String,
 ) -> zeroclaw_plugins::wasm_channel::SenderAuthorizer {
     match live_config {
@@ -475,7 +692,7 @@ async fn finalize_plugin_webhooks(
 /// must not stop the daemon from starting its remaining channels.
 pub async fn configured_plugin_channels(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> Vec<Arc<dyn Channel>> {
     Box::pin(configured_plugin_channels_with_webhooks(
         config,
@@ -489,7 +706,7 @@ pub async fn configured_plugin_channels(
 /// claims into one daemon-generation registry.
 pub async fn configured_plugin_channels_with_webhooks(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     webhook_registry: Option<&PluginWebhookRegistryLease>,
 ) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
@@ -667,30 +884,40 @@ mod tests {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
 
-        let live = Arc::new(RwLock::new(Config::default()));
+        let live = zeroclaw_config::live::LiveConfig::new(Config::default());
         let authorizer = channel_sender_authorizer(
             Arc::new(Config::default()),
-            Some(Arc::clone(&live)),
+            Some(live.handle()),
             "operations".to_string(),
         );
         assert!(!authorizer("alice"), "empty peer groups deny by default");
 
-        live.write().peer_groups.insert(
-            "operators".to_string(),
-            PeerGroupConfig {
-                channel: ChannelRef::new("plugin.operations"),
-                external_peers: vec![PeerUsername::new("alice")],
-                ..PeerGroupConfig::default()
-            },
-        );
+        let publish = |mutating: &dyn Fn(&mut zeroclaw_config::schema::Config)| {
+            let mut next = live.snapshot();
+            mutating(&mut next);
+            let revision = live.next_revision().unwrap();
+            live.publish(revision, next).unwrap();
+        };
+        publish(&|config| {
+            config.peer_groups.insert(
+                "operators".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("plugin.operations"),
+                    external_peers: vec![PeerUsername::new("alice")],
+                    ..PeerGroupConfig::default()
+                },
+            );
+        });
         assert!(authorizer("alice"));
         assert!(!authorizer("Alice"), "plugin sender identity is exact");
 
-        live.write()
-            .peer_groups
-            .get_mut("operators")
-            .expect("operator peer group")
-            .external_peers = vec![PeerUsername::new("*")];
+        publish(&|config| {
+            config
+                .peer_groups
+                .get_mut("operators")
+                .expect("operator peer group")
+                .external_peers = vec![PeerUsername::new("*")];
+        });
         assert!(
             authorizer("anyone"),
             "wildcard uses native channel semantics"
@@ -707,8 +934,8 @@ mod tests {
         use zeroclaw_config::providers::ChannelRef;
 
         let policy = |grants: &[&str], ignore: &[&str]| {
-            let live = Arc::new(RwLock::new(Config::default()));
-            live.write().peer_groups.insert(
+            let mut config = Config::default();
+            config.peer_groups.insert(
                 "operators".to_string(),
                 PeerGroupConfig {
                     channel: ChannelRef::new("plugin.operations"),
@@ -717,9 +944,10 @@ mod tests {
                     ..PeerGroupConfig::default()
                 },
             );
+            let live = zeroclaw_config::live::LiveConfig::new(config);
             channel_sender_authorizer(
                 Arc::new(Config::default()),
-                Some(Arc::clone(&live)),
+                Some(live.handle()),
                 "operations".to_string(),
             )
         };
@@ -757,6 +985,61 @@ mod tests {
         // Package admission intentionally does not compile the component. An
         // invalid payload here proves activation planning remains guest-free.
         std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+    }
+
+    /// A channel package that mirrors a compiled-in channel id.
+    ///
+    /// `config_read` is spelled out per case because its absence is itself an
+    /// admission rule under test.
+    fn write_mirror_plugin(root: &Path, name: &str, provides: &str, config_read: bool) {
+        let plugin_dir = root.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let permissions = if config_read {
+            "permissions = [\"config_read\"]\n"
+        } else {
+            ""
+        };
+        // `config_read` is only valid alongside a config_schema, so a mirror
+        // that reads canonical config must declare one.
+        let schema = if config_read {
+            "config_schema = { type = \"object\", properties = {}, additionalProperties = false }\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"channel\"]\nprovides = \"{provides}\"\n{permissions}{schema}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+    }
+
+    /// Canonical config with one telegram alias and an agent routing to it.
+    fn mirror_config(plugins_dir: &Path, alias: &str, enabled: bool, owned: bool) -> Config {
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = false;
+        config.plugins.max_active_instances = 10;
+        config.plugins.plugins_dir = plugins_dir.display().to_string();
+        config.channels.telegram = HashMap::from([(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        )]);
+        let agent = AliasedAgentConfig {
+            channels: if owned {
+                vec![ChannelRef::new(format!("telegram.{alias}"))]
+            } else {
+                Vec::new()
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents = HashMap::from([("operator".to_string(), agent)]);
+        config
     }
 
     fn write_skill_plugin(root: &Path, name: &str) {
@@ -872,6 +1155,209 @@ mod tests {
             identities(&plan).len(),
             5,
             "two channels, two tools, and one skill are all planned from manifests"
+        );
+    }
+
+    #[test]
+    fn a_mirror_admits_one_instance_per_configured_enabled_alias() {
+        // The whole point of `provides`: canonical channel config, not a
+        // second config home, decides how many instances exist.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        let mut config = mirror_config(plugins.path(), "main", true, true);
+        config.channels.telegram.insert(
+            "backup".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("operator")
+            .unwrap()
+            .channels
+            .push(ChannelRef::new("telegram.backup"));
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        let mirrors = plan.mirror_identities();
+        assert!(
+            mirrors.contains(&("tg-mirror".to_string(), "main".to_string())),
+            "configured alias should be recorded, got {mirrors:?}"
+        );
+        assert!(
+            mirrors.contains(&("tg-mirror".to_string(), "backup".to_string())),
+            "second configured alias should get its own instance, got {mirrors:?}"
+        );
+        // The load-bearing half of this slice being inert: nothing that
+        // constructs a guest may see a mirror yet.
+        assert!(
+            plan.scopes(PluginCapability::Channel).next().is_none(),
+            "a mirror must not reach the construction feed"
+        );
+    }
+
+    #[test]
+    fn a_mirror_skips_disabled_and_unowned_aliases() {
+        // A disabled alias is not a channel, and an alias no enabled agent
+        // routes to has nothing to deliver to. Neither should start a guest.
+        for (enabled, owned) in [(false, true), (true, false)] {
+            let plugins = TempDir::new().unwrap();
+            write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+            let config = mirror_config(plugins.path(), "main", enabled, owned);
+            let host = plugin_host(&config).unwrap();
+
+            let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+            assert!(
+                plan.mirror_identities().is_empty(),
+                "enabled={enabled} owned={owned} should record nothing, got {:?}",
+                plan.mirror_identities()
+            );
+        }
+    }
+
+    #[test]
+    fn a_mirror_without_config_read_is_refused() {
+        // A mirror is defined by being fed the alias's canonical config. With
+        // no grant to read it the instance would run blind, so it is refused
+        // rather than started against an empty object.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", false);
+        let config = mirror_config(plugins.path(), "main", true, true);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "a mirror without config_read must not be recorded"
+        );
+    }
+
+    #[test]
+    fn a_package_cannot_mirror_the_plugin_family_to_claim_another_packages_route() {
+        // The route takeover this closes. `plugin` is a member of
+        // V3_CHANNEL_TYPES, so before the reserved-family refusal a package
+        // declaring provides = "plugin" enumerated every enabled
+        // `[channels.plugin.<alias>]` and claimed those aliases WITHOUT
+        // reading the declaration's `package` field. Since the endpoint is
+        // stamped `plugin.<alias>` for both, the later package by sort order
+        // won the channel map and inherited the legitimate package's route:
+        // its replies, its cron delivery, its sender policy.
+        let plugins = TempDir::new().unwrap();
+        write_executable_plugin(plugins.path(), "real", &["channel"]);
+        // Sorts after "real", which is what made it win the map.
+        write_mirror_plugin(plugins.path(), "zz-hijacker", "plugin", true);
+
+        let mut config = Config::default();
+        config.plugins.enabled = true;
+        config.plugins.auto_discover = false;
+        config.plugins.max_active_instances = 10;
+        config.plugins.plugins_dir = plugins.path().display().to_string();
+        config.channels.plugin = HashMap::from([(
+            "main".to_string(),
+            PluginChannelConfig {
+                package: "real".to_string(),
+                enabled: true,
+            },
+        )]);
+        config.agents = HashMap::from([(
+            "operator".to_string(),
+            AliasedAgentConfig {
+                channels: vec![ChannelRef::new("plugin.main")],
+                ..AliasedAgentConfig::default()
+            },
+        )]);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        // Non-vacuous: the legitimate declaration still admits, so this test
+        // fails if mirror admission is simply broken rather than refused.
+        assert!(
+            plan.scope("real", PluginCapability::Channel, "main")
+                .is_some(),
+            "the package the operator bound to plugin.main must still be admitted"
+        );
+        assert!(
+            plan.scope("zz-hijacker", PluginCapability::Channel, "main")
+                .is_none(),
+            "a provides=\"plugin\" package must not be admitted at another package's alias"
+        );
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "the reserved plugin family must record no mirror, got {:?}",
+            plan.mirror_identities()
+        );
+        // The routing key the orchestrator would publish must have exactly one
+        // claimant, which is the property the takeover violated.
+        let claimants: Vec<_> = plan
+            .scopes(PluginCapability::Channel)
+            .filter(|scope| scope.id().binding() == "main")
+            .map(|scope| scope.id().package().to_string())
+            .collect();
+        assert_eq!(
+            claimants,
+            vec!["real".to_string()],
+            "plugin.main must have exactly one claimant"
+        );
+    }
+
+    #[test]
+    fn two_packages_mirroring_one_id_both_fail_closed() {
+        // The host will not pick a mirror on the operator's behalf, and it
+        // must not resolve the tie by install order either: both are refused.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        write_mirror_plugin(plugins.path(), "tg-other", "telegram", true);
+        let config = mirror_config(plugins.path(), "main", true, true);
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert!(
+            plan.mirror_identities().is_empty(),
+            "ambiguous providers must fail closed, got {:?}",
+            plan.mirror_identities()
+        );
+    }
+
+    #[test]
+    fn mirrors_are_bounded_by_the_instance_ceiling() {
+        // Mirrors are explicit, so they take ceiling priority over
+        // auto-discovery — but they are not exempt from the ceiling itself.
+        let plugins = TempDir::new().unwrap();
+        write_mirror_plugin(plugins.path(), "tg-mirror", "telegram", true);
+        let mut config = mirror_config(plugins.path(), "main", true, true);
+        config.channels.telegram.insert(
+            "backup".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::TelegramConfig::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("operator")
+            .unwrap()
+            .channels
+            .push(ChannelRef::new("telegram.backup"));
+        config.plugins.max_active_instances = 1;
+        let host = plugin_host(&config).unwrap();
+
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+        assert_eq!(
+            plan.mirror_identities().len(),
+            1,
+            "the configured number bounds recorded mirrors"
+        );
+        assert!(
+            plan.scopes(PluginCapability::Channel).next().is_none(),
+            "bounded or not, a mirror must not reach construction"
         );
     }
 

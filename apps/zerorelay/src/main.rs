@@ -33,9 +33,8 @@ use zerorelay::{
     Admission, AdmissionPolicy, PublicOpenGuard, RelayConfig, RelayServer, RelayStatus,
 };
 
-/// Build-time version: `git describe` (tag + commits-since + short hash, `-dirty`
-/// when modified), or the crate version when git is unavailable. Set by build.rs.
-const VERSION: &str = env!("ZERORELAY_VERSION");
+/// Package version and `git describe` build id stamped by `build.rs`.
+const VERSION: &str = env!("ZEROCLAW_VERSION");
 
 #[derive(Parser, Debug)]
 #[command(
