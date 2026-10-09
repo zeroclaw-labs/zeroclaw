@@ -14476,6 +14476,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-memory-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-plugins"
 version = "0.8.5"
 dependencies = [
