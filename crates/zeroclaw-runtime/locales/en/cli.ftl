@@ -1454,3 +1454,11 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+# A scoped tool process must report its result before an independent operator
+# terminates the daemon. This is an accident guard, not an authorization boundary.
+service-control-active-turn-refused = Service stop, restart, or uninstall was not performed because this command is running inside an active agent turn. Finish and report the current result first, then have an independent operator run the service command. Do not unset the session marker or use another termination command to bypass this guard.
+
+# Durable transcript recovery record only; hydration does not send a message or
+# automatically replay tools. The preceding durable user row owns the request.
+channel-runtime-interrupted-request = [Request interrupted before a final result was recorded. Your preceding request is preserved. Some actions may already have completed; their outcomes are unverified here. Ask to continue from that request, first checking current state and operation receipts before repeating any external action. No automatic retry was started.]

@@ -1942,7 +1942,22 @@ fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     Ok(())
 }
 
+/// Shell/skill tools inherit this marker from the currently scoped turn. It is
+/// a conservative accident guard, not proof of daemon ancestry or a security
+/// boundary: service control from an independent operator remains available.
+fn ensure_operator_service_control() -> Result<()> {
+    if std::env::var_os(crate::tools::shell::SESSION_ID_ENV_VAR)
+        .is_some_and(|session| !session.is_empty())
+    {
+        anyhow::bail!(crate::i18n::get_required_cli_string(
+            "service-control-active-turn-refused"
+        ));
+    }
+    Ok(())
+}
+
 pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_operator_service_control()?;
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
         let _ = run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL));
@@ -1988,6 +2003,7 @@ fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 }
 
 pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_operator_service_control()?;
     if cfg!(target_os = "macos") {
         stop(config, init_system)?;
         start(config, init_system)?;
@@ -2394,6 +2410,7 @@ fn tail_files(paths: &[PathBuf], lines: usize, follow: bool) -> Result<()> {
 }
 
 pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_operator_service_control()?;
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
         ensure_linux_default_install_scope(config, "uninstall")?;
@@ -4309,6 +4326,84 @@ mod linux_service_tests {
 #[cfg(test)]
 mod service_helper_tests {
     use super::*;
+
+    // Run real entrypoints in a subprocess to avoid changing global environment
+    // in this parallel test binary. All platform tools and service files are
+    // isolated too, so a regression cannot operate the developer's service.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_service_termination_refuses_before_platform_side_effects() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let log = temporary.path().join("platform-called");
+        for program in ["launchctl", "systemctl", "rc-service"] {
+            let path = bin.join(program);
+            fs::write(
+                &path,
+                "#!/bin/sh\nprintf called >> \"$ZEROCLAW_SERVICE_GUARD_LOG\"\nexit 0\n",
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for session in [Some("synthetic-session"), Some(""), None] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "service::service_helper_tests::scoped_service_termination_child",
+                    "--exact",
+                    "--ignored",
+                ])
+                .env("ZEROCLAW_SERVICE_GUARD_CHILD", "1")
+                .env("ZEROCLAW_SERVICE_GUARD_LOG", &log)
+                .env("HOME", temporary.path())
+                .env("XDG_CONFIG_HOME", temporary.path())
+                .env("PATH", &bin);
+            if let Some(session) = session {
+                child.env(crate::tools::shell::SESSION_ID_ENV_VAR, session);
+            } else {
+                child.env_remove(crate::tools::shell::SESSION_ID_ENV_VAR);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                "subprocess fixture must actually run"
+            );
+            assert!(!log.exists(), "service control reached a platform command");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture; requires an isolated service environment"]
+    fn scoped_service_termination_child() {
+        assert_eq!(
+            std::env::var("ZEROCLAW_SERVICE_GUARD_CHILD").as_deref(),
+            Ok("1")
+        );
+        if std::env::var_os(crate::tools::shell::SESSION_ID_ENV_VAR)
+            .is_none_or(|value| value.is_empty())
+        {
+            // An independent operator is permitted. Never dispatch a real stop
+            // just to prove the absence of the guard.
+            assert!(ensure_operator_service_control().is_ok());
+            return;
+        }
+        let expected = crate::i18n::get_required_cli_string("service-control-active-turn-refused");
+        assert!(!expected.starts_with('{'), "English fallback must resolve");
+        assert!(!expected.contains("synthetic-session"));
+        for action in [stop, restart, uninstall] {
+            let error = action(&Config::default(), InitSystem::Auto).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn xml_escape_escapes_reserved_chars() {

@@ -16308,7 +16308,12 @@ fn hydrate_session_transcript(
 
     let mut orphan_closed = false;
     if msgs.last().is_some_and(|msg| msg.role == "user") {
-        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        // The existing user row remains the authoritative request. This records
+        // the missing final result; it does not establish whether tools ran,
+        // replay the turn, or claim a notification was delivered to the channel.
+        let closure = ChatMessage::assistant(zeroclaw_runtime::i18n::get_required_cli_string(
+            "channel-runtime-interrupted-request",
+        ));
         if let Err(e) = store.append(session_key, &closure) {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -23411,6 +23416,324 @@ api_key = "anthropic-key"
 
     fn breadcrumb_text() -> String {
         zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    #[test]
+    fn hydration_closes_consecutive_interruptions_once_and_preserves_retry_intent() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let sender = "synthetic_interrupted_channel";
+        let closure =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-interrupted-request");
+        assert!(!closure.starts_with('{'), "English fallback must resolve");
+        let requests = [
+            "Apply the reviewed setting and report its actual result.",
+            "Continue that setting request after checking the current value.",
+        ];
+        for (index, request) in requests.iter().enumerate() {
+            // Reopening the real durable backend models consecutive restarts.
+            let store = zeroclaw_infra::session_store::SessionStore::new(temporary.path()).unwrap();
+            store.append(sender, &ChatMessage::user(*request)).unwrap();
+            let recovered = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+            assert!(recovered.orphan_closed);
+            assert_eq!(recovered.messages.len(), (index + 1) * 2);
+            assert_eq!(recovered.messages[index * 2].content, *request);
+            assert_eq!(recovered.messages[index * 2 + 1].content, closure);
+            for _ in 0..3 {
+                let repeated = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+                assert!(!repeated.orphan_closed);
+                assert_eq!(repeated.messages.len(), recovered.messages.len());
+                assert_eq!(store.load(sender).len(), recovered.messages.len());
+            }
+        }
+        let store = zeroclaw_infra::session_store::SessionStore::new(temporary.path()).unwrap();
+        let retry = "Inspect the current state and receipts before any repeated mutation.";
+        store.append(sender, &ChatMessage::user(retry)).unwrap();
+        store
+            .append(
+                sender,
+                &ChatMessage::assistant(
+                    "The existing result was verified without replaying the action.",
+                ),
+            )
+            .unwrap();
+        let completed = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+        assert!(!completed.orphan_closed);
+        assert_eq!(completed.messages.len(), 6);
+        assert_eq!(completed.messages[0].content, requests[0]);
+        assert_eq!(completed.messages[2].content, requests[1]);
+        assert_eq!(completed.messages[4].content, retry);
+        assert_eq!(
+            completed
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == closure)
+                .count(),
+            2
+        );
+        let normalized = normalize_cached_channel_turns(completed.messages);
+        assert_eq!(
+            normalized.len(),
+            6,
+            "retry must retain both interrupted requests and their closures"
+        );
+    }
+
+    /// Drive the real channel/tool loop, losing two in-flight futures after
+    /// tool effects but before final responses. Only the external provider,
+    /// channel transport and operation are fixtures; all state is temporary.
+    #[tokio::test]
+    async fn interrupted_channel_retry_checks_receipt_without_repeating_effect() {
+        use std::io::Write;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        const RECEIPT: &str = "synthetic operation committed\n";
+        const FINAL: &str = "Verified the saved operation receipt; no repeated mutation.";
+
+        struct OperationProbe {
+            receipt_path: std::path::PathBuf,
+            reads: Arc<AtomicUsize>,
+        }
+        impl zeroclaw_api::attribution::Attributable for OperationProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                NamedMockTool("recovery_operation").role()
+            }
+            fn alias(&self) -> &str {
+                "recovery_operation"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Tool for OperationProbe {
+            fn name(&self) -> &str {
+                "recovery_operation"
+            }
+            fn description(&self) -> &str {
+                "Apply a synthetic operation or inspect its temporary receipt"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["apply","inspect"]}},"required":["action"]})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                match args["action"].as_str() {
+                    Some("apply") => {
+                        // Deliberately non-idempotent: a replay adds another
+                        // line, so the final assertion detects duplicate effects.
+                        let mut receipt = std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&self.receipt_path)?;
+                        receipt.write_all(RECEIPT.as_bytes())?;
+                        receipt.sync_all()?;
+                    }
+                    Some("inspect") => {
+                        self.reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => anyhow::bail!("unexpected synthetic operation"),
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: std::fs::read_to_string(&self.receipt_path)?.into(),
+                    error: None,
+                })
+            }
+        }
+
+        struct RecoveryProvider {
+            operation: &'static str,
+            interrupt: bool,
+            calls: AtomicUsize,
+            histories: Mutex<Vec<Vec<ChatMessage>>>,
+            after_tool: tokio::sync::Notify,
+        }
+        impl zeroclaw_api::attribution::Attributable for RecoveryProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                ToolCallingModelProvider.role()
+            }
+            fn alias(&self) -> &str {
+                "recovery-provider"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for RecoveryProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("recovery must use the preserved conversation history")
+            }
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.histories.lock().unwrap().push(messages.to_vec());
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(format!(
+                        "<tool_call>{}</tool_call>",
+                        serde_json::json!({"name":"recovery_operation","arguments":{"action":self.operation}})
+                    )),
+                    1 => {
+                        assert!(messages.iter().any(|m| m.content.contains(RECEIPT.trim())));
+                        if self.interrupt {
+                            self.after_tool.notify_one();
+                            // Aborting the owner below models lost process-local
+                            // execution, not the graceful /stop cancellation path.
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(FINAL.to_string())
+                    }
+                    _ => anyhow::bail!("unexpected recovery/provider replay"),
+                }
+            }
+        }
+
+        let temporary = tempfile::TempDir::new().unwrap();
+        let receipt_path = temporary.path().join("operation-receipt");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let channel = Arc::new(RecordingChannel::default());
+        let closure =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-interrupted-request");
+        let requests = [
+            "Apply the synthetic setting and report its result.",
+            "Continue the setting request by inspecting its receipt first.",
+            "Retry receipt verification and report the existing result without reapplying it.",
+        ];
+
+        for (turn, request) in requests.iter().enumerate() {
+            let provider = Arc::new(RecoveryProvider {
+                operation: if turn == 0 { "apply" } else { "inspect" },
+                interrupt: turn < 2,
+                calls: AtomicUsize::new(0),
+                histories: Mutex::new(Vec::new()),
+                after_tool: tokio::sync::Notify::new(),
+            });
+            let store: Arc<dyn SessionBackend> =
+                Arc::new(SqliteSessionBackend::new(temporary.path()).unwrap());
+            let config = zeroclaw_config::schema::Config {
+                config_path: temporary.path().join("fixture-config.toml"),
+                data_dir: temporary.path().to_path_buf(),
+                ..Default::default()
+            };
+            let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                channel.clone(),
+                provider.clone(),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                vec![Box::new(OperationProbe {
+                    receipt_path: receipt_path.clone(),
+                    reads: reads.clone(),
+                })],
+            );
+            let context = Arc::get_mut(&mut ctx).unwrap();
+            context.session_store = Some(store.clone());
+            context.workspace_dir = Arc::new(temporary.path().to_path_buf());
+            context.show_tool_calls = false;
+            context.ack_reactions = false;
+            let mut message = message_sent_hook_test_message();
+            message.id = format!("interrupted-recovery-{turn}");
+            message.content = request.to_string();
+            let key = conversation_history_key(&message);
+
+            if turn < 2 {
+                let task = zeroclaw_spawn::spawn!(process_channel_message(
+                    ctx,
+                    message,
+                    CancellationToken::new()
+                ));
+                let reached_tool_result =
+                    tokio::time::timeout(Duration::from_secs(5), provider.after_tool.notified())
+                        .await;
+                // Always reap even if the fixture failed to reach its gate.
+                task.abort();
+                let stopped = task.await;
+                reached_tool_result
+                    .expect("tool result must reach the provider before interruption");
+                assert!(stopped.unwrap_err().is_cancelled());
+                assert!(channel.sent_messages.lock().await.is_empty());
+                assert_eq!(store.load(&key).last().unwrap().role, "user");
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    process_channel_message(ctx, message, CancellationToken::new()),
+                )
+                .await
+                .expect("the explicit retry must finish");
+                assert_eq!(channel.final_send_calls.load(Ordering::SeqCst), 1);
+                let sent = channel.sent_messages.lock().await;
+                assert_eq!(sent.len(), 1, "only the completed retry sends a reply");
+                assert!(sent[0].contains(FINAL));
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            {
+                let histories = provider.histories.lock().unwrap();
+                for original in &requests[..=turn] {
+                    assert!(
+                        histories[0]
+                            .iter()
+                            .any(|m| { m.role == "user" && m.content.contains(original) }),
+                        "the actual retry provider must receive every original request"
+                    );
+                }
+                assert_eq!(
+                    histories[0].iter().filter(|m| m.content == closure).count(),
+                    turn.min(2)
+                );
+            }
+            drop(store);
+            let reopened = SqliteSessionBackend::new(temporary.path()).unwrap();
+            let restored = hydrate_session_transcript(&reopened, &key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.orphan_closed, turn < 2);
+            for _ in 0..3 {
+                let repeated = hydrate_session_transcript(&reopened, &key)
+                    .unwrap()
+                    .unwrap();
+                assert!(!repeated.orphan_closed);
+                assert_eq!(repeated.messages.len(), restored.messages.len());
+            }
+            assert_eq!(
+                reopened
+                    .load(&key)
+                    .iter()
+                    .filter(|m| m.content == closure)
+                    .count(),
+                (turn + 1).min(2)
+            );
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                2,
+                "restore cannot replay a provider"
+            );
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                turn,
+                "one inspection per retry"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&receipt_path).unwrap(),
+                RECEIPT,
+                "the completed but unanswered operation must never execute twice"
+            );
+            if turn == 2 {
+                assert_eq!(
+                    reopened
+                        .load(&key)
+                        .iter()
+                        .filter(|m| { m.role == "assistant" && m.content.contains(FINAL) })
+                        .count(),
+                    1,
+                    "exactly one final resolution must be durable"
+                );
+            }
+        }
     }
 
     #[test]
