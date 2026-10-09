@@ -1335,13 +1335,13 @@ impl InputBarState {
         if text.is_empty() {
             return false;
         }
-        if !self.input.is_empty() {
-            self.input.push_str("\n\n");
-        }
-        self.input.push_str(text);
-        self.cursor =
-            crate::text_navigation::normalize_grapheme_cursor(&self.input, self.input.len());
-        self.clear_selection();
+        self.edit(|state| {
+            if !state.input.is_empty() {
+                state.input.push_str("\n\n");
+            }
+            state.input.push_str(text);
+            state.cursor = state.input.len();
+        });
         self.dismiss_autocomplete();
         true
     }
@@ -3363,6 +3363,44 @@ mod tests {
         assert!(bar.selection.is_none());
         assert_eq!(bar.pending_attachments().len(), 1);
         assert_eq!(bar.pending_attachments()[0].filename, "keep.png");
+    }
+
+    #[test]
+    fn append_text_at_end_is_separate_from_typing_in_undo_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("saved ".into(), Vec::new());
+        for c in "draft".chars() {
+            bar.push_input_char(c);
+        }
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.push_input_char('!');
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft");
+        bar.redo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        bar.undo();
+        assert_eq!(bar.input(), "saved ");
+    }
+
+    #[test]
+    fn append_text_at_end_invalidates_stale_redo() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft");
+        bar.insert_text(" abandoned");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
     }
 
     #[test]

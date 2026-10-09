@@ -204,8 +204,7 @@ not approve until it is filled.
 Also run a truthfulness scrub on the public artifacts before choosing a
 verdict:
 
-- Live labels match the PR body's label snapshot and the diff's real risk,
-  size, and type.
+- Check live GitHub labels against the diff's real risk, size, and type. Keep labels in GitHub's label UI; do not require or maintain a PR-body label snapshot.
 - Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
   when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
   or `Supersedes`.

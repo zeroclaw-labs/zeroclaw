@@ -10,6 +10,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
@@ -863,7 +864,7 @@ fn plugin_egress_policy(
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
     zeroclaw_plugins::egress::EgressHostService::new(
         zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
@@ -927,7 +928,7 @@ fn plugin_config_values(
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
     let data_dir = config.data_dir.clone();
     let config_dir = config
@@ -996,7 +997,6 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
@@ -1041,7 +1041,7 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_and_acp_sessions(
         config,
@@ -1099,7 +1099,7 @@ pub(crate) fn all_tools_with_runtime_context(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
@@ -1148,13 +1148,13 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        Ok(match handle.join() {
+        match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        })
+        }
     })
 }
 
@@ -1188,7 +1188,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
@@ -1246,7 +1246,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
@@ -1303,10 +1303,10 @@ fn all_tools_with_runtime_on_thread(
     tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -1314,6 +1314,10 @@ fn all_tools_with_runtime_on_thread(
         shell_tool,
         sandbox,
     } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
+    sandbox.check_initialization().map_err(|error| {
+        let context = format!("agents.{agent_alias}: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -1652,9 +1656,9 @@ fn all_tools_with_runtime_on_thread(
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
     if root_config.a2a.client.enabled {
-        let live = live_config
-            .clone()
-            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        let live = live_config.clone().unwrap_or_else(|| {
+            zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
+        });
         // The zeroclaw dir (config file parent) + secrets.encrypt enable
         // decrypting encrypted peer tokens via the canonical SecretStore,
         // the same path http_request uses for its auth_secret values.
@@ -2282,7 +2286,7 @@ fn all_tools_with_runtime_on_thread(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
-                return AllToolsResult {
+                return Ok(AllToolsResult {
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
@@ -2293,7 +2297,7 @@ fn all_tools_with_runtime_on_thread(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
-                };
+                });
             }
 
             let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
@@ -2500,7 +2504,7 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
-    AllToolsResult {
+    Ok(AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
@@ -2511,7 +2515,7 @@ fn all_tools_with_runtime_on_thread(
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
-    }
+    })
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2917,6 +2921,74 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registry_reports_seatbelt_initialization_before_tool_execution() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cycle = tmp.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let cfg = test_config(&tmp);
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "none".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let build = |root, enabled| {
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: tmp.path().to_path_buf(),
+                allowed_roots_read_only: vec![root],
+                ..SecurityPolicy::default()
+            });
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(enabled),
+                sandbox_backend: Some("sandbox-exec".into()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(zeroclaw_config::platform::NativeRuntime::new()),
+                memory.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let error = build(cycle.clone(), true)
+            .err()
+            .expect("registry must reject failed Seatbelt initialization");
+        assert!(
+            error
+                .to_string()
+                .starts_with("agents.test-agent: Seatbelt initialization failed: Seatbelt root symlink limit exceeded")
+        );
+        assert!(build(tmp.path().to_path_buf(), true).is_ok());
+        assert!(build(cycle, false).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
@@ -3030,20 +3102,18 @@ const = true
             entry(&instance_key, "true"),
             entry(&backup_instance_key, "false"),
         ];
-        let live = Arc::new(parking_lot::RwLock::new(current));
-        let services = plugin_host_services(
-            Arc::clone(&host),
-            Arc::new(snapshot),
-            Some(Arc::clone(&live)),
-        );
+        let live = zeroclaw_config::live::LiveConfig::new(current);
+        let services =
+            plugin_host_services(Arc::clone(&host), Arc::new(snapshot), Some(live.handle()));
 
         assert!(services.resolve_config(&scope).is_ok());
         assert!(
             services.resolve_config(&backup_scope).is_err(),
             "backup must use its invalid canonical entry, not a valid raw-name decoy"
         );
+        let mut updated = live.snapshot();
         for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
-            live.write()
+            updated
                 .plugins
                 .entries
                 .iter_mut()
@@ -3052,6 +3122,8 @@ const = true
                 .config
                 .insert("enabled".to_string(), enabled.to_string());
         }
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert!(
             services.resolve_config(&scope).is_err(),
             "work must observe its own canonical key's live update"
@@ -5903,7 +5975,7 @@ permissions = ["http_client"]
             allowed_private_hosts: vec!["127.0.0.1".into()],
             ..FileDownloadConfig::default()
         };
-        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(root_config.clone());
 
         let tools = all_tools_with_runtime(
             Arc::new(root_config.clone()),
@@ -5926,7 +5998,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
-            Some(live_config.clone()),
+            Some(live_config.handle()),
         )
         .expect("tool registry should build")
         .tools;
@@ -5939,11 +6011,11 @@ permissions = ["http_client"]
         let first = file_download.execute(args.clone()).await.unwrap();
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut revoked = live_config.snapshot();
+        revoked.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), revoked)
+            .unwrap();
 
         let second = file_download.execute(args).await.unwrap();
         assert!(

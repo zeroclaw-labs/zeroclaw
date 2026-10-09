@@ -1033,7 +1033,23 @@ impl BedrockModelProvider {
                     converse_messages.push(tool_result_msg);
                 }
                 _ => {
-                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
+                    // A prompt-mode tool-result carrier reads through its
+                    // declaration, never its body: the declared image
+                    // attachments become image blocks and the carrier text
+                    // survives verbatim as one text block, through the same
+                    // `parse_user_message_image_refs` seam every other
+                    // adapter uses. Ordinary user messages keep the marker
+                    // behavior unchanged.
+                    let content_blocks = if zeroclaw_api::tool_carrier::classify(
+                        &msg.role,
+                        &msg.content,
+                    )
+                    .is_some()
+                    {
+                        Self::parse_prompt_carrier_content_blocks(&msg.content)
+                    } else {
+                        Self::parse_user_content_blocks(&msg.content)
+                    };
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
                         content: content_blocks,
@@ -1183,12 +1199,7 @@ impl BedrockModelProvider {
                     let mime = &rest[..semi];
                     let after_semi = &rest[semi + 1..];
                     if let Some(b64) = after_semi.strip_prefix("base64,") {
-                        let format = match mime {
-                            "image/png" => "png",
-                            "image/gif" => "gif",
-                            "image/webp" => "webp",
-                            _ => "jpeg",
-                        };
+                        let format = Self::image_format_for_mime(mime);
                         blocks.push(ContentBlock::Image(ImageWrapper {
                             image: ImageBlock {
                                 format: format.to_string(),
@@ -1230,6 +1241,94 @@ impl BedrockModelProvider {
         }
 
         blocks
+    }
+
+    /// Build user-role blocks for a prompt-mode tool-result carrier: the
+    /// declared image attachments become image blocks, and the carrier text
+    /// `parse_user_message_image_refs` returns (the rebuilt carrier without
+    /// its image attachment lines) becomes one verbatim text block that is
+    /// never scanned for markers. The Bedrock counterpart of the seam every
+    /// other adapter routes user-role carriers through, so a carrier body
+    /// quoting marker syntax stays text instead of smuggling an image into
+    /// the request.
+    fn parse_prompt_carrier_content_blocks(content: &str) -> Vec<ContentBlock> {
+        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+        let mut blocks = Vec::new();
+
+        for image_ref in &image_refs {
+            let (mime, payload) = if image_ref.starts_with("data:") {
+                // Routed through the same shared structural check the
+                // anthropic adapter's user arm uses, so both adapters agree
+                // on what a deliverable image is: a header without `;base64`,
+                // a media type off the allowlist, a non-canonical payload, or
+                // one over the per-image ceiling is dropped here instead of
+                // drawing a 400 from the API.
+                match crate::multimodal::split_base64_image_data_uri(
+                    image_ref,
+                    crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES,
+                ) {
+                    Ok((mime, payload)) => (mime.to_ascii_lowercase(), payload.to_string()),
+                    Err(reason) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{reason}"),
+                                "error_key": "bedrock_image_marker_malformed_data_uri",
+                            })),
+                            "dropping image marker: data URI failed the structural check"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "bedrock_image_source_missing",
+                        })),
+                    "dropping image marker: source is neither a data URI nor an existing file"
+                );
+                // The multimodal normalizer is the only component allowed to
+                // turn a file reference into inline image content, so a
+                // non-inline reference is dropped rather than read: reading
+                // the path (extension-inferred MIME, no size or content
+                // validation) would reopen the hole the normalizer exists to
+                // close. Mirrors the anthropic adapter's user arm.
+                continue;
+            };
+
+            let format = Self::image_format_for_mime(&mime);
+            blocks.push(ContentBlock::Image(ImageWrapper {
+                image: ImageBlock {
+                    format: format.to_string(),
+                    source: ImageSource {
+                        bytes: payload.to_string(),
+                    },
+                },
+            }));
+        }
+
+        blocks.push(ContentBlock::Text(TextBlock { text }));
+        blocks
+    }
+
+    /// Map an image MIME media type to the Bedrock image `format` field
+    /// value. JPEG is the catch-all, exactly as the inline user-marker parse
+    /// has always mapped it.
+    fn image_format_for_mime(mime: &str) -> &'static str {
+        match mime {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "jpeg",
+        }
     }
 
     /// Parse assistant message containing structured tool calls.
@@ -2083,6 +2182,128 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    fn image_marker(target: &str) -> String {
+        zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        })
+    }
+
+    /// A count-zero carrier whose body quotes a data-URI marker and a path
+    /// marker, the ordinary shape of a tool reading source text that
+    /// contains them. The carrier reads through its declaration, so the
+    /// quotes stay body text: zero image blocks, and the delivered text is
+    /// the carrier byte-for-byte, no marker rewrite.
+    #[test]
+    fn convert_messages_prompt_carrier_quoting_data_uri_marker_stays_text() {
+        let body = format!(
+            "source example: {} and {} in prose",
+            image_marker("data:image/png;base64,QUJD"),
+            image_marker("/tmp/quoted.png")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_))),
+            "no image block may be built from carrier body text"
+        );
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, carrier, "the carrier content is delivered verbatim");
+    }
+
+    /// A declared carrier with one data-URI image attachment whose body
+    /// quotes a second data-URI marker: exactly one image block, built from
+    /// the declared attachment and never the quoted one, with the body text
+    /// verbatim around it.
+    #[test]
+    fn convert_messages_prompt_carrier_declared_image_builds_exactly_one_block() {
+        let declared = "data:image/png;base64,iVBORw0KGgo=";
+        let body = format!(
+            "source example: {} in prose",
+            image_marker("data:image/png;base64,QUJD")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            &body,
+            &[zeroclaw_api::media::RenderedMarker {
+                target: declared.to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            }],
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            images.len(),
+            1,
+            "exactly the declared attachment builds an image block"
+        );
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        assert_eq!(
+            text, expected,
+            "the body text is verbatim in the rebuilt count-zero carrier"
+        );
+        assert!(
+            text.contains(&body),
+            "the quoted marker stays in the body verbatim"
+        );
+    }
+
+    /// Control for the carrier branch: a plain user message whose text carries
+    /// one data-URI marker still lifts it into exactly one image block, the
+    /// pre-carrier behavior of `parse_user_content_blocks` unchanged.
+    #[test]
+    fn convert_messages_user_text_marker_still_builds_image_block() {
+        let content = format!(
+            "look {}",
+            image_marker("data:image/png;base64,iVBORw0KGgo=")
+        );
+        let messages = vec![ChatMessage::user(content)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "the user-text marker still lifts");
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
     }
 
     #[test]
