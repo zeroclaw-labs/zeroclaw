@@ -496,15 +496,13 @@ const MAX_TRACKED_IPS: usize = 4096;
 /// ([`MAX_CONTROL_FRAME`], 64 KiB) is the only bound a `Register` frame would
 /// otherwise hit, which is far too loose for a registry key that is retained
 /// per live daemon and echoed into status output and logs.
-pub const MAX_NODE_ID_LEN: usize = 128;
+pub use zeroclaw_relay_proto::MAX_NODE_ID_LEN;
 
 /// A node-id is a routing label, not free-form text: bounded, non-empty, and
 /// printable ASCII so it cannot smuggle control characters into operator
 /// surfaces or bloat the registry.
 fn valid_node_id(node_id: &str) -> bool {
-    !node_id.is_empty()
-        && node_id.len() <= MAX_NODE_ID_LEN
-        && node_id.chars().all(|c| c.is_ascii_graphic())
+    zeroclaw_relay_proto::is_valid_node_id(node_id)
 }
 
 struct Inner {
@@ -1166,7 +1164,10 @@ where
     }
 
     // Challenge / verify: prove possession of the private key over a fresh nonce.
-    let mut nonce = [0u8; 32];
+    // The length is pinned by the protocol (see `REGISTRATION_NONCE_LEN`): the
+    // daemon refuses to sign a challenge of any other size, because that key
+    // also signs its claim ownership proof.
+    let mut nonce = [0u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
     if SystemRandom::new().fill(&mut nonce).is_err() {
         let _ = send_setup_control(&mut ws, &Control::error("internal", "rng"), deadline).await;
         return Ok(());

@@ -4,6 +4,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 <classify EXIT_CODE|render> JSON_FILE" >&2
+    echo "       $0 issue-body REPORT_FILE RUN_URL ARTIFACT_URL" >&2
     exit 2
 }
 
@@ -92,6 +93,29 @@ render() {
     ' "$json_file"
 }
 
+issue_body() {
+    local report_file="$1"
+    local run_url="$2"
+    local artifact_url="$3"
+
+    # Even four-byte Unicode characters fit below GitHub's body limit.
+    # jq slices characters, so the preview cannot split UTF-8 bytes.
+    jq -n -r --rawfile report "$report_file" \
+        --arg run_url "$run_url" --arg artifact_url "$artifact_url" '
+        ($report | length > 12000) as $truncated
+        | (if $truncated then $report[:12000] | sub("[^\n]*$"; "") else $report end) as $preview
+        | "## Outdated dependencies found\n\n"
+          + "Workflow run: \($run_url)\n\n"
+          + "[Download the complete scan report](\($artifact_url)) (retained for 30 days).\n\n"
+          + "The following dependencies have newer versions available:\n\n"
+          + "```\n\($preview)\n```\n\n"
+          + (if $truncated then "The preview is truncated. The artifact contains the complete text and JSON reports.\n\n" else "" end)
+          + "Review and update dependencies at your earliest convenience.\n"
+          + "Breaking changes may require more attention than patch bumps.\n"
+        | if utf8bytelength < 60000 then . else error("issue body exceeds the reporting budget") end
+    '
+}
+
 case "${1:-}" in
     classify)
         [[ "$#" -eq 3 ]] || usage
@@ -100,6 +124,10 @@ case "${1:-}" in
     render)
         [[ "$#" -eq 2 ]] || usage
         render "$2"
+        ;;
+    issue-body)
+        [[ "$#" -eq 4 ]] || usage
+        issue_body "$2" "$3" "$4"
         ;;
     *)
         usage

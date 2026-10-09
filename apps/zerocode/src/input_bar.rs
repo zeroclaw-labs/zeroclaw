@@ -1328,6 +1328,24 @@ impl InputBarState {
         });
     }
 
+    /// Append text to the composer without replacing or inserting into the
+    /// user's current draft selection. This is used for transcript context,
+    /// which must preserve the draft and leave the cursor at the end.
+    pub(crate) fn append_text_at_end(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        self.edit(|state| {
+            if !state.input.is_empty() {
+                state.input.push_str("\n\n");
+            }
+            state.input.push_str(text);
+            state.cursor = state.input.len();
+        });
+        self.dismiss_autocomplete();
+        true
+    }
+
     pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
         self.file_explorer.is_none()
             && !self.input.is_empty()
@@ -3314,6 +3332,75 @@ mod tests {
         bar.move_cursor_left();
         bar.insert_text("XX");
         assert_eq!(bar.input(), "helXXlo");
+    }
+
+    #[test]
+    fn append_text_at_end_populates_empty_draft_without_separator() {
+        let mut bar = input_bar_with_shared_commands();
+
+        assert!(bar.append_text_at_end("> selected"));
+        assert_eq!(bar.input(), "> selected");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn append_text_at_end_preserves_draft_selection_attachments_and_unicode_cursor() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft 世界");
+        bar.move_cursor_left();
+        bar.selection = Some((0, "draft".len()));
+        bar.add_attachment(PendingAttachment {
+            path: PathBuf::from("keep.png"),
+            mime_type: "image/png".to_string(),
+            filename: "keep.png".to_string(),
+            size_bytes: 4,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        assert!(bar.append_text_at_end("> 引用\n> \n> é"));
+        assert_eq!(bar.input(), "draft 世界\n\n> 引用\n> \n> é");
+        assert_eq!(bar.cursor(), bar.input().len());
+        assert!(bar.selection.is_none());
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "keep.png");
+    }
+
+    #[test]
+    fn append_text_at_end_is_separate_from_typing_in_undo_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("saved ".into(), Vec::new());
+        for c in "draft".chars() {
+            bar.push_input_char(c);
+        }
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.push_input_char('!');
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "saved draft");
+        bar.redo();
+        assert_eq!(bar.input(), "saved draft\n\n> selected");
+        bar.undo();
+        bar.undo();
+        assert_eq!(bar.input(), "saved ");
+    }
+
+    #[test]
+    fn append_text_at_end_invalidates_stale_redo() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft");
+        bar.insert_text(" abandoned");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+
+        assert!(bar.append_text_at_end("> selected"));
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
+        bar.undo();
+        assert_eq!(bar.input(), "draft");
+        bar.redo();
+        assert_eq!(bar.input(), "draft\n\n> selected");
     }
 
     #[test]

@@ -247,7 +247,7 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
@@ -392,7 +392,7 @@ jobs:
   build-desktop:
     name: Build Desktop App (macOS Universal)
     needs: [validate, web]
-    runs-on: macos-14
+    runs-on: macos-15
     # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
     # then the universal app build on top.
     timeout-minutes: 180
