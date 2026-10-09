@@ -2476,6 +2476,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn opper_factory_sends_bearer_and_model_ids_to_compat_endpoint() {
+        use axum::http::{HeaderMap, Uri};
+        use axum::routing::{get, post};
+        use axum::{Json, Router, extract::State};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Seen {
+            path: String,
+            auth: Option<String>,
+            model: Option<String>,
+        }
+
+        type Capture = Arc<Mutex<Vec<Seen>>>;
+
+        fn record(capture: &Capture, uri: &Uri, headers: &HeaderMap, model: Option<String>) {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let mut captured = capture.lock().expect("capture lock poisoned");
+            captured.push(Seen {
+                path: uri.path().to_string(),
+                auth,
+                model,
+            });
+        }
+
+        async fn capture_chat(
+            State(capture): State<Capture>,
+            uri: Uri,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let model = body["model"].as_str().map(str::to_string);
+            record(&capture, &uri, &headers, model);
+            Json(json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        async fn capture_models(
+            State(capture): State<Capture>,
+            uri: Uri,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            record(&capture, &uri, &headers, None);
+            Json(json!({
+                "data": [
+                    {"id": "claude-sonnet-4-6"},
+                    {"id": "anthropic/claude-sonnet-4-6"}
+                ]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v3/compat/chat/completions", post(capture_chat))
+            .route("/v3/compat/models", get(capture_models))
+            .with_state(capture.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let provider = OpperModelProviderConfig::default()
+            .create_provider(
+                "default",
+                Some("opper-test-key"),
+                Some(&format!("http://{addr}/v3/compat")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("opper provider should build");
+
+        // A pool name and a route-pinned provider/model id must both reach
+        // the wire unchanged.
+        for model in ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"] {
+            assert_eq!(
+                provider
+                    .chat_with_system(None, "hello", model, Some(0.7))
+                    .await
+                    .expect("opper chat should reach the compat endpoint"),
+                "ok"
+            );
+        }
+        assert_eq!(
+            provider.list_models().await.expect("list opper models"),
+            vec![
+                "anthropic/claude-sonnet-4-6".to_string(),
+                "claude-sonnet-4-6".to_string(),
+            ]
+        );
+
+        let expected_auth = Some("Bearer opper-test-key".to_string());
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(
+            seen,
+            vec![
+                Seen {
+                    path: "/v3/compat/chat/completions".to_string(),
+                    auth: expected_auth.clone(),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                },
+                Seen {
+                    path: "/v3/compat/chat/completions".to_string(),
+                    auth: expected_auth.clone(),
+                    model: Some("anthropic/claude-sonnet-4-6".to_string()),
+                },
+                Seen {
+                    path: "/v3/compat/models".to_string(),
+                    auth: expected_auth,
+                    model: None,
+                },
+            ]
+        );
+        server.abort();
+    }
+
     #[test]
     fn merge_extra_body_nests_chat_template_kwargs_under_own_key() {
         let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "max"});
