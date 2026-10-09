@@ -204,7 +204,10 @@ mod tests {
     use super::*;
 
     fn command(args: &[&str]) -> Result<()> {
-        run(&args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>())
+        run(&args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>())
     }
 
     #[test]
@@ -274,7 +277,10 @@ mod tests {
         let signed = fs::read_to_string(&output).expect("read command output");
         let root: toml::Table = toml::from_str(&signed).expect("signed output is TOML");
         let expected_digest = signature::sha256_hex(payload_bytes);
-        assert_eq!(root[PAYLOAD_DIGEST].as_str(), Some(expected_digest.as_str()));
+        assert_eq!(
+            root[PAYLOAD_DIGEST].as_str(),
+            Some(expected_digest.as_str())
+        );
         let verdict = signature::enforce_signature_policy(
             "signing-fixture",
             &signed,
