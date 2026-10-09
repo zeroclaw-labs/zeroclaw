@@ -426,8 +426,28 @@ struct ModelEntry {
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
     /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
-    #[serde(default)]
+    /// Vendors also use `pricing` for other shapes (xAI image models send an
+    /// array of per-tier objects); those read as unknown pricing rather than
+    /// failing the whole listing.
+    #[serde(default, deserialize_with = "deserialize_lenient_pricing")]
     pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
+}
+
+/// Accept only the per-token object shape for `pricing`; any other shape (an
+/// array, a scalar, an object with non-string rates) is `None`. Arrays must be
+/// rejected explicitly: serde would otherwise read them positionally into the
+/// struct.
+fn deserialize_lenient_pricing<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeroclaw_api::model_provider::ModelPricing>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(object @ serde_json::Value::Object(_)) => serde_json::from_value(object).ok(),
+        _ => None,
+    })
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -16221,6 +16241,67 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    /// xAI's `/v1/models` mixes chat models (flat integer price fields, no
+    /// `pricing`) with image models whose `pricing` is an array of per-tier
+    /// objects. One unrecognized `pricing` shape must not fail the listing.
+    const XAI_MODELS_WITH_TIERED_IMAGE_PRICING: &str = r#"{
+        "data": [
+            {"id": "grok-4.6", "aliases": [], "context_length": 256000,
+             "created": 1768003200, "object": "model", "owned_by": "xai",
+             "prompt_text_token_price": 20000, "completion_text_token_price": 80000,
+             "capabilities": {"reasoning_effort": ["low", "high"]}},
+            {"id": "grok-imagine-image", "aliases": [], "created": 1769472000,
+             "object": "model", "owned_by": "xai", "image_price": 200000000,
+             "pricing": [
+                 {"quality": "medium", "resolution": "1k", "image_price": 200000000},
+                 {"quality": "high", "resolution": "2k", "image_price": 400000000}
+             ]}
+        ],
+        "object": "list"
+    }"#;
+
+    #[test]
+    fn model_ids_parse_despite_tiered_array_pricing() {
+        let ids = parse_model_ids_from_bytes(XAI_MODELS_WITH_TIERED_IMAGE_PRICING.as_bytes())
+            .expect("array-shaped pricing must not fail the model list");
+        assert_eq!(ids, vec!["grok-4.6", "grok-imagine-image"]);
+    }
+
+    #[test]
+    fn models_with_pricing_drop_unrecognized_pricing_shape() {
+        let body: ModelsResponse =
+            serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
+        let models = normalize_models_with_pricing(body);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "a pricing shape we cannot read is unknown pricing, not a parse failure"
+        );
+    }
+
+    #[test]
+    fn models_with_pricing_keep_object_pricing() {
+        // OpenRouter/Kilo object shape must still parse; a malformed object
+        // (non-string rate) degrades that entry to unknown pricing only.
+        let body: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "b", "pricing": {"prompt": {"tier": 1}}},
+                {"id": "c", "pricing": null}
+            ]}"#,
+        )
+        .unwrap();
+        let models = normalize_models_with_pricing(body);
+        let a = models[0]
+            .pricing
+            .as_ref()
+            .expect("object pricing preserved");
+        assert_eq!(a.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(a.completion.as_deref(), Some("0.000015"));
+        assert!(models[1].pricing.is_none());
+        assert!(models[2].pricing.is_none());
     }
 
     #[test]

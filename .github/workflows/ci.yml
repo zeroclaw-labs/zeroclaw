@@ -28,8 +28,8 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so runner selection does not wait for fmt. Only the separate
-# windows-task-owner-recovery job waits for path-changes; the build matrix
+# directly, so runner selection does not wait for fmt. The separate required
+# Windows jobs wait for windows-required-changes; the build matrix
 # waits only for the push debounce, which is skipped on PR and merge-queue events.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
@@ -407,47 +407,56 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
-  windows-service-smoke-changes:
-    name: Detect Windows Service Smoke changes
+  windows-required-changes:
+    name: Select required Windows jobs
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:
-      run: ${{ steps.changed.outputs.run }}
+      windows_root: ${{ steps.select.outputs.windows_root }}
+      windows_voice_wake: ${{ steps.select.outputs.windows_voice_wake }}
+      windows_recovery: ${{ steps.select.outputs.windows_recovery }}
+      windows_service: ${{ steps.select.outputs.windows_service }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - name: Detect Windows service smoke changes
-        id: changed
+      - name: Test Windows scope contracts
+        run: |
+          bash scripts/ci/windows_recovery_change_filter.test.sh
+          bash scripts/ci/windows_test_scope.test.sh
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - name: Select required Windows jobs
+        id: select
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
 
           changed_files="$(mktemp)"
-          case "${{ github.event_name }}" in
-            pull_request)
-              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
-              ;;
-            push|merge_group)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            *)
-              echo "run=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          if grep -Eq '^(src/main\.rs|crates/zeroclaw-runtime/(src/service/mod\.rs|examples/windows_service_smoke_fixture\.rs)|scripts/ci/windows_service_smoke\.ps1|\.github/workflows/ci\.yml)$' "$changed_files"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+          metadata_file="$(mktemp)"
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            if ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
+              # Discard partial evidence so it cannot authorize a skip.
+              : > "$changed_files"
+            fi
+            # No registry resolution, downloads or build-script execution.
+            if ! cargo metadata --locked --offline --no-deps --format-version 1 > "$metadata_file"; then
+              : > "$metadata_file"
+            fi
           fi
+          python3 scripts/ci/windows_test_scope.py --required-jobs \
+            --event "$EVENT_NAME" --changed-paths-file "$changed_files" \
+            --metadata-file "$metadata_file" --repo-root "$GITHUB_WORKSPACE" \
+            | tee -a "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
 
   windows-service-smoke:
     name: Windows Service Smoke
-    needs: [windows-service-smoke-changes]
-    if: needs.windows-service-smoke-changes.outputs.run == 'true'
+    needs: [windows-required-changes]
+    if: needs.windows-required-changes.outputs.windows_service == 'true'
     runs-on: windows-latest
     timeout-minutes: 35
     env:
@@ -518,10 +527,6 @@ jobs:
             target: aarch64-apple-darwin
             cmd: check
             label: Check
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cmd: check
-            label: Check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -589,6 +594,69 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+  # Windows admission must not hold the unconditional Linux/macOS matrix.
+  # Keep the old build cache identity and commands after splitting this leg.
+  windows-build:
+    name: Check x86_64-pc-windows-msvc
+    needs: [master-debounce, windows-required-changes]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && (needs.windows-required-changes.outputs.windows_root == 'true' || needs.windows-required-changes.outputs.windows_voice_wake == 'true') }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - uses: ./.github/actions/rust-cache
+        id: rust-cache
+        with:
+          use-blacksmith: 'false'
+          shared-key: build
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Check
+        if: needs.windows-required-changes.outputs.windows_root == 'true'
+        shell: bash
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-build-x86_64-pc-windows-msvc.log"
+          SECONDS=0
+          cargo check --profile ci --locked --target x86_64-pc-windows-msvc 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          {
+            echo "### Check diagnostics: x86_64-pc-windows-msvc"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`x86_64-pc-windows-msvc\` |"
+            echo "| Runner OS | \`Windows\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Cargo duration | \`${duration_seconds}s\` |"
+            echo "| Cargo status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+          exit "$cargo_status"
+      - name: Check voice-wake
+        if: needs.windows-required-changes.outputs.windows_voice_wake == 'true'
+        shell: bash
+        run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc
+
   # Split out of the Windows build leg so the recovery harness compiles in
   # parallel with `cargo check` and voice-wake instead of after them. The three
   # compiles share nothing (check metadata cannot feed a test-profile build), so
@@ -596,8 +664,8 @@ jobs:
   # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
   windows-task-owner-recovery:
     name: Test Windows task-owner recovery
-    needs: [path-changes, master-debounce]
-    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.path-changes.result == 'success' && needs.path-changes.outputs.windows_recovery != 'false' }}
+    needs: [windows-required-changes, master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && needs.windows-required-changes.outputs.windows_recovery == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -1250,7 +1318,7 @@ jobs:
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
-  # Detect non-Rust job families and the Windows recovery probe a PR touches,
+  # Detect non-Rust job families a PR touches,
   # so unrelated PRs do not pay for them. Cheap and always-on; forces every
   # family true on push / merge_group so master cache-warming and the required
   # gate keep exercising the full set. A path-skipped job leaves `CI Required
@@ -1269,15 +1337,10 @@ jobs:
       nix: ${{ steps.filter.outputs.nix }}
       nix_hash: ${{ steps.filter.outputs.nix_hash }}
       web: ${{ steps.filter.outputs.web }}
-      windows_recovery: ${{ steps.filter.outputs.windows_recovery }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - name: Test Windows scope contracts
-        run: |
-          bash scripts/ci/windows_recovery_change_filter.test.sh
-          bash scripts/ci/windows_test_scope.test.sh
       - name: Classify changed paths
         id: filter
         shell: bash
@@ -1294,7 +1357,6 @@ jobs:
                 echo "nix=true"
                 echo "nix_hash=true"
                 echo "web=true"
-                echo "windows_recovery=true"
               } >> "$GITHUB_OUTPUT"
               exit 0
               ;;
@@ -1302,7 +1364,6 @@ jobs:
 
           changed="$(mktemp)"
           git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
-          bash scripts/ci/windows_recovery_change_filter.sh pull_request "$changed" >> "$GITHUB_OUTPUT"
 
           emit() {
             local name="$1" pattern="$2"
@@ -1527,12 +1588,35 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "::error::One or more CI jobs failed or were cancelled"
             exit 1
           fi
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          detector = needs["windows-required-changes"]
+          if detector["result"] != "success":
+              raise SystemExit("Required Windows selection did not succeed")
+          outputs = detector["outputs"]
+          for job, flags in (
+              ("windows-build", ("windows_root", "windows_voice_wake")),
+              ("windows-service-smoke", ("windows_service",)),
+              ("windows-task-owner-recovery", ("windows_recovery",)),
+          ):
+              if any(outputs.get(flag) not in {"true", "false"} for flag in flags):
+                  raise SystemExit(f"Missing or invalid Windows selection for {job}")
+              selected = any(outputs[flag] == "true" for flag in flags)
+              expected = "success" if selected else "skipped"
+              if needs[job]["result"] != expected:
+                  raise SystemExit(f"{job}: expected {expected}, got {needs[job]['result']}")
+          PY
