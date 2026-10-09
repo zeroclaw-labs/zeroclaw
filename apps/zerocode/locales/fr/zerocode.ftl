@@ -160,6 +160,7 @@ zc-queue-full = La file d'attente est pleine ({ $cap } max). Attendez que les me
 zc-queue-title = File d'attente ({ $count })
 zc-queue-empty-list = Aucun message en file d'attente.
 zc-queue-paused-ghost = File d'attente suspendue — appuyez sur { $key } ou envoyez un message pour reprendre
+zc-queue-missing-completion-ghost = Fin non confirmée. { $key } ou envoi pour reprendre.
 zc-queue-item-injected = (injection)
 zc-queue-resumed = File d'attente reprise.
 zc-queue-clear-empty = La file d'attente est déjà vide.

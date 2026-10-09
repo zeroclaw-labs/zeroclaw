@@ -44,6 +44,10 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.inner.supports_exact_request_replay(request, model)
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.stable_request_identity
             .unwrap_or_else(|| self.inner.has_stable_request_identity(model))
@@ -354,6 +358,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityFake {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            model == "routed-model" && request.tools.is_none()
+        }
+
         fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: model == "routed-model",
@@ -406,6 +414,28 @@ mod tests {
             None,
         ));
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn exact_replay_preserves_inner_model_and_request_restrictions() {
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        for vision in [None, Some(false), Some(true)] {
+            let wrapped =
+                VisionOverrideProvider::factory_leaf(Box::new(ModelAwareCapabilityFake), vision);
+            assert!(wrapped.supports_exact_request_replay(request, "routed-model"));
+            assert!(!wrapped.supports_exact_request_replay(request, "other-model"));
+            assert!(!wrapped.supports_exact_request_replay(
+                ChatRequest {
+                    tools: Some(&[]),
+                    ..request
+                },
+                "routed-model"
+            ));
+        }
     }
 
     #[test]
