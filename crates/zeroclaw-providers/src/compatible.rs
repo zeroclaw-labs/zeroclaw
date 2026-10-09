@@ -19,9 +19,26 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
 use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
+
+tokio::task_local! {
+    static EXACT_REQUEST_REPLAY: ();
+}
+
+/// Run one compatible-provider dispatch without provider-internal retries or
+/// request-shape fallbacks. Runtime uses this only for exact image recovery.
+#[doc(hidden)]
+pub async fn scope_exact_request_replay<F: std::future::Future>(future: F) -> F::Output {
+    EXACT_REQUEST_REPLAY.scope((), future).await
+}
+
+fn exact_request_replay_active() -> bool {
+    EXACT_REQUEST_REPLAY.try_with(|_| ()).is_ok()
+}
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -346,7 +363,18 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
         .ok()
         .and_then(|value| structured_api_error_message(&value));
     let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
-    StreamError::ModelProvider(format!("{status}: {sanitized}"))
+    StreamError::HttpStatus {
+        status: status.as_u16(),
+        message: sanitized,
+    }
+}
+
+fn provider_http_error(name: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let error = super::api_error_from_parts(name, status, body);
+    anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+        status,
+        error.to_string(),
+    ))
 }
 
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
@@ -398,8 +426,28 @@ struct ModelEntry {
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
     /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
-    #[serde(default)]
+    /// Vendors also use `pricing` for other shapes (xAI image models send an
+    /// array of per-tier objects); those read as unknown pricing rather than
+    /// failing the whole listing.
+    #[serde(default, deserialize_with = "deserialize_lenient_pricing")]
     pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
+}
+
+/// Accept only the per-token object shape for `pricing`; any other shape (an
+/// array, a scalar, an object with non-string rates) is `None`. Arrays must be
+/// rejected explicitly: serde would otherwise read them positionally into the
+/// struct.
+fn deserialize_lenient_pricing<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeroclaw_api::model_provider::ModelPricing>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(object @ serde_json::Value::Object(_)) => serde_json::from_value(object).ok(),
+        _ => None,
+    })
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -1481,7 +1529,7 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+                content: self.message_content_for_role(&m.role, &m.content, !merge),
                 thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
@@ -1524,7 +1572,9 @@ impl OpenAiCompatibleModelProvider {
         };
 
         if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
+            let status = response.status();
+            let body = response.text().await?;
+            return Err(provider_http_error(&self.name, status, &body));
         }
 
         let body = response.text().await?;
@@ -3283,6 +3333,29 @@ impl OpenAiCompatibleModelProvider {
         if role != "user" || !allow_user_image_parts {
             return MessageContent::Text(content.to_string());
         }
+        // A prompt-mode tool carrier contributes only its declared image
+        // attachment lines; its body — and a legacy carrier's whole text —
+        // is never scanned for markers.
+        if is_tool_result_carrier(role, content) {
+            let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
+            if image_refs.is_empty() {
+                return MessageContent::Text(content.to_string());
+            }
+            let mut parts = Vec::with_capacity(image_refs.len() + 1);
+            let trimmed_text = cleaned_text.trim();
+            if !trimmed_text.is_empty() {
+                parts.push(MessagePart::Text {
+                    text: trimmed_text.to_string(),
+                    cache_control: None,
+                });
+            }
+            for image_ref in image_refs {
+                parts.push(MessagePart::ImageUrl {
+                    image_url: ImageUrlPart { url: image_ref },
+                });
+            }
+            return MessageContent::Parts(parts);
+        }
         Self::content_with_image_parts(content)
     }
 
@@ -3310,55 +3383,72 @@ impl OpenAiCompatibleModelProvider {
         MessageContent::Parts(parts)
     }
 
-    fn sanitize_tool_result_content(content: &str) -> String {
-        let mut cleaned = String::with_capacity(content.len());
-        let mut cursor = 0;
-        let mut removed_image_marker = false;
-
-        while let Some(relative_start) = content[cursor..].find("[IMAGE:") {
-            let start = cursor + relative_start;
-            cleaned.push_str(&content[cursor..start]);
-            removed_image_marker = true;
-
-            let after_prefix = start + "[IMAGE:".len();
-            cursor = content[after_prefix..]
-                .find(']')
-                .map(|relative_end| after_prefix + relative_end + 1)
-                .unwrap_or(content.len());
-            if cursor == content.len() {
-                break;
+    /// Resolve one tool-result carrier's model-facing content from its
+    /// declared attachments: `image_url` parts from the image entries when
+    /// the provider takes them, or the fixed omission notice under the
+    /// `omit` policy. The body is never scanned for markers.
+    fn tool_carrier_content(
+        &self,
+        body: &str,
+        attachments: &[RenderedMarker],
+        allow_image_parts: bool,
+    ) -> MessageContent {
+        if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
+            if attachments.is_empty() {
+                return MessageContent::Text(body.to_string());
             }
+            let mut text = body.to_string();
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+            return MessageContent::Text(text);
         }
-
-        cleaned.push_str(&content[cursor..]);
-        if !removed_image_marker {
-            return content.to_string();
+        if !allow_image_parts {
+            return MessageContent::Text(body.to_string());
         }
-
-        if !cleaned.is_empty() {
-            cleaned.push_str("\n\n");
+        let image_refs: Vec<&str> = attachments
+            .iter()
+            .filter(|marker| marker.kind == MarkerKind::Image)
+            .map(|marker| marker.target.as_str())
+            .collect();
+        if image_refs.is_empty() {
+            return MessageContent::Text(body.to_string());
         }
-        cleaned.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
-        cleaned
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed_body = body.trim();
+        if !trimmed_body.is_empty() {
+            parts.push(MessagePart::Text {
+                text: trimmed_body.to_string(),
+                cache_control: None,
+            });
+        }
+        for image_ref in image_refs {
+            parts.push(MessagePart::ImageUrl {
+                image_url: ImageUrlPart {
+                    url: image_ref.to_string(),
+                },
+            });
+        }
+        MessageContent::Parts(parts)
     }
 
+    /// Drop a declared carrier's attachments under the `omit` policy, keeping
+    /// the body verbatim and appending the fixed notice. Legacy carriers
+    /// (no attachments key) pass through untouched: their bodies are text,
+    /// nothing promotes from them, and there is nothing to omit.
     fn sanitize_tool_result_message(content: &str) -> String {
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content)
-            && let Some(tool_content) = value.get_mut("content")
-        {
-            let raw_content = tool_content
-                .as_str()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| tool_content.to_string());
-            let sanitized_content = Self::sanitize_tool_result_content(&raw_content);
-            if sanitized_content == raw_content {
-                return content.to_string();
-            }
-            *tool_content = serde_json::Value::String(sanitized_content);
-            return value.to_string();
+        let Some(mut parts) = classify("tool", content).filter(|parts| parts.declared) else {
+            return content.to_string();
+        };
+        if parts.attachments.is_empty() {
+            return content.to_string();
         }
-
-        Self::sanitize_tool_result_content(content)
+        if !parts.text.is_empty() {
+            parts.text.push_str("\n\n");
+        }
+        parts.text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+        rebuild_carrier("tool", content, &parts, &[])
     }
 
     fn message_content_for_role(
@@ -3366,16 +3456,24 @@ impl OpenAiCompatibleModelProvider {
         role: &str,
         content: &str,
         allow_user_image_parts: bool,
-        allow_tool_image_parts: bool,
     ) -> MessageContent {
-        if role == "tool" {
-            if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
-                return MessageContent::Text(Self::sanitize_tool_result_content(content));
-            }
-            if allow_tool_image_parts && allow_user_image_parts {
-                return Self::content_with_image_parts(content);
-            }
-            return MessageContent::Text(content.to_string());
+        if role == "tool"
+            && let Some(parts) = classify(role, content)
+        {
+            // `classify` never returns `None` for a tool message: raw text
+            // and a non-string payload are legacy carriers whose text is
+            // the raw content, so the raw-text fallback this arm once
+            // carried is gone. Declaredness alone decides whether
+            // attachments ride along; an envelope carrier resolves through
+            // its declared attachments (this is the path `chat_with_history`
+            // takes, where the whole envelope string arrives here) and its
+            // body is never scanned.
+            let attachments = if parts.declared {
+                parts.attachments
+            } else {
+                Vec::new()
+            };
+            return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
         }
         Self::to_message_content(role, content, allow_user_image_parts)
     }
@@ -3508,23 +3606,26 @@ impl OpenAiCompatibleModelProvider {
                     if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
                         tool_call_id = last_assistant_tool_call_ids.first().cloned();
                     }
+                    // The envelope's attachments are the only image source:
+                    // the content string is never scanned for markers.
+                    // Declaredness comes from the one classifier, so this
+                    // seam cannot drift from the adapters on what counts as
+                    // a declaration.
+                    let attachments = classify("tool", &message.content)
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments)
+                        .unwrap_or_default();
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| {
-                            self.message_content_for_role(
-                                "tool",
-                                value,
-                                allow_user_image_parts,
-                                true,
-                            )
+                        .map(|body| {
+                            self.tool_carrier_content(body, &attachments, allow_user_image_parts)
                         })
                         .or_else(|| {
                             Some(self.message_content_for_role(
                                 "tool",
                                 &message.content,
                                 allow_user_image_parts,
-                                false,
                             ))
                         });
 
@@ -3561,7 +3662,6 @@ impl OpenAiCompatibleModelProvider {
                         &message.role,
                         &message.content,
                         allow_user_image_parts,
-                        false,
                     )),
                     tool_call_id: None,
                     tool_calls: None,
@@ -3825,6 +3925,27 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn supports_exact_request_replay(
+        &self,
+        request: ProviderChatRequest<'_>,
+        _model: &str,
+    ) -> bool {
+        // Tools can activate reasoning/schema fallback, and provider-backed
+        // auth can refresh or replace the credential between physical calls.
+        let uses_static_credential = self
+            .credential
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|credential| !credential.is_empty())
+            || self.auth_service.is_none();
+        request.tools.is_none()
+            && self
+                .extra_body
+                .as_ref()
+                .is_none_or(|extra| extra.get("tools").is_none())
+            && uses_static_credential
+    }
+
     fn default_base_url(&self) -> Option<&str> {
         self.canonical_base_url
     }
@@ -4140,8 +4261,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(provider_http_error(&self.name, status, &error));
         }
 
         let body = response.text().await?;
@@ -4195,6 +4315,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
@@ -4233,6 +4354,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .await
             {
                 Ok(response) => response,
+                Err(error) if exact_request_replay => return Err(error.into()),
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -4258,7 +4380,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let status = response.status();
             let error = response.text().await?;
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -4283,7 +4406,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            return Err(super::api_error_from_parts(&self.name, status, &error));
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -4311,6 +4434,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self
@@ -4384,7 +4508,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -4409,7 +4534,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            if !exact_request_replay
+                && tools_count > 0
+                && Self::is_native_tool_schema_unsupported(status, &sanitized)
+            {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let (message, usage) = self
@@ -4425,7 +4553,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return Ok(response);
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -4497,6 +4625,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
+        let exact_request_replay = exact_request_replay_active();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -4547,7 +4676,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             &message.role,
                             &message.content,
                             !merge,
-                            false,
                             // Streamed requests are thinking-off under
                             // passthrough (see streaming_thinking_params):
                             // history replay blocks require the request
@@ -4678,7 +4806,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                if tools_count > 0
+                if !exact_request_replay
+                    && tools_count > 0
                     && super::rejects_tools_with_reasoning_effort(status, &error)
                     && ensure_reasoning_effort_none(&mut payload)
                 {
@@ -4947,7 +5076,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
+                    content: provider.message_content_for_role(&m.role, &m.content, !merge),
                     thinking_blocks: None,
                 })
                 .collect();
@@ -5205,12 +5334,15 @@ mod tests {
     fn streaming_api_error_sanitizes_and_bounds_upstream_body() {
         let secret = "sk-test-streaming-secret";
         let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
-        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body);
 
-        assert!(error.starts_with("ModelProvider error: 401 Unauthorized:"));
-        assert!(error.contains("[REDACTED]"));
-        assert!(!error.contains(secret));
-        assert!(error.chars().count() <= 550);
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 401);
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(secret));
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
@@ -5231,13 +5363,17 @@ mod tests {
         })
         .to_string();
 
-        let error =
-            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body);
 
-        assert_eq!(
-            error,
-            format!("ModelProvider error: 500 Internal Server Error: {message}")
-        );
+        let StreamError::HttpStatus {
+            status,
+            message: actual_message,
+        } = error
+        else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 500);
+        assert_eq!(actual_message, message);
     }
 
     #[tokio::test]
@@ -9040,7 +9176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejecting_endpoint_retries_once_with_reasoning_disabled() {
+    async fn tool_bearing_request_is_ineligible_and_retains_reasoning_fallback() {
         let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -9058,18 +9194,14 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
 
-        let response = provider
-            .chat(
-                crate::traits::ChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                    thinking: None,
-                },
-                "gpt-5",
-                None,
-            )
-            .await
-            .unwrap();
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: Some(&tools),
+            thinking: None,
+        };
+        assert!(!provider.supports_exact_request_replay(request, "gpt-5"));
+
+        let response = provider.chat(request, "gpt-5", None).await.unwrap();
         assert_eq!(response.text.as_deref(), Some("ok"));
 
         let bodies = bodies.lock().unwrap();
@@ -9151,6 +9283,54 @@ mod tests {
             Some("none")
         );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_replay_scope_suppresses_stream_reasoning_retry() {
+        use futures_util::StreamExt as _;
+
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let events = scope_exact_request_replay(async {
+            provider
+                .stream_chat(
+                    crate::traits::ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "gpt-5",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await;
+
+        assert!(events.iter().any(Result::is_err));
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            1,
+            "exact replay must suppress the spawned stream worker's reasoning retry"
+        );
         server.abort();
     }
 
@@ -10916,13 +11096,13 @@ mod tests {
     }
 
     fn assert_sanitized_streaming_error(error: StreamError, secret: &str) {
-        let StreamError::ModelProvider(message) = error else {
-            panic!("expected model-provider error, got {error}");
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
         };
-        assert!(message.contains("401 Unauthorized"));
+        assert_eq!(status, 401);
         assert!(message.contains("[REDACTED]"));
         assert!(!message.contains(secret));
-        assert!(message.chars().count() <= 525);
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
@@ -11152,7 +11332,15 @@ mod tests {
         // text blob — vision backends count base64 bytes as text tokens and
         // reject the request as over-context otherwise
         let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+            serde_json::json!({
+                "tool_call_id": "call_img",
+                "content": "snapshot captured",
+                "attachments": [{
+                    "kind": "image",
+                    "target": "data:image/jpeg;base64,/9j/4AAQ"
+                }],
+            })
+            .to_string(),
         )];
 
         let provider = make_model_provider("test", "https://example.com", None);
@@ -11190,7 +11378,11 @@ mod tests {
         let input = vec![ChatMessage::tool(
             serde_json::json!({
                 "tool_call_id": "call_img",
-                "content": "before [IMAGE:data:image/jpeg;base64,/9j/4AAQ] middle [IMAGE:https://example.com/secret.png] after"
+                "content": "before, middle, after",
+                "attachments": [
+                    {"kind": "image", "target": "data:image/jpeg;base64,/9j/4AAQ"},
+                    {"kind": "image", "target": "https://example.com/secret.png"},
+                ],
             })
             .to_string(),
         )];
@@ -11213,8 +11405,8 @@ mod tests {
         let content = content.as_str().expect("omitted tool content is text");
 
         assert_eq!(
-            content,
-            "before  middle  after\n\n[tool-result image omitted by provider policy]"
+            content, "before, middle, after\n\n[tool-result image omitted by provider policy]",
+            "declared attachments drop under omit and the body survives verbatim"
         );
         assert_eq!(
             content
@@ -11229,7 +11421,10 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_sanitizes_malformed_tool_result_json() {
+    fn convert_messages_for_native_keeps_malformed_legacy_tool_text_verbatim() {
+        // A raw non-JSON tool message is a legacy carrier: its body is text
+        // under the attachment-identity contract, so even the omit policy
+        // leaves it byte for byte — nothing was ever promoted from it.
         let input = vec![ChatMessage::tool(
             "malformed result [IMAGE:/tmp/secret.png]",
         )];
@@ -11249,21 +11444,22 @@ mod tests {
                 .expect("malformed tool message should carry content"),
         )
         .unwrap();
-        let content = content.as_str().expect("sanitized fallback should be text");
+        let content = content.as_str().expect("legacy tool content is text");
 
         assert_eq!(converted[0].role, "tool");
         assert_eq!(
-            content,
-            "malformed result \n\n[tool-result image omitted by provider policy]"
+            content, "malformed result [IMAGE:/tmp/secret.png]",
+            "a legacy tool body passes through verbatim under omit"
         );
         assert_eq!(converted[0].tool_call_id, None);
         assert_eq!(converted[0].name, None);
-        assert!(!content.contains("[IMAGE:"));
-        assert!(!content.contains("/tmp/secret.png"));
     }
 
     #[test]
-    fn convert_messages_for_native_sanitizes_non_string_tool_result_content() {
+    fn convert_messages_for_native_keeps_non_string_legacy_content_verbatim() {
+        // A non-string `content` payload is a legacy envelope (no attachments
+        // key): the fallback renders the whole envelope as text, verbatim —
+        // the old marker strip no longer applies to bodies.
         let input = vec![ChatMessage::tool(
             serde_json::json!({
                 "tool_call_id": "call_obj",
@@ -11288,19 +11484,25 @@ mod tests {
                 .expect("non-string tool message should carry content"),
         )
         .unwrap();
-        let content = content.as_str().expect("sanitized fallback should be text");
+        let content = content.as_str().expect("legacy envelope content is text");
 
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_obj"));
         assert_eq!(converted[0].name.as_deref(), Some("read"));
-        assert!(content.contains("\"payload\":\""));
-        assert!(content.contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE));
-        assert_eq!(content.matches(TOOL_RESULT_IMAGE_OMITTED_NOTICE).count(), 1);
-        assert!(!content.contains("[IMAGE:"));
-        assert!(!content.contains("/tmp/secret.png"));
+        assert!(
+            content.contains("\"payload\":\""),
+            "the non-string payload renders as the envelope text"
+        );
+        assert!(
+            content.contains("[IMAGE:/tmp/secret.png]"),
+            "marker syntax inside a legacy payload stays text"
+        );
+        assert!(!content.contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE));
     }
 
     #[test]
-    fn convert_messages_for_native_sanitizes_unterminated_tool_result_marker() {
+    fn convert_messages_for_native_keeps_unterminated_legacy_marker_verbatim() {
+        // An unterminated marker inside a legacy body is just text now; the
+        // omit policy only drops declared attachments.
         let input = vec![ChatMessage::tool(
             serde_json::json!({
                 "tool_call_id": "call_unterminated",
@@ -11326,22 +11528,20 @@ mod tests {
         .unwrap();
         let content = content
             .as_str()
-            .expect("sanitized tool content should be text");
+            .expect("legacy tool content should be text");
 
         assert_eq!(
-            content,
-            "prefix \n\n[tool-result image omitted by provider policy]"
+            content, "prefix [IMAGE:/tmp/secret.png",
+            "an unterminated marker in a legacy body survives verbatim"
         );
         assert_eq!(
             converted[0].tool_call_id.as_deref(),
             Some("call_unterminated")
         );
-        assert!(!content.contains("[IMAGE:"));
-        assert!(!content.contains("/tmp/secret.png"));
     }
 
     #[tokio::test]
-    async fn chat_with_history_no_tools_sanitizes_tool_result_request_content() {
+    async fn chat_with_history_no_tools_omits_declared_tool_attachment() {
         let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
             "choices": [{"message": {"content": "ok"}}]
         }))
@@ -11349,7 +11549,15 @@ mod tests {
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
 
         let messages = vec![ChatMessage::tool(
-            "history [IMAGE:data:image/png;base64,SECRET] tail",
+            serde_json::json!({
+                "tool_call_id": "call_img",
+                "content": "history tail",
+                "attachments": [{
+                    "kind": "image",
+                    "target": "data:image/png;base64,SECRET"
+                }],
+            })
+            .to_string(),
         )];
         let response = provider
             .chat_with_history(&messages, "test-model", None)
@@ -11366,17 +11574,16 @@ mod tests {
             .as_str()
             .expect("tool content should serialize as a string");
         assert_eq!(
-            content,
-            "history  tail\n\n[tool-result image omitted by provider policy]"
+            content, "history tail\n\n[tool-result image omitted by provider policy]",
+            "the declared attachment drops under omit, the body survives"
         );
-        assert!(!content.contains("[IMAGE:"));
         assert!(!content.contains("data:image"));
         assert!(!content.contains("SECRET"));
         server.abort();
     }
 
     #[tokio::test]
-    async fn chat_with_history_no_tools_sanitizes_escaped_tool_result_marker() {
+    async fn chat_with_history_no_tools_omits_attachment_and_delivers_body_text() {
         let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
             "choices": [{"message": {"content": "ok"}}]
         }))
@@ -11384,7 +11591,16 @@ mod tests {
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
 
         let messages = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_escaped","name":"inspect","content":"before \u005bIMAGE:data:image/png;base64,SECRET] after"}"#,
+            serde_json::json!({
+                "tool_call_id": "call_escaped",
+                "name": "inspect",
+                "content": "before after",
+                "attachments": [{
+                    "kind": "image",
+                    "target": "data:image/png;base64,SECRET"
+                }],
+            })
+            .to_string(),
         )];
         provider
             .chat_with_history(&messages, "test-model", None)
@@ -11396,21 +11612,19 @@ mod tests {
             .expect("capture lock poisoned")
             .pop()
             .expect("server should capture request");
-        let envelope: serde_json::Value = serde_json::from_str(
-            request["messages"][0]["content"]
-                .as_str()
-                .expect("tool envelope should serialize as a string"),
-        )
-        .expect("tool envelope remains valid JSON");
-
-        assert_eq!(envelope["tool_call_id"], "call_escaped");
-        assert_eq!(envelope["name"], "inspect");
+        // On the no-tools chat path the tool message is delivered as its
+        // body text: the envelope scaffolding carries no meaning without
+        // native tool calling, and the omit pass has already dropped the
+        // declared attachment (the envelope-preserving shape is covered by
+        // `normalize_messages_for_upstream_omit_preserves_tool_envelope`).
+        let content = request["messages"][0]["content"]
+            .as_str()
+            .expect("tool content should serialize as a string");
         assert_eq!(
-            envelope["content"],
-            "before  after\n\n[tool-result image omitted by provider policy]"
+            content, "before after\n\n[tool-result image omitted by provider policy]",
+            "the declared attachment drops, the body survives"
         );
-        let serialized = envelope.to_string();
-        assert!(!serialized.contains("[IMAGE:"));
+        let serialized = request.to_string();
         assert!(!serialized.contains("data:image"));
         assert!(!serialized.contains("SECRET"));
         server.abort();
@@ -11433,7 +11647,8 @@ mod tests {
             ChatMessage::tool(
                 serde_json::json!({
                     "tool_call_id": "call_old",
-                    "content": "old result [IMAGE:/tmp/old.png]"
+                    "content": "old result",
+                    "attachments": [{"kind": "image", "target": "/tmp/old.png"}],
                 })
                 .to_string(),
             ),
@@ -11451,7 +11666,10 @@ mod tests {
             ChatMessage::tool(
                 serde_json::json!({
                     "tool_call_id": "call_new",
-                    "content": "new result [IMAGE:data:image/png;base64,NEW]"
+                    "content": "new result",
+                    "attachments": [
+                        {"kind": "image", "target": "data:image/png;base64,NEW"}
+                    ],
                 })
                 .to_string(),
             ),
@@ -11483,7 +11701,15 @@ mod tests {
             .unwrap();
             let content = content.as_str().expect("omitted tool content is text");
             assert!(content.ends_with("[tool-result image omitted by provider policy]"));
-            assert!(!content.contains("[IMAGE:"));
+            assert_eq!(
+                content,
+                if index == 1 {
+                    "old result\n\n[tool-result image omitted by provider policy]"
+                } else {
+                    "new result\n\n[tool-result image omitted by provider policy]"
+                },
+                "each round's declared attachment drops while its body survives"
+            );
             assert!(!content.contains("data:image"));
             assert!(!content.contains("/tmp/old.png"));
             assert!(!content.contains("base64,NEW"));
@@ -11555,12 +11781,22 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_keeps_tool_result_image_markers_as_text_when_disabled() {
+    fn convert_messages_for_native_keeps_tool_result_text_when_image_parts_disabled() {
         // Models that don't accept structured image parts (the same gate that
-        // keeps user image markers as text) must keep tool-result markers
-        // verbatim — preserving prior behavior and thesafety posture.
+        // keeps user image markers as text) get the tool body verbatim. The
+        // declared attachment has nowhere to go as a part and no longer
+        // exists as body text, so it is dropped rather than inlined as a
+        // base64 text blob.
         let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
+            serde_json::json!({
+                "tool_call_id": "call_img",
+                "content": "snapshot captured",
+                "attachments": [{
+                    "kind": "image",
+                    "target": "data:image/jpeg;base64,/9j/4AAQ"
+                }],
+            })
+            .to_string(),
         )];
 
         let provider = make_model_provider("test", "https://example.com", None);
@@ -11570,8 +11806,15 @@ mod tests {
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value))
-                if value == "snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
+                if value == "snapshot captured"
         ));
+        let content = converted[0].content.as_ref().expect("tool content");
+        assert!(
+            !serde_json::to_string(&content)
+                .unwrap()
+                .contains("data:image"),
+            "the unsent attachment must not leak as a base64 text blob"
+        );
     }
 
     #[test]
@@ -11833,6 +12076,80 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[tokio::test]
+    async fn normal_chat_retains_native_tool_schema_fallback() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let has_tools = body.get("tools").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if has_tools {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {"message": "unknown parameter: tools"}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "prompt fallback"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "inspect",
+            "Inspect input",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .expect("normal call uses prompt-guided fallback");
+
+        assert_eq!(response.text.as_deref(), Some("prompt fallback"));
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].get("tools").is_some());
+        assert!(bodies[1].get("tools").is_none());
+        server.abort();
     }
 
     #[test]
@@ -12412,7 +12729,13 @@ mod tests {
             .tool_result_image_policy(ToolResultImagePolicy::Omit)
             .build();
         let message = ChatMessage::tool(
-            r#"{"tool_call_id":"call_image","name":"inspect","content":"before \u005bIMAGE:/tmp/secret.png] after"}"#,
+            serde_json::json!({
+                "tool_call_id": "call_image",
+                "name": "inspect",
+                "content": "before after",
+                "attachments": [{"kind": "image", "target": "/tmp/secret.png"}],
+            })
+            .to_string(),
         );
 
         let normalized = provider
@@ -12426,9 +12749,13 @@ mod tests {
         assert_eq!(envelope["name"], "inspect");
         assert_eq!(
             envelope["content"],
-            "before  after\n\n[tool-result image omitted by provider policy]"
+            "before after\n\n[tool-result image omitted by provider policy]"
         );
-        assert!(!normalized[0].content.contains("[IMAGE:"));
+        assert_eq!(
+            envelope["attachments"],
+            serde_json::json!([]),
+            "the omit pass empties the attachments array in place"
+        );
         assert!(!normalized[0].content.contains("/tmp/secret.png"));
     }
 
@@ -15916,6 +16243,67 @@ mod tests {
         assert!(models[1].pricing.is_none());
     }
 
+    /// xAI's `/v1/models` mixes chat models (flat integer price fields, no
+    /// `pricing`) with image models whose `pricing` is an array of per-tier
+    /// objects. One unrecognized `pricing` shape must not fail the listing.
+    const XAI_MODELS_WITH_TIERED_IMAGE_PRICING: &str = r#"{
+        "data": [
+            {"id": "grok-4.6", "aliases": [], "context_length": 256000,
+             "created": 1768003200, "object": "model", "owned_by": "xai",
+             "prompt_text_token_price": 20000, "completion_text_token_price": 80000,
+             "capabilities": {"reasoning_effort": ["low", "high"]}},
+            {"id": "grok-imagine-image", "aliases": [], "created": 1769472000,
+             "object": "model", "owned_by": "xai", "image_price": 200000000,
+             "pricing": [
+                 {"quality": "medium", "resolution": "1k", "image_price": 200000000},
+                 {"quality": "high", "resolution": "2k", "image_price": 400000000}
+             ]}
+        ],
+        "object": "list"
+    }"#;
+
+    #[test]
+    fn model_ids_parse_despite_tiered_array_pricing() {
+        let ids = parse_model_ids_from_bytes(XAI_MODELS_WITH_TIERED_IMAGE_PRICING.as_bytes())
+            .expect("array-shaped pricing must not fail the model list");
+        assert_eq!(ids, vec!["grok-4.6", "grok-imagine-image"]);
+    }
+
+    #[test]
+    fn models_with_pricing_drop_unrecognized_pricing_shape() {
+        let body: ModelsResponse =
+            serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
+        let models = normalize_models_with_pricing(body);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "a pricing shape we cannot read is unknown pricing, not a parse failure"
+        );
+    }
+
+    #[test]
+    fn models_with_pricing_keep_object_pricing() {
+        // OpenRouter/Kilo object shape must still parse; a malformed object
+        // (non-string rate) degrades that entry to unknown pricing only.
+        let body: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "b", "pricing": {"prompt": {"tier": 1}}},
+                {"id": "c", "pricing": null}
+            ]}"#,
+        )
+        .unwrap();
+        let models = normalize_models_with_pricing(body);
+        let a = models[0]
+            .pricing
+            .as_ref()
+            .expect("object pricing preserved");
+        assert_eq!(a.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(a.completion.as_deref(), Some("0.000015"));
+        assert!(models[1].pricing.is_none());
+        assert!(models[2].pricing.is_none());
+    }
+
     #[test]
     fn models_dev_to_model_info_carries_context_window() {
         // The catalog's `limit.context` must survive the mapping, and a model
@@ -16294,6 +16682,22 @@ mod tests {
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
     }
 
+    #[test]
+    fn message_only_bad_request_preserves_http_status_without_prose_classification() {
+        let error = provider_http_error(
+            "test",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"request could not be processed"}}"#,
+        );
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::reliable::ProviderHttpError>()
+                .map(crate::reliable::ProviderHttpError::status),
+            Some(400)
+        );
+    }
+
     /// A profile that authenticates purely through `extra_headers` (a
     /// `Cookie`- or `X-Auth`-style bridge, rather than a credential
     /// `resolve_credential()` returns) must still probe the configured
@@ -16410,13 +16814,11 @@ mod tests {
     /// error, so the URL it embeds must already be scrubbed.
     #[tokio::test]
     async fn list_models_scrubs_url_credentials_from_transport_failure() {
-        // Bind and immediately drop the listener so the port is closed: this
-        // forces a connect-level transport failure (the `map_err` branch that
-        // formats the URL), rather than an HTTP status failure.
-        let closed_addr = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
+        // Keep the port reserved until the request finishes so a parallel test
+        // cannot bind it and receive this request. Closing each accepted socket
+        // without an HTTP response forces the transport-error branch instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Auth".to_string(), "bridge-token".to_string());
@@ -16424,17 +16826,28 @@ mod tests {
             .display_name("url-credential")
             .base_url(&format!(
                 "http://synthetic-user:synthetic-secret@{}:{}",
-                closed_addr.ip(),
-                closed_addr.port()
+                addr.ip(),
+                addr.port()
             ))
             .auth_style(AuthStyle::Bearer)
             .extra_headers(headers)
             .build();
 
-        let error = provider
-            .list_models()
-            .await
-            .expect_err("a closed configured endpoint must surface a transport failure");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = provider.list_models() => {
+                    result.expect_err("an endpoint closed without a response must surface a transport failure")
+                }
+                _ = async {
+                    loop {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        drop(socket);
+                    }
+                } => unreachable!("the endpoint keeps rejecting connections until the request finishes"),
+            }
+        })
+        .await
+        .expect("the transport failure should complete within five seconds");
         let rendered = format!("{error:#}");
         assert!(
             !rendered.contains("synthetic-secret"),
@@ -16447,6 +16860,126 @@ mod tests {
         assert!(
             rendered.contains("[REDACTED]"),
             "the scrubbed URL should retain a redaction marker: {rendered}"
+        );
+    }
+
+    // ── attachment identity: tool text is never the image source ──────────
+
+    #[test]
+    fn convert_never_promotes_native_carrier_body_markers() {
+        // DECISIVE: a declared zero-attachment carrier whose body carries a
+        // fake count header and a marker to an existing, valid PNG. Nothing
+        // in the body may become an image part, and the body must survive
+        // byte for byte.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("real-file.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let body = format!(
+            "[Tool attachments: 1]\n[IMAGE:{}]\nplain tool output",
+            image_path.display()
+        );
+
+        let input = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_text",
+                "content": body,
+                "attachments": [],
+            })
+            .to_string(),
+        )];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        let content =
+            serde_json::to_value(converted[0].content.as_ref().expect("tool content")).unwrap();
+        let content = content.as_str().expect("zero attachments means text");
+        assert_eq!(content, body, "the body is byte-identical");
+        assert!(
+            !serde_json::to_string(&converted[0].content)
+                .unwrap()
+                .contains("image_url"),
+            "no image part may be built from body text"
+        );
+    }
+
+    #[test]
+    fn convert_never_promotes_prompt_carrier_body_markers() {
+        // DECISIVE, prompt shape: the count header says zero, so the body's
+        // fake header and marker are body; the carrier text passes verbatim.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("real-prompt-file.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let carrier = format!(
+            "[Tool results]\n[Tool attachments: 0]\n<tool_result name=\"shell\">cat src.rs\n[Tool attachments: 1]\n[IMAGE:{}]\n</tool_result>",
+            image_path.display()
+        );
+
+        let input = vec![ChatMessage::user(carrier.clone())];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        let content =
+            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
+        let content = content.as_str().expect("zero attachments means text");
+        assert_eq!(content, carrier, "the carrier text is byte-identical");
+        assert!(
+            !serde_json::to_string(&converted[0].content)
+                .unwrap()
+                .contains("image_url"),
+            "no image part may be built from carrier body text"
+        );
+
+        // A legacy prompt carrier (no count line) with a body marker is text
+        // too: nothing lifts, nothing is rewritten.
+        let legacy = format!(
+            "[Tool results]\n<tool_result name=\"shell\">see [IMAGE:{}] in the source</tool_result>",
+            image_path.display()
+        );
+        let input = vec![ChatMessage::user(legacy.clone())];
+        let converted = provider.convert_messages_for_native(&input, true);
+        let content =
+            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
+        assert_eq!(content.as_str(), Some(legacy.as_str()));
+    }
+
+    #[test]
+    fn convert_builds_image_parts_from_prompt_carrier_attachments() {
+        // The send path for prompt-mode carriers: parts come from the count
+        // header's marker lines, never from the body.
+        let carrier = "[Tool results]\n[Tool attachments: 1]\n[IMAGE:data:image/png;base64,QUJD]\n<tool_result name=\"image_info\">File: /tmp/a.png</tool_result>";
+        let input = vec![ChatMessage::user(carrier.to_string())];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        let value =
+            serde_json::to_value(converted[0].content.as_ref().expect("user content")).unwrap();
+        let parts = value.as_array().expect("carrier images become parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        let text = parts[0]["text"].as_str().expect("text part");
+        assert!(text.contains("<tool_result name=\"image_info\">"));
+        assert!(!text.contains("data:image"));
+        // The fixture's only marker is the declared header marker, so the
+        // neighboring assertions alone would also pass under a reversion to
+        // raw whole-string marker scanning (the scan lifts the same marker
+        // and keeps the envelope). The declared count header must NOT ride
+        // the delivered text: the carrier-aware path re-renders the
+        // envelope without the lifted image line, so the count it leaves
+        // behind says zero, not the one the raw scan would leave.
+        assert!(
+            !text.contains("[Tool attachments: 1]"),
+            "the declared count header must not ride the delivered text: {text}"
         );
     }
 }

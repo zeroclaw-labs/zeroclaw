@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_config::cost::tracker::CostTracker;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_infra::session_backend::SessionBackend;
@@ -18,6 +18,7 @@ use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
 use crate::LiveConfigAuthority;
 use crate::daemon::ChannelGenerationControl;
+use crate::live_config_authority::{ConfigCommit, ConfigCommitError};
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
@@ -129,34 +130,22 @@ impl ApprovalPendingMap {
     }
 }
 
-/// Owned guard for [`RpcContext::config_write_lock`]. Owned (not
-/// borrowed) so a handler can release it explicitly at its commit point
-/// — letting post-commit side effects run unlocked — and pass it by
-/// value into delegated handlers without lifetime coupling.
-pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
-
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
-    /// Live config behind a read-write lock so `config/set` can mutate
-    /// without a full daemon reload. Mirrors the gateway's
-    /// `Arc<RwLock<Config>>` pattern.
-    pub config: Arc<RwLock<Config>>,
+    /// Read-only live config handle: RPC readers observe the published
+    /// config and its revision as one pair and cannot bypass publication
+    /// with a raw write. Mutating handlers admit through
+    /// `RpcContext::begin_config_commit` instead.
+    pub config: LiveConfigHandle,
 
-    /// Serializes the read-mutate-flush critical section of every RPC
-    /// handler that mutates `config` (config/set, config/delete, map-key
-    /// create/delete/rename, alias rename, quickstart/apply). A tokio
-    /// mutex, not `parking_lot`, because the guard must survive the
-    /// `.await` on config-save I/O.
-    ///
-    /// Invariant: every mutation of `config` must happen while holding
-    /// this mutex, acquired before the first `config` read-for-modify or
-    /// write and held through the flush that persists it. Never acquire
-    /// it while holding a `config` guard — lock order is this mutex
-    /// first, `config` second, always. A writer that bypasses this lock
-    /// and re-dirties a just-saved path while a flush is mid-save loses
-    /// disk persistence for that write (memory keeps it, but the dirty
-    /// flag is cleared by the concurrent flush).
-    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The live-config authority that owns this context's publication
+    /// transaction: the process-wide writer mutex, the parent config-write
+    /// lifecycle lease, and the published pair. Every RPC config writer
+    /// serializes through it before cloning the current config, and the
+    /// irreversible save-and-publish phase of each commit runs retained
+    /// (see `save_and_publish_config` in `dispatch.rs`), so request
+    /// cancellation cannot abandon a dispatched commit.
+    pub config_authority: LiveConfigAuthority,
 
     /// Alias-scoped admission and destructive lifecycle authority paired with
     /// this context's live config identity.
@@ -269,10 +258,47 @@ pub struct ConfigCommitPause {
 }
 
 impl RpcContext {
-    pub(crate) fn config_handles_for_authority(
+    /// Admit one serialized config write on this context's authority.
+    /// Fails closed once the daemon generation is closing.
+    pub(crate) async fn begin_config_commit(&self) -> Result<ConfigCommit, ConfigCommitError> {
+        self.config_authority.begin_config_commit().await
+    }
+
+    /// Build a minimal context sharing `authority`'s publication domain —
+    /// the cross-surface shape the daemon wires and the mixed
+    /// HTTP/RPC writer tests exercise.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_authority(
         authority: &LiveConfigAuthority,
-    ) -> (Arc<RwLock<Config>>, Arc<tokio::sync::Mutex<()>>) {
-        (authority.config(), authority.config_write_lock())
+        sessions: Arc<SessionStore>,
+    ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&authority.live_handle().read());
+        Arc::new(Self {
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_driver_handles: None,
+            sop_audit: None,
+            hooks: None,
+            cert_audit: None,
+            auth,
+            #[cfg(test)]
+            config_commit_pause: None,
+        })
     }
 
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
@@ -292,8 +318,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -324,8 +350,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -363,10 +389,11 @@ impl RpcContext {
         )
         .ok();
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
+            agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
             session_backend: None,
@@ -446,8 +473,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -482,8 +509,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -524,8 +551,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -559,8 +586,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -595,8 +622,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -632,8 +659,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -669,8 +696,8 @@ impl RpcContext {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: authority.config(),
-            config_write_lock: authority.config_write_lock(),
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
@@ -704,12 +731,21 @@ mod tests {
     use zeroclaw_api::channel::ChannelApprovalResponse;
 
     #[test]
-    fn config_handles_for_authority_preserve_identity() {
+    fn context_for_authority_shares_the_publication_domain() {
         let authority = LiveConfigAuthority::new(Config::default());
-        let (config, write_lock) = RpcContext::config_handles_for_authority(&authority);
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            8, 30, 600,
+        ));
+        let sessions = Arc::new(SessionStore::new(16, queue));
+        let ctx = RpcContext::for_authority(&authority, sessions);
 
-        assert!(Arc::ptr_eq(&config, &authority.config()));
-        assert!(Arc::ptr_eq(&write_lock, &authority.config_write_lock()));
+        assert!(ctx.config.same_storage(&authority.live_handle()));
+        assert!(
+            ctx.config_authority
+                .live_handle()
+                .same_storage(&authority.live_handle())
+        );
+        assert_eq!(ctx.config.revision(), authority.published_revision());
     }
 
     #[test]
