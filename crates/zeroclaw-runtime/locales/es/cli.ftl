@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = Crea una aplicación en {$url}, configura 
 cli-integrations-chat-configure = Ejecuta {$command}, abre Configuración y configura una instancia de {$channel} y sus credenciales.
 cli-integrations-chat-bind = Vincula el alias del canal a un agente y revisa el acceso de los grupos de pares.
 cli-integrations-chat-enable = Activa la instancia del canal solo después de revisar su configuración y acceso.
+cli-integrations-chat-imessage-transport = Envía mensajes mediante la automatización de AppleScript y los recibe leyendo la base de datos local de Mensajes.
+cli-integrations-chat-imessage-permissions = Concede acceso de Automatización de macOS para controlar Mensajes y Acceso total al disco para leer la base de datos de Mensajes.
+cli-integrations-chat-generic-setup = Ejecuta {$command}, abre Configuración, configura los campos obligatorios, el enrutamiento y el acceso de {$channel}, revisa los ajustes y, después, actívalo.
 cli-skills-about = Gestiona habilidades (capacidades definidas por el usuario)
 cli-sop-about = Gestiona los procedimientos operativos estándar (SOP)
 cli-migrate-about = Migra datos desde otros entornos de ejecución de agentes
@@ -1004,6 +1007,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` no está disponible — respuesta de **{ $actual }** (`{ $model }`)
     Cambiar modelo: /models
+channel-runtime-model-fallback-redacted = ⚡ El modelo solicitado no estaba disponible; un modelo de respaldo generó esta respuesta.
 delegate-provider-fallback-warning = Advertencia: El agente delegado se recuperó mediante una alternativa de proveedor. Los detalles del fallo del proveedor se registraron y se omitieron de este resultado.
 turn-tool-protocol-strict-mixed-error = El análisis estricto de herramientas no puede ejecutar una cadena de alternativas que mezcle candidatos con herramientas nativas y candidatos de solo texto. Configura cada candidato accesible para que use el mismo protocolo de herramientas, o establece strict_tool_parsing en false.
 delegate-provider-fallback-header = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model })]

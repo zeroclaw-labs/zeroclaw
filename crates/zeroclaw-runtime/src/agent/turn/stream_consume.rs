@@ -2,9 +2,8 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -17,6 +16,32 @@ use zeroclaw_config::schema::StreamReasoningMode;
 #[cfg(test)]
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::{ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+
+#[derive(Debug, thiserror::Error)]
+#[error("model_provider stream error: {source}")]
+pub(crate) struct StreamProviderFailure {
+    #[source]
+    source: zeroclaw_api::model_provider::StreamError,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    replay_safe: bool,
+}
+
+impl StreamProviderFailure {
+    pub(crate) fn usage(&self) -> Option<zeroclaw_providers::traits::TokenUsage> {
+        self.usage.clone()
+    }
+
+    pub(crate) fn replay_safe(&self) -> bool {
+        self.replay_safe
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.source,
+            zeroclaw_api::model_provider::StreamError::Terminal(_)
+        )
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -120,6 +145,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
+    let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
@@ -211,8 +237,8 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
+                    let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
@@ -236,12 +262,12 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
-                    message,
-                    usage: outcome.usage,
-                    // Keep the typed error so the provider-call step can
-                    // recognize terminal stream failures (no fallback).
+                return Err(StreamProviderFailure {
                     source: err,
+                    usage: outcome.usage,
+                    // Mutable drafts allow the original request's fallback, but
+                    // image-free recovery requires no output on either sink.
+                    replay_safe: !replay_blocking_activity && !outcome.forwarded_live_deltas,
                 }
                 .into());
             }
@@ -252,6 +278,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 outcome.usage = Some(usage);
             }
             StreamEvent::ToolCall(tool_call) => {
+                replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
             }
             // Transient, human-readable thinking progress. Surfaced via
@@ -263,6 +290,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 if delta.is_empty() {
                     continue;
                 }
+                replay_blocking_activity = true;
                 if draft_reasoning == StreamReasoningMode::Full
                     && let Some(tx) = on_delta
                 {
@@ -277,12 +305,14 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             // reasoning_content for history reconstruction and never
             // surfaced as user-visible progress.
             StreamEvent::ReasoningFinalized(payload) => {
+                replay_blocking_activity = true;
                 outcome.reasoning_content.push_str(&payload);
             }
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
@@ -301,6 +331,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
@@ -404,6 +435,23 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if text_guard.suppressed_protocol
+        && let Some(diagnostic) = text_guard.suppression
+    {
+        // Attributes carry only the detector and the candidate offset so a
+        // false positive can be diagnosed without logging the withheld text.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "detector": diagnostic.detector,
+                    "candidate_offset": diagnostic.candidate_offset,
+                })),
+            "streaming text guard suppressed protocol candidate"
+        );
+    }
 
     if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
         ::zeroclaw_log::record!(

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_api::hook::ToolCallHookContext;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
@@ -78,6 +79,7 @@ async fn record_duplicate_tool_call(
     }
     ToolExecutionOutcome {
         output: duplicate.clone(),
+        attachments: Vec::new(),
         success: false,
         error_reason: Some(duplicate),
         duration: Duration::ZERO,
@@ -194,6 +196,7 @@ pub(crate) async fn prepare_tool_calls(
                     }
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
@@ -277,7 +280,9 @@ pub(crate) async fn prepare_tool_calls(
                     abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                anyhow::bail!("{repeated}");
+                return Err(
+                    TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
+                );
             }
         }
 
@@ -536,6 +541,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,
@@ -790,6 +796,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,
