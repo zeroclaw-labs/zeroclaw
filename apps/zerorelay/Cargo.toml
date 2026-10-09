@@ -16,6 +16,9 @@ path = "src/main.rs"
 name = "zerorelay"
 path = "src/lib.rs"
 
+[build-dependencies]
+zeroclaw-buildinfo.workspace = true
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

@@ -60,29 +60,6 @@ impl ScopedToolRegistry {
         self.0.retain(f);
     }
 
-    /// Re-point the forwarded client environment of the shell tool in an
-    /// ALREADY-sealed registry to `env` (already filtered for the current
-    /// connection's entitlement; empty overlays nothing). A reused session's
-    /// canonical agent keeps the shell tool it was built with, whose
-    /// environment was filtered for the ORIGINAL connection; on reuse under a
-    /// re-derived entitlement (a principal that lost `admin`, a WSS reconnect
-    /// describing another host) that stale environment must be re-derived, or
-    /// the resumed session would keep overlaying the first connection's
-    /// forwarded shell environment onto its subprocesses.
-    ///
-    /// This mutates the existing tool in place through its wrapper chain
-    /// (`Tool::rebind_forwarded_env` is forwarded by the rate-limit/path-guard
-    /// wrappers), so the sandbox, rate limiter and timeout the seal installed
-    /// are preserved — only the forwarded environment changes. It never adds or
-    /// removes a tool name.
-    pub(crate) fn rebind_shell_env(&self, env: Option<std::collections::HashMap<String, String>>) {
-        for tool in self.0.iter() {
-            if tool.name() == "shell" {
-                tool.rebind_forwarded_env(env.clone());
-            }
-        }
-    }
-
     /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
     /// backend handle. Session memory follows its owner: when a session is
     /// pinned to a principal's private plane the memory tools — which each

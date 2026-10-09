@@ -1,13 +1,43 @@
-//! Process-global access to the daemon's control plane.
+//! Process-global access to daemon and non-daemon control-plane owners.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::boot::{ControlPlaneHandle, ControlPlaneRecoveryOwner};
 
 static CONTROL_PLANE: OnceLock<ControlPlaneRecoveryOwner> = OnceLock::new();
+type RecoveryOwnerCell = tokio::sync::OnceCell<ControlPlaneRecoveryOwner>;
+static NON_DAEMON_CONTROL_PLANES: OnceLock<Mutex<HashMap<PathBuf, Arc<RecoveryOwnerCell>>>> =
+    OnceLock::new();
+
+/// Retain one recovery owner and reaper for each configured non-daemon store.
+/// Delegate and peer producers share this owner instead of reconciling the same
+/// store independently.
+pub(crate) async fn non_daemon_control_plane(
+    data_dir: &Path,
+) -> anyhow::Result<ControlPlaneHandle> {
+    let cell = NON_DAEMON_CONTROL_PLANES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .entry(data_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(RecoveryOwnerCell::new()))
+        .clone();
+    cell.get_or_try_init(|| async {
+        let owner = ControlPlaneRecoveryOwner::start(data_dir).await?;
+        std::mem::drop(owner.spawn_reaper(
+            super::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            CancellationToken::new(),
+        ));
+        Ok::<_, anyhow::Error>(owner)
+    })
+    .await
+    .map(|owner| owner.handle().clone())
+}
 
 /// Install the daemon's control-plane handle. Called ONCE at boot
 /// (`daemon::run`). Subsequent calls are ignored (returns `false`), so a reload

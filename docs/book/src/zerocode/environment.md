@@ -75,6 +75,7 @@ cloned and used. The other clients' envs are never touched. Concretely:
 | Two clients open from different shells with different `PATH`s | Each session gets its own `PATH`; neither affects the other |
 | Client A has `VIRTUAL_ENV` set; Client B does not | Only sessions from Client A see `VIRTUAL_ENV` |
 | Client A disconnects while Client B's session is running | Client B is unaffected; env was **cloned at session creation** |
+| Client B attaches a session Client A created while that session is still live | Refused unless both clients forward exactly the same environment; per-terminal variables such as `TERM_SESSION_ID` usually differ, so start a new session instead |
 | Client A reconnects with the same `tui_id` | Old entry is removed, new entry with fresh env is registered; already-running sessions keep their original clone |
 
 The last point matters: the registry hands the session a **clone**, not a

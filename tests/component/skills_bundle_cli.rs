@@ -84,3 +84,65 @@ Review release readiness before signoff.
         "agent runtime view should include installed skill:\n{stdout}"
     );
 }
+
+#[test]
+fn well_known_install_requires_a_selected_skill() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "schema_version = 3\n",
+    )
+    .expect("write config");
+
+    let output = run_zeroclaw(
+        config_dir.path(),
+        &["skills", "install", "https://example.com", "--well-known"],
+    );
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("--well-known requires --skill"),
+        "output: {text}"
+    );
+}
+
+#[test]
+fn well_known_install_rejects_non_https_and_private_sources() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "schema_version = 3\n",
+    )
+    .expect("write config");
+
+    for source in ["http://example.com", "https://127.0.0.1"] {
+        let output = run_zeroclaw(
+            config_dir.path(),
+            &[
+                "skills",
+                "install",
+                source,
+                "--well-known",
+                "--skill",
+                "demo",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "source should be rejected: {source}"
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("HTTPS") || text.contains("network policy") || text.contains("private"),
+            "source {source} output: {text}"
+        );
+    }
+}

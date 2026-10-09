@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::select;
+use tokio::{select, sync::Notify};
+use tokio_util::sync::CancellationToken;
 use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelConversationScope,
@@ -437,16 +438,21 @@ pub struct WhatsAppWebChannel {
     /// Empty admits no group unless `group_policy` is `all`, which admits
     /// every group. Direct messages bypass.
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle to the canonical shared `Config`.
+    /// Optional pairing-persist authority for the canonical shared `Config`.
     /// `None` in tests; `Some` in the long-running daemon, wired via
-    /// `.with_persistence(config)`. Same contract as WeChat's handle: on
-    /// connect, the linked account is persisted into `peer_groups` through
-    /// `crate::identity_persist` (no channel-local allowlist cache).
-    persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    /// `.with_persistence_authority(authority)`. Same contract as WeChat's
+    /// authority: on connect, the linked account is persisted into
+    /// `peer_groups` through `crate::identity_persist` (no channel-local
+    /// allowlist cache).
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// See [`ApprovalSendHook`]. `None` outside the tests that need to act
     /// between a token's registration and the cleanup that follows it.
     #[cfg(test)]
     approval_send_hook: Option<ApprovalSendHook>,
+    /// Supervisor lifecycle notification point. Injected via
+    /// `set_cancel_token` before `listen()` starts so the internal
+    /// shutdown `select!` subscribes to the single SIGINT consumer.
+    cancel_notify: Arc<Notify>,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -579,6 +585,7 @@ impl WhatsAppWebChannel {
             persist: None,
             #[cfg(test)]
             approval_send_hook: None,
+            cancel_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -588,17 +595,13 @@ impl WhatsAppWebChannel {
         &self.alias
     }
 
-    /// Wire the shared Config handle so a completed pairing can persist the
-    /// linked account into `peer_groups` and save — the same contract as
-    /// `WeChatChannel::with_persistence`. The long-running daemon sets this
-    /// from the orchestrator; tests and one-shot callers leave it unset
-    /// (pairing works at runtime, doesn't persist).
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_persistence(
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
         mut self,
-        config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
     ) -> Self {
-        self.persist = Some(config);
+        self.persist = Some(authority);
         self
     }
 
@@ -3506,6 +3509,18 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
+    fn set_cancel_token(&self, token: CancellationToken) {
+        let notify = self.cancel_notify.clone();
+        ::zeroclaw_spawn::spawn!(async move {
+            token.cancelled().await;
+            notify.notify_one();
+        });
+    }
+
+    fn uses_cancel_token(&self) -> bool {
+        true
+    }
+
     /// Without this the trait default (`false`) applies, so every WhatsApp DM
     /// is treated as a non-direct message. Callers that exist to spare direct
     /// messages extra handling — notably the reply-intent precheck bypass in
@@ -3892,6 +3907,10 @@ impl Channel for WhatsAppWebChannel {
                 voice_chats: self.voice_chats.clone(),
             };
             let configured_push_name = self.push_name.clone();
+            // The SDK detaches event callbacks. Fence their config writes
+            // even when listener cancellation skips the shutdown code below.
+            let persistence_cancel = tokio_util::sync::CancellationToken::new();
+            let persistence_guard = persistence_cancel.clone().drop_guard();
 
             let mut builder = Bot::builder()
                 .with_backend_arc(backend)
@@ -3914,6 +3933,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let persist_inner = persist_clone.clone();
+                    let persistence_cancel = persistence_cancel.clone();
                     let inbound_context = inbound_context.clone();
                     let configured_push_name = configured_push_name.clone();
                     async move {
@@ -3980,12 +4000,13 @@ impl Channel for WhatsAppWebChannel {
                                     let digits = Self::jid_digits(pn.user());
                                     if !digits.is_empty()
                                         && let Err(e) =
-                                            crate::identity_persist::persist_external_peer(
+                                            crate::identity_persist::persist_external_peer_with_cancellation(
                                                 persist_inner.as_ref(),
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
                                                 Self::phone_matches,
+                                                Some(&persistence_cancel),
                                             )
                                             .await
                                     {
@@ -3994,6 +4015,7 @@ impl Channel for WhatsAppWebChannel {
                                 }
                             }
                             Event::LoggedOut(_) => {
+                                persistence_cancel.cancel();
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
                                 crate::login_events::LoginEvent::LoggedOut.emit(
                                     "whatsapp",
@@ -4115,18 +4137,24 @@ impl Channel for WhatsAppWebChannel {
             drop(logout_tx);
 
             // Wait for a logout signal or process shutdown.
+            // Shutdown arrives through the supervisor lifecycle token
+            // injected via set_cancel_token — a bridge task notifies
+            // so the single SIGINT consumer in main.rs deterministically
+            // reaches this listener.
             let should_reconnect = select! {
                 res = logout_rx.recv() => {
                     // Both Ok(()) and Err (sender dropped) mean the session ended.
                     let _ = res;
                     true
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received Ctrl+C");
+                () = self.cancel_notify.notified() => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received shutdown signal");
                     false
                 }
             };
 
+            // Stop admitting pairing writes before shutdown or reconnect awaits.
+            drop(persistence_guard);
             *self.client.lock() = None;
             let handle = self.bot_handle.lock().take();
             if let Some(handle) = handle {
@@ -4849,6 +4877,24 @@ mod tests {
                 .origin(BatchOrigin::Live)
                 .build(),
         )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority =
+            zeroclaw_runtime::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            Arc::new(Vec::<String>::new),
+        )
+        .with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[test]

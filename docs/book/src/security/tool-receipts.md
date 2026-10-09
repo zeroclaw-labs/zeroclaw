@@ -54,7 +54,7 @@ The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receip
 - **Don't cover blocked or failed calls.** Approval denials, timeouts, blocked calls, and failed tool returns are observability or audit events, not receipt-bearing tool results.
 - **Don't travel across receipt scopes.** Receipt keys are ephemeral, so a receipt generated under one scope cannot be verified after that scope is gone.
 - **Don't isolate channels or conversations from each other within one channel runtime context.** Channel-server conversations in that context share the key. The threat model targets LLM fabrication inside the runtime, not cross-channel forgery.
-- **Don't extend to background or detached delegate spawns.** Background and parallel delegate spawns that detach from the user's turn (`background: true`) do not surface receipts in the user-visible block, since the per-turn collector is rendered before those spawns finish. Receipts inside synchronous delegate sub-agents are captured.
+- **Don't extend to background or detached delegate spawns.** Background and parallel delegate spawns that detach from the user's turn (`background: true`) do not surface receipts in the user-visible block, since the per-turn collector is rendered before those spawns finish. Receipts inside synchronous delegate sub-agents are captured. A background delegate's newest five receipts do reach the parent agent, through `progress.receipt_tail` in `check_result`, and are stored on the delegate's control-plane task row; they are signed with the launching turn's key and, like any receipt, cannot be verified once that key is gone.
 
 ## Viewing receipts
 

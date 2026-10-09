@@ -155,6 +155,9 @@ EOF
 FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build
 
 WORKDIR /src
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 COPY . .
 
 # Fetch all workspace dependencies (network available)
@@ -240,6 +243,9 @@ CMD ["daemon"]
 FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS build-fat
 
 WORKDIR /src
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 COPY . .
 
 # Fetch all workspace dependencies (network available)

@@ -84,8 +84,9 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
 }
 
 /// Attempt to auto-pair with the gateway so the WebView has a valid token
-/// before the React frontend mounts. Runs on localhost so the admin endpoints
-/// are accessible without auth.
+/// before the React frontend mounts. The code is minted through the kernel
+/// CLI, which presents the gateway's owner-only admin token; see
+/// [`daemon::mint_pairing_code`].
 async fn auto_pair(state: &state::SharedState) -> Option<String> {
     let url = {
         let s = state.read().await;
@@ -110,9 +111,15 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
         }
     }
 
-    // No valid token — auto-pair by requesting a new code and exchanging it.
+    // No valid token — mint a new code through the CLI and exchange it.
+    let binary = daemon::find_zeroclaw_binary()?;
+    let code =
+        tokio::task::spawn_blocking(move || daemon::mint_pairing_code(&binary, GATEWAY_PORT))
+            .await
+            .ok()?
+            .ok()?;
     let client = GatewayClient::new(&url, None);
-    match client.auto_pair().await {
+    match client.pair_with_code(&code).await {
         Ok(token) => {
             let mut s = state.write().await;
             s.token = Some(token.clone());

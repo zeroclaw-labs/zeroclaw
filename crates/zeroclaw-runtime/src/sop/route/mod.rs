@@ -239,6 +239,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         }
     }
 

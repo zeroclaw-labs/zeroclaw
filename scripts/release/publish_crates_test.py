@@ -38,6 +38,8 @@ if tool == "cargo" and args[0] == "metadata":
 elif tool == "cargo" and args[0] == "publish":
     with (root / "publishes.jsonl").open("a") as log:
         log.write(json.dumps(args) + "\n")
+    with (root / "publish-cwd.log").open("a") as log:
+        log.write(os.getcwd() + "\n")
     if "--dry-run" not in args:
         name = args[args.index("-p") + 1]
         (root / "registry" / name).touch()
@@ -61,7 +63,7 @@ class PublishCratesTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         script_dir = self.root / "scripts/release"
         script_dir.mkdir(parents=True)
-        for filename in ("publish-crates.sh", "publish_order.py"):
+        for filename in ("publish-crates.sh", "publish_order.py", "web_dist_digest.sh"):
             source = RELEASE / filename
             if source.exists():
                 shutil.copyfile(source, script_dir / filename)
@@ -81,7 +83,8 @@ class PublishCratesTest(unittest.TestCase):
                     "PUBLISH_TEST_ROOT": str(self.root), "PUBLISH_DELAY_SECONDS": "0"}
         self.env.pop("CARGO_REGISTRY_TOKEN", None)
 
-    def run_publisher(self, packages=None, *, raw=None, execute=False, token=True):
+    def run_publisher(self, packages=None, *, raw=None, execute=False, token=True,
+                      web_digest=None, source_root=None):
         # Match the real workspace's private and independent members. Bash 3.2
         # cannot expand empty arrays under nounset in the existing summary.
         metadata = raw if raw is not None else json.dumps({"packages": [
@@ -92,6 +95,10 @@ class PublishCratesTest(unittest.TestCase):
         env = self.env.copy()
         if execute and token:
             env["CARGO_REGISTRY_TOKEN"] = "fixture-not-a-credential"
+        if web_digest is not None:
+            env["WEB_DIST_DIGEST"] = web_digest
+        if source_root is not None:
+            env["PUBLISH_SOURCE_ROOT"] = str(source_root)
         args = ["bash", str(self.root / "scripts/release/publish-crates.sh")]
         if execute:
             args.append("--execute")
@@ -267,6 +274,121 @@ class PublishCratesTest(unittest.TestCase):
                     self.assert_preflight_failure(result, "dependency cycle: a -> b -> a")
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+
+    def web_digest(self, directory=None):
+        result = subprocess.run(
+            ["bash", str(self.root / "scripts/release/web_dist_digest.sh"),
+             str(directory or self.root / "web/dist")],
+            text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^[0-9a-f]{64}$")
+        return result.stdout.strip()
+
+    def test_matching_web_digest_publishes_the_verified_bundle(self):
+        digest = self.web_digest()
+        for execute in (False, True):
+            with self.subTest(execute=execute):
+                result = self.run_publisher([package("a")], execute=execute,
+                                            web_digest=digest)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("web/dist matches the verified bundle", result.stdout)
+
+    def test_mismatched_web_digest_fails_before_registry_queries_in_both_modes(self):
+        digest = self.web_digest()
+        (self.root / "web/dist/index.html").write_text("rebuilt")
+        for execute in (False, True):
+            with self.subTest(execute=execute):
+                result = self.run_publisher([package("a")], execute=execute,
+                                            web_digest=digest)
+                self.assert_preflight_failure(
+                    result, "web/dist does not match the bundle preflight verified")
+
+    def test_unreadable_web_bundle_fails_closed_when_a_digest_is_expected(self):
+        (self.root / "web/dist/link").symlink_to("index.html")
+        result = self.run_publisher([package("a")], execute=True, web_digest="0" * 64)
+        self.assert_preflight_failure(result, "could not compute the web/dist digest")
+
+    def test_web_digest_tracks_content_paths_and_hidden_files_only(self):
+        dist = self.root / "web/dist"
+        (dist / "assets").mkdir()
+        (dist / "assets/app.js").write_text("js")
+        base = self.web_digest()
+
+        copy = self.root / "copy"
+        copy.mkdir()
+        # Created in the reverse order with different timestamps.
+        (copy / "assets").mkdir()
+        (copy / "assets/app.js").write_text("js")
+        (copy / "index.html").write_text("fixture")
+        os.utime(copy / "index.html", (1, 1))
+        self.assertEqual(self.web_digest(copy), base)
+
+        for change in ("content", "rename", "hidden", "empty-dir"):
+            with self.subTest(change=change):
+                variant = self.root / f"variant-{change}"
+                shutil.copytree(dist, variant)
+                if change == "content":
+                    (variant / "assets/app.js").write_text("js2")
+                elif change == "rename":
+                    (variant / "assets/app.js").rename(variant / "assets/main.js")
+                elif change == "hidden":
+                    (variant / ".vite-manifest").write_text("")
+                else:
+                    (variant / "empty").mkdir()
+                if change == "empty-dir":
+                    # Directories carry no bytes into the tarball.
+                    self.assertEqual(self.web_digest(variant), base)
+                else:
+                    self.assertNotEqual(self.web_digest(variant), base)
+
+    def test_web_digest_rejects_empty_trees(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        result = subprocess.run(
+            ["bash", str(self.root / "scripts/release/web_dist_digest.sh"), str(empty)],
+            text=True, capture_output=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains no files", result.stderr)
+
+
+    def tagged_tree_with_broken_publisher(self):
+        """A release tree whose own copy of the publisher is broken."""
+        source = self.root / "tagged-release"
+        (source / "scripts/release").mkdir(parents=True)
+        (source / "web/dist").mkdir(parents=True)
+        (source / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.3"\n')
+        (source / "web/dist/index.html").write_text("tagged bundle")
+        broken = source / "scripts/release/publish-crates.sh"
+        broken.write_text("#!/usr/bin/env bash\necho 'tagged publisher ran' >&2\nexit 97\n")
+        broken.chmod(0o755)
+        return source
+
+    def test_recovery_runs_current_tooling_against_the_tagged_tree(self):
+        source = self.tagged_tree_with_broken_publisher()
+        # Before: the workflow ran the tag's own publisher, so the only way
+        # through a publisher bug was a manual publish outside the workflow.
+        before = subprocess.run(["bash", str(source / "scripts/release/publish-crates.sh"),
+                                 "--execute"], env=self.env, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(before.returncode, 97)
+        # After: the fixed tooling packages the tagged tree, including its
+        # dashboard bundle, and never runs the tag's broken copy.
+        digest = self.web_digest(source / "web/dist")
+        result = self.run_publisher([package("a-runtime", [dependency("z-relay", "dev")]),
+                                     package("z-relay")], execute=True,
+                                    web_digest=digest, source_root=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("tagged publisher ran", result.stderr)
+        self.assertEqual(self.uploads(), ["z-relay", "a-runtime"])
+        cwds = (self.root / "publish-cwd.log").read_text().splitlines()
+        self.assertEqual({Path(cwd).resolve() for cwd in cwds}, {source.resolve()})
+
+    def test_recovery_source_root_must_be_a_release_tree(self):
+        empty = self.root / "not-a-release"
+        empty.mkdir()
+        result = self.run_publisher([package("a")], execute=True, source_root=empty)
+        self.assert_preflight_failure(result, "has no Cargo.toml; set PUBLISH_SOURCE_ROOT")
 
 
 if __name__ == "__main__":

@@ -1291,6 +1291,86 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_truncation_cli_strings_format_in_all_locales() {
+        let alias = "alpha";
+        let file = "AGENTS.md";
+        let cases = [
+            (
+                "cli-doctor-bootstrap-file-truncated-compact",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "6000"),
+                    ("total", "13985"),
+                    ("discarded", "7985"),
+                    ("limit", "6000"),
+                    ("profile", "nightly"),
+                ][..],
+                &[
+                    alias,
+                    file,
+                    "6000",
+                    "13985",
+                    "7985",
+                    "compact_context = false",
+                    "nightly",
+                ][..],
+            ),
+            (
+                "cli-doctor-bootstrap-file-truncated-compact-no-profile",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "6000"),
+                    ("total", "13985"),
+                    ("discarded", "7985"),
+                    ("limit", "6000"),
+                ][..],
+                &[
+                    alias,
+                    file,
+                    "6000",
+                    "13985",
+                    "7985",
+                    "compact_context = false",
+                    "runtime_profile = \"<name>\"",
+                ][..],
+            ),
+            (
+                "cli-doctor-bootstrap-file-truncated",
+                &[
+                    ("alias", alias),
+                    ("file", file),
+                    ("retained", "20000"),
+                    ("total", "20500"),
+                    ("discarded", "500"),
+                    ("limit", "20000"),
+                ][..],
+                &[alias, file, "20000", "20500", "500", "20000"][..],
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for &(key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for &expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cli_approval_prompt_strings_format_in_all_locales() {
         let tool = "shell";
         let cases = [
@@ -2072,6 +2152,8 @@ mod tests {
             "cli-integrations-builtin-heading",
             "cli-integrations-chat-bind",
             "cli-integrations-chat-enable",
+            "cli-integrations-chat-imessage-transport",
+            "cli-integrations-chat-imessage-permissions",
         ];
         let args = [
             ("name", "definitely-not-a-real-integration"),
@@ -2113,6 +2195,10 @@ mod tests {
                     "cli-integrations-chat-configure",
                     vec![("command", "zerocode"), ("channel", "Telegram")],
                 ),
+                (
+                    "cli-integrations-chat-generic-setup",
+                    vec![("command", "zerocode"), ("channel", "MQTT")],
+                ),
             ] {
                 let formatted = format_ftl_message(source, locale, key, &setup_args)
                     .unwrap_or_else(|| panic!("{locale}: {key} should format"));
@@ -2139,6 +2225,46 @@ mod tests {
                 _ => unreachable!("unlisted committed locale: {locale}"),
             };
             assert!(enable.contains(expected), "{locale}: {enable}");
+
+            let imessage_transport = format_ftl_message(
+                source,
+                locale,
+                "cli-integrations-chat-imessage-transport",
+                &[],
+            )
+            .expect("iMessage transport guidance should format");
+            let expected_transport = match locale {
+                "en" => "AppleScript automation",
+                "es" => "automatización de AppleScript",
+                "fr" => "automatisation AppleScript",
+                "ja" => "AppleScript オートメーション",
+                "zh-CN" => "AppleScript 自动化",
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            };
+            assert!(
+                imessage_transport.contains(expected_transport),
+                "{locale}: {imessage_transport}"
+            );
+
+            let imessage_permissions = format_ftl_message(
+                source,
+                locale,
+                "cli-integrations-chat-imessage-permissions",
+                &[],
+            )
+            .expect("iMessage permission guidance should format");
+            let expected_permission = match locale {
+                "en" => "Full Disk Access",
+                "es" => "Acceso total al disco",
+                "fr" => "accès complet au disque",
+                "ja" => "フルディスクアクセス",
+                "zh-CN" => "完全磁盘访问权限",
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            };
+            assert!(
+                imessage_permissions.contains(expected_permission),
+                "{locale}: {imessage_permissions}"
+            );
 
             let unknown = format_ftl_message(source, locale, "cli-integrations-unknown", &args)
                 .unwrap_or_else(|| panic!("{locale}: cli-integrations-unknown should format"));

@@ -24,7 +24,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_fs_ext::{DirEntryExt, DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
@@ -52,9 +52,9 @@ const WORKSPACE_FAMILY: &str = "agents";
 /// One filesystem object's identity.
 ///
 /// `dev`/`ino` are the portable identity pair `cap-fs-ext` exposes: on Windows
-/// they are the volume serial and file index, and cap-primitives builds every
-/// view from an opened handle, so neither side of a comparison is a by-name
-/// guess.
+/// they are the volume serial and file index. Callers must use handle-derived
+/// metadata or `DirEntryExt::full_metadata`: ordinary directory-entry metadata
+/// omits these identifiers on Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObjectId {
     dev: u64,
@@ -268,12 +268,43 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
 /// a symlink. Canonicalizing the whole destination here would replace the name
 /// with its target before the no-follow admission check ever sees it.
 fn resolve_destination_path(path: &Path) -> Result<PathBuf> {
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
         return Ok(absolute);
     };
     Ok(resolve_path(parent)?.join(name))
+}
+
+/// Check traversed parents before platform normalization can erase them.
+fn absolute_export_path(path: &Path) -> Result<PathBuf> {
+    // Windows absolute-path resolution collapses `missing/..` without touching
+    // the filesystem. Validate each directory before `..` while it is still
+    // present, so source and destination admission cannot mistake that path for
+    // one whose ancestors exist. Configured ancestor symlinks remain allowed;
+    // the later handle-bound opens enforce the source and destination boundaries.
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            let traversed = if prefix.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                prefix.as_path()
+            };
+            std::fs::metadata(traversed)
+                .and_then(|metadata| {
+                    if metadata.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotADirectory))
+                    }
+                })
+                .with_context(|| {
+                    format!("failed to resolve {} before `..`", traversed.display())
+                })?;
+        }
+        prefix.push(component.as_os_str());
+    }
+    std::path::absolute(path).with_context(|| format!("failed to resolve {}", path.display()))
 }
 
 /// Resolve `path` to an absolute, symlink-free form.
@@ -284,8 +315,7 @@ fn resolve_destination_path(path: &Path) -> Result<PathBuf> {
 /// symlinked ancestor (`/tmp` → `/private/tmp` on macOS, an operator's
 /// symlinked data dir anywhere) would otherwise hide an overlap.
 fn resolve_path(path: &Path) -> Result<PathBuf> {
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let mut below: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = absolute.as_path();
     loop {
@@ -868,8 +898,7 @@ fn open_configured_root(path: &Path) -> Result<SourceRoot> {
             )
         );
     }
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
         // Unreachable after the check above; kept as the same refusal so a
         // platform surprise fails closed rather than publishing.
@@ -1127,7 +1156,7 @@ fn copy_skills(
             continue;
         }
         let classified = entry
-            .metadata()
+            .full_metadata()
             .with_context(|| format!("failed to stat {root}/{skill}"))?;
         let file_type = classified.file_type();
         if file_type.is_symlink() {
@@ -1226,13 +1255,12 @@ fn copy_tree(
             continue;
         }
 
-        // `DirEntry::metadata` is a no-follow stat through the directory handle,
-        // so it describes the object sitting in *this* directory under that
-        // name, not whatever a fresh path lookup would resolve to. The opens
-        // below are no-follow through the same handle, so the object that is
-        // read is the object this classified.
+        // Full metadata preserves the no-follow classification and includes
+        // the Windows volume/file identifiers needed by the comparison below.
+        // Ordinary directory-entry metadata omits them on Windows. A failure
+        // to obtain full metadata aborts rather than weakening the identity check.
         let classified = entry
-            .metadata()
+            .full_metadata()
             .with_context(|| format!("failed to stat {}", rel(spec, &child)))?;
         let file_type = classified.file_type();
         if file_type.is_symlink() {
@@ -2691,7 +2719,6 @@ mod tests {
     /// and open passes every symlink test; only filesystem identity separates
     /// it from the tree that was classified. The copy carries what it
     /// inspected or nothing at all.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_walk_component_replaced_by_another_directory_fails_the_export() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2794,7 +2821,6 @@ mod tests {
     /// directory renamed away and the excluded sibling renamed into its
     /// place, both real directories. Only filesystem identity separates the
     /// opened handle from the classified entry.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_skill_replaced_by_an_excluded_sibling_directory_is_not_copied() {
         let workspace = tempfile::tempdir().unwrap();
@@ -3002,7 +3028,6 @@ mod tests {
     /// The replacement that passes every shape test: a different regular file,
     /// one link, no symlink anywhere. Only identity separates it from the entry
     /// the copy classified.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_renamed_over_an_admitted_entry_is_not_copied() {
         // Same filesystem as the workspace, so this is a rename, not a copy.
@@ -3022,9 +3047,11 @@ mod tests {
             let _swap = EntrySwap::install(move |relative| {
                 if relative == Path::new("notes.md") {
                     std::fs::rename(&host, &entry).unwrap();
-                    let meta = std::fs::symlink_metadata(&entry).unwrap();
+                    let meta = cap_std::fs::File::from_std(std::fs::File::open(&entry).unwrap())
+                        .metadata()
+                        .unwrap();
                     assert!(meta.file_type().is_file());
-                    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&meta), 1);
+                    assert_eq!(meta.nlink(), 1);
                 }
             });
             write_bundle(&mut plan, &out, false).await.unwrap()
@@ -3042,8 +3069,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_workspace_directory_replaced_mid_copy_is_not_copied() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host");
+        write(&host.join("secret.md"), "host secret bytes");
+        let source = root.path().join("workspace");
+        let entry = source.join("notes");
+        write(&entry.join("plan.md"), "workspace note");
+        let retired = root.path().join("retired-notes");
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let copied = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes") {
+                    std::fs::rename(&entry, &retired).unwrap();
+                    std::fs::rename(&host, &entry).unwrap();
+                }
+            });
+            write_bundle(&mut plan_for(&source), &out, false)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(copied.workspace.replaced_skipped, 1);
+        assert_eq!(copied.workspace.files, 0);
+        assert!(all_files(&out.join(WORKSPACE_DIR)).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source.join("notes/secret.md")).unwrap(),
+            "host secret bytes"
+        );
+        assert_eq!(entry_names(parent.path()), vec!["bundle".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_existing_hard_link_is_not_carried_in_the_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host-secret.txt");
+        write(&host, "host secret bytes");
+        let source = root.path().join("workspace");
+        write(&source.join("notes.md"), "workspace note");
+        std::fs::hard_link(&host, source.join("borrowed.txt")).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let copied = write_bundle(&mut plan_for(&source), &out, false)
+            .await
+            .unwrap();
+
+        assert_eq!(copied.workspace.hard_links_skipped, 1);
+        assert_eq!(copied.workspace.files, 1);
+        assert_eq!(
+            entry_names(&out.join(WORKSPACE_DIR)),
+            vec!["notes.md".to_string()]
+        );
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), "host secret bytes");
+        assert_eq!(entry_names(parent.path()), vec!["bundle".to_string()]);
+    }
+
     /// The same shape one level down, inside carried skill content.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_skill_file_renamed_over_an_admitted_entry_is_not_copied() {
         let root = tempfile::tempdir().unwrap();
@@ -3086,7 +3171,6 @@ mod tests {
     /// No-follow proves a name is not a symlink; it says nothing about whether
     /// the bytes belong to this tree. A hard link is the same object under a
     /// second name, so it classifies and opens as an ordinary regular file.
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_replaced_by_a_hard_link_to_a_host_file_is_not_copied() {
         let outside = tempfile::tempdir().unwrap();

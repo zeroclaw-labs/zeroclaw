@@ -3108,7 +3108,7 @@ pub fn v2_workspace_toplevel_dest(name: &str) -> V2WorkspaceDest {
 pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
     match v2_workspace_toplevel_dest(name) {
         V2WorkspaceDest::DataDir | V2WorkspaceDest::MemorySubentryDispatch => {
-            install.join("data").join(name)
+            super::install_data_dir(install).join(name)
         }
         V2WorkspaceDest::SharedDir => install.join("shared").join(name),
         V2WorkspaceDest::AgentDefault => install
@@ -3122,7 +3122,9 @@ pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
 /// V3 destination path for a subentry under legacy `workspace/memory/`.
 pub fn memory_subentry_v3_path(install: &Path, sub_name: &str) -> PathBuf {
     if V2_MEMORY_DATA_NAMES.contains(&sub_name) {
-        install.join("data").join("memory").join(sub_name)
+        super::install_data_dir(install)
+            .join("memory")
+            .join(sub_name)
     } else {
         install
             .join("agents")
@@ -3160,29 +3162,46 @@ pub fn migrate_v2_to_v3_install_filesystem(
         });
     }
 
-    let data_target = install_root.join("data");
-    let data_populated = data_target
-        .is_dir()
-        .then(|| std::fs::read_dir(&data_target).ok())
-        .flatten()
-        .is_some_and(|mut it| it.next().is_some());
-    let agent_populated = agent_default
-        .is_dir()
-        .then(|| std::fs::read_dir(&agent_default).ok())
-        .flatten()
-        .is_some_and(|mut it| it.next().is_some());
-    if data_populated && agent_populated {
+    // The split is done only when nothing in the legacy workspace is left to
+    // move. Whether the V3 targets already hold *something* is no evidence:
+    // startup creates and locks `data/config-lifecycle.lock` before the
+    // config is loaded, and a split interrupted part way leaves both targets
+    // partly filled with entries still waiting in `workspace/`. Those must
+    // move now, or the databases among them are stranded.
+    let entries = legacy_split_entries(&legacy, install_root)?;
+    if entries.iter().all(|(_, target)| target.exists()) {
+        // Nothing to move, but anything still here was refused because its
+        // destination exists. Name each one: it may be a database stranded
+        // by an earlier skipped split that the operator has to merge.
+        for (source, target) in &entries {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "source": source.display().to_string(),
+                        "target": target.display().to_string(),
+                    })),
+                "[system] filesystem migration: target already exists; legacy entry left in place"
+            );
+        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
-                    "data_target": data_target.display().to_string(),
                     "agent_target": agent_default.display().to_string(),
                     "legacy": legacy.display().to_string(),
+                    "left_in_place": entries.len(),
                 })
             ),
-            "[system] filesystem migration: targets already populated; skipping split"
+            "[system] filesystem migration: nothing left to move; skipping split"
         );
+        if std::fs::read_dir(&legacy)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(&legacy);
+        }
         relocate_default_agent_skills_to_shared(install_root)?;
         return Ok(FilesystemMigrationReport {
             backup_dir: None,
@@ -3249,6 +3268,49 @@ pub fn migrate_v2_to_v3_install_filesystem(
         backup_dir: Some(backup_dir.parent().unwrap_or(&backup_dir).to_path_buf()),
         entries_relocated,
     })
+}
+
+/// Every legacy entry the split routes, with its V3 destination: each
+/// top-level entry, and each child of `memory/` in place of `memory/` itself.
+/// Non-UTF-8 names are left out, as the split skips them. An entry whose
+/// destination is missing is one the split would move; one whose destination
+/// exists is refused (refuse-to-clobber) and stays in `legacy/`.
+fn legacy_split_entries(legacy: &Path, install_root: &Path) -> MigResult<Vec<(PathBuf, PathBuf)>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(legacy).with_context(|| {
+        format!(
+            "[system] failed to enumerate legacy workspace at {}",
+            legacy.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        match v2_workspace_toplevel_dest(name) {
+            V2WorkspaceDest::MemorySubentryDispatch => {
+                let memory = entry.path();
+                if !memory.is_dir() {
+                    continue;
+                }
+                for child in std::fs::read_dir(&memory)
+                    .with_context(|| format!("[system] failed to enumerate {}", memory.display()))?
+                {
+                    let child = child?;
+                    let child_name = child.file_name();
+                    if let Some(child_name) = child_name.to_str() {
+                        entries.push((
+                            child.path(),
+                            memory_subentry_v3_path(install_root, child_name),
+                        ));
+                    }
+                }
+            }
+            _ => entries.push((entry.path(), workspace_toplevel_v3_path(install_root, name))),
+        }
+    }
+    Ok(entries)
 }
 
 /// Iterate `legacy/` top-level entries and relocate each via the
@@ -4385,6 +4447,131 @@ mod fs_db_migration_tests {
         assert!(
             legacy_still || in_backup,
             "legacy devices.db must be preserved (in legacy/ or backup/)"
+        );
+    }
+    /// A split interrupted after moving an identity file and the sessions
+    /// directory, with startup's `config-lifecycle.lock` already in `data/`,
+    /// still has `devices.db` and the memory databases waiting in the legacy
+    /// workspace. Both targets hold entries, but the split must resume.
+    #[test]
+    fn an_interrupted_split_resumes_even_when_both_targets_hold_entries() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        let agent = install.join("agents/default/workspace");
+        fs::create_dir_all(&agent).unwrap();
+        fs::rename(
+            install.join("workspace/IDENTITY.md"),
+            agent.join("IDENTITY.md"),
+        )
+        .unwrap();
+        fs::create_dir_all(install.join("data")).unwrap();
+        fs::rename(
+            install.join("workspace/sessions"),
+            install.join("data/sessions"),
+        )
+        .unwrap();
+        fs::write(install.join("data/config-lifecycle.lock"), b"").unwrap();
+
+        let report = migrate_v2_to_v3_install_filesystem(install).expect("resume must succeed");
+
+        assert!(
+            report.backup_dir.is_some(),
+            "the resumed split backs up first"
+        );
+        assert_eq!(
+            fs::read(install.join("data/devices.db")).unwrap(),
+            b"pretend-paired-devices-blob"
+        );
+        assert!(install.join("data/memory/brain.db").is_file());
+        assert!(agent.join("SOUL.md").is_file());
+        assert!(
+            !install.join("workspace").exists(),
+            "nothing is left behind"
+        );
+        assert_eq!(
+            fs::read(install.join("data/sessions/sessions.db")).unwrap(),
+            b"sessions"
+        );
+    }
+
+    /// When every entry left in the legacy workspace was refused because its
+    /// destination exists, there is nothing to move and the split is not
+    /// redone (no new backup).
+    #[test]
+    fn a_split_with_only_refused_leftovers_is_not_redone() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        fs::create_dir_all(install.join("data")).unwrap();
+        fs::write(
+            workspace_toplevel_v3_path(install, "devices.db"),
+            b"operator-owned",
+        )
+        .unwrap();
+        migrate_v2_to_v3_install_filesystem(install).expect("first split");
+        assert!(
+            install.join("workspace/devices.db").is_file(),
+            "refused, left in place"
+        );
+
+        ::zeroclaw_log::try_install_capture_subscriber();
+        let mut events = ::zeroclaw_log::subscribe_or_install();
+        let again = migrate_v2_to_v3_install_filesystem(install).expect("second run");
+
+        assert!(again.backup_dir.is_none(), "{again:?}");
+        assert_eq!(again.entries_relocated, 0);
+        assert!(install.join("workspace/devices.db").is_file());
+
+        // The leftover is named at WARN, so an operator can find and merge it.
+        let mut logs = String::new();
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    logs.push_str(&event.to_string());
+                    logs.push('\n');
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let install_name = install.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            logs.lines().any(|line| {
+                line.contains("legacy entry left in place")
+                    && line.contains(&install_name)
+                    && line.contains("devices.db")
+            }),
+            "no WARN names the refused devices.db:\n{logs}"
+        );
+    }
+
+    /// After a complete split, `brain.db` alone reappears under the legacy
+    /// `memory/` while `data/memory/` still holds the other shared files.
+    /// The only pending entry is that `memory/` child, and it must move.
+    #[test]
+    fn a_pending_memory_subentry_alone_resumes_the_split() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+        migrate_v2_to_v3_install_filesystem(install).expect("first split");
+        assert!(!install.join("workspace").exists());
+        assert!(install.join("data/memory/audit.db").is_file());
+
+        fs::remove_file(install.join("data/memory/brain.db")).unwrap();
+        fs::create_dir_all(install.join("workspace/memory")).unwrap();
+        fs::write(install.join("workspace/memory/brain.db"), b"restored").unwrap();
+
+        let report = migrate_v2_to_v3_install_filesystem(install).expect("resume");
+
+        assert_eq!(report.entries_relocated, 1, "{report:?}");
+        assert_eq!(
+            fs::read(install.join("data/memory/brain.db")).unwrap(),
+            b"restored"
+        );
+        assert!(
+            !install.join("workspace").exists(),
+            "nothing is left behind"
         );
     }
 }

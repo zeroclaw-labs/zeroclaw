@@ -12,6 +12,7 @@ use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
+use crate::security::SecurityPolicy;
 use crate::tools::ActivatedToolSet;
 use crate::tools::scoped::ScopedToolRegistry;
 
@@ -80,11 +81,12 @@ impl ResolvedModelAccess<'_> {
         // (`prepare_messages_for_provider`): callers that want images in the
         // request normalize before calling, and the max-iteration graceful
         // summary does. As a fail-closed backstop for every other caller,
-        // loadable audio markers are replaced with a placeholder here, and so
-        // are image markers whose reference is not an inline `data:` URI, so
-        // no filesystem path or URL marker can reach a provider adapter
-        // through this seam. Both helpers borrow the input untouched when
-        // clean.
+        // loadable audio markers are replaced with a placeholder here, and
+        // image references that are not inline `data:` URIs are dropped the
+        // same way: a path or URL marker in a legacy body becomes a
+        // placeholder, while a declared carrier keeps its body verbatim and
+        // loses only the undeliverable attachments from its declared list.
+        // Both helpers borrow the input untouched when clean.
         let ChatRequest {
             messages,
             tools,
@@ -193,6 +195,12 @@ pub struct ResolvedAgentExecution<'a> {
     pub silent: bool,
     /// Approval policy + back-channel; `None` for paths that never prompt.
     pub approval: Option<&'a ApprovalManager>,
+    /// The agent's filesystem policy, applied by the no-vision image-marker
+    /// gate so a local marker counts as resolvable only when the agent's own
+    /// file tools could read it. `None` on configless (test) paths, where the
+    /// gate fails closed to a degrade. The gate lives in
+    /// `crate::agent::turn::vision_route::resolve_vision_provider`.
+    pub security: Option<&'a SecurityPolicy>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config, for resolving the configured `vision_model_provider`'s
@@ -244,6 +252,9 @@ pub struct ResolvedIo<'a> {
     pub observer: &'a dyn Observer,
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
+    /// Filesystem policy for the no-vision image-marker gate; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::security`].
+    pub security: Option<&'a SecurityPolicy>,
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config for vision-route provider-alias resolution; `None` on
     /// configless (test) paths. See [`ResolvedAgentExecution::config`].
@@ -283,6 +294,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             observer: io.observer,
             silent: io.silent,
             approval: io.approval,
+            security: io.security,
             multimodal_config: io.multimodal_config,
             config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,

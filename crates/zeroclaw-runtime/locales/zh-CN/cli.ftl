@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = 在 {$url} 创建应用，配置机器人�
 cli-integrations-chat-configure = 运行 {$command}，打开配置，设置 {$channel} 实例及其凭据。
 cli-integrations-chat-bind = 将频道别名绑定到智能体，并检查对等组的访问权限。
 cli-integrations-chat-enable = 确认设置和访问权限后，再启用频道实例。
+cli-integrations-chat-imessage-transport = 通过 AppleScript 自动化发送信息，并通过读取本地“信息”数据库接收信息。
+cli-integrations-chat-imessage-permissions = 授予 macOS“自动化”权限以控制“信息”，并授予“完全磁盘访问权限”以读取“信息”数据库。
+cli-integrations-chat-generic-setup = 运行 {$command}，打开“配置”，设置 {$channel} 所需的字段、路由和访问权限，确认设置后再启用。
 cli-skills-about = 管理技能（用户自定义能力）
 cli-sop-about = 管理标准操作程序（SOPs）
 cli-migrate-about = 从其他智能体运行时迁移数据
@@ -438,6 +441,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 凭据已登录，但没有模型提供方槽位使用它们。请在 OpenAI 提供方槽位上设置 `requires_openai_auth = true`，并将 agent 的 `model_provider` 指向它，或运行 `zeroclaw quickstart`。
 cli-doctor-codex-auth-slot-no-profile = OpenAI 槽位 {$slots} 已设置 `requires_openai_auth = true`，但没有 OpenAI Codex 凭据登录。请运行 `zeroclaw auth login --provider openai-codex`。
 cli-doctor-codex-auth-ok = OpenAI Codex 凭据已登录，并由模型提供方槽位引用。
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。该智能体的 compact_context 为开启状态，每个引导文件的上限为 {$limit} 个字符。请在 `[runtime_profiles.{$profile}]` 中设置 `compact_context = false`，或缩短该文件。
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。该智能体的 compact_context 为开启状态（默认值，未分配 runtime profile），每个引导文件的上限为 {$limit} 个字符。请添加一个带 `compact_context = false` 的 `[runtime_profiles.<name>]`，并在该智能体上设置 `runtime_profile = "<name>"`，或缩短该文件。
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。每个引导文件的上限为 {$limit} 个字符；请缩短该文件。
 cli-doctor-systemd-linger-enabled = systemd 用户 linger 已启用
 cli-doctor-systemd-linger-disabled = systemd 用户 linger 已禁用；用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = 无法使用 loginctl 检查 systemd 用户 linger
@@ -784,6 +790,7 @@ cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
 cli-desktop-blurb2 = 它连接到与 CLI 相同的网关。
 cli-config-all-configured = 所有部分均已配置。
+cli-config-initialized-sections = 已使用默认值初始化 {$count} 个部分：
 cli-config-schema-current = 配置已为当前架构版本。
 cli-config-applied-ops = 已应用 {$count} 个操作：
 cli-plugins-none = 未安装任何插件。
@@ -999,6 +1006,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
     切换模型：/models
+channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
 turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]

@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = Crea una aplicación en {$url}, configura 
 cli-integrations-chat-configure = Ejecuta {$command}, abre Configuración y configura una instancia de {$channel} y sus credenciales.
 cli-integrations-chat-bind = Vincula el alias del canal a un agente y revisa el acceso de los grupos de pares.
 cli-integrations-chat-enable = Activa la instancia del canal solo después de revisar su configuración y acceso.
+cli-integrations-chat-imessage-transport = Envía mensajes mediante la automatización de AppleScript y los recibe leyendo la base de datos local de Mensajes.
+cli-integrations-chat-imessage-permissions = Concede acceso de Automatización de macOS para controlar Mensajes y Acceso total al disco para leer la base de datos de Mensajes.
+cli-integrations-chat-generic-setup = Ejecuta {$command}, abre Configuración, configura los campos obligatorios, el enrutamiento y el acceso de {$channel}, revisa los ajustes y, después, actívalo.
 cli-skills-about = Gestiona habilidades (capacidades definidas por el usuario)
 cli-sop-about = Gestiona los procedimientos operativos estándar (SOP)
 cli-migrate-about = Migra datos desde otros entornos de ejecución de agentes
@@ -439,6 +442,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = Las credenciales de OpenAI Codex tienen sesión iniciada, pero ningún slot de proveedor de modelo las usa. Establece `requires_openai_auth = true` en un slot de proveedor OpenAI y apunta el `model_provider` de un agente a él, o ejecuta `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = Los slots OpenAI {$slots} tienen `requires_openai_auth = true`, pero no hay credenciales de OpenAI Codex con sesión iniciada. Ejecuta `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = Las credenciales de OpenAI Codex tienen sesión iniciada y están referenciadas por un slot de proveedor de modelo.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). compact_context está activado para este agente y limita cada archivo de arranque a {$limit} caracteres. Establece `compact_context = false` en `[runtime_profiles.{$profile}]` o acorta el archivo.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). compact_context está activado para este agente (el valor predeterminado, sin perfil de ejecución asignado) y limita cada archivo de arranque a {$limit} caracteres. Añade un `[runtime_profiles.<name>]` con `compact_context = false` y asigna `runtime_profile = "<name>"` al agente, o acorta el archivo.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). Cada archivo de arranque está limitado a {$limit} caracteres; acorta el archivo.
 cli-doctor-systemd-linger-enabled = la permanencia de usuario de systemd está habilitada
 cli-doctor-systemd-linger-disabled = la permanencia de usuario de systemd está deshabilitada; el servicio de usuario puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = no se pudo comprobar la permanencia de usuario de systemd con loginctl
@@ -785,6 +791,7 @@ cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está i
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
 cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
 cli-config-all-configured = Todas las secciones ya están configuradas.
+cli-config-initialized-sections = Se inicializaron {$count} secciones con valores predeterminados:
 cli-config-schema-current = La configuración ya está en la versión actual del esquema.
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
 cli-plugins-none = No hay complementos instalados.
@@ -1000,6 +1007,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` no está disponible — respuesta de **{ $actual }** (`{ $model }`)
     Cambiar modelo: /models
+channel-runtime-model-fallback-redacted = ⚡ El modelo solicitado no estaba disponible; un modelo de respaldo generó esta respuesta.
 delegate-provider-fallback-warning = Advertencia: El agente delegado se recuperó mediante una alternativa de proveedor. Los detalles del fallo del proveedor se registraron y se omitieron de este resultado.
 turn-tool-protocol-strict-mixed-error = El análisis estricto de herramientas no puede ejecutar una cadena de alternativas que mezcle candidatos con herramientas nativas y candidatos de solo texto. Configura cada candidato accesible para que use el mismo protocolo de herramientas, o establece strict_tool_parsing en false.
 delegate-provider-fallback-header = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model })]

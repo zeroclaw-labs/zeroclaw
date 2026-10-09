@@ -802,6 +802,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         PersistedRun::new(r, last_progress.to_string(), SopTriggerSource::Manual)
     }

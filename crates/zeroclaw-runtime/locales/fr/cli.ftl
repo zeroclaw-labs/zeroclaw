@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = Créez une application sur {$url}, configu
 cli-integrations-chat-configure = Lancez {$command}, ouvrez Configuration et configurez une instance de {$channel} avec ses identifiants.
 cli-integrations-chat-bind = Associez l’alias du canal à un agent et vérifiez les accès des groupes de pairs.
 cli-integrations-chat-enable = Activez l’instance du canal uniquement après avoir vérifié ses paramètres et ses accès.
+cli-integrations-chat-imessage-transport = Envoie les messages par automatisation AppleScript et les reçoit en lisant la base de données locale de Messages.
+cli-integrations-chat-imessage-permissions = Autorisez l’accès Automatisation de macOS pour contrôler Messages et l’accès complet au disque pour lire la base de données de Messages.
+cli-integrations-chat-generic-setup = Lancez {$command}, ouvrez Configuration, configurez les champs requis, le routage et les accès de {$channel}, vérifiez les réglages, puis activez-le.
 cli-skills-about = Gérer les compétences (capacités définies par l'utilisateur)
 cli-sop-about = Gérer les procédures opérationnelles standard (SOP)
 cli-migrate-about = Migrer les données depuis d'autres runtimes d'agents
@@ -442,6 +445,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = Des identifiants OpenAI Codex sont connectés, mais aucun slot de fournisseur de modèle ne les utilise. Définissez `requires_openai_auth = true` sur un slot de fournisseur OpenAI et pointez le `model_provider` d'un agent vers celui-ci, ou exécutez `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = Les slots OpenAI {$slots} définissent `requires_openai_auth = true`, mais aucun identifiant OpenAI Codex n'est connecté. Exécutez `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = Les identifiants OpenAI Codex sont connectés et référencés par un slot de fournisseur de modèle.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). compact_context est activé pour cet agent et limite chaque fichier d'amorçage à {$limit} caractères. Définissez `compact_context = false` dans `[runtime_profiles.{$profile}]` ou raccourcissez le fichier.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). compact_context est activé pour cet agent (le réglage par défaut, aucun profil d'exécution attribué) et limite chaque fichier d'amorçage à {$limit} caractères. Ajoutez un `[runtime_profiles.<name>]` avec `compact_context = false` et attribuez `runtime_profile = "<name>"` à l'agent, ou raccourcissez le fichier.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). Chaque fichier d'amorçage est limité à {$limit} caractères ; raccourcissez le fichier.
 cli-doctor-systemd-linger-enabled = persistance utilisateur systemd activée
 cli-doctor-systemd-linger-disabled = persistance utilisateur systemd désactivée ; le service utilisateur peut s'arrêter après la déconnexion. Activez-la avec : loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = impossible de vérifier la persistance utilisateur systemd avec loginctl
@@ -788,6 +794,7 @@ cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installé
 cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
 cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
 cli-config-all-configured = Toutes les sections sont déjà configurées.
+cli-config-initialized-sections = {$count} section(s) initialisée(s) avec les valeurs par défaut :
 cli-config-schema-current = La configuration est déjà à la version actuelle du schéma.
 cli-config-applied-ops = {$count} opération(s) appliquée(s) :
 cli-plugins-none = Aucun plugin installé.
@@ -1003,6 +1010,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` indisponible — réponse de **{ $actual }** (`{ $model }`)
     Changer de modèle : /models
+channel-runtime-model-fallback-redacted = ⚡ Le modèle demandé était indisponible ; un modèle de secours a généré cette réponse.
 delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
 turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
 delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]

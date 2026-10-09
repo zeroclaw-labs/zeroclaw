@@ -50,6 +50,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.a2a",
     "tool.browser",
     "tool.composio",
+    "tool.file_download",
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
@@ -83,6 +84,21 @@ struct RuntimeProxyCachedClient {
 }
 
 // ── Top-level config ──────────────────────────────────────────────
+
+/// How `[agents.<alias>].cron_jobs` membership claims a cron job id. See
+/// [`Config::agent_for_cron_job`]: only a [`CronJobClaim::Sole`] claim names an
+/// owner through configuration; every other shape names none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronJobClaim<'a> {
+    /// No enabled agent lists the id.
+    Unclaimed,
+    /// Only disabled agents list the id.
+    DisabledOnly,
+    /// Exactly one enabled agent lists the id.
+    Sole(&'a str),
+    /// More than one enabled agent lists the id (aliases sorted).
+    Contested(Vec<&'a str>),
+}
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
@@ -146,6 +162,18 @@ pub struct Config {
     /// CLI surfaces upgrade guidance without retaining the retired secret.
     #[serde(skip)]
     pub retired_node_transport_config: bool,
+    /// The config file this value was populated from — set by
+    /// `load_or_init` (both the existing-file read and the fresh-init
+    /// write) and by loaders that re-read a config file before mutating.
+    /// `Default`/programmatic construction leaves it `None`, and `save()`
+    /// then refuses to overwrite an existing file this value cannot prove
+    /// it read, so a near-empty snapshot cannot wipe an operator's config;
+    /// `force_save()` is the explicit intentional-overwrite path. Binding
+    /// provenance to the path (not a boolean) also refuses a value loaded
+    /// from file A that is later repointed at a different existing file B.
+    /// Never serialized — a load-time signal.
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -336,6 +364,12 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub wss: WssConfig,
+
+    /// Local IPC endpoint limits for the RPC socket or named pipe (`[rpc]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub rpc: RpcConfig,
 
     /// Nominated-relay client for reaching this daemon through a relay (`[relay]`).
     #[serde(default)]
@@ -804,17 +838,18 @@ impl WireApi {
     }
 }
 
-/// Policy for image markers embedded in native tool-result content.
+/// Policy for images a native tool-result carrier declared in its
+/// `attachments` array.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Preserve tool-result image markers as structured `image_url` parts.
+    /// Send declared tool-result images as structured `image_url` parts.
     #[default]
     ImageUrl,
-    /// Remove tool-result image payloads and leave a fixed notice for the model.
+    /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
 }
 
@@ -970,6 +1005,18 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through this OpenAI-compatible
+    /// provider. When true and the runtime requests native thinking, request
+    /// bodies gain an Anthropic-shaped `thinking` object
+    /// (`{"type":"enabled","budget_tokens":N}`), and gateway thinking
+    /// responses are normalized into replayable signed blocks. Only
+    /// gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic API support this (e.g. LiteLLM); a non-translating upstream
+    /// rejects the injected object with HTTP 400. Default `false`: request
+    /// bodies and response handling are unchanged.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through this OpenAI-compatible
     /// provider. When true, request bodies on the structured paths (agent
     /// turns, tool calls, structured streaming) gain an Anthropic-shaped
@@ -1065,10 +1112,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// How native compatible chat-completions providers handle image markers in
-    /// role=`tool` results. `image_url` preserves structured image parts;
-    /// `omit` removes their payloads and appends a fixed notice. This does not
-    /// affect direct user image content or OpenAI Responses providers.
+    /// How native compatible chat-completions providers handle images a
+    /// role=`tool` result declared in its `attachments` array. `image_url`
+    /// sends them as structured image parts; `omit` drops them and appends a
+    /// fixed notice, keeping the result text verbatim. Legacy tool results
+    /// (no array key) pass verbatim under both settings: they declare
+    /// nothing and their bodies are text, so literal marker syntax in a
+    /// tool's output never drives this policy. This does not affect direct
+    /// user image content or OpenAI Responses providers.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_default_tool_result_image_policy")]
     pub tool_result_image_policy: ToolResultImagePolicy,
@@ -3754,6 +3805,7 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    pub max_execution_tree_iterations: Option<usize>,
     /// History retention limit. Structured Agent and legacy loop sessions
     /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
@@ -3829,18 +3881,40 @@ pub struct ResolvedContextLimits {
 impl ResolvedContextLimits {
     /// Compatibility-fallback limits for paths that cannot resolve a route
     /// (missing config or an empty agent alias): the unconfigured-window
-    /// fallback with the caller's budget preserved — `0` stays `0` (proactive
-    /// trimming disabled), any positive value is clamped to that window.
+    /// fallback bound to the caller's budget. `0` stays `0` (proactive
+    /// trimming disabled); a positive budget is honored, raising the stub
+    /// window to meet it, because the stub is not model truth (see
+    /// [`Self::bind_budget`]).
     #[must_use]
     pub fn legacy_fallback(budget: usize) -> Self {
-        Self {
-            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
-            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
-            context_token_budget: if budget == 0 {
-                0
-            } else {
-                budget.min(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        Self::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
             },
+            budget,
+        )
+    }
+
+    /// Bind an already-resolved proactive budget to a route's capacity.
+    ///
+    /// A configured capacity is a hard cap on every positive budget. The
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`] stub is not: it exists only so
+    /// budget arithmetic has an operand, and an operator's explicit budget is
+    /// better evidence of the model's real window than that stub. When the
+    /// capacity is a compatibility fallback, the window operand is raised to
+    /// the budget so `context_token_budget <= model_context_window` still
+    /// holds, while the source keeps reporting the capacity as unconfigured.
+    #[must_use]
+    pub fn bind_budget(capacity: ResolvedModelContextWindow, budget: usize) -> Self {
+        let model_context_window = match capacity.source {
+            ModelContextWindowSource::Configured => capacity.tokens,
+            ModelContextWindowSource::CompatibilityFallback => capacity.tokens.max(budget),
+        };
+        Self {
+            model_context_window,
+            model_context_window_source: capacity.source,
+            context_token_budget: budget.min(model_context_window),
         }
     }
 
@@ -3871,6 +3945,19 @@ impl ResolvedRuntime {
             model_context_window
         } else {
             UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        };
+        // An unconfigured capacity is only the compatibility stub, not model
+        // truth. An explicit absolute budget above it is the operator telling
+        // us the window is at least that large, so it becomes the window
+        // operand instead of being clamped down to the stub. The source is
+        // left untouched so wire/UI consumers still report the
+        // capacity as unconfigured.
+        let model_context_window = match (self.model_context_window_source, self.max_context_tokens)
+        {
+            (ModelContextWindowSource::CompatibilityFallback, Some(budget)) if budget > 0 => {
+                model_context_window.max(budget)
+            }
+            _ => model_context_window,
         };
 
         // Preserve the established disable sentinel before applying any
@@ -3924,6 +4011,7 @@ impl Default for ResolvedRuntime {
         Self {
             compact_context: true,
             max_tool_iterations: 10,
+            max_execution_tree_iterations: None,
             max_history_messages: 50,
             max_context_tokens: None,
             model_context_window: 32_000,
@@ -4132,6 +4220,10 @@ pub struct AliasedAgentConfig {
     /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
+    /// Exactly one enabled agent may claim a given id: a job listed by two
+    /// enabled agents is refused rather than run under an arbitrary one,
+    /// unless its row already carries a stored owner from before the second
+    /// claim was added.
     #[tab(Cron)]
     #[serde(default)]
     pub cron_jobs: Vec<String>,
@@ -4536,6 +4628,12 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_execution_tree_iterations)
+    }
+
+    #[must_use]
     pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_history_messages)
@@ -4806,6 +4904,8 @@ impl Config {
         let model_context_window = self.resolved_model_context_window(agent_alias);
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
+            max_execution_tree_iterations: self
+                .effective_max_execution_tree_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
@@ -4950,20 +5050,79 @@ impl Config {
             .collect()
     }
 
-    /// Reverse-lookup the agent alias that owns a declaratively-configured
-    /// cron job (`[cron.<alias>]`). Returns the first agent listing the
-    /// alias in its `cron_jobs` field. `None` when no agent claims the
-    /// job — orphaned cron jobs are skipped at scheduler time with a
-    /// warning. Imperative jobs (created at runtime via `cron_add`) have
-    /// UUID-shaped ids that won't match any agent's `cron_jobs`; the
-    /// scheduler treats those separately (carrying their owning agent
-    /// alongside the DB row is a follow-up).
+    /// The single enabled agent that claims `cron_alias` through
+    /// `[agents.<alias>].cron_jobs`, or `None` when the claim is not unique.
+    /// This is the answer to "who owns this cron job" for ownership that lives
+    /// only in configuration: the scheduler's execution fallback, declarative
+    /// sync, and upgrade ownership recovery all use it. A job row that already
+    /// carries a stored owner is resolved through that stored alias first (see
+    /// the runtime's owner resolution), so this rule governs empty-alias rows
+    /// and not-yet-materialized declarative ids. `agents` is a hash map, so an
+    /// id claimed by two enabled agents would otherwise resolve to whichever
+    /// one iteration yields first, differing between processes; such a job is
+    /// refused rather than run under a coin-flip authority. See
+    /// [`Config::cron_job_claim`] for the reason a claim is not unique.
     #[must_use]
     pub fn agent_for_cron_job(&self, cron_alias: &str) -> Option<&str> {
-        self.agents
-            .iter()
-            .find(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == cron_alias))
-            .map(|(alias, _)| alias.as_str())
+        match self.cron_job_claim(cron_alias) {
+            CronJobClaim::Sole(alias) => Some(alias),
+            _ => None,
+        }
+    }
+
+    /// How `[agents.<alias>].cron_jobs` membership claims `cron_alias`.
+    pub fn cron_job_claim(&self, cron_alias: &str) -> CronJobClaim<'_> {
+        let mut enabled: Vec<&str> = Vec::new();
+        let mut disabled = false;
+        for (alias, agent) in &self.agents {
+            if !agent.cron_jobs.iter().any(|c| c == cron_alias) {
+                continue;
+            }
+            if agent.enabled {
+                enabled.push(alias.as_str());
+            } else {
+                disabled = true;
+            }
+        }
+        enabled.sort_unstable();
+        match enabled.len() {
+            0 if disabled => CronJobClaim::DisabledOnly,
+            0 => CronJobClaim::Unclaimed,
+            1 => CronJobClaim::Sole(enabled[0]),
+            _ => CronJobClaim::Contested(enabled),
+        }
+    }
+
+    /// One warning per cron job id that more than one enabled agent claims:
+    /// such a job is refused at runtime rather than run under an arbitrary
+    /// claimant, and that should surface at validation time, not in the
+    /// scheduler's poll log.
+    fn collect_cron_claim_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut ids: Vec<&str> = self
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .flat_map(|agent| agent.cron_jobs.iter().map(String::as_str))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            if let CronJobClaim::Contested(claimants) = self.cron_job_claim(id) {
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "cron_job_contested_claim",
+                    format!(
+                        "cron job `{id}` is listed in the cron_jobs of more than one enabled agent \
+                         ({}); a job without a stored owner is refused rather than run under an \
+                         arbitrary one. Keep it in exactly one enabled agent's list.",
+                        claimants.join(", ")
+                    ),
+                    "agents",
+                ));
+            }
+        }
     }
 
     /// Resolve the per-agent workspace directory for `alias`.
@@ -7019,16 +7178,17 @@ impl Default for PipelineConfig {
 ///
 /// # Privacy and cost note
 ///
-/// Tool results that print real local image paths (e.g. shell tools doing
-/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
-/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
-/// This means image bytes that previously stayed local will be uploaded to
-/// the configured provider when surfaced by a tool.
+/// Tool text is never scanned for image paths: a tool result that merely
+/// prints a local path (e.g. shell tools doing `ls /pictures` or
+/// `find . -name '*.png'`) stays text. Image bytes are uploaded only when a
+/// tool explicitly declares an attachment, and a declared attachment is
+/// base64-inlined into the next provider request, so operators running
+/// tools that declare image attachments over personal or sensitive files
+/// should be aware of the upload semantics.
 ///
 /// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
-/// image budget, but operators running shell-style tools over directories of
-/// personal or sensitive images should be aware of the upload semantics. See
-/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
+/// image budget. See `docs/book/src/contributing/privacy.md` for the
+/// project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
@@ -7037,9 +7197,14 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. Acts as
-    /// the upper bound on per-turn upload cost when tool outputs surface
-    /// local image paths.
+    /// dropped first when the cumulative count exceeds this limit. When a
+    /// new image takes the count past the limit, the oldest surviving
+    /// image is removed from its message, which can invalidate a
+    /// provider's cached prefix from that message onward; a larger limit
+    /// delays cap eviction and reduces how many happen over a session,
+    /// but once the limit is full each further image still evicts one.
+    /// Acts as the upper bound on per-turn upload cost when tool outputs
+    /// surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8170,6 +8335,36 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+/// Local IPC endpoint limits (`[rpc]`).
+///
+/// Applies to the Unix socket or Windows named pipe that local clients such as
+/// zerocode connect to. The remote WSS plane has its own limits under `[wss]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "rpc"]
+pub struct RpcConfig {
+    /// Ceiling on concurrently open local IPC connections (default: 512).
+    /// A connection past the ceiling receives one error frame naming this
+    /// setting and is closed. Values below 1 are treated as 1, and values
+    /// above the runtime's semaphore ceiling are clamped to it. Read when the
+    /// local listener starts, so a change applies at the next daemon restart
+    /// or reload.
+    #[serde(default = "default_rpc_max_local_connections")]
+    pub max_local_connections: usize,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            max_local_connections: default_rpc_max_local_connections(),
+        }
+    }
+}
+
+fn default_rpc_max_local_connections() -> usize {
+    512
 }
 
 fn default_enroll_bind() -> String {
@@ -10213,6 +10408,13 @@ pub struct FileDownloadConfig {
     #[serde(default = "default_file_download_timeout_secs")]
     pub timeout_secs: u64,
 
+    /// Private, loopback, or link-local endpoint hosts that file_download may
+    /// contact. Cloud metadata and credential-delivery addresses remain blocked
+    /// even when their host appears here. Use only for operator-controlled
+    /// internal document services.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
+
     /// Static HTTP headers attached to every download request — typically an
     /// `Authorization: Bearer …` token for the upstream endpoint. Same shape as
     /// `[mcp.servers.*.headers]`.
@@ -10237,6 +10439,7 @@ impl Default for FileDownloadConfig {
             max_file_size_bytes: default_file_download_max_size_bytes(),
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
@@ -10781,13 +10984,13 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-/// The standard `web_fetch` request and every `http_request` request are direct
-/// so their locally validated DNS answers can be pinned: they bypass environment
-/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
-/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
-/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
-/// normal environment proxy discovery. To proxy other traffic, use `services` scope
-/// without those selectors or `tool.*`.
+/// The standard `web_fetch` request, every `http_request` request, and configured
+/// `file_download` requests are direct so their locally validated DNS answers can
+/// be pinned: they bypass environment proxies and reject a runtime proxy scope
+/// that applies to their `tool.*` selectors, including an enabled `environment`
+/// scope. Unmanaged process proxy variables are warned when ignored. The optional
+/// Firecrawl API fallback uses normal environment proxy discovery. To proxy other
+/// traffic, use `services` scope without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -13528,8 +13731,11 @@ pub struct WebhookAuditConfig {
     /// The destination controls retention of exported payloads.
     #[serde(default)]
     pub include_args: bool,
-    /// Maximum size (in bytes) of serialised arguments included in a single
-    /// audit payload. Arguments exceeding this limit are truncated.
+    /// Maximum source bytes retained from scrubbed, serialised arguments before
+    /// the truncation marker is appended. The marker and enclosing audit-payload
+    /// JSON do not count toward this limit. Arguments exceeding it are truncated
+    /// on a UTF-8 boundary and exported as a string instead of their original
+    /// JSON structure.
     /// Default: `4096`.
     #[serde(default = "default_max_args_bytes")]
     pub max_args_bytes: u64,
@@ -14452,6 +14658,8 @@ pub struct RuntimeProfileConfig {
     pub agentic: bool,
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
+    /// Maximum aggregate loop iterations for one execution tree. Omitted disables it.
+    pub max_execution_tree_iterations: Option<usize>,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
     /// Maximum actions allowed per hour. `0` is a hard zero budget — the
     /// per-sender rate tracker treats a max of 0 as always exhausted
@@ -14535,6 +14743,7 @@ impl Default for RuntimeProfileConfig {
         Self {
             agentic: false,
             max_tool_iterations: 0,
+            max_execution_tree_iterations: None,
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
@@ -15588,6 +15797,22 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Notice policy for ordinary same-family, different-model channel fallback.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackNotice {
+    /// Omit ordinary same-family model fallback notices.
+    #[default]
+    Off,
+    /// Report fallback without exposing provider or model identifiers.
+    Redacted,
+    /// Include requested and served provider/model identifiers.
+    Detailed,
+}
+
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -15769,6 +15994,13 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Notice mode for ordinary same-family, different-model fallback: `off`
+    /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
+    /// channels and is read from live config at outbound delivery. Detailed
+    /// notices expose requested and served provider/model identifiers to the
+    /// channel audience. Cross-family and safeguard notices are unchanged.
+    #[serde(default)]
+    pub model_fallback_notice: ModelFallbackNotice,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -16232,6 +16464,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -19234,8 +19467,12 @@ pub struct SecurityConfig {
     /// serialized. A legacy table may carry a plaintext `client_secret`, so
     /// keeping it would let `GET /api/config` disclose that credential to a
     /// `config:read` principal (the raw value sits outside the derived
-    /// `mask_secrets`). Discarding it here keeps the dead secret out of both
-    /// the API response and the next on-disk save.
+    /// `mask_secrets`). Discarding it here keeps the dead secret out of the
+    /// loaded configuration, and so out of the API response and the next
+    /// on-disk save. The deserializer still materializes the input before
+    /// dropping it and the file loader holds the raw text, so this is a
+    /// retention boundary, not zeroization. `save_dirty` removes the table
+    /// from the file itself (see `retire_nevis_table_in_doc`).
     #[serde(
         default,
         skip_serializing,
@@ -19268,7 +19505,9 @@ impl Default for SecurityConfig {
 /// discard every value it carries. Only a content-free presence marker
 /// (`Some(Value::Null)`) is returned, so validation can warn once while the
 /// removed integration's fields — including any plaintext `client_secret` —
-/// never reach memory, `GET /api/config`, or the next on-disk save.
+/// are never retained in the loaded configuration, and so never reach
+/// `GET /api/config` or the next on-disk save. (The value is materialized
+/// transiently to be discarded; this is not zeroization.)
 fn deserialize_inert_nevis<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -20822,7 +21061,7 @@ impl Default for Config {
         });
 
         Self {
-            data_dir: zeroclaw_dir.join("data"),
+            data_dir: install_data_dir(&zeroclaw_dir),
             config_path: zeroclaw_dir.join("config.toml"),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
@@ -20832,6 +21071,7 @@ impl Default for Config {
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -20861,6 +21101,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -20925,11 +21166,23 @@ impl Default for Config {
 
 fn default_config_and_data_dirs() -> Result<(PathBuf, PathBuf)> {
     let config_dir = default_config_dir()?;
-    // The second value is the shared instance data directory
-    // (databases + state files). Per-agent identity + markdown lives
-    // at `<config-dir>/agents/<alias>/workspace/`, resolved separately
-    // via `Config::agent_workspace_dir`.
-    Ok((config_dir.clone(), config_dir.join("data")))
+    let data_dir = install_data_dir(&config_dir);
+    Ok((config_dir, data_dir))
+}
+
+/// The shared instance data directory (databases and state files) of the
+/// install rooted at `config_dir`. Per-agent identity and markdown live at
+/// `<config-dir>/agents/<alias>/workspace/`, resolved separately via
+/// `Config::agent_workspace_dir`.
+///
+/// Every path to the data directory goes through here: the runtime
+/// resolution a daemon uses to lock its state before loading the config,
+/// `Config::load_or_init`, which sets `config.data_dir`, and the V2-to-V3
+/// filesystem migration's targets. A daemon refuses to start when the first
+/// two disagree. Outside this crate, `zerocode` derives the same
+/// `<config-dir>/data` for its daemon socket; keep them in step.
+pub(crate) fn install_data_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("data")
 }
 
 fn default_config_dir() -> Result<PathBuf> {
@@ -20959,7 +21212,9 @@ fn default_config_dir() -> Result<PathBuf> {
 /// `~/.zeroclaw`. The zerocode binary mirrors this path inline (it carries no
 /// `zeroclaw-*` dependency).
 pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
-    Ok(default_config_dir()?.join("data").join("ftl").join(locale))
+    Ok(install_data_dir(&default_config_dir()?)
+        .join("ftl")
+        .join(locale))
 }
 
 /// The FTL catalogues that `zeroclaw locales fetch` / the daemon's
@@ -21005,16 +21260,29 @@ fn default_path_under_config_dir(relative: &str) -> String {
     }
 }
 
+/// Resolve the install a `ZEROCLAW_DATA_DIR` (or deprecated
+/// `ZEROCLAW_WORKSPACE`) value points at: its config directory and that
+/// install's data directory.
+///
+/// The value locates the install. It is the install itself when it holds a
+/// `config.toml`, or the data directory beside a `.zeroclaw` install (as in
+/// the container images). The data directory returned is always the
+/// install's own `<config-dir>/data`, which is where `Config::load_or_init`
+/// keeps the databases.
 pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
-    let data_config_dir = data_dir.to_path_buf();
-    if data_config_dir.join("config.toml").exists() {
-        return (data_config_dir.clone(), data_config_dir.join("data"));
+    let config_dir = config_dir_for_data(data_dir);
+    let data_dir = install_data_dir(&config_dir);
+    (config_dir, data_dir)
+}
+
+fn config_dir_for_data(data_dir: &Path) -> PathBuf {
+    if data_dir.join("config.toml").exists() {
+        return data_dir.to_path_buf();
     }
 
-    let legacy_config_dir = data_dir.parent().map(|parent| parent.join(".zeroclaw"));
-    if let Some(legacy_dir) = legacy_config_dir {
+    if let Some(legacy_dir) = data_dir.parent().map(|parent| parent.join(".zeroclaw")) {
         if legacy_dir.join("config.toml").exists() {
-            return (legacy_dir, data_config_dir);
+            return legacy_dir;
         }
 
         // Accept either the new "data" suffix or the legacy "workspace"
@@ -21024,11 +21292,11 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
         if data_dir.file_name().is_some_and(|name| {
             name == std::ffi::OsStr::new("data") || name == std::ffi::OsStr::new("workspace")
         }) {
-            return (legacy_dir, data_config_dir);
+            return legacy_dir;
         }
     }
 
-    (data_config_dir.clone(), data_config_dir.join("data"))
+    data_dir.to_path_buf()
 }
 
 pub async fn classify_runtime_config_kind(config_path: &Path) -> RuntimeConfigKind {
@@ -21258,11 +21526,8 @@ async fn resolve_runtime_config_dirs(
                 );
             }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
-            return Ok((
-                zeroclaw_dir.clone(),
-                zeroclaw_dir.join("data"),
-                ConfigResolutionSource::EnvConfigDir,
-            ));
+            let data_dir = install_data_dir(&zeroclaw_dir);
+            return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvConfigDir));
         }
     }
 
@@ -21311,9 +21576,10 @@ async fn resolve_runtime_config_dirs(
         && let Ok(exe) = std::env::current_exe()
         && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
     {
+        let data_dir = install_data_dir(&homebrew_config_dir);
         return Ok((
-            homebrew_config_dir.clone(),
-            homebrew_config_dir.join("workspace"),
+            homebrew_config_dir,
+            data_dir,
             ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
@@ -21721,6 +21987,176 @@ enum PeerGroupChannelRef {
         /// that pick between candidates are deterministic.
         known_aliases: Vec<String>,
     },
+}
+
+/// Test-only coordination for the config save's post-atomic-rename
+/// visibility window (see the pause call inside the save path). `arm(target)`
+/// returns a handle whose `wait_paused` resolves once a save of that exact
+/// config path is holding inside the window — after the new config is visible
+/// on disk, before permission hardening and directory sync finish — and whose
+/// `release` lets that save proceed and disarms the gate. Path-scoping keeps
+/// parallel tests (each with its own config root) from consuming each other's
+/// gates. Dropping the handle disarms. Compiled only under
+/// `test`/`test-helpers`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_post_replace_pause_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    struct Gate {
+        target: PathBuf,
+        reached: Notify,
+        release: Notify,
+        claimed: AtomicBool,
+        released: AtomicBool,
+    }
+
+    static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
+
+    fn disarm(gate: &Arc<Gate>) {
+        gate.released.store(true, Ordering::Release);
+        gate.release.notify_waiters();
+        GATES
+            .lock()
+            .unwrap()
+            .retain(|registered| !Arc::ptr_eq(registered, gate));
+    }
+
+    /// Handle for one armed gate. Dropping it disarms, so a failed test
+    /// cannot leave later saves paused forever.
+    pub struct GateHandle {
+        gate: Arc<Gate>,
+    }
+
+    impl GateHandle {
+        /// Resolve once the armed save is paused inside the post-rename
+        /// window.
+        pub async fn wait_paused(&self) {
+            self.gate.reached.notified().await;
+        }
+
+        /// Let the paused save proceed and disarm the gate.
+        pub fn release(&self) {
+            disarm(&self.gate);
+        }
+    }
+
+    impl Drop for GateHandle {
+        fn drop(&mut self) {
+            disarm(&self.gate);
+        }
+    }
+
+    /// Arm the gate for the next save of `target` that reaches the
+    /// post-rename window.
+    pub fn arm(target: PathBuf) -> GateHandle {
+        let gate = Arc::new(Gate {
+            target,
+            reached: Notify::new(),
+            release: Notify::new(),
+            claimed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let displaced = {
+            let mut gates = GATES.lock().unwrap();
+            let displaced = gates
+                .iter()
+                .position(|registered| registered.target == gate.target)
+                .map(|index| gates.remove(index));
+            gates.push(Arc::clone(&gate));
+            displaced
+        };
+        if let Some(displaced) = displaced {
+            displaced.released.store(true, Ordering::Release);
+            displaced.release.notify_waiters();
+        }
+        GateHandle { gate }
+    }
+
+    /// Save-side hook: notify waiters and block while the gate is armed for
+    /// this config path. The std lock is never held across the await.
+    pub(crate) async fn pause(config_path: &Path) {
+        let gate = {
+            GATES
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|gate| gate.target == config_path)
+                .cloned()
+        };
+        if let Some(gate) = gate {
+            if gate
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            gate.reached.notify_one();
+            let released = gate.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !gate.released.load(Ordering::Acquire) {
+                released.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[tokio::test]
+        async fn dropped_handle_releases_only_its_path() {
+            let first_path = PathBuf::from("test-post-replace-first.toml");
+            let second_path = PathBuf::from("test-post-replace-second.toml");
+            let first = arm(first_path.clone());
+            let second = arm(second_path.clone());
+
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
+            let second_save = ::zeroclaw_spawn::spawn!(async move { pause(&second_path).await });
+            first.wait_paused().await;
+            second.wait_paused().await;
+
+            drop(first);
+            tokio::time::timeout(Duration::from_secs(1), first_save)
+                .await
+                .expect("dropping a gate must release its paused save")
+                .expect("first pause task must not panic");
+            assert!(
+                !second_save.is_finished(),
+                "dropping one path must not release another path"
+            );
+
+            second.release();
+            tokio::time::timeout(Duration::from_secs(1), second_save)
+                .await
+                .expect("releasing a gate must release its paused save")
+                .expect("second pause task must not panic");
+        }
+
+        #[tokio::test]
+        async fn gate_pauses_only_the_next_matching_save() {
+            let path = PathBuf::from("test-post-replace-next-save.toml");
+            let gate = arm(path.clone());
+            let first_path = path.clone();
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
+            gate.wait_paused().await;
+
+            tokio::time::timeout(Duration::from_secs(1), pause(&path))
+                .await
+                .expect("a second matching save must not consume the armed gate");
+
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(1), first_save)
+                .await
+                .expect("releasing the gate must release the first save")
+                .expect("first pause task must not panic");
+        }
+    }
 }
 
 impl Config {
@@ -22165,7 +22601,7 @@ impl Config {
         // migration against `default_zeroclaw_dir` would silently skip
         // any install reached via `ZEROCLAW_CONFIG_DIR` or
         // `ZEROCLAW_WORKSPACE`.
-        let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
+        let (zeroclaw_dir, _data_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
         // One-time, V<3 → V3 ONLY move of `<install>/workspace/` into
@@ -22237,7 +22673,7 @@ impl Config {
         // cost records) and hygiene/state files. Per-agent identity
         // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
         // `Config::agent_workspace_dir(alias)` instead.
-        let data_dir = zeroclaw_dir.join("data");
+        let data_dir = install_data_dir(&zeroclaw_dir);
         fs::create_dir_all(&data_dir).await.with_context(|| {
             format!(
                 "Failed to create data directory: {}",
@@ -22462,6 +22898,7 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.data_dir = workspace_dir;
+            config.loaded_from = Some(config_path.clone());
 
             // Ensure each configured skill-bundle's resolved directory
             // exists on disk so the bundle has somewhere for skills to
@@ -22535,6 +22972,9 @@ impl Config {
             // freshly-created config file. Env overrides apply post-save to
             // populate the in-memory Config for the running process.
             config.save().await?;
+            // This value just wrote the file; mark provenance so later full
+            // saves of the same value stay legitimate.
+            config.loaded_from = Some(config_path.clone());
 
             // Restrict permissions on newly created config file (may contain API keys)
             #[cfg(unix)]
@@ -22564,6 +23004,66 @@ impl Config {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
+    }
+
+    /// Hydrate one already-migrated config body exactly as a reload would,
+    /// without replacing the config file.
+    ///
+    /// This is the preparation step for config migration (see the
+    /// gateway's migrate endpoint): the candidate must be fully hydrated
+    /// — strict parse into the current schema, computed paths attached,
+    /// secrets decrypted through the install's store, env overrides
+    /// applied with their save-masking snapshots captured — and must pass
+    /// strict validation *before* the migrated file is allowed to replace
+    /// the live one. Any failure (parse, secret, unresolvable env path,
+    /// validation) refuses the migration with the original config file
+    /// untouched and nothing published. Migration acceptance is stricter
+    /// than resilient boot ([`Config::load_or_init`] warns and serves);
+    /// an operator-driven replacement may not install a config the
+    /// current schema rejects.
+    ///
+    /// The caller supplies the canonical `config_path` and `data_dir`
+    /// (from the currently published config) so the prepared candidate is
+    /// exactly the config the next daemon generation would load from the
+    /// migrated file.
+    pub async fn prepare_from_migrated_toml(
+        content: &str,
+        config_path: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let mut config = crate::migration::migrate_to_current(content)
+            .context("migrated config failed to hydrate as the current schema")?;
+        config.config_path = config_path.to_path_buf();
+        config.data_dir = data_dir.to_path_buf();
+
+        if let Some(default_profile) = config.risk_profiles.get_mut("default") {
+            default_profile.ensure_default_auto_approve();
+        }
+
+        let zeroclaw_dir = config_path
+            .parent()
+            .context("config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config = tokio::task::spawn_blocking(move || {
+            config.decrypt_secrets(&store)?;
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("migrated config secret decryption task failed")??;
+
+        let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+
+        // Strict validation: unlike resilient boot, an operator-driven
+        // migration refuses a candidate the current schema rejects. The
+        // refusal happens before any disk replacement, so the original
+        // file and the published pair are unchanged.
+        config
+            .validate()
+            .context("migrated config failed strict validation")?;
+        Ok(config)
     }
 
     /// Report that opting into `[verifiable_intent]` does not currently enable
@@ -22628,6 +23128,7 @@ impl Config {
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
+        self.collect_cron_claim_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -22686,30 +23187,49 @@ impl Config {
             return;
         }
 
-        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
-            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
-            ProxyScope::Services => (
-                self.proxy.should_apply_to_service("tool.http_request"),
-                self.proxy.should_apply_to_service("tool.web_fetch"),
-            ),
-        };
-        if !http_request_blocked && !web_fetch_blocked {
+        let file_download_enabled = self
+            .file_download
+            .url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let mut affected = Vec::new();
+        match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => {
+                affected.push("http_request");
+                affected.push("web_fetch");
+                if file_download_enabled {
+                    affected.push("file_download");
+                }
+            }
+            ProxyScope::Services => {
+                if self.proxy.should_apply_to_service("tool.http_request") {
+                    affected.push("http_request");
+                }
+                if self.proxy.should_apply_to_service("tool.web_fetch") {
+                    affected.push("web_fetch");
+                }
+                if file_download_enabled && self.proxy.should_apply_to_service("tool.file_download")
+                {
+                    affected.push("file_download");
+                }
+            }
+        }
+        if affected.is_empty() {
             return;
         }
-
-        let affected = match (http_request_blocked, web_fetch_blocked) {
-            (true, true) => "http_request and web_fetch",
-            (true, false) => "http_request",
-            (false, true) => "web_fetch",
-            (false, false) => return,
+        let affected = match affected.as_slice() {
+            [one] => (*one).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            [first, second, third] => format!("{first}, {second}, and {third}"),
+            _ => affected.join(", "),
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
             format!(
                 "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
                  those calls will fail instead of using an unpinned proxy connection. Use \
-                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
-                 proxy.services; tool.* also selects web_fetch."
+                 proxy.scope = \"services\" and omit tool.http_request, tool.web_fetch, \
+                 tool.file_download, and tool.* from proxy.services."
             ),
             if self.proxy.scope == ProxyScope::Services {
                 "proxy.services"
@@ -23383,6 +23903,16 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
+
+        for (profile_alias, profile) in &self.runtime_profiles {
+            if profile.max_execution_tree_iterations == Some(0) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{profile_alias}.max_execution_tree_iterations"),
+                    "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
+                );
+            }
+        }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -24653,7 +25183,9 @@ impl Config {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "[security.nevis] is deprecated and ignored: the Nevis integration was \
                  removed. Configure [oidc.<alias>] with [users] / [permission_profiles] \
-                 instead; the table will be dropped on the next config save."
+                 instead; the table is removed from config.toml on the next save \
+                 (full or incremental). Backups of config.toml taken before that save \
+                 still carry the original table and any client_secret in it."
             );
         }
 
@@ -25537,7 +26069,30 @@ impl Config {
         Ok(resolved)
     }
 
+    /// Full save. Refuses to overwrite an existing config file unless this
+    /// value was loaded from that exact file (`loaded_from`), so a default,
+    /// programmatically built, or repointed `Config` cannot replace an
+    /// operator's config with a near-empty snapshot. Creating a
+    /// missing file (first run) always succeeds — a value that never read
+    /// a file gets exactly one create and must then reload or use
+    /// `force_save()`; `force_save()` is the explicit overwrite path.
     pub async fn save(&self) -> Result<()> {
+        self.save_impl(false).await.map(|_| ())
+    }
+
+    /// Same as `save()`, but skips the loaded-provenance guard. Only for
+    /// callers that verifiably intend to replace an existing file with a
+    /// `Config` that never read it.
+    ///
+    /// Destination-path checks still apply. To replace an existing file, set
+    /// `config_path` to the intended path with a nonempty parent directory.
+    /// A bare filename such as `config.toml` is refused if its runtime-resolved
+    /// destination already exists.
+    pub async fn force_save(&self) -> Result<()> {
+        self.save_impl(true).await.map(|_| ())
+    }
+
+    async fn save_impl(&self, force: bool) -> Result<PathBuf> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -25546,6 +26101,35 @@ impl Config {
         // emit a body-newer-than-label file. See `save_dirty` and.
         config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
+        // Fail closed: a metadata error must not read as "file absent" and
+        // slip an unproven save past the guard.
+        let target_exists = config_path.try_exists().with_context(|| {
+            format!(
+                "Cannot check config target {}; refusing to save",
+                config_path.display()
+            )
+        })?;
+        if !force && target_exists && self.loaded_from.as_ref() != Some(&config_path) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.save_refused_unproven_overwrite",
+                        "path": config_path.display().to_string(),
+                    })),
+                "refusing to overwrite an existing config this Config was never loaded from"
+            );
+            anyhow::bail!(
+                "Refusing to overwrite existing config at {}: this Config was \
+                 not loaded from that file (default-constructed, built \
+                 programmatically, or loaded from a different file), so saving \
+                 would replace the operator's file with a near-empty snapshot. \
+                 Load it first (e.g. `Config::load_or_init`) or call \
+                 `force_save()` to overwrite deliberately.",
+                config_path.display()
+            );
+        }
         let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
@@ -25611,7 +26195,11 @@ impl Config {
             new_toml
         };
 
-        write_config_atomically(&config_path, &toml_str).await
+        write_config_atomically(&config_path, &toml_str).await?;
+        // Report the path actually written so `save_dirty`'s create
+        // fallback can record provenance without re-resolving (the
+        // resolver re-reads the environment for parentless paths).
+        Ok(config_path)
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -25627,11 +26215,16 @@ impl Config {
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save().await;
-            if result.is_ok() {
-                self.clear_dirty();
-            }
-            return result;
+            return match self.save_impl(false).await {
+                Ok(written) => {
+                    // This value just created the file; `written` is the
+                    // path the full save actually wrote.
+                    self.loaded_from = Some(written);
+                    self.clear_dirty();
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
         }
 
         let mut config_to_save = self.clone();
@@ -25676,6 +26269,15 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
+        // Retire the inert `[security.nevis]` table from the file. The shim
+        // discards its content at load and `skip_serializing` keeps it out of
+        // a full save, but an incremental save reparses the original file and
+        // rewrites only dirty paths, so without this the retired table (and a
+        // plaintext `client_secret` it may carry) would outlive every ordinary
+        // CLI/dashboard edit. Only that one table is touched; comments and
+        // unrelated ciphertext elsewhere in the file are preserved.
+        let retired_nevis = retire_nevis_table_in_doc(doc.as_table_mut());
+
         // Stamp the current schema version. An incremental save writes
         // current-schema-shaped sections (e.g. the dashboard saving a single
         // `agents.<name>.model_provider`) but `schema_version` is never a
@@ -25692,6 +26294,19 @@ impl Config {
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
         write_config_atomically(&config_path, &toml_str).await?;
+        if retired_nevis {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "retired_config": "security.nevis",
+                    })),
+                "Removed the retired [security.nevis] table from config.toml on save; \
+                 the Nevis integration no longer exists. Backups taken before this \
+                 save still carry the original table."
+            );
+        }
         self.clear_dirty();
         Ok(())
     }
@@ -25898,6 +26513,16 @@ async fn write_config_atomically_with_sync(
         }
         anyhow::bail!("Failed to atomically replace config file: {e}");
     }
+
+    // Test-only pause gate: the atomic rename above is the point where the
+    // new config becomes externally visible, while `save_dirty` continues
+    // with permission hardening, directory synchronization, and backup
+    // handling before returning. Tests use this gate to hold the save inside
+    // that visibility window (e.g. to prove a cancelled caller cannot strand
+    // a committed disk config without its live swap and cleanup), then let
+    // the save proceed. Inert unless armed.
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_post_replace_pause_gate::pause(config_path).await;
 
     #[cfg(unix)]
     {
@@ -26834,6 +27459,34 @@ fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
     cursor.remove(last);
 }
 
+/// Remove the retired `[security.nevis]` table from an on-disk document
+/// during an incremental save. Returns whether anything was removed.
+///
+/// The removed Nevis integration's table is tolerated at load (see
+/// `deserialize_inert_nevis`), but the loaded config carries none of its
+/// content, so nothing about it is ever a dirty path and `save_dirty` would
+/// otherwise carry the original bytes forward indefinitely. Both spellings
+/// are handled: a `[security.nevis]` header (a `nevis` key inside the
+/// `security` table) and a dotted or inline `nevis = { ... }` entry. A
+/// `[security]` table left empty by the removal is dropped too, so a file
+/// that only had the retired table does not keep an empty header; a
+/// `[security]` table with other keys keeps them and their comments.
+fn retire_nevis_table_in_doc(root: &mut toml_edit::Table) -> bool {
+    let Some(security) = root
+        .get_mut("security")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return false;
+    };
+    if security.remove("nevis").is_none() {
+        return false;
+    }
+    if security.is_empty() {
+        root.remove("security");
+    }
+    true
+}
+
 /// Same `TableLike` traversal as `delete_path_in_doc`, for the same
 /// reason: a write into a key that already lives inside a hand-edited
 /// inline table must land in that inline table rather than silently
@@ -26853,7 +27506,19 @@ fn set_path_in_doc(root: &mut toml_edit::Table, segs: &[&str], value: &toml::Val
         };
     }
     let new_item = crate::migration::toml_value_to_edit_item(value);
-    cursor.insert(last, new_item);
+    match cursor.get_mut(last) {
+        // Key already present: mutate the value in place so the key's leading
+        // decor (a full-line comment above it, blank lines) is preserved.
+        // `insert` would replace the whole key/value pair with a fresh key
+        // carrying default decor, silently dropping an operator's in-section
+        // comment on overwrite. Mirrors `migration::sync_table`'s decor-
+        // preserving update so the incremental (`save_dirty`) and full (`save`)
+        // write paths keep comments identically.
+        Some(existing) => *existing = new_item,
+        None => {
+            cursor.insert(last, new_item);
+        }
+    }
 }
 
 #[allow(clippy::unused_async)] // async needed on unix for tokio File I/O; no-op on other platforms
@@ -27841,6 +28506,64 @@ mod tests {
         assert!(all_denied.channel_voice_peers("telegram", "ops").is_empty());
     }
 
+    fn claiming_agent(enabled: bool, ids: &[&str]) -> super::AliasedAgentConfig {
+        super::AliasedAgentConfig {
+            enabled,
+            cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn cron_job_claim_distinguishes_every_shape() {
+        use super::CronJobClaim;
+        let mut config = super::Config::default();
+        config
+            .agents
+            .insert("a".into(), claiming_agent(true, &["sole", "shared"]));
+        config
+            .agents
+            .insert("b".into(), claiming_agent(true, &["shared"]));
+        config
+            .agents
+            .insert("off".into(), claiming_agent(false, &["dormant", "shared"]));
+
+        assert_eq!(config.cron_job_claim("sole"), CronJobClaim::Sole("a"));
+        assert_eq!(
+            config.cron_job_claim("shared"),
+            CronJobClaim::Contested(vec!["a", "b"]),
+            "a disabled claimant does not count toward contention"
+        );
+        assert_eq!(config.cron_job_claim("dormant"), CronJobClaim::DisabledOnly);
+        assert_eq!(config.cron_job_claim("nobody"), CronJobClaim::Unclaimed);
+
+        // Only the sole claim names an owner; a contested id has none.
+        assert_eq!(config.agent_for_cron_job("sole"), Some("a"));
+        assert_eq!(config.agent_for_cron_job("shared"), None);
+        assert_eq!(config.agent_for_cron_job("dormant"), None);
+        assert_eq!(config.agent_for_cron_job("nobody"), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn contested_cron_claim_is_a_validation_warning() {
+        let mut config = super::Config::default();
+        config
+            .agents
+            .insert("a".into(), claiming_agent(true, &["shared", "mine"]));
+        config
+            .agents
+            .insert("b".into(), claiming_agent(true, &["shared"]));
+        let warnings = config.collect_warnings();
+        let contested: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.code == "cron_job_contested_claim")
+            .collect();
+        assert_eq!(contested.len(), 1, "{warnings:?}");
+        assert!(contested[0].message.contains("`shared`"));
+        assert!(contested[0].message.contains("a, b"));
+        assert_eq!(contested[0].path, "agents");
+    }
+
     #[::core::prelude::v1::test]
     fn cache_passthrough_deserializes_and_defaults_to_omitted() {
         let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
@@ -28049,6 +28772,171 @@ mod tests {
             ..ResolvedRuntime::default()
         };
         assert_eq!(r.effective_context_budget(), 8_000);
+
+        // An unconfigured capacity is a compatibility stub, not model truth.
+        // An explicit absolute budget above the stub is honored, and the
+        // window operand is raised to it so capacity stays a hard invariant
+        // while its provenance still reports "not configured".
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            ..ResolvedRuntime::default()
+        };
+        let limits = r.context_limits();
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(limits.configured_model_context_window(), None);
+
+        // In ratio mode the explicit budget stands in for the unknown window.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 800_000);
+
+        // A pruning threshold still pulls the honored budget down.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(1_000_000),
+            history_pruning: crate::scattered_types::HistoryPrunerConfig {
+                enabled: true,
+                max_tokens: 12_000,
+                ..crate::scattered_types::HistoryPrunerConfig::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 12_000);
+
+        // An explicit budget at or below the stub leaves the stub untouched.
+        let r = ResolvedRuntime {
+            max_context_tokens: Some(16_000),
+            ..ResolvedRuntime::default()
+        };
+        let limits = r.context_limits();
+        assert_eq!(limits.context_token_budget, 16_000);
+        assert_eq!(limits.model_context_window, 32_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn compatibility_fallback_limits_honor_explicit_budget_above_the_stub() {
+        use super::{
+            ModelContextWindowSource, ResolvedContextLimits, ResolvedModelContextWindow,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+        };
+
+        // Zero stays the proactive-trimming disable sentinel.
+        let limits = ResolvedContextLimits::legacy_fallback(0);
+        assert_eq!(limits.context_token_budget, 0);
+        assert_eq!(
+            limits.model_context_window,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // A budget below the stub is preserved against the stub.
+        let limits = ResolvedContextLimits::legacy_fallback(16_000);
+        assert_eq!(limits.context_token_budget, 16_000);
+        assert_eq!(
+            limits.model_context_window,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // A budget above the stub is no longer clamped to it: the stub is not
+        // model truth, and the operator's explicit value is better evidence.
+        let limits = ResolvedContextLimits::legacy_fallback(1_000_000);
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(limits.configured_model_context_window(), None);
+
+        // Binding a budget to a configured capacity still caps at capacity.
+        let limits = ResolvedContextLimits::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: 8_000,
+                source: ModelContextWindowSource::Configured,
+            },
+            1_000_000,
+        );
+        assert_eq!(limits.context_token_budget, 8_000);
+        assert_eq!(limits.model_context_window, 8_000);
+        assert_eq!(limits.configured_model_context_window(), Some(8_000));
+
+        // Binding to the compatibility stub honors the budget.
+        let limits = ResolvedContextLimits::bind_budget(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            },
+            1_000_000,
+        );
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+    }
+
+    /// Mirrors the reported operator setup: a provider profile that declares `model`
+    /// and `max_tokens` but no `context_window`, bound to a runtime profile
+    /// with a large explicit `max_context_tokens`. The profile budget must
+    /// win over the 32,000 compatibility stub.
+    #[::core::prelude::v1::test]
+    fn unconfigured_provider_capacity_honors_explicit_profile_budget() {
+        use super::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut cfg = Config::default();
+        let provider = cfg
+            .providers
+            .models
+            .ensure("anthropic", "clod")
+            .expect("known model provider type");
+        provider.model = Some("claude-opus-5-5".to_string());
+        provider.max_tokens = Some(128_000);
+        cfg.runtime_profiles.insert(
+            "normal".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(1_000_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "zerocode".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "normal".into(),
+                model_provider: "anthropic.clod".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let limits =
+            cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
+        assert_eq!(limits.context_token_budget, 1_000_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(
+            limits.model_context_window_source,
+            super::ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(cfg.configured_model_context_window("zerocode"), None);
+        assert_eq!(
+            cfg.resolved_agent_config("zerocode")
+                .expect("agent resolves")
+                .resolved
+                .effective_context_budget(),
+            1_000_000
+        );
+
+        // With the ratio also set, the explicit budget is the window operand.
+        cfg.runtime_profiles
+            .get_mut("normal")
+            .expect("profile exists")
+            .context_compact_ratio = Some(0.8);
+        let limits =
+            cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
+        assert_eq!(limits.context_token_budget, 800_000);
+        assert_eq!(limits.model_context_window, 1_000_000);
     }
 
     #[::core::prelude::v1::test]
@@ -31956,6 +32844,7 @@ auto_save = true
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -32097,6 +32986,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
@@ -32108,6 +32998,7 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -32763,6 +33654,7 @@ reasoning_effort = "turbo"
         let cfg = AliasedAgentConfig::default();
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
+        assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
@@ -32866,6 +33758,62 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_is_disabled_when_omitted() {
+        let raw = r#"
+[runtime_profiles.default]
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            None
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, None);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_resolves_positive_value() {
+        let raw = r#"
+[runtime_profiles.default]
+max_execution_tree_iterations = 7
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            Some(7)
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, Some(7));
+    }
+
+    #[test]
+    async fn validate_rejects_zero_runtime_profile_execution_tree_budget() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            RuntimeProfileConfig {
+                max_execution_tree_iterations: Some(0),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let error = config
+            .validate()
+            .expect_err("zero execution-tree budget must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.default.max_execution_tree_iterations")
+        );
     }
 
     #[test]
@@ -33213,6 +34161,7 @@ default_temperature = 0.7
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -33243,6 +34192,7 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
+            rpc: RpcConfig::default(),
             relay: RelayConfig::default(),
             enroll: EnrollConfig::default(),
             composio: ComposioConfig::default(),
@@ -33743,6 +34693,10 @@ default_temperature = 0.7
         );
         config.save().await.unwrap();
         assert!(config_path.exists());
+        // This value just wrote the file; mirror load_or_init's fresh-init
+        // provenance so the second save exercises the atomic-write path,
+        // not the unproven-overwrite guard.
+        config.loaded_from = Some(config_path.clone());
 
         config
             .providers
@@ -34212,6 +35166,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -34232,6 +35187,68 @@ allowed_users = ["@u:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_empty());
         assert!(c.matrix.is_empty());
+    }
+
+    #[test]
+    async fn model_fallback_notice_defaults_round_trips_and_configurable_values() {
+        let parsed: Config = toml::from_str("[channels]").unwrap();
+        assert_eq!(
+            parsed.channels.model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+        assert_eq!(
+            ChannelsConfig::default().model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+
+        let mut config = Config::default();
+        for (value, mode) in [
+            ("off", ModelFallbackNotice::Off),
+            ("redacted", ModelFallbackNotice::Redacted),
+            ("detailed", ModelFallbackNotice::Detailed),
+        ] {
+            config
+                .set_prop("channels.model_fallback_notice", value)
+                .unwrap();
+            assert_eq!(config.channels.model_fallback_notice, mode);
+            assert_eq!(
+                config.get_prop("channels.model_fallback_notice").unwrap(),
+                value
+            );
+
+            let serialized = toml::to_string(&config.channels).unwrap();
+            assert!(serialized.contains(&format!("model_fallback_notice = \"{value}\"")));
+            let round_trip: ChannelsConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(round_trip.model_fallback_notice, mode);
+        }
+
+        assert!(toml::from_str::<ChannelsConfig>("model_fallback_notice = \"verbose\"").is_err());
+        assert!(
+            config
+                .set_prop("channels.model_fallback_notice", "verbose")
+                .is_err()
+        );
+        assert_eq!(
+            config.channels.model_fallback_notice,
+            ModelFallbackNotice::Detailed
+        );
+
+        #[cfg(feature = "schema-export")]
+        {
+            let field = config
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "channels.model_fallback_notice")
+                .unwrap();
+            assert_eq!(
+                field.enum_variants.unwrap()(),
+                vec![
+                    "off".to_string(),
+                    "redacted".to_string(),
+                    "detailed".to_string()
+                ]
+            );
+        }
     }
 
     // ── Edge cases: serde(default) for non-secret optional fields ─────
@@ -34768,6 +35785,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -35878,6 +36896,211 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    /// The daemon locks the data directory `resolve_runtime_dirs` reports
+    /// before it loads the config, then refuses to start if the loaded
+    /// `config.data_dir` differs. Every layout must agree, and the loaded
+    /// data directory must stay where that layout keeps its databases.
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn runtime_dirs_match_the_loaded_data_dir_in_every_layout() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw_test_dirs_{}", uuid::Uuid::new_v4()));
+
+        // (layout, HOME, ZEROCLAW_CONFIG_DIR, ZEROCLAW_DATA_DIR, existing
+        // config.toml, expected config dir, expected data dir)
+        let docker = root.join("docker");
+        let default_home = root.join("default");
+        let explicit = root.join("explicit");
+        let inline = root.join("inline");
+        let fresh = root.join("fresh");
+        let cases = [
+            (
+                "container: ZEROCLAW_DATA_DIR beside .zeroclaw/config.toml",
+                docker.clone(),
+                None,
+                Some(docker.join("data")),
+                Some(docker.join(".zeroclaw/config.toml")),
+                docker.join(".zeroclaw"),
+                docker.join(".zeroclaw/data"),
+            ),
+            (
+                "default ~/.zeroclaw",
+                default_home.clone(),
+                None,
+                None,
+                Some(default_home.join(".zeroclaw/config.toml")),
+                default_home.join(".zeroclaw"),
+                default_home.join(".zeroclaw/data"),
+            ),
+            (
+                "explicit --config-dir",
+                root.join("explicit-home"),
+                Some(explicit.clone()),
+                None,
+                Some(explicit.join("config.toml")),
+                explicit.clone(),
+                explicit.join("data"),
+            ),
+            (
+                "ZEROCLAW_DATA_DIR holding config.toml",
+                root.join("inline-home"),
+                None,
+                Some(inline.clone()),
+                Some(inline.join("config.toml")),
+                inline.clone(),
+                inline.join("data"),
+            ),
+            (
+                "fresh ZEROCLAW_DATA_DIR named data",
+                root.join("fresh-home"),
+                None,
+                Some(fresh.join("data")),
+                None,
+                fresh.join(".zeroclaw"),
+                fresh.join(".zeroclaw/data"),
+            ),
+        ];
+
+        let mut mismatches = Vec::new();
+        for (layout, home, config_dir, data_dir, config_file, want_config, want_data) in cases {
+            if let Some(config_file) = &config_file {
+                fs::create_dir_all(config_file.parent().unwrap())
+                    .await
+                    .unwrap();
+                fs::write(config_file, "schema_version = 3\n")
+                    .await
+                    .unwrap();
+            }
+            let _home_guard = EnvValueGuard::set("HOME", &home);
+            let _config_guard = match &config_dir {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR"),
+            };
+            let _data_guard = match &data_dir {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_DATA_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_DATA_DIR"),
+            };
+
+            let (locked_config, locked_data) = resolve_runtime_dirs().await.unwrap();
+            let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            if locked_data != loaded.data_dir {
+                mismatches.push(format!(
+                    "{layout}: locked {}, loaded {}",
+                    locked_data.display(),
+                    loaded.data_dir.display()
+                ));
+            }
+            assert_eq!(locked_config, want_config, "{layout}: config dir");
+            assert_eq!(
+                loaded.data_dir, want_data,
+                "{layout}: database placement moved"
+            );
+        }
+        let _ = fs::remove_dir_all(&root).await;
+        assert!(
+            mismatches.is_empty(),
+            "pre-lock and loaded data dirs disagree:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// Startup creates and locks `config-lifecycle.lock` in the resolved data
+    /// directory before it loads the config. A V2-to-V3 filesystem migration
+    /// interrupted after moving an identity file, with the device database
+    /// still in the legacy workspace, must still resume on that load: the
+    /// database ends up readable in the loaded `data_dir`, and the legacy
+    /// copy is moved out and kept in the migration backup.
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn an_interrupted_v2_migration_resumes_despite_the_pre_load_lock() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let mut failures = Vec::new();
+        for layout in ["default ~/.zeroclaw", "container", "explicit --config-dir"] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path();
+            let (install, config_dir_env, data_dir_env) = match layout {
+                "container" => (home.join(".zeroclaw"), None, Some(home.join("data"))),
+                "explicit --config-dir" => {
+                    (home.join("explicit"), Some(home.join("explicit")), None)
+                }
+                _ => (home.join(".zeroclaw"), None, None),
+            };
+            let legacy = install.join("workspace");
+            std::fs::create_dir_all(&legacy).unwrap();
+            std::fs::write(install.join("config.toml"), "schema_version = 2\n").unwrap();
+            let agent = install.join("agents/default/workspace");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(agent.join("IDENTITY.md"), "moved before the interruption").unwrap();
+            {
+                let db = rusqlite::Connection::open(legacy.join("devices.db")).unwrap();
+                db.execute_batch(
+                    "CREATE TABLE marker(value TEXT NOT NULL);
+                     INSERT INTO marker VALUES('existing device');",
+                )
+                .unwrap();
+            }
+
+            let _home_guard = EnvValueGuard::set("HOME", home);
+            let _config_guard = match &config_dir_env {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR"),
+            };
+            let _data_guard = match &data_dir_env {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_DATA_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_DATA_DIR"),
+            };
+
+            // The pre-load lock step: create the lifecycle lock where the
+            // daemon would, and hold an advisory lock on it across the load.
+            let (_, locked_data) = resolve_runtime_dirs().await.unwrap();
+            std::fs::create_dir_all(&locked_data).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(locked_data.join("config-lifecycle.lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+
+            let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            drop(lock);
+
+            let moved = loaded.data_dir.join("devices.db");
+            let marker: Option<String> = rusqlite::Connection::open_with_flags(
+                &moved,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|db| db.query_row("SELECT value FROM marker", [], |row| row.get(0)))
+            .ok();
+            let backed_up = std::fs::read_dir(&install).unwrap().flatten().any(|entry| {
+                entry.file_name().to_string_lossy().starts_with("backup-")
+                    && entry.path().join("legacy-workspace/devices.db").is_file()
+            });
+            if marker.as_deref() != Some("existing device")
+                || legacy.join("devices.db").exists()
+                || !backed_up
+            {
+                failures.push(format!(
+                    "{layout}: locked {}, loaded {}; row at loaded data dir: {marker:?}; \
+                     still in legacy workspace: {}; in migration backup: {backed_up}",
+                    locked_data.display(),
+                    loaded.data_dir.display(),
+                    legacy.join("devices.db").exists()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the device database was not migrated:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -37046,6 +38269,24 @@ api_token = "tok"
         assert!(http_warning.message.contains("tool calls (http_request)"));
         assert!(!http_warning.message.contains("tool calls (web_fetch)"));
 
+        let file_download_warning = Config {
+            file_download: FileDownloadConfig {
+                url: Some("https://files.example.test/download".into()),
+                ..FileDownloadConfig::default()
+            },
+            ..services_config(vec!["tool.file_download"])
+        }
+        .collect_warnings()
+        .into_iter()
+        .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+        .expect("the explicit file_download selector must warn when file_download is enabled");
+        assert_eq!(file_download_warning.path, "proxy.services");
+        assert!(
+            file_download_warning
+                .message
+                .contains("tool calls (file_download)")
+        );
+
         let wildcard_warning = services_config(vec!["tool.*"])
             .collect_warnings()
             .into_iter()
@@ -37794,6 +39035,139 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn save_refuses_unproven_overwrite_of_existing_config() {
+        // A Config that never read the target file
+        // must not be able to overwrite an operator's populated config, and
+        // the refusal must leave the existing bytes untouched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let operator_bytes = "# operator's hand-written config\n[observability]\nenabled = false\n";
+        tokio::fs::write(&config_path, operator_bytes)
+            .await
+            .unwrap();
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+
+        let err = config
+            .save()
+            .await
+            .expect_err("unproven overwrite must fail");
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "error should name the refusal, got: {err:#}"
+        );
+        let after = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert_eq!(
+            after, operator_bytes,
+            "refused save must leave the existing file byte-identical"
+        );
+    }
+
+    #[test]
+    async fn force_save_overwrites_without_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(&config_path, "old = true\n")
+            .await
+            .unwrap();
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.force_save().await.unwrap();
+        let after = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !after.contains("old = true"),
+            "force_save must actually replace the file content, got: {after}"
+        );
+        assert!(
+            after.contains("schema_version"),
+            "force_save must write a real config body, got: {after}"
+        );
+    }
+
+    #[test]
+    async fn save_refuses_when_provenance_points_at_a_different_file() {
+        // Path-bound provenance: a value loaded from file A that is later
+        // repointed at a different existing file B must not overwrite B.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path_a = tmp.path().join("a-config.toml");
+        let path_b = tmp.path().join("b-config.toml");
+        let b_bytes = "# operator's file B\n[observability]\nenabled = false\n";
+        tokio::fs::write(&path_a, "# source file A\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&path_b, b_bytes).await.unwrap();
+
+        let mut config = Config {
+            config_path: path_a.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.loaded_from = Some(path_a.clone());
+        config.config_path = path_b.clone();
+
+        let err = config.save().await.expect_err("repointed save must fail");
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "error should name the refusal, got: {err:#}"
+        );
+        let after = tokio::fs::read_to_string(&path_b).await.unwrap();
+        assert_eq!(after, b_bytes, "file B must stay byte-identical");
+    }
+
+    #[test]
+    async fn save_creates_missing_file_without_provenance() {
+        // First-run creation stays open: the guard only protects an
+        // existing file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    async fn load_or_init_config_saves_over_existing_file() {
+        // load_or_init establishes provenance in both branches: a value
+        // that read the file (or just created it) keeps full-save rights.
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        // ZEROCLAW_* vars outrank HOME in path resolution; remove them so an
+        // inherited developer environment cannot redirect this test at a
+        // real operator config. RAII guards restore on panic.
+        let _home = EnvValueGuard::set("HOME", &temp_home);
+        let _config_dir = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_dir = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _workspace = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let fresh = Box::pin(Config::load_or_init()).await.unwrap();
+        fresh
+            .save()
+            .await
+            .expect("fresh-init value keeps save rights");
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+        loaded
+            .save()
+            .await
+            .expect("loaded config keeps save rights");
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
     #[cfg(unix)]
     #[test]
     async fn save_restricts_existing_world_readable_config_to_owner_only() {
@@ -37805,6 +39179,10 @@ group_policy = "disabled"
             ..Default::default()
         };
         config.save().await.unwrap();
+        // This value just wrote the file; mirror load_or_init's fresh-init
+        // provenance so the second save below exercises the permission
+        // repair, not the unproven-overwrite guard.
+        config.loaded_from = Some(config_path.clone());
 
         // Simulate the regression state observed in issue.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -40218,6 +41596,239 @@ role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
         );
     }
 
+    /// Seed an on-disk config that still carries the retired
+    /// `[security.nevis]` table next to unrelated content an incremental save
+    /// must preserve: a comment, another `[security]` key, and ciphertext in
+    /// an unrelated section. Returns the loaded config, pointed at the file.
+    fn seed_config_with_legacy_nevis_table(dir: &std::path::Path) -> Config {
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"schema_version = 3
+
+# Operator note that must survive the save.
+[security]
+trust_daemon_uid = false
+
+[security.nevis]
+enabled = true
+instance_url = "https://nevis.example.com"
+client_secret = "NEVIS-PLAINTEXT-SECRET"
+role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
+
+[observability]
+backend = "none"
+
+[channels.telegram.main]
+bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
+"#,
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
+            .expect("a config carrying the retired table still loads");
+        config.loaded_from = Some(config_path.clone());
+        config.config_path = config_path;
+        config
+    }
+
+    #[test]
+    async fn save_dirty_removes_retired_nevis_table_from_disk() {
+        // The shim discards the table's content at load and `skip_serializing`
+        // keeps it out of a full save, but `save_dirty` reparses the ORIGINAL
+        // file and rewrites only dirty paths. Nothing about the shim is ever
+        // dirty, so without an explicit retirement step an unrelated edit
+        // through the CLI or dashboard would carry the original bytes (secret
+        // included) forward indefinitely, and the load-time warning would fire
+        // on every start despite promising removal on the next save.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config_with_legacy_nevis_table(tmp.path());
+        assert_eq!(config.security.nevis, Some(serde_json::Value::Null));
+
+        // An unrelated dirty path drives the save.
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            !written.contains("nevis"),
+            "an incremental save must remove the retired table; got:\n{written}"
+        );
+        assert!(
+            !written.contains("NEVIS-PLAINTEXT-SECRET"),
+            "the retired table's secret must not survive an incremental save; got:\n{written}"
+        );
+        // Unrelated content is untouched: the dirty value lands, the sibling
+        // `[security]` key and its comment stay, and ciphertext elsewhere is
+        // carried through byte-for-byte.
+        assert!(written.contains("backend = \"otel\""), "got:\n{written}");
+        assert!(
+            written.contains("trust_daemon_uid = false"),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("# Operator note that must survive the save."),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("bot_token = \"enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE\""),
+            "got:\n{written}"
+        );
+
+        // A second load no longer sees the table (so validation stops
+        // warning), and a second incremental save is a clean no-op for it.
+        let mut reloaded: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reloaded.security.nevis, None);
+        reloaded.config_path = tmp.path().join("config.toml");
+        reloaded.observability.backend = ObservabilityBackend::None;
+        reloaded.mark_dirty("observability.backend");
+        reloaded.save_dirty().await.unwrap();
+        let rewritten = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!rewritten.contains("nevis"), "got:\n{rewritten}");
+        assert!(
+            rewritten.contains("trust_daemon_uid = false"),
+            "got:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    async fn save_dirty_nevis_success_is_logged_only_after_atomic_replace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = seed_config_with_legacy_nevis_table(tmp.path());
+        let original = std::fs::read_to_string(&config.config_path).unwrap();
+        config.observability.backend = ObservabilityBackend::Otel;
+        config.mark_dirty("observability.backend");
+        let dirty = config.dirty_paths.clone();
+
+        // A directory prevents the pre-commit backup copy on every platform,
+        // without relying on permissions that an elevated runner can bypass.
+        let backup_path = tmp.path().join("config.toml.bak");
+        std::fs::create_dir(&backup_path).unwrap();
+        let mut rx = capture_log_events();
+        let test_case = "nevis-atomic-save-boundary";
+        let retirement_events = |rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>| {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if event
+                    .pointer("/attributes/test_case")
+                    .and_then(|v| v.as_str())
+                    == Some(test_case)
+                    && event
+                        .pointer("/attributes/retired_config")
+                        .and_then(|v| v.as_str())
+                        == Some("security.nevis")
+                {
+                    events.push(event);
+                }
+            }
+            events
+        };
+        let error = ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .expect_err("blocked backup must prevent config replacement");
+        assert!(
+            error.to_string().contains("Failed to create config backup"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config.config_path).unwrap(),
+            original
+        );
+        assert_eq!(
+            config.dirty_paths, dirty,
+            "failed save must remain retryable"
+        );
+        assert!(
+            retirement_events(&mut rx).is_empty(),
+            "failed replacement must not announce removal"
+        );
+
+        std::fs::remove_dir(backup_path).unwrap();
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(!written.contains("nevis"));
+        assert!(!written.contains("NEVIS-PLAINTEXT-SECRET"));
+        assert!(config.dirty_paths.is_empty());
+        let events = retirement_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "successful retry emits one retirement event: {events:?}"
+        );
+        assert_eq!(
+            events[0].pointer("/event/outcome").and_then(|v| v.as_str()),
+            Some("success")
+        );
+
+        ::zeroclaw_log::scope!(test_case: test_case, => config.save_dirty())
+            .await
+            .unwrap();
+        assert!(
+            retirement_events(&mut rx).is_empty(),
+            "a no-op save must not announce another removal"
+        );
+    }
+
+    #[test]
+    async fn save_removes_retired_nevis_table_from_disk() {
+        // The full-save path already omits the field through
+        // `skip_serializing`; pin it against the same fixture so the two save
+        // paths cannot drift apart on the retirement promise.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = seed_config_with_legacy_nevis_table(tmp.path());
+        config.save().await.unwrap();
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!written.contains("nevis"), "got:\n{written}");
+        assert!(
+            !written.contains("NEVIS-PLAINTEXT-SECRET"),
+            "got:\n{written}"
+        );
+        assert!(
+            written.contains("trust_daemon_uid = false"),
+            "got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn retire_nevis_table_in_doc_handles_every_spelling() {
+        // `[security.nevis]` header form, leaving a sibling key behind.
+        let mut doc: toml_edit::DocumentMut =
+            "[security]\ntrust_daemon_uid = false\n\n[security.nevis]\nenabled = true\n"
+                .parse()
+                .unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        let out = doc.to_string();
+        assert!(!out.contains("nevis"), "got:\n{out}");
+        assert!(out.contains("trust_daemon_uid = false"), "got:\n{out}");
+
+        // Inline-table form under a dotted key.
+        let mut doc: toml_edit::DocumentMut =
+            "security.nevis = { enabled = true, client_secret = \"x\" }\n"
+                .parse()
+                .unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!doc.to_string().contains("nevis"));
+
+        // A `[security]` table that held only the retired table is dropped
+        // rather than left as an empty header.
+        let mut doc: toml_edit::DocumentMut = "[security.nevis]\nenabled = true\n".parse().unwrap();
+        assert!(retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert!(!doc.to_string().contains("security"), "got:\n{}", doc);
+
+        // Nothing to do: a config without the table is untouched, byte for byte.
+        let original = "[security]\ntrust_daemon_uid = false\n";
+        let mut doc: toml_edit::DocumentMut = original.parse().unwrap();
+        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
+        assert_eq!(doc.to_string(), original);
+
+        // No `[security]` table at all.
+        let mut doc: toml_edit::DocumentMut =
+            "[observability]\nbackend = \"none\"\n".parse().unwrap();
+        assert!(!retire_nevis_table_in_doc(doc.as_table_mut()));
+    }
+
     #[test]
     async fn git_config_debug_redacts_private_key_and_access_token() {
         let cfg = GitConfig {
@@ -41855,6 +43466,9 @@ stream_tool_arguments = [
         let mut reloaded: Config = crate::migration::migrate_to_current(&raw).unwrap();
         reloaded.config_path = config.config_path.clone();
         reloaded.data_dir = config.data_dir.clone();
+        // Parsed from the on-disk file, like load_or_init's existing-file
+        // branch; keep full-save provenance for the save below.
+        reloaded.loaded_from = Some(reloaded.config_path.clone());
         let store = crate::secrets::SecretStore::new(dir.path(), reloaded.secrets.encrypt);
         reloaded.decrypt_secrets(&store).unwrap();
         assert_eq!(
@@ -44464,6 +46078,11 @@ allowed_users = []
         assert_eq!(
             LarkConfig::default().approval_timeout_secs,
             default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            DiscordConfig::default().stall_timeout_secs,
+            0,
+            "stall watchdog remains an explicit opt-in until its default is changed"
         );
     }
 
