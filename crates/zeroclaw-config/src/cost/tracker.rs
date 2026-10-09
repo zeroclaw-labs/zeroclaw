@@ -30,7 +30,10 @@ use std::sync::{Arc, OnceLock};
 /// Shared by `Arc` into the budget scopes of the whole chain: the entry's
 /// owning scope checks it in `check_budget`, and every descendant tracker
 /// recording under an inherited chain adds its recorded cost to the
-/// accumulator.
+/// accumulator. A descendant recording under an alias that also appears
+/// as an ancestor entry (a chain that revisits an agent) does not add to
+/// that entry: the ancestor's check already reads the row through its
+/// alias's ledger total.
 pub struct SubtreeSpend {
     alias: String,
     daily_ceiling_usd: f64,
@@ -661,6 +664,9 @@ impl CostTracker {
         };
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
+        // Kept past the session-totals move below: the ancestor
+        // accumulator loop compares it against each ancestor's alias.
+        let recorded_alias = effective_alias.clone();
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
                 .with_conversation_id(conversation_id);
@@ -692,9 +698,17 @@ impl CostTracker {
         // ancestor's ceiling for that day and the accumulator rolls over
         // with the ledger's daily totals. Gated on the same
         // `track_per_agent` flag as the attribution above: chains only
-        // exist on per-agent scopes.
+        // exist on per-agent scopes. An ancestor entry whose alias is the
+        // alias this record was just attributed to (a chain that revisits
+        // an agent, A -> B -> A) is skipped: its `check_budget` already
+        // reads this row through that alias's ledger daily total, so
+        // adding it to the accumulator too would count the spend twice
+        // against that ancestor's ceiling.
         if track_per_agent && let BudgetScope::Agent { inherited, .. } = &self.budget_scope {
             for entry in inherited {
+                if recorded_alias.as_deref() == Some(entry.alias.as_str()) {
+                    continue;
+                }
                 entry.add_descendant_spend(record_day, cost_usd);
             }
         }
@@ -3108,6 +3122,91 @@ mod tests {
             "the per-agent ceiling must compare the agent's OWN daily spend, \
              not the shared process-wide total"
         );
+    }
+
+    #[test]
+    fn chain_revisiting_an_alias_counts_its_spend_once() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // A -> B -> A, threaded the way delegation plumbing builds it:
+        // each hop derives with its parent's chain-for-children.
+        let a1 = base.derived_for_agent("alpha", 1.0);
+        let b = base.derived_for_agent_in_chain("beta", 1.0, a1.subtree_chain_for_children());
+        let a2 = base.derived_for_agent_in_chain("alpha", 1.0, b.subtree_chain_for_children());
+
+        a1.record_usage_with_agent(
+            TokenUsage::new("test/model", 100_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("alpha"),
+        )
+        .unwrap();
+        b.record_usage_with_agent(
+            TokenUsage::new("test/model", 100_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("beta"),
+        )
+        .unwrap();
+        a2.record_usage_with_agent(
+            TokenUsage::new("test/model", 350_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("alpha"),
+        )
+        .unwrap();
+
+        // Actual spend is $0.55. The outer alpha's check must see that,
+        // not $0.90 (its own $0.45 ledger total plus the inner alpha's
+        // $0.35 again through the accumulator plus beta's $0.10).
+        match a1.check_budget(0.5).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 0.55).abs() < 1e-9,
+                    "outer alpha must count the subtree once: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("alpha"));
+            }
+            other => panic!("expected alpha-scoped Exceeded at $0.55 + $0.50, got {other:?}"),
+        }
+
+        // With $0.45 of headroom the outer alpha still admits $0.40, which
+        // the double count ($0.90 + $0.40) would have refused.
+        assert!(
+            !matches!(a1.check_budget(0.4).unwrap(), BudgetCheck::Exceeded { .. }),
+            "a revisited alias must not exhaust the outer ceiling early"
+        );
+
+        // A different alias below the revisit still counts once against
+        // every ancestor: gamma's $0.10 reaches beta and the outer alpha.
+        let c = base.derived_for_agent_in_chain("gamma", 1.0, a2.subtree_chain_for_children());
+        c.record_usage_with_agent(
+            TokenUsage::new("test/model", 100_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("gamma"),
+        )
+        .unwrap();
+        match a1.check_budget(0.4).unwrap() {
+            BudgetCheck::Exceeded { current_usd, .. } => {
+                assert!(
+                    (current_usd - 0.65).abs() < 1e-9,
+                    "outer alpha must count gamma's spend once: {current_usd}"
+                );
+            }
+            other => panic!("expected alpha-scoped Exceeded at $0.65 + $0.40, got {other:?}"),
+        }
+        match b.check_budget(0.0).unwrap() {
+            BudgetCheck::Allowed | BudgetCheck::Warning { .. } => {}
+            other => panic!("beta ($0.55 subtree) must still admit, got {other:?}"),
+        }
     }
 
     #[test]

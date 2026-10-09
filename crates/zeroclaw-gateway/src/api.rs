@@ -481,6 +481,21 @@ pub async fn handle_api_cron_add(
         shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -659,6 +674,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -673,11 +693,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 
@@ -877,12 +898,23 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
-    // Held through the swap below so a concurrent config writer can't land
-    // between this read and the save.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut config = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish below so a concurrent config writer can't land
+    // between them. The save runs retained on the commit, so a dropped
+    // request cannot abandon a dispatched save without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "config commit refused without any change: the daemon generation is closing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut config = commit.current_config();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
         config.scheduler.enabled = v;
@@ -897,15 +929,43 @@ pub async fn handle_api_cron_settings_patch(
         config.mark_dirty("scheduler.max-run-history");
     }
 
-    if let Err(e) = config.save_dirty().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
-    }
-
-    *state.config.write() = config.clone();
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config revision unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            if let Err(e) = config.save_dirty().await {
+                return Err(format!("Failed to save config: {e}"));
+            }
+            commit
+                .publish(revision, config.clone())
+                .map_err(|e| format!("Failed to publish config: {e}"))?;
+            Ok(config)
+        }));
+    let config = match task.await {
+        Ok(Ok(config)) => config,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config commit task failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -2225,7 +2285,6 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2398,9 +2457,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -3193,14 +3254,14 @@ pub(crate) mod tests {
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job_id.to_string());
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent configured by with_test_agent")
+                .cron_jobs
+                .push(job_id.to_string());
+        });
     }
 
     fn config_with_webhook(
@@ -4236,6 +4297,44 @@ pub(crate) mod tests {
             "state handler must accept underscore display ids from the sessions list"
         );
         assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
     }
 
     #[tokio::test]

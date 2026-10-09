@@ -870,7 +870,7 @@ async fn safety_net_steering_persistence_includes_tool_round_shapes() {
         })],
     );
     let (tx, _rx) = mpsc::channel(256);
-    let (steer_tx, mut steer_rx) = mpsc::channel::<String>(4);
+    let (steer_tx, mut steer_rx) = mpsc::channel::<crate::agent::SteeringInput>(4);
     steer_tx
         .send("steer-text".into())
         .await

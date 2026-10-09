@@ -186,6 +186,12 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-param-session-id = The existing Chat session ID whose legacy history should be appended (for example, telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>.
+tool-sessions-send-param-message = Legacy content to append as an ordinary 'user' message; this does not notify or run the session.
+tool-sessions-send-output-appended = Legacy content appended to session '{ $session_id }' as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-output-appended-alias = Legacy content appended to session '{ $session_id }' (requested '{ $requested_id }') as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-error-append = Failed to append content to session history: { $error }
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
 
@@ -204,6 +210,7 @@ tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not
 tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
 tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
 tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
+tool-browser-screenshot-error-allocated-target-exists = Allocated screenshot target '{ $filename }' already exists; pass an explicit `path` instead of overwriting it
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 

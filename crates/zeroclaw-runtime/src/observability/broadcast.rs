@@ -418,6 +418,22 @@ mod tests {
         assert_eq!(snapshot[1]["sequence"], 2);
     }
 
+    /// History is a bounded, lossy ring: past capacity the oldest frames go,
+    /// and the newest `capacity` remain in order.
+    #[test]
+    fn event_buffer_evicts_the_oldest_at_capacity() {
+        let buffer = EventBuffer::new(4);
+        for sequence in 1..=10 {
+            buffer.push(serde_json::json!({"sequence": sequence}));
+        }
+        let sequences: Vec<_> = buffer
+            .snapshot()
+            .iter()
+            .map(|event| event["sequence"].clone())
+            .collect();
+        assert_eq!(sequences, [7, 8, 9, 10]);
+    }
+
     fn make_broadcast() -> (
         Arc<BroadcastObserver>,
         tokio::sync::broadcast::Receiver<serde_json::Value>,

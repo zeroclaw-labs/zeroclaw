@@ -1,5 +1,7 @@
 #[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
 mod acp_cli;
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
@@ -27,6 +29,8 @@ mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
 mod provider_schema;
+#[cfg(feature = "agent-runtime")]
+mod relay_claim_cli;
 mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;

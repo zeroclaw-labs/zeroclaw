@@ -159,6 +159,10 @@ anyhow = "1.0"
 sha2 = "0.10"
 hex = "0.4"
 
+# Relay claim proofs belong to the CLI; reuse the registration signer implementation.
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
+
 # Async traits
 async-trait = "0.1"
 
@@ -263,6 +267,8 @@ agent-runtime = [
     "dep:crossterm",
     "dep:tokio-tungstenite",
     "dep:rustls",
+    "dep:base64",
+    "dep:ring",
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor
@@ -450,7 +456,7 @@ scopeguard = "1.2"
 rcgen = "0.13"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
-# test-only: moved out of [dependencies] — no `src/` usage
+# Also used by tests in builds without the relay CLI feature.
 base64 = "0.22"
 hmac = "0.12"
 parking_lot = "0.12"
