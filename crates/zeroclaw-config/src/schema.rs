@@ -16640,6 +16640,14 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+fn default_telegram_rate_limit_max_wait_secs() -> u64 {
+    60
+}
+
+fn default_telegram_typing_refresh_interval_secs() -> u64 {
+    4
+}
+
 pub const TELEGRAM_OFFICIAL_API_BASE_URL: &str = "https://api.telegram.org";
 
 fn default_telegram_api_base_url() -> String {
@@ -16705,6 +16713,19 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Maximum seconds a deliver-class Bot API call (final answers, approval
+    /// prompts) waits out a Telegram flood-control window (`retry_after`)
+    /// before giving up. Droppable calls (draft edits, typing indicators)
+    /// are skipped instead of waiting. Default: 60.
+    #[tab(Behavior)]
+    #[serde(default = "default_telegram_rate_limit_max_wait_secs")]
+    pub rate_limit_max_wait_secs: u64,
+    /// Seconds between `sendChatAction` typing refreshes while a reply is in
+    /// flight. Telegram expires the typing indicator after ~5 seconds.
+    /// Default: 4.
+    #[tab(Behavior)]
+    #[serde(default = "default_telegram_typing_refresh_interval_secs")]
+    pub typing_refresh_interval_secs: u64,
     /// Minimum delay (ms) between successive multi_message narration messages
     /// (and before the approval prompt) for one recipient. Does not apply to the
     /// fixed pacing between physical fragments of a single over-4096-character
@@ -16808,6 +16829,8 @@ impl Default for TelegramConfig {
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+            typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
@@ -32933,6 +32956,9 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+                        typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(
+                        ),
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
@@ -34730,6 +34756,8 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            rate_limit_max_wait_secs: 45,
+            typing_refresh_interval_secs: 3,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
@@ -34748,6 +34776,8 @@ default_temperature = 0.7
         assert_eq!(parsed.bot_token, "123:XYZ");
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
+        assert_eq!(parsed.rate_limit_max_wait_secs, 45);
+        assert_eq!(parsed.typing_refresh_interval_secs, 3);
         assert!(parsed.interrupt_on_new_message);
     }
 
@@ -34757,6 +34787,8 @@ default_temperature = 0.7
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert_eq!(parsed.rate_limit_max_wait_secs, 60);
+        assert_eq!(parsed.typing_refresh_interval_secs, 4);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.api_base_url, "https://api.telegram.org");
     }
@@ -40990,6 +41022,8 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+                typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(),
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
