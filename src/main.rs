@@ -4841,7 +4841,10 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default()),
+            Vec::<String>::new()
+        );
     }
 }
 
@@ -16078,8 +16081,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert_eq!(domains, Vec::<String>::new());
+                assert_eq!(tools, Vec::<String>::new());
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -16550,7 +16553,7 @@ mod tests {
                 .expect("resource-keyed sections are ignored, not rejected")
                 .is_none()
         );
-        assert!(config.cost.rates.providers.models.openai.is_empty());
+        assert_eq!(config.cost.rates.providers.models.openai.len(), 0);
     }
 
     #[test]
@@ -16562,7 +16565,7 @@ mod tests {
             err.to_string().contains("reserved"),
             "message should name the reserved alias: {err}"
         );
-        assert!(config.agents.is_empty());
+        assert_eq!(config.agents.len(), 0);
 
         assert_eq!(
             init_map_alias(&mut config, "agents.researcher")
@@ -17867,7 +17870,7 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert_eq!(clean.degraded_security, Vec::<String>::new());
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 

@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -293,7 +293,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -385,7 +385,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: clippy
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -456,7 +456,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -526,7 +526,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -604,7 +604,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
       # Restore the Windows build leg's master-seeded cache (registry, git, and
       # shared dependency artifacts) under the same key, and never write: a
@@ -665,7 +665,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -727,7 +727,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - name: Install plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
@@ -847,7 +847,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           targets: i686-unknown-linux-gnu
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -878,7 +878,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -934,7 +934,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -1022,7 +1022,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         with:
@@ -1067,7 +1067,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1150,7 +1150,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1179,7 +1179,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -1207,7 +1207,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -1419,7 +1419,7 @@ jobs:
         run: bash scripts/ci/install_target_triple_test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1451,7 +1451,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: 'false'

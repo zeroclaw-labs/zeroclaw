@@ -228,7 +228,7 @@ mod tests {
             .recall_namespaced("agent-a", "verbose", 10, None, None, None)
             .await
             .unwrap();
-        assert!(results.is_empty(), "agent-a should not see agent-b data");
+        assert_eq!(results.len(), 0, "agent-a should not see agent-b data");
     }
 
     #[tokio::test]
@@ -1051,7 +1051,7 @@ mod tests {
             .recall_namespaced("nonexistent-ns", "data", 10, None, None, None)
             .await
             .unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 0);
     }
 
     #[test]

@@ -2033,6 +2033,8 @@ fn duckduckgo_gap(entropy: u64) -> Duration {
 /// the requirement here is only "not a fixed, fingerprintable pattern", not
 /// unpredictability against an adversary. A seeded xorshift64 over one atomic
 /// meets that at zero dependency cost.
+// Keep the pre-1.99 method name while the workspace MSRV remains 1.96.
+#[allow(deprecated)]
 fn scrape_entropy() -> u64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
 
