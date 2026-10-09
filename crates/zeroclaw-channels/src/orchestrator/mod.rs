@@ -41081,6 +41081,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     .contains_key(&scope_override_key(scope, &command, "agentX"))
             );
 
+            let mut manual_turn = scope_test_msg("alice", "chan-1", None);
+            manual_turn.id = format!("manual-turn-{scope_flag}");
+            manual_turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), manual_turn, CancellationToken::new()).await;
+
             command.id = format!("reset-{scope_flag}");
             command.content = format!("/model {scope_flag} auto");
             assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
@@ -41096,14 +41101,14 @@ BTC is currently around $65,000 based on latest tool output."#
             turn.content = "hi".into();
             process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
 
-            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
             assert_eq!(
                 provider
                     .models
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_slice(),
-                &["local-model".to_string()]
+                &["cloud-model".to_string(), "local-model".to_string()]
             );
             assert_eq!(
                 provider
@@ -41111,7 +41116,46 @@ BTC is currently around $65,000 based on latest tool output."#
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_slice(),
-                &[(true, false)]
+                &[(true, true), (true, false)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_manual_channel_overrides_bypass_automatic_classification() {
+        for (hint, content, expected_model) in [
+            ("cloud", "hi".to_string(), "cloud-model"),
+            ("local", "a".repeat(201), "local-model"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{hint}");
+            command.content = format!("/model {hint}");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("manual-{hint}-turn");
+            turn.content = content;
+            process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[expected_model.to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, true)]
             );
         }
     }
