@@ -2023,6 +2023,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cron_agent_default_excluded_tools_are_inventoried() {
+        let missing: Vec<&str> = CRON_AGENT_DEFAULT_EXCLUDED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "CRON_AGENT_DEFAULT_EXCLUDED_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
