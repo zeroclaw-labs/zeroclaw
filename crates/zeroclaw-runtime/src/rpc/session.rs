@@ -2527,6 +2527,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_abort_authorizes_after_the_real_cancellation_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for revoke in [true, false] {
+            let store = Arc::new(make_store(4));
+            store
+                .insert(
+                    "s".into(),
+                    RpcSession::new(
+                        make_agent(),
+                        "test",
+                        "/tmp",
+                        super::super::types::ChatMode::Chat,
+                    ),
+                )
+                .await
+                .unwrap();
+            let generation = store.get_generation("s").await.unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            store.register_cancel_token_for_generation_for_test("s", generation, token.clone());
+            let allowed = Arc::new(AtomicBool::new(true));
+            let held = store.cancel_tokens.lock().unwrap();
+            let waiting_store = Arc::clone(&store);
+            let waiting_allowed = Arc::clone(&allowed);
+            let waiter = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(waiting_store.signal_cancellation_authorized(
+                        "s",
+                        Some(generation),
+                        None,
+                        CancelCause::OperatorAbort,
+                        |_| {
+                            if waiting_allowed.load(Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                Err("revoked")
+                            }
+                        },
+                    ))
+            });
+            // The waiter holds the map before trying cancel_tokens. Observing
+            // that lock proves it reached the actual cancellation boundary.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while store.sessions.try_lock().is_ok() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let reached = store.sessions.try_lock().is_err();
+            if revoke {
+                allowed.store(false, Ordering::SeqCst);
+            }
+            assert!(!token.is_cancelled());
+            drop(held);
+            let result = waiter.join().unwrap();
+            assert!(
+                reached,
+                "waiter acquired the incarnation lock before revocation"
+            );
+            if revoke {
+                assert_eq!(result, Err("revoked"));
+                assert!(!token.is_cancelled());
+                assert_eq!(store.take_cancel_cause("s"), None);
+            } else {
+                assert_eq!(result, Ok(Some(true)));
+                assert!(token.is_cancelled());
+                assert_eq!(
+                    store.take_cancel_cause("s"),
+                    Some(CancelCause::OperatorAbort)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn history_wait_releases_map_and_refuses_replaced_incarnation() {
         let store = make_store(4);
         store
