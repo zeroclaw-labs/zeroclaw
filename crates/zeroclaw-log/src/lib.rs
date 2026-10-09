@@ -104,3 +104,15 @@ pub fn __private_test_writer_lock() -> impl Drop {
 pub fn __private_test_hook_lock() -> impl Drop {
     crate::broadcast::HOOK_TEST_LOCK.lock()
 }
+
+/// Test support: whether the dispatcher active on the calling thread
+/// includes [`LogCaptureLayer`]. Capture tests report this when an
+/// expected event is missing, to tell "the layer never saw it" apart
+/// from "the broadcast channel lost it".
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_capture_layer_active() -> bool {
+    ::tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<LogCaptureLayer>().is_some()
+    })
+}

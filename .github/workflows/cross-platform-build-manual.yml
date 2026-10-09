@@ -174,7 +174,7 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: aarch64-linux-android

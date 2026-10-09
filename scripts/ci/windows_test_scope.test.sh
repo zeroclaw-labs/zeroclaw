@@ -333,8 +333,111 @@ if [ -e "$repo_root/unsafe" ]; then
     exit 1
 fi
 
-WORKFLOW="$workflow" python3 - <<'PY'
+SELECTOR="$selector" METADATA="$metadata_file" REPO_ROOT="$repo_root" FIXTURE_DIR="$fixture_dir" python3 - <<'PY'
+import copy
+import json
 import os
+import subprocess
+from pathlib import Path
+
+selector = os.environ["SELECTOR"]
+root = Path(os.environ["REPO_ROOT"])
+fixtures = Path(os.environ["FIXTURE_DIR"])
+metadata = json.loads(Path(os.environ["METADATA"]).read_text())
+packages = metadata["packages"]
+by_id = {package["id"]: package for package in packages}
+for node in metadata["resolve"]["nodes"]:
+    by_id[node["id"]]["dependencies"] = [
+        {"name": by_id[edge["pkg"]]["name"], "path": str(root / Path(by_id[edge["pkg"]]["manifest_path"]).parent)}
+        for edge in node["deps"]
+    ]
+metadata["resolve"] = None
+for name, path in (("zeroclaw-spawn", "crates/zeroclaw-spawn"), ("zerocode", "apps/zerocode")):
+    package = {"id": name, "name": name, "manifest_path": f"{path}/Cargo.toml", "dependencies": []}
+    packages.append(package)
+    metadata["workspace_members"].append(name)
+by_name = {package["name"]: package for package in packages}
+for dependent, dependency in (("zeroclaw-runtime", "zeroclaw-config"), ("zeroclaw-channels", "zeroclaw-config"), ("zeroclaw-config", "zeroclaw-api"), ("zeroclaw-runtime", "zeroclaw-spawn")):
+    by_name[dependent]["dependencies"].append({
+        "name": dependency, "rename": "renamed_dependency", "optional": True,
+        "kind": "dev", "target": "cfg(windows)",
+        "path": str(root / "crates" / dependency),
+    })
+
+flags = ("windows_root", "windows_voice_wake", "windows_recovery", "windows_service")
+paths_file = fixtures / "required-paths"
+metadata_file = fixtures / "no-deps.json"
+
+def run(paths, expected, *, event="pull_request", graph=metadata):
+    paths_file.write_text("\n".join(paths) + ("\n" if paths else ""))
+    metadata_file.write_text(json.dumps(graph))
+    command = ["python3", selector, "--required-jobs", "--event", event,
+               "--changed-paths-file", str(paths_file), "--metadata-file", str(metadata_file),
+               "--repo-root", str(root)]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    actual = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert actual == dict(zip(flags, ("true" if value else "false" for value in expected))), (paths, actual)
+
+run(["apps/zerocode/src/chat.rs"], (False, False, False, False))
+run(["apps/zerocode/Cargo.toml"], (False, False, False, False))
+run(["apps/zerocode/build.rs"], (False, False, False, False))
+run(["docs/README.md"], (False, False, False, False))
+run(["src/main.rs"], (True, False, False, False))
+run(["crates/zeroclaw-runtime/src/sop/engine.rs", "src/main.rs"], (True, False, False, False))
+run(["crates/zeroclaw-gateway/Cargo.toml"], (True, False, False, False))
+run(["crates/zeroclaw-gateway/build.rs"], (True, False, False, False))
+run(["crates/zeroclaw-config/src/lib.rs"], (True, True, False, True))
+run(["crates/zeroclaw-api/Cargo.toml"], (True, True, True, True))
+run(["crates/zeroclaw-runtime/Cargo.toml"], (True, False, True, True))
+run(["crates/zeroclaw-spawn/src/lib.rs"], (True, False, False, True))
+for path in ("crates/zeroclaw-runtime/src/control_plane/authority.rs", "crates/zeroclaw-runtime/src/control_plane/task_registry.rs"):
+    run([path], (True, False, True, False))
+for path in ("crates/zeroclaw-runtime/src/service/mod.rs", "crates/zeroclaw-runtime/examples/windows_service_smoke_fixture.rs"):
+    run([path], (True, False, False, True))
+run(["crates/zeroclaw-runtime/src/lib.rs"], (True, False, True, True))
+for path in ("Cargo.lock", "Cargo.toml", "build.rs", "rust-toolchain.toml", ".cargo/config.toml", ".github/actions/rust-cache/action.yml", ".github/workflows/ci.yml", "scripts/ci/windows_service_smoke.ps1", "crates/unknown/Cargo.toml", "../outside.rs"):
+    run([path], (True, True, True, True))
+run([], (True, True, True, True))
+for event in ("push", "merge_group", "unknown"):
+    run(["docs/README.md"], (True, True, True, True), event=event)
+for graph in ({}, {"packages": [], "workspace_members": []}, None):
+    run(["apps/zerocode/src/chat.rs"], (True, True, True, True), graph=graph)
+for mutation in ("missing-list", "missing-owner", "unknown-edge", "non-path-edge", "invalid-path", "duplicate-name"):
+    broken = copy.deepcopy(metadata)
+    if mutation == "missing-list":
+        del broken["packages"][0]["dependencies"]
+    elif mutation == "missing-owner":
+        broken["packages"] = [p for p in broken["packages"] if p["name"] != "zeroclaw-spawn"]
+        broken["workspace_members"].remove("zeroclaw-spawn")
+    elif mutation == "unknown-edge":
+        broken["packages"][0]["dependencies"][0]["path"] = "/missing-package"
+    elif mutation == "non-path-edge":
+        del broken["packages"][0]["dependencies"][0]["path"]
+    elif mutation == "invalid-path":
+        broken["packages"][0]["dependencies"][0]["path"] = "/invalid\x00path"
+    else:
+        broken["packages"][-1]["name"] = "zeroclaw"
+    run(["apps/zerocode/src/chat.rs"], (True, True, True, True), graph=broken)
+for missing_input in ("--changed-paths-file", "--metadata-file"):
+    command = ["python3", selector, "--required-jobs", "--event", "pull_request",
+               "--changed-paths-file", str(paths_file), "--metadata-file", str(metadata_file),
+               "--repo-root", str(root)]
+    command[command.index(missing_input) + 1] = str(fixtures / "absent-evidence")
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    assert dict(line.split("=", 1) for line in result.stdout.splitlines()) == dict.fromkeys(flags, "true")
+
+# Advisory input semantics have not silently switched to the unresolved graph.
+advisory = subprocess.run(["python3", selector, "--event", "pull_request", "--changed-paths-file", str(paths_file), "--metadata-file", str(metadata_file), "--repo-root", str(root)], capture_output=True, text=True, check=True)
+assert "mode=full\n" in advisory.stdout
+print("Required Windows package ownership: pass")
+PY
+
+WORKFLOW="$workflow" python3 - <<'PY'
+import itertools
+import json
+import os
+import subprocess
+import textwrap
 from pathlib import Path
 
 workflow = Path(os.environ["WORKFLOW"]).read_text()
@@ -457,6 +560,55 @@ assert '\n          exit "$overall_status"' in windows_job
 assert normalization in windows_job
 assert extraction in windows_job
 assert windows_job.index(normalization) < windows_job.index(extraction)
+
+build = workflow.split("\n  build:\n", 1)[1].split("\n  windows-build:\n", 1)[0]
+required = workflow.split("\n  windows-required-changes:\n", 1)[1].split("\n  windows-service-smoke:\n", 1)[0]
+windows_build = workflow.split("\n  windows-build:\n", 1)[1].split("\n  windows-task-owner-recovery:\n", 1)[0]
+gate = workflow.split("\n  gate:\n", 1)[1]
+assert "windows-required-changes" not in build
+assert "- os: windows-latest" not in build
+assert "- os: blacksmith-8vcpu-ubuntu-2404" in build
+assert "target: aarch64-apple-darwin" in build
+assert "cargo metadata --locked --offline --no-deps --format-version 1" in required
+assert 'git diff --name-only "$BASE_SHA" HEAD' in required
+assert "windows-required-changes" in gate.split("\n    runs-on:", 1)[0]
+assert "windows-build" in gate.split("\n    runs-on:", 1)[0]
+assert "shared-key: build" in windows_build
+assert "cargo check --profile ci --locked --target x86_64-pc-windows-msvc" in windows_build
+assert "cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc" in windows_build
+assert "if: needs.windows-required-changes.outputs.windows_root == 'true'" in windows_build
+assert "if: needs.windows-required-changes.outputs.windows_voice_wake == 'true'" in windows_build
+
+# Execute the workflow's actual consistency guard, not a second implementation.
+program = textwrap.dedent(gate.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+flags = ("windows_root", "windows_voice_wake", "windows_service", "windows_recovery")
+jobs = ("windows-build", "windows-service-smoke", "windows-task-owner-recovery")
+
+def guard(needs, expected):
+    result = subprocess.run(["python3", "-c", program], env={**os.environ, "NEEDS_JSON": json.dumps(needs)}, capture_output=True, text=True)
+    assert (result.returncode == 0) == expected, (needs, result.stderr)
+
+for bits in itertools.product((False, True), repeat=4):
+    needs = {"windows-required-changes": {"result": "success", "outputs": dict(zip(flags, ("true" if value else "false" for value in bits)))}}
+    selected = (bits[0] or bits[1], bits[2], bits[3])
+    for job, run in zip(jobs, selected):
+        needs[job] = {"result": "success" if run else "skipped"}
+    guard(needs, True)
+    for job, run in zip(jobs, selected):
+        original = needs[job]["result"]
+        for invalid in (("skipped", "failure", "cancelled") if run else ("success",)):
+            needs[job]["result"] = invalid
+            guard(needs, False)
+        needs[job]["result"] = original
+    for invalid in ("failure", "cancelled", "skipped"):
+        needs["windows-required-changes"]["result"] = invalid
+        guard(needs, False)
+    needs["windows-required-changes"]["result"] = "success"
+    for flag in flags:
+        original = needs["windows-required-changes"]["outputs"].pop(flag)
+        guard(needs, False)
+        needs["windows-required-changes"]["outputs"][flag] = original
+print("Required Windows gate consistency: pass")
 PY
 
 echo "windows test scope contract tests: pass"

@@ -625,7 +625,7 @@ mod tests {
     ) -> (
         Router,
         Arc<RpcInboundAuth>,
-        Arc<parking_lot::RwLock<Config>>,
+        zeroclaw_runtime::LiveConfigAuthority,
     ) {
         let pairing = Arc::new(PairingGuard::new(
             config.gateway.require_pairing,
@@ -636,17 +636,16 @@ mod tests {
             RpcInboundAuth::from_config(&config, Arc::clone(&pairing))
                 .expect("inbound auth builds from a valid config"),
         );
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
         let state = AppState {
             pairing,
-            config: Arc::clone(&live_config),
             ..crate::api::tests::test_state(config)
         };
+        let authority = state.config_authority.clone();
         let auth = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc_auth)));
         (
             crate::config_admin_router(&auth).with_state(state),
             rpc_auth,
-            live_config,
+            authority,
         )
     }
 
@@ -1344,11 +1343,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // The RPC context's save, in the order `save_and_swap_config` runs
-        // it: swap the live configuration, then publish the policy compiled
+        // The RPC context's save, in the order `save_and_publish_config` runs
+        // it: publish the live configuration, then publish the policy compiled
         // from it as the next accepted revision. The mapped profile keeps a
         // grant but loses Config.
-        let mut revoked = live_config.read().clone();
+        let commit = live_config.begin_config_commit().await.unwrap();
+        let mut revoked = commit.current_config();
         revoked.permission_profiles.insert(
             "config-reader".into(),
             PermissionProfileConfig {
@@ -1356,11 +1356,13 @@ mod tests {
                 ..PermissionProfileConfig::default()
             },
         );
-        *live_config.write() = revoked.clone();
+        let config_revision = commit.next_revision().unwrap();
+        commit.publish(config_revision, revoked.clone()).unwrap();
         let revision = rpc_auth.accepted_revision().saturating_add(1);
         rpc_auth
             .publish_accepted(&revoked, revision)
             .expect("the revoked policy compiles");
+        drop(commit);
 
         let (status, _) = send(
             &router,
