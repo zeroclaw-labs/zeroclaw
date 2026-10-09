@@ -1045,6 +1045,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
     モデル切り替え: /models
+channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
 turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]

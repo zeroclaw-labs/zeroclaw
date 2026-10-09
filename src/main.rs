@@ -2957,7 +2957,7 @@ async fn run_quickstart_cli(
     };
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
             println!(
                 "{}",
@@ -2983,6 +2983,45 @@ async fn run_quickstart_cli(
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors,
+            },
+        ) => {
+            // The config was persisted (the agent exists) but a
+            // post-commit side effect — the personality files — failed.
+            // The committed config is not rolled back: report the partial
+            // success truthfully (no "complete" line), and preserve the
+            // historical nonzero failure result for this outcome.
+            eprintln!();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-quickstart-partial-personality-failure",
+                    &[("alias", &applied.alias)],
+                    "The agent config for {$alias} was saved, but installing its \
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
+                )
+            );
+            eprintln!();
+            for err in &errors {
+                eprintln!("  • {}: {}", quickstart_step_label(err.step), err.message);
+            }
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errors.len().to_string())],
+                )
+            )
         }
         Err(errs) => {
             eprintln!();

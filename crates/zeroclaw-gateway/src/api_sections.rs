@@ -905,10 +905,16 @@ async fn select_section(
 ) -> Response {
     // Held through the swap at the end of this handler so a concurrent
     // config writer can't land between this read and the save below.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
+    let _cfg_guard = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("config commit refused without any change: {e}"),
+            ));
+        }
+    };
+    let mut working = _cfg_guard.current_config();
 
     use zeroclaw_config::sections::Section;
     let Some(section_enum) = Section::from_key(&section) else {
@@ -1553,10 +1559,11 @@ mod tests {
     fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
@@ -2163,7 +2170,10 @@ mod tests {
 
         let mut disk_cfg = state.config.read().clone();
         disk_cfg.memory.backend = "postgres".to_string();
-        disk_cfg.save().await.expect("write external memory drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external memory drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted memory config");
@@ -2224,7 +2234,10 @@ mod tests {
             .as_mut()
             .expect("tailscale defaults")
             .funnel = true;
-        disk_cfg.save().await.expect("write external tunnel drift");
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external tunnel drift");
         let disk_before = tokio::fs::read(&config_path)
             .await
             .expect("read drifted tunnel config");

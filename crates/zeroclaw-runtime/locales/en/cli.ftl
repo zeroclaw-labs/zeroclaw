@@ -723,6 +723,7 @@ cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
 cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
 cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
 cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-partial-personality-failure = The agent config for {$alias} was saved, but installing its personality files failed. Repair the reported paths or permissions, then create or edit the intended personality files in this existing agent's workspace. Do not rerun Quickstart for this saved alias.
 cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
 cli-quickstart-pick-preset = Pick a preset
 cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
@@ -737,6 +738,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-publish-config = failed to publish quickstart config: {$err}
 cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
@@ -1089,6 +1091,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-provider-images-quarantined =
+    { $count_plural ->
+        [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
+       *[other] { $count } images that had not previously succeeded with this provider were omitted after the provider rejected the request.
+    } Send an omitted image again in a new message to try it again.
 turn-failed = [turn failed]
 turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
@@ -1120,6 +1127,14 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+# Safe reply delivered when the streaming protocol guard withheld the same
+# response text on two attempts that were both rejected as tool-protocol
+# parse issues (a recovered valid tool call is not stopped this way):
+# retrying cannot recover the withheld envelope, so the turn ends instead of
+# spending another model call. Prose released ahead of the envelope may
+# already have reached the user, so the text claims nothing about the rest
+# of the reply.
+cli-agent-error-protocol-guard-withheld = I withheld the tool-protocol-shaped part of this reply, and a retry produced the same text.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
@@ -1192,6 +1207,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-model-fallback-redacted = ⚡ The requested model was unavailable; a fallback model served this reply.
 channel-runtime-safeguard-footer-server =
     🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
 channel-runtime-safeguard-footer-client =
