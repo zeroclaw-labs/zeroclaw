@@ -8461,7 +8461,10 @@ impl RpcDispatcher {
                                 ));
                             }
                             cursor_result = Some((page.next_cursor, page.has_older));
-                            conversation_message_entries(&page.messages)
+                            conversation_message_entries_with_times(
+                                &page.messages,
+                                &page.message_created_at,
+                            )
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -8498,7 +8501,10 @@ impl RpcDispatcher {
                                 "Session not found or not owned by this principal",
                             ));
                         }
-                        conversation_message_entries(&data.messages)
+                        conversation_message_entries_with_times(
+                            &data.messages,
+                            &data.message_created_at,
+                        )
                     } else {
                         Vec::new()
                     }
@@ -8516,16 +8522,17 @@ impl RpcDispatcher {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
                 backend
-                    .load(&key)
+                    .load_with_timestamps(&key)
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
+                    .map(|stamped| MessageEntry {
+                        role: stamped.message.role,
+                        content: stamped.message.content,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: stamped.created_at.map(|at| at.to_rfc3339()),
                     })
                     .collect()
             }
@@ -12711,11 +12718,23 @@ impl RpcDispatcher {
 }
 
 fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
+    conversation_message_entries_with_times(messages, &[])
+}
+
+/// Project `messages` into wire entries. `times` is index-aligned with
+/// `messages` (missing tail entries mean "no time"); each entry takes the
+/// time of the message it came from, and a result folded into its call keeps
+/// the call's time.
+fn conversation_message_entries_with_times(
+    messages: &[ConversationMessage],
+    times: &[Option<String>],
+) -> Vec<MessageEntry> {
     let mut entries = Vec::new();
     let mut tool_entries_by_id =
         std::collections::HashMap::<String, std::collections::VecDeque<usize>>::new();
 
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
+        let created_at = times.get(message_index).cloned().flatten();
         match message {
             ConversationMessage::Chat(chat) => entries.push(MessageEntry {
                 role: chat.role.clone(),
@@ -12725,6 +12744,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                created_at: created_at.clone(),
             }),
             ConversationMessage::AssistantToolCalls {
                 text, tool_calls, ..
@@ -12738,6 +12758,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                         tool_name: None,
                         tool_input: None,
                         tool_output: None,
+                        created_at: created_at.clone(),
                     });
                 }
 
@@ -12758,6 +12779,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .unwrap_or_else(|_| Value::String(call.arguments.clone())),
                         ),
                         tool_output: None,
+                        created_at: created_at.clone(),
                     });
                 }
             }
@@ -12795,6 +12817,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 .then(|| result.tool_name.clone()),
                             tool_input: None,
                             tool_output: Some(output),
+                            created_at: created_at.clone(),
                         });
                     }
                 }
@@ -31818,6 +31841,61 @@ mod tests {
     }
 
     #[test]
+    fn conversation_message_entries_carry_each_source_message_time() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let messages = [
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![call],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+        let times = [
+            Some("2026-10-08T17:00:00+00:00".to_string()),
+            Some("2026-10-08T17:05:00+00:00".to_string()),
+            Some("2026-10-08T17:06:00+00:00".to_string()),
+            None,
+        ];
+        let entries = conversation_message_entries_with_times(&messages, &times);
+        let got: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.kind, entry.created_at.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (MessageEntryKind::Message, Some("2026-10-08T17:00:00+00:00")),
+                (MessageEntryKind::Message, Some("2026-10-08T17:05:00+00:00")),
+                // The folded result keeps its call's time.
+                (
+                    MessageEntryKind::ToolCall,
+                    Some("2026-10-08T17:05:00+00:00")
+                ),
+                (MessageEntryKind::Message, None),
+            ]
+        );
+        let wire = serde_json::to_value(&entries[3]).unwrap();
+        assert!(
+            wire.get("created_at").is_none(),
+            "an unknown time stays off the wire for older clients: {wire}"
+        );
+        let wire = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(wire["created_at"], "2026-10-08T17:00:00+00:00");
+    }
+
+    #[test]
     fn conversation_message_entries_projects_typed_tool_exchange() {
         use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
 
@@ -32616,8 +32694,12 @@ mod tests {
             )
             .unwrap();
 
-        let durable = acp_store.load_session(sid).unwrap().unwrap().messages;
-        let expected = serde_json::to_value(conversation_message_entries(&durable)).unwrap();
+        let durable = acp_store.load_session(sid).unwrap().unwrap();
+        let expected = serde_json::to_value(conversation_message_entries_with_times(
+            &durable.messages,
+            &durable.message_created_at,
+        ))
+        .unwrap();
         let mut pages = Vec::new();
         let mut cursor = serde_json::Value::Null;
         loop {

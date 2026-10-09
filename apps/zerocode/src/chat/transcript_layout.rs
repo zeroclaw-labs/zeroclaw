@@ -27,6 +27,10 @@ pub(super) enum LinesDirty {
 pub(super) struct EntryLayoutInput<'a> {
     pub index: usize,
     pub entry: &'a ChatEntry,
+    /// Gap divider drawn above the entry (outside its line range).
+    pub divider: Option<String>,
+    /// Turn footer drawn below the entry (outside its line range).
+    pub footer: Option<String>,
     pub highlighted: bool,
     pub disclosure: ToolDisclosure,
 }
@@ -198,12 +202,20 @@ impl TranscriptLayoutCache {
                 .position(|&(index, _, _)| index == entry_index)
             && range_pos + 1 == self.layout.cached_line_ranges.len()
         {
-            let line_start = self.layout.cached_line_ranges[range_pos].1;
+            let input = inputs.nth(entry_index - range.start);
+            // A divider above the entry is outside its line range; drop it
+            // too so the re-render does not draw it twice.
+            let line_start =
+                self.layout.cached_line_ranges[range_pos]
+                    .1
+                    .saturating_sub(usize::from(
+                        input.as_ref().is_some_and(|i| i.divider.is_some()),
+                    ));
             let row_start = self.layout.cached_line_screen_ranges[line_start].0;
             self.layout.cached_lines.truncate(line_start);
             self.layout.cached_line_ranges.truncate(range_pos);
             self.layout.cached_tool_footer_lines.remove(&entry_index);
-            if let Some(input) = inputs.nth(entry_index - range.start) {
+            if let Some(input) = input {
                 self.append_entry(input, show_thoughts, width);
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
@@ -255,6 +267,11 @@ impl TranscriptLayoutCache {
     /// Every rebuild mode publishes identical absolute line/footer offsets and
     /// omits entries that render no lines, such as hidden thoughts.
     fn append_entry(&mut self, input: EntryLayoutInput<'_>, show_thoughts: bool, width: u16) {
+        if let Some(label) = input.divider.as_deref() {
+            self.layout
+                .cached_lines
+                .push(super::entry_time::divider_line(label, width));
+        }
         let before = self.layout.cached_lines.len();
         let footer_line = render_entry_into(
             input.entry,
@@ -269,6 +286,11 @@ impl TranscriptLayoutCache {
             self.layout
                 .cached_line_ranges
                 .push((input.index, before, after));
+        }
+        if let Some(label) = input.footer.as_deref() {
+            self.layout
+                .cached_lines
+                .push(super::entry_time::footer_line(label));
         }
         if let Some(footer_line) = footer_line {
             self.layout

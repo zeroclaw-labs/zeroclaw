@@ -67,6 +67,9 @@ struct RetainedContextRecord {
     messages: Vec<ConversationMessage>,
 }
 
+/// `(id, role, content, reasoning_content, created_at)` of one `acp_messages` row.
+type MessageRow = (i64, String, String, Option<String>, Option<String>);
+
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
 }
@@ -83,6 +86,11 @@ pub struct AcpSessionData {
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub messages: Vec<ConversationMessage>,
+    /// RFC 3339 `created_at` of the row each entry of `messages` came from,
+    /// index-aligned with `messages`. Every message of one turn shares the
+    /// turn's finalization time, except the turn's prompt, which carries the
+    /// time the turn began.
+    pub message_created_at: Vec<Option<String>>,
     /// Whether `messages`' first non-system entry is the synthetic
     /// history-trim breadcrumb. Rows written after the `trim_breadcrumb`
     /// column was added carry this as recorded by the owning turn loop,
@@ -171,6 +179,8 @@ pub struct AcpSessionPage {
     /// revalidation without loading the complete transcript.
     pub principal_id: Option<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Row `created_at` per entry of `messages`, index-aligned with it.
+    pub message_created_at: Vec<Option<String>>,
     pub next_cursor: Option<String>,
     pub has_older: bool,
 }
@@ -259,7 +269,8 @@ impl AcpSessionStore {
 
              CREATE TABLE IF NOT EXISTS acp_turn_checkpoints (
                  session_id    INTEGER PRIMARY KEY REFERENCES acp_sessions(id) ON DELETE CASCADE,
-                 turn_id       TEXT NOT NULL
+                 turn_id       TEXT NOT NULL,
+                 started_at    TEXT
              );
 
              CREATE TABLE IF NOT EXISTS acp_turn_checkpoint_events (
@@ -290,6 +301,8 @@ impl AcpSessionStore {
 
         Self::ensure_retained_context_columns(&conn)
             .context("Failed to migrate ACP retained context columns")?;
+        Self::ensure_turn_checkpoint_started_at_column(&conn)
+            .context("Failed to migrate ACP turn checkpoint start time")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -566,6 +579,38 @@ impl AcpSessionStore {
         }
     }
 
+    /// Add the nullable `started_at` column on upgrade. A checkpoint begun by
+    /// an older binary has no start time; its prompt row then keeps the
+    /// finalization time, as before.
+    fn ensure_turn_checkpoint_started_at_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_turn_checkpoints)")
+            .context("Failed to inspect ACP turn checkpoint schema")?;
+        let present = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read ACP turn checkpoint schema")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP turn checkpoint column name")?
+            .iter()
+            .any(|column| column == "started_at");
+        drop(stmt);
+        if present {
+            return Ok(());
+        }
+        match conn.execute(
+            "ALTER TABLE acp_turn_checkpoints ADD COLUMN started_at TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add started_at"),
+        }
+    }
+
     fn ensure_retained_context_columns(conn: &Connection) -> Result<()> {
         let mut stmt = conn
             .prepare("PRAGMA table_info(acp_sessions)")
@@ -820,7 +865,7 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
-        let messages = Self::load_messages(&conn, session_id)?;
+        let (messages, message_created_at) = Self::load_messages_with_times(&conn, session_id)?;
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
@@ -840,6 +885,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
+            message_created_at,
             trim_breadcrumb,
             retained_context,
             principal_id,
@@ -919,6 +965,7 @@ impl AcpSessionStore {
             return Ok(AcpSessionPage {
                 principal_id,
                 messages: Vec::new(),
+                message_created_at: Vec::new(),
                 next_cursor: None,
                 has_older: false,
             });
@@ -933,7 +980,7 @@ impl AcpSessionStore {
         while remaining > 0 && current_id > 0 {
             let row = conn
                 .query_row(
-                    "SELECT id, role, content, reasoning_content
+                    "SELECT id, role, content, reasoning_content, created_at
                      FROM acp_messages
                      WHERE session_id = ?1 AND role != 'system' AND id <= ?2 AND id <= ?3
                      ORDER BY id DESC LIMIT 1",
@@ -944,11 +991,12 @@ impl AcpSessionStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((message_id, role, content, reasoning_content)) = row else {
+            let Some((message_id, role, content, reasoning_content, row_created_at)) = row else {
                 break;
             };
             let group = load_projected_group(&conn, message_id, role, content, reasoning_content)?;
@@ -960,13 +1008,16 @@ impl AcpSessionStore {
                 group.ensure_well_formed(&conn)?;
             }
             let start = end.saturating_sub(remaining);
-            reverse_page.push(group.entries_to_messages(
-                &conn,
-                start..end,
-                session_id,
-                state.max_message_id,
-                message_id,
-            )?);
+            reverse_page.push((
+                group.entries_to_messages(
+                    &conn,
+                    start..end,
+                    session_id,
+                    state.max_message_id,
+                    message_id,
+                )?,
+                row_created_at,
+            ));
             remaining -= end - start;
 
             let previous = if start > 0 {
@@ -1009,14 +1060,17 @@ impl AcpSessionStore {
         }
 
         let mut messages = Vec::new();
-        for group in reverse_page.into_iter().rev() {
+        let mut message_created_at = Vec::new();
+        for (group, row_created_at) in reverse_page.into_iter().rev() {
             messages.extend(group);
+            message_created_at.resize(messages.len(), row_created_at);
         }
         let next_cursor = next.map(encode_cursor).transpose()?;
         let has_older = next_cursor.is_some();
         Ok(AcpSessionPage {
             principal_id,
             messages,
+            message_created_at,
             next_cursor,
             has_older,
         })
@@ -1074,7 +1128,7 @@ impl AcpSessionStore {
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
-        let messages = Self::load_messages(&conn, session_id)?;
+        let (messages, message_created_at) = Self::load_messages_with_times(&conn, session_id)?;
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
@@ -1094,6 +1148,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
+            message_created_at,
             trim_breadcrumb,
             retained_context,
             principal_id,
@@ -1201,7 +1256,7 @@ impl AcpSessionStore {
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
-        let messages = Self::load_messages(&conn, session_id)?;
+        let (messages, message_created_at) = Self::load_messages_with_times(&conn, session_id)?;
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
@@ -1222,6 +1277,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
+            message_created_at,
             trim_breadcrumb,
             retained_context,
         })))
@@ -1361,6 +1417,14 @@ impl AcpSessionStore {
     }
 
     fn load_messages(conn: &Connection, session_id: i64) -> Result<Vec<ConversationMessage>> {
+        Ok(Self::load_messages_with_times(conn, session_id)?.0)
+    }
+
+    /// `load_messages` plus each message's row `created_at`, index-aligned.
+    fn load_messages_with_times(
+        conn: &Connection,
+        session_id: i64,
+    ) -> Result<(Vec<ConversationMessage>, Vec<Option<String>>)> {
         // Pull all message rows, excluding any `system` row. `insert_messages`
         // has never written one since the write-path filter that keeps the
         // Agent's system prompt out of authoritative replacements, but a
@@ -1370,18 +1434,19 @@ impl AcpSessionStore {
         // regresses or an old row survives a partial migration.
         let mut msg_stmt = conn
             .prepare(
-                "SELECT id, role, content, reasoning_content
+                "SELECT id, role, content, reasoning_content, created_at
                  FROM acp_messages WHERE session_id = ?1 AND role != 'system' ORDER BY id ASC",
             )
             .context("Failed to prepare message query")?;
 
-        let msg_rows: Vec<(i64, String, String, Option<String>)> = msg_stmt
+        let msg_rows: Vec<MessageRow> = msg_stmt
             .query_map(params![session_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1397,7 +1462,8 @@ impl AcpSessionStore {
             .context("Failed to prepare tool_call query")?;
 
         let mut out = Vec::with_capacity(msg_rows.len());
-        for (msg_id, role, content, reasoning_content) in msg_rows {
+        let mut times = Vec::with_capacity(msg_rows.len());
+        for (msg_id, role, content, reasoning_content, row_created_at) in msg_rows {
             // Split this message's tool_calls into ins and outs preserving order.
             let mut ins: Vec<ToolCall> = Vec::new();
             let mut outs: Vec<ToolResultMessage> = Vec::new();
@@ -1480,9 +1546,10 @@ impl AcpSessionStore {
                     out.push(ConversationMessage::ToolResults(outs));
                 }
             }
+            times.resize(out.len(), row_created_at);
         }
 
-        Ok(out)
+        Ok((out, times))
     }
 
     /// Refresh the persisted projected-entry counts whose watermark has gone
@@ -1608,7 +1675,11 @@ impl AcpSessionStore {
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
+        prompt_at: Option<&str>,
     ) -> Result<i64> {
+        // The first user row of a checkpointed turn is its prompt; it keeps
+        // the time the turn began instead of the finalization time.
+        let mut prompt_at = prompt_at;
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
@@ -1621,11 +1692,16 @@ impl AcpSessionStore {
             match msg {
                 ConversationMessage::Chat(chat) if chat.role == "system" => continue,
                 ConversationMessage::Chat(chat) => {
+                    let row_at = if chat.role == "user" {
+                        prompt_at.take().unwrap_or(now)
+                    } else {
+                        now
+                    };
                     tx.execute(
                         "INSERT INTO acp_messages
                            (session_id, role, content, reasoning_content, created_at)
                          VALUES (?1, ?2, ?3, NULL, ?4)",
-                        params![session_id, chat.role, chat.content, now],
+                        params![session_id, chat.role, chat.content, row_at],
                     )
                     .context("Failed to insert chat message")?;
                     projected_increment += 1;
@@ -1778,6 +1854,7 @@ impl AcpSessionStore {
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
+        prompt_at: Option<&str>,
     ) -> Result<()> {
         let messages = Self::bounded_transcript_messages(messages);
         // The persisted pair is a cache of the rows' projection, valid only
@@ -1797,7 +1874,7 @@ impl AcpSessionStore {
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .context("Failed to read ACP session projected count cache")?;
-        let projected_increment = Self::insert_messages(tx, session_id, &messages, now)?;
+        let projected_increment = Self::insert_messages(tx, session_id, &messages, now, prompt_at)?;
         let watermark_now: Option<i64> = tx
             .query_row(
                 "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
@@ -1864,6 +1941,7 @@ impl AcpSessionStore {
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
+        prompt_at: Option<&str>,
     ) -> Result<()> {
         // The checkpoint projection is the one owner-produced path allowed to
         // carry the synthetic interruption marker. Store it under an explicit
@@ -1881,7 +1959,7 @@ impl AcpSessionStore {
                 other => other.clone(),
             })
             .collect::<Vec<_>>();
-        Self::append_messages(tx, session_uuid, session_id, &messages, now)
+        Self::append_messages(tx, session_uuid, session_id, &messages, now, prompt_at)
     }
 
     fn session_id(conn: &Connection, session_uuid: &str) -> Result<i64> {
@@ -1914,7 +1992,7 @@ impl AcpSessionStore {
         let tx = conn
             .transaction()
             .context("Failed to begin append_turn transaction")?;
-        Self::append_messages(&tx, session_uuid, session_id, messages, &now)?;
+        Self::append_messages(&tx, session_uuid, session_id, messages, &now, None)?;
 
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
@@ -1961,7 +2039,7 @@ impl AcpSessionStore {
         // inside insert_messages starts from an empty open-call balance and
         // its return value is the projected entry count of the new
         // transcript as a whole: the counter is set to it, not incremented.
-        let projected_count = Self::insert_messages(&tx, session_id, messages, &now)?;
+        let projected_count = Self::insert_messages(&tx, session_id, messages, &now, None)?;
         // The new transcript is authoritative, so the cache pair is set from
         // it: the count to its projection and the watermark to the rows just
         // written (NULL for an empty transcript, valid at 0).
@@ -2004,8 +2082,9 @@ impl AcpSessionStore {
             .transaction()
             .context("Failed to begin ACP turn checkpoint transaction")?;
         tx.execute(
-            "INSERT INTO acp_turn_checkpoints (session_id, turn_id) VALUES (?1, ?2)",
-            params![session_id, turn_id],
+            "INSERT INTO acp_turn_checkpoints (session_id, turn_id, started_at)
+             VALUES (?1, ?2, ?3)",
+            params![session_id, turn_id, Utc::now().to_rfc3339()],
         )
         .context("Failed to begin ACP turn checkpoint")?;
         Self::append_checkpoint_events(&tx, session_id, messages)?;
@@ -2179,6 +2258,20 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    /// When the session's active checkpoint began, if the binary that began
+    /// it recorded one.
+    fn checkpoint_started_at(tx: &Transaction<'_>, session_id: i64) -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT started_at FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint start time")?
+            .flatten())
+    }
+
     pub fn checkpoint_frontier(&self, session_uuid: &str, turn_id: &str) -> Result<i64> {
         let conn = self.conn.lock();
         let session_id = Self::session_id(&conn, session_uuid)?;
@@ -2314,7 +2407,15 @@ impl AcpSessionStore {
         } else {
             Self::bounded_transcript_messages(terminal_messages)
         };
-        Self::append_checkpoint_visible_messages(&tx, session_uuid, session_id, &visible, &now)?;
+        let prompt_at = Self::checkpoint_started_at(&tx, session_id)?;
+        Self::append_checkpoint_visible_messages(
+            &tx,
+            session_uuid,
+            session_id,
+            &visible,
+            &now,
+            prompt_at.as_deref(),
+        )?;
         let retained = Self::bounded_transcript_messages(retained_messages);
         let record = RetainedContextRecord {
             messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
@@ -2379,7 +2480,15 @@ impl AcpSessionStore {
             "ACP turn checkpoint identity mismatch"
         );
         let messages = Self::bounded_transcript_messages(messages);
-        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        let prompt_at = Self::checkpoint_started_at(&tx, session_id)?;
+        Self::append_messages(
+            &tx,
+            session_uuid,
+            session_id,
+            &messages,
+            &now,
+            prompt_at.as_deref(),
+        )?;
         tx.execute(
             "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
             params![session_id, turn_id],
@@ -2476,7 +2585,15 @@ impl AcpSessionStore {
             .collect::<Result<Vec<_>>>()?;
         let visible =
             Self::bounded_transcript_messages(&Self::fold_checkpoint_fragments(fragments));
-        Self::append_messages(&tx, session_uuid, session_id, &visible, &now)?;
+        let prompt_at = Self::checkpoint_started_at(&tx, session_id)?;
+        Self::append_messages(
+            &tx,
+            session_uuid,
+            session_id,
+            &visible,
+            &now,
+            prompt_at.as_deref(),
+        )?;
         tx.execute(
             "INSERT INTO acp_messages
                (session_id, role, content, reasoning_content, created_at)
@@ -3940,6 +4057,177 @@ mod tests {
             &data.messages[1],
             ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
         ));
+    }
+
+    /// Force a session's message rows and active checkpoint start onto
+    /// known, distinct times so ordering assertions do not race the clock.
+    fn backdate_checkpoint_start(store: &AcpSessionStore, session_uuid: &str, at: &str) {
+        let conn = store.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE acp_turn_checkpoints SET started_at = ?1
+                  WHERE session_id = (SELECT id FROM acp_sessions WHERE session_uuid = ?2)",
+                params![at, session_uuid],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "session must have an active checkpoint");
+    }
+
+    #[test]
+    fn finalized_turn_prompt_keeps_turn_start_time_and_reply_keeps_finalization_time() {
+        let (_tmp, store) = open_store();
+        let sid = "times-finalize";
+        store
+            .create_session(sid, "default", "/tmp/workspace", None)
+            .unwrap();
+        let prompt = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store.begin_turn_checkpoint(sid, "turn-1", &prompt).unwrap();
+        let started = "2026-10-08T17:00:00+00:00";
+        backdate_checkpoint_start(&store, sid, started);
+
+        let terminal = vec![
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+        store
+            .finalize_turn_checkpoint_with_context(sid, "turn-1", &terminal, &terminal, false)
+            .unwrap();
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(data.messages.len(), data.message_created_at.len());
+        assert_eq!(data.message_created_at[0].as_deref(), Some(started));
+        let finalized = data.message_created_at[1].clone().expect("reply time");
+        assert_ne!(finalized, started, "only the prompt keeps the turn start");
+        assert!(
+            data.message_created_at[1..]
+                .iter()
+                .all(|at| at.as_deref() == Some(&finalized)),
+            "the rest of the turn shares the finalization time: {:?}",
+            data.message_created_at
+        );
+
+        // A cursor page projects narration apart from its calls, so it can
+        // hold more messages than a full load; its times stay aligned and
+        // carry the same prompt/finalization split.
+        let page = store.load_message_page(sid, 10, None).unwrap();
+        assert_eq!(page.messages.len(), page.message_created_at.len());
+        assert_eq!(page.message_created_at[0].as_deref(), Some(started));
+        assert!(
+            page.message_created_at[1..]
+                .iter()
+                .all(|at| at.as_deref() == Some(&finalized)),
+            "{:?}",
+            page.message_created_at
+        );
+        let newest = store.load_message_page(sid, 1, None).unwrap();
+        assert_eq!(newest.message_created_at, vec![Some(finalized.clone())]);
+        let older = store
+            .load_message_page(sid, 10, newest.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(older.message_created_at[0].as_deref(), Some(started));
+    }
+
+    #[test]
+    fn recovered_turn_prompt_keeps_turn_start_time() {
+        let (_tmp, store) = open_store();
+        let sid = "times-recover";
+        store
+            .create_session(sid, "default", "/tmp/workspace", None)
+            .unwrap();
+        let prompt = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store.begin_turn_checkpoint(sid, "turn-1", &prompt).unwrap();
+        let started = "2026-10-08T17:00:00+00:00";
+        backdate_checkpoint_start(&store, sid, started);
+        store
+            .append_turn_checkpoint(
+                sid,
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+            )
+            .unwrap();
+        assert!(store.recover_turn_checkpoint(sid, "interrupted").unwrap());
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(data.messages.len(), 3);
+        assert_eq!(data.message_created_at[0].as_deref(), Some(started));
+        assert_ne!(data.message_created_at[1].as_deref(), Some(started));
+    }
+
+    #[test]
+    fn turn_checkpoint_start_column_is_added_to_an_existing_database() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE acp_sessions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_uuid TEXT NOT NULL UNIQUE,
+                     agent_alias TEXT NOT NULL,
+                     workspace_dir TEXT NOT NULL,
+                     token_count INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL,
+                     last_activity TEXT NOT NULL
+                 );
+                 CREATE TABLE acp_turn_checkpoints (
+                     session_id INTEGER PRIMARY KEY REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                     turn_id TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            let columns = conn
+                .prepare("PRAGMA table_info(acp_turn_checkpoints)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(columns, ["session_id", "turn_id", "started_at"]);
+        }
+        store
+            .create_session("legacy", "default", "/tmp", None)
+            .unwrap();
+        store
+            .begin_turn_checkpoint(
+                "legacy",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::user("q"))],
+            )
+            .unwrap();
+        store
+            .finalize_turn_checkpoint_with_context(
+                "legacy",
+                "turn-1",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::Chat(ChatMessage::assistant("a")),
+                ],
+                &[],
+                false,
+            )
+            .unwrap();
+        let data = store.load_session("legacy").unwrap().unwrap();
+        assert!(data.message_created_at.iter().all(Option::is_some));
     }
 
     #[test]

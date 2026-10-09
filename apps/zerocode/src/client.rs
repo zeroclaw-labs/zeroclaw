@@ -4754,6 +4754,10 @@ pub struct MessageEntry {
     pub tool_input: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_output: Option<String>,
+    /// RFC 3339 time the daemon's store recorded for this entry. Absent from
+    /// older daemons; the transcript then shows no time for the entry.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]

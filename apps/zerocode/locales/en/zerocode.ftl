@@ -528,6 +528,12 @@ zc-model-provider-catalog-failed = Could not load model_providers: { $error }
 
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
+zc-chat-time-today = Today { $time }
+zc-chat-time-yesterday = Yesterday { $time }
+zc-chat-turn-span = { $start } → { $end } · { $duration }
+zc-chat-duration-seconds = { $seconds }s
+zc-chat-duration-minutes-seconds = { $minutes }m { $seconds }s
+zc-chat-duration-hours-minutes = { $hours }h { $minutes }m
 
 zc-chat-loading-agents = Loading agents…
 zc-chat-loading-agents-msg = Loading agents...
