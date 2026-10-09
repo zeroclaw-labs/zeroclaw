@@ -154,6 +154,9 @@ delete tools, which the agent registry does not register; and `skills_list`,
 `skill_view`, and `skill_manage`, which only the opt-in background skill review
 registers.
 
+A test checks the three tier tables below against
+`crates/zeroclaw-tools/src/inventory.rs`, so edit both together.
+
 ### Tier 1: core
 
 Tier 1 is the retained core set: the baseline from

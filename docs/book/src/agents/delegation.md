@@ -76,6 +76,14 @@ The agent loop applies a per-turn duplicate-call guard: a tool called twice with
 
 When parallel tool execution is enabled (`parallel_tools = true` in the runtime profile), multiple `spawn_subagent` calls in one turn run concurrently and every child's final response is returned to the parent, keyed to its own tool call. `delegate` has its own explicit fan-out via the `parallel: [...]` argument (see the output-strings section); that path spawns each target on its own task and aggregates all results.
 
+## ZeroCode transcript inspection
+
+Foreground `spawn_subagent` and `delegate` calls have expandable transcript cards showing the task, delegate target names when provided, and retained result text. Parallel delegation remains one invocation with the existing per-target result blocks. Additional arguments, such as context, remain visible in the input field. Malformed or oversized arguments fall back to the generic tool card. Expansion retains the tool display limits of 8 KiB or 100 lines per field; Copy uses the original retained entry, whose result may already have been capped at 16 KiB.
+
+Delegate target names appear in the card heading, followed by the task and a **Response** section. For a matching synchronous delegate envelope, the returned answer appears first and the provider/model metadata remains in expanded **Details**. Other result formats stay intact. A missing response says **Result not recorded**. The card does not assert that a child is currently running or that the child succeeded, including in restored history or returned diagnostic text. Background launches and management actions such as `check_result` and `await_sessions` keep generic cards, so a launch acknowledgment is not displayed as child completion.
+
+Live child inspection still needs runtime metadata correlated to the parent tool-call ID: child task/session identity, authoritative lifecycle and outcome, timestamps, and child tool events or an authorized transcript link. Current parent tool notifications do not carry these fields. ZeroCode does not infer them from result text, tracing logs, prompt matching, or target aliases; the runtime control plane remains the lifecycle owner. This is a partial implementation of #8763, not live child supervision.
+
 ## Permission inheritance
 
 A SubAgent inherits the parent's permissions verbatim unless the spawn site supplies a narrowing `SubAgentOverrides`. Today both in-tree spawn sites pass `SubAgentOverrides::default()` (inherit everything). The override surface is shipped and validated; a future caller-supplied narrowing path drops in without runtime changes.

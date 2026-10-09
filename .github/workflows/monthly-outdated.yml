@@ -85,6 +85,19 @@ jobs:
             *) echo "::error::Unexpected scan result: $scan_result"; exit 2 ;;
           esac
 
+      - name: Preserve complete scan report
+        id: report
+        if: steps.scan.outputs.scan_result == 'outdated' || steps.scan.outputs.scan_result == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: monthly-outdated-report
+          path: |
+            ${{ runner.temp }}/outdated-output.txt
+            ${{ runner.temp }}/outdated-output.json
+            ${{ runner.temp }}/outdated-error.txt
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Open issue on outdated dependencies
         id: outdated_issue
         if: steps.scan.outputs.scan_result == 'outdated'
@@ -92,6 +105,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_URL: ${{ steps.report.outputs.artifact-url }}
         run: |
           issues_enabled=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')
           if [[ "$issues_enabled" != "true" ]]; then
@@ -115,16 +129,8 @@ jobs:
           fi
 
           OUTPUT_FILE="${{ runner.temp }}/outdated-output.txt"
-          scan_output=$(cat "$OUTPUT_FILE")
-
-          {
-            printf '## Outdated dependencies found\n\n'
-            printf 'Workflow run: %s\n\n' "${RUN_URL}"
-            printf 'The following dependencies have newer versions available:\n\n'
-            printf '```\n%s\n```\n\n' "${scan_output}"
-            printf 'Review and update dependencies at your earliest convenience.\n'
-            printf 'Breaking changes may require more attention than patch bumps.\n'
-          } > "${{ runner.temp }}/issue-body.md"
+          bash scripts/ci/monthly_outdated_result.sh issue-body \
+            "$OUTPUT_FILE" "$RUN_URL" "$ARTIFACT_URL" > "${{ runner.temp }}/issue-body.md"
 
           issue_url=$(gh issue create \
             --repo "$GITHUB_REPOSITORY" \
