@@ -10229,16 +10229,17 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Box::pin(config.save_dirty()).await?;
 
-                // Report the withheld tool when this patch is what enabled the
-                // section. The helper returns early while it stays disabled, so
-                // the guard is only about the already-enabled case: the startup
-                // call has recorded that one for this process, and recording it
-                // again here would restore the second copy this command used to
-                // write. The trace sink was installed before the command
-                // dispatched, so the record has somewhere to go.
+                // Report only a new enable transition: startup already recorded
+                // an enabled section. Drain this post-save notice before the
+                // short-lived CLI exits, while preserving the committed config
+                // if the persistence writer reports a failure.
                 #[cfg(feature = "agent-runtime")]
-                if !verifiable_intent_was_enabled {
+                if !verifiable_intent_was_enabled && config.verifiable_intent.enabled {
                     warn_verifiable_intent_withheld(&config);
+                    zeroclaw_log::flush().context(t(
+                        "cli-config-patch-notice-flush-failed",
+                        "Config patch was saved, but its notice could not be flushed",
+                    ))?;
                 }
 
                 if json {
