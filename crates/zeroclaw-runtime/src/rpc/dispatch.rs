@@ -8598,14 +8598,12 @@ impl RpcDispatcher {
         // makes it hold against a concurrent creator. A scoped caller naming
         // another principal's session gets the uniform ownership denial
         // first, so run-once cannot probe which ids exist.
+        let grants = self.recheck_authority_after_admission(Method::SessionRunOnce)?;
+        let scope = self.scoped_principal_id_from(grants.as_ref());
         let session_id = match req.session_id {
             Some(sid) => {
                 if self
-                    .resolve_session_record_for_mode(
-                        &sid,
-                        None,
-                        self.scoped_principal_id().as_deref(),
-                    )
+                    .resolve_session_record_for_mode(&sid, None, scope.as_deref())
                     .await?
                     .is_some()
                 {
