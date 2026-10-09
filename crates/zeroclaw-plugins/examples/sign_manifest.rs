@@ -33,6 +33,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use zeroclaw_plugins::signature::{self, SignatureMode};
+use zeroize::Zeroizing;
 
 const USAGE: &str = "usage:
   sign_manifest keygen <private-key-out>
@@ -42,6 +43,10 @@ const PAYLOAD_DIGEST: &str = "wasm_sha256";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args)
+}
+
+fn run(args: &[String]) -> Result<()> {
     match args.split_first() {
         Some((command, rest)) if command == "keygen" => keygen(rest),
         Some((command, rest)) if command == "sign" => sign(rest),
@@ -52,6 +57,7 @@ fn main() -> Result<()> {
 fn keygen(args: &[String]) -> Result<()> {
     let [key_path] = args else { bail!(USAGE) };
     let (private_key, public_key) = signature::generate_signing_key()?;
+    let private_key = Zeroizing::new(private_key);
     write_private_key(Path::new(key_path), &private_key)?;
     println!("{public_key}");
     Ok(())
@@ -74,8 +80,9 @@ fn sign(args: &[String]) -> Result<()> {
     };
     let key_path = key_path.context(USAGE)?;
 
-    let private_key =
-        fs::read(key_path).with_context(|| format!("read the private key {key_path}"))?;
+    let private_key = Zeroizing::new(
+        fs::read(key_path).with_context(|| format!("read the private key {key_path}"))?,
+    );
     let mut manifest = fs::read_to_string(manifest_in)
         .with_context(|| format!("read the manifest {manifest_in}"))?;
     if let Some(payload_path) = payload_path {
@@ -190,4 +197,121 @@ fn create_private_dir(dir: &Path) -> Result<()> {
     builder
         .create(dir)
         .with_context(|| format!("create the private key directory {}", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Result<()> {
+        run(&args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn keygen_creates_private_key_and_refuses_overwrite() {
+        let directory = tempfile::tempdir().expect("isolated keygen fixture");
+        let key_path = directory.path().join("private").join("publisher.pk8");
+        let key_arg = key_path.to_str().expect("fixture path is UTF-8");
+
+        command(&["keygen", key_arg]).expect("keygen succeeds");
+        let original = Zeroizing::new(fs::read(&key_path).expect("read generated key"));
+        signature::public_key_hex(&original).expect("generated key is valid PKCS#8");
+        assert!(command(&["keygen", key_arg]).is_err());
+        let retained = Zeroizing::new(fs::read(&key_path).expect("read retained key"));
+        assert!(
+            original.as_slice() == retained.as_slice(),
+            "keygen overwrote the key"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(key_path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn sign_payload_records_digest_and_verifies_with_strict_host_policy() {
+        let directory = tempfile::tempdir().expect("isolated signing fixture");
+        let key_path = directory.path().join("publisher.pk8");
+        let input = directory.path().join("manifest.toml");
+        let output = directory.path().join("signed").join("manifest.toml");
+        let payload = directory.path().join("component.wasm");
+        let payload_bytes = b"controlled payload bytes";
+        command(&["keygen", key_path.to_str().unwrap()]).expect("generate publisher key");
+        fs::write(
+            &input,
+            "name = \"signing-fixture\"\nversion = \"0.1.0\"\nwasm_path = \"component.wasm\"\n",
+        )
+        .expect("write input manifest");
+        fs::write(&payload, payload_bytes).expect("write payload fixture");
+
+        command(&[
+            "sign",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--key",
+            key_path.to_str().unwrap(),
+            "--payload",
+            payload.to_str().unwrap(),
+        ])
+        .expect("sign command succeeds");
+
+        let private_key = Zeroizing::new(fs::read(&key_path).expect("read publisher key"));
+        let public_key =
+            signature::public_key_hex(&private_key).expect("derive trusted public key");
+        let signed = fs::read_to_string(&output).expect("read command output");
+        let root: toml::Table = toml::from_str(&signed).expect("signed output is TOML");
+        let expected_digest = signature::sha256_hex(payload_bytes);
+        assert_eq!(root[PAYLOAD_DIGEST].as_str(), Some(expected_digest.as_str()));
+        let verdict = signature::enforce_signature_policy(
+            "signing-fixture",
+            &signed,
+            root.get("signature").and_then(toml::Value::as_str),
+            root.get("publisher_key").and_then(toml::Value::as_str),
+            &[public_key],
+            SignatureMode::Strict,
+        )
+        .expect("host strict signature policy accepts output");
+        assert!(verdict.is_valid());
+    }
+
+    #[test]
+    fn sign_payload_without_wasm_path_refuses_before_creating_output() {
+        let directory = tempfile::tempdir().expect("isolated refused signing fixture");
+        let key_path = directory.path().join("publisher.pk8");
+        let input = directory.path().join("manifest.toml");
+        let output = directory.path().join("not-created").join("manifest.toml");
+        let payload = directory.path().join("component.wasm");
+        command(&["keygen", key_path.to_str().unwrap()]).expect("generate publisher key");
+        fs::write(&input, "name = \"skill-fixture\"\nversion = \"0.1.0\"\n")
+            .expect("write manifest");
+        fs::write(&payload, b"controlled payload bytes").expect("write payload fixture");
+
+        assert!(
+            command(&[
+                "sign",
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+                "--key",
+                key_path.to_str().unwrap(),
+                "--payload",
+                payload.to_str().unwrap(),
+            ])
+            .is_err()
+        );
+        assert!(!output.exists());
+        assert!(!output.parent().unwrap().exists());
+    }
 }

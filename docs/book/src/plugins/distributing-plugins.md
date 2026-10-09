@@ -70,6 +70,9 @@ recorded, because strict mode refuses such a package. A manifest without
 `wasm_path`, such as a skill bundle, takes no `--payload`: the host rejects a
 digest there.
 
+On Windows the key file inherits its directory's ACL. Keep the private key
+in a directory that only the publisher can read.
+
 The signed manifest then carries two extra **root** fields: `signature` (the
 base64url value) and `publisher_key` (your hex public key). Put both before the
 first table header, including `[config_schema]`; appending them after a table
