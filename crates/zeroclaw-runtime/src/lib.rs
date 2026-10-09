@@ -19,6 +19,7 @@ pub mod agent_lifecycle;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
+pub mod composition;
 pub mod control_plane;
 pub mod cost;
 pub mod cron;
