@@ -355,6 +355,21 @@ fn configured_provider_allowed_for_turn(
         || attempt_allowlist.is_none_or(|allowed| allowed.contains(provider_ref))
 }
 
+fn effort_routing_classification_content(message: &str) -> String {
+    static ATTACHMENT_MARKER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\[\s*(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|AUDIO|VOICE|LOCATION)\s*:[^\]]+\]",
+            )
+            .expect("attachment marker regex must compile")
+        });
+
+    ATTACHMENT_MARKER_RE
+        .replace_all(message, "")
+        .trim()
+        .to_string()
+}
+
 fn resolve_channel_context_limits(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -4925,6 +4940,10 @@ async fn handle_runtime_command_for_delivery(
     let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+    let effort_auto_reset_enabled = defaults_snapshot
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str())
+        .is_some_and(|agent| agent.resolved.effort_routing.is_some());
 
     if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
         let request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -5068,7 +5087,7 @@ async fn handle_runtime_command_for_delivery(
                         ("model", model.as_str()),
                     ],
                 )
-            } else if model.eq_ignore_ascii_case("auto") {
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
                 clear_scope_override(ctx, scope, msg);
                 let current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
                 channel_runtime_cli_string_with_args(
@@ -5127,7 +5146,7 @@ async fn handle_runtime_command_for_delivery(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
-            } else if model.eq_ignore_ascii_case("auto") {
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
                 #[cfg(feature = "channel-telegram")]
                 let picker_applied =
                     crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
@@ -9085,6 +9104,10 @@ async fn process_channel_message_body(
         msg.content = thinking.effective_content.clone();
     }
 
+    // Classify only the user's text. Media markers and later enrichment are
+    // transport context, not evidence that the request itself is complex.
+    let effort_routing_content = effort_routing_classification_content(&msg.content);
+
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision =
@@ -9183,7 +9206,7 @@ async fn process_channel_message_body(
             let Some(selection) = zeroclaw_runtime::agent::eval::resolve_effort_route(
                 policy,
                 &runtime_defaults.config.model_routes,
-                &msg.content,
+                &effort_routing_content,
             ) else {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -9205,6 +9228,14 @@ async fn process_channel_message_body(
                         )
                         .await;
                 }
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
                 return;
             };
             attempt_allowlist = Some(Arc::new(selection.allowed_provider_refs.clone()));
@@ -9216,7 +9247,7 @@ async fn process_channel_message_body(
             };
             zeroclaw_runtime::agent::eval::log_effort_route_selection(
                 &selection,
-                msg.content.len(),
+                effort_routing_content.len(),
                 "channel",
             );
         }
@@ -27276,6 +27307,7 @@ BTC is currently around $65,000 based on latest tool output."#
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
         attempt_allowlists: std::sync::Mutex<Vec<(bool, bool)>>,
+        supports_vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -27309,6 +27341,10 @@ BTC is currently around $65,000 based on latest tool output."#
                     zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.cloud"),
                 ));
             Ok("ok".to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.supports_vision
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ModelCaptureModelProvider {
@@ -40878,12 +40914,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[tokio::test]
     async fn dispatch_session_auto_restores_automatic_route() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let ctx = channel_runtime_context_for_defaults_test(
-            tmp.path(),
-            "agentX",
-            "openrouter.default",
-            "default-model",
-        );
+        let (ctx, _provider, _channel) = effort_routing_channel_context(tmp.path(), true);
         let mut msg = scope_test_msg("alice", "chan", None);
         let sender_key = conversation_history_key(&msg);
         let snapshot = runtime_defaults_snapshot(&ctx);
@@ -40901,12 +40932,12 @@ BTC is currently around $65,000 based on latest tool output."#
         msg.content = "/model auto".into();
         let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
 
-        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&target)).await);
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&target)).await);
 
-        let restored = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        let restored = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
         assert!(restored.automatic);
-        assert_eq!(restored.model_provider, "openrouter.default");
-        assert_eq!(restored.model, "default-model");
+        assert_eq!(restored.model_provider, "custom.local");
+        assert_eq!(restored.model, "local-model");
         assert!(
             !ctx.route_overrides
                 .lock()
@@ -40916,12 +40947,42 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[tokio::test]
+    async fn dispatch_session_auto_preserves_legacy_route_without_effort_routing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "auto".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet".into(),
+            api_key: None,
+        }]);
+        let mut msg = scope_test_msg("alice", "chan", None);
+        msg.content = "/model auto".into();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&target)).await);
+
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, "anthropic.work");
+        assert_eq!(selected.model, "claude-sonnet");
+    }
+
     fn effort_routing_channel_context(
         zeroclaw_dir: &std::path::Path,
+        include_cloud_route: bool,
     ) -> (
         Arc<ChannelRuntimeContext>,
         Arc<ModelCaptureModelProvider>,
-        Arc<dyn Channel>,
+        Arc<SendMessageRecordingChannel>,
     ) {
         use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
 
@@ -40931,26 +40992,30 @@ BTC is currently around $65,000 based on latest tool output."#
             peer_group("discord.clamps", &["alice"], true),
         );
         let mut ctx = channel_runtime_context_with_peer_groups(zeroclaw_dir, groups);
-        let channel: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+        let channel_impl = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
         ctx.channels_by_name = Arc::new(HashMap::from([(
             channel.name().to_string(),
             Arc::clone(&channel),
         )]));
 
-        let routes = vec![
-            zeroclaw_config::schema::ModelRouteConfig {
-                hint: "local".into(),
-                model_provider: "custom.local".into(),
-                model: "local-model".into(),
-                api_key: None,
-            },
-            zeroclaw_config::schema::ModelRouteConfig {
+        let mut routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        if include_cloud_route {
+            routes.push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "cloud".into(),
                 model_provider: "custom.cloud".into(),
                 model: "cloud-model".into(),
                 api_key: None,
-            },
-        ];
+            });
+        }
         let mut config = ctx.prompt_config.as_ref().clone();
         config.model_routes = routes.clone();
         config.runtime_profiles.insert(
@@ -40982,7 +41047,10 @@ BTC is currently around $65,000 based on latest tool output."#
         ctx.model_provider_ref = Arc::new("custom.local".into());
         ctx.model = Arc::new("local-model".into());
 
-        let provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let provider_impl = Arc::new(ModelCaptureModelProvider {
+            supports_vision: true,
+            ..Default::default()
+        });
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         ctx.model_provider = Arc::clone(&provider);
         ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
@@ -40990,7 +41058,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ("custom.cloud".into(), provider),
         ])));
 
-        (Arc::new(ctx), provider_impl, channel)
+        (Arc::new(ctx), provider_impl, channel_impl)
     }
 
     #[tokio::test]
@@ -41000,7 +41068,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ("--agent", OverrideScope::Agent),
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
-            let (ctx, provider, channel) = effort_routing_channel_context(tmp.path());
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
             let mut command = scope_test_msg("alice", "chan-1", None);
             command.id = format!("set-{scope_flag}");
             command.content = format!("/model {scope_flag} cloud");
@@ -41045,6 +41114,93 @@ BTC is currently around $65,000 based on latest tool output."#
                 &[(true, false)]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_selects_cloud_for_complex_auto() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "complex-auto-turn".into();
+        turn.content = "a".repeat(201);
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["cloud-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_fails_closed_when_hint_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, channel) = effort_routing_channel_context(tmp.path(), false);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "missing-cloud-hint-turn".into();
+        turn.content = "hi".into();
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+        assert!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        let sent = channel.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].content,
+            channel_runtime_cli_string("channel-runtime-effort-routing-invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_channel_classification_ignores_media_marker_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "media-marker-turn".into();
+        turn.content = format!(
+            "what [ is this?\n[IMAGE:data:image/png;base64,{}]\n\nhi",
+            "a".repeat(256)
+        );
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["local-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, false)]
+        );
     }
 
     #[test]
@@ -43101,11 +43257,10 @@ BTC is currently around $65,000 based on latest tool output."#
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn runtime_command_late_revoked_model_picker_auto_does_not_mutate_route() {
+    async fn runtime_command_late_revoked_model_picker_selection_does_not_mutate_route() {
         // Serialize on the crate-wide registry test lock: the picker
         // delivery-ack registry is process-global (see
         // `model_picker_delivery::registry_test_lock`).
-        #[cfg(feature = "channel-telegram")]
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut ctx = channel_runtime_context_for_defaults_test(
@@ -43126,20 +43281,11 @@ BTC is currently around $65,000 based on latest tool output."#
             reply_target: "chat-42".into(),
             channel: "telegram".into(),
             channel_alias: Some("main".into()),
-            content: "/model auto".into(),
+            content: "/model fast".into(),
             ..Default::default()
         };
         let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
-        let sender_key = conversation_history_key(&msg);
-        let snapshot = runtime_defaults_snapshot(&ctx);
-        let manual = ChannelRouteSelection {
-            model_provider: "anthropic.work".into(),
-            model: "claude-sonnet-4-5".into(),
-            automatic: false,
-            api_key: None,
-        };
-        set_route_selection(&ctx, &sender_key, manual.clone(), &snapshot);
 
         // Past the early gate still registered (the gate leaves
         // non-revoked entries in place); the ack timeout then fires before
@@ -43154,7 +43300,68 @@ BTC is currently around $65,000 based on latest tool output."#
             handled,
             "revoked selection must be reported handled so it is not re-dispatched to the agent"
         );
-        let retained = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(
+            ctx.route_overrides.lock().unwrap().is_empty(),
+            "late-revoked selection must not write a route override"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "late-revoked selection must not produce a switch response"
+        );
+        assert!(
+            channel_impl.requests.lock().await.is_empty(),
+            "late-revoked selection must not re-open the picker"
+        );
+        // The authoritative check consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn runtime_command_late_revoked_model_picker_auto_does_not_mutate_route() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _provider, _recording_channel) = effort_routing_channel_context(tmp.path(), true);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked_past_gate".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model auto".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+        let manual = ChannelRouteSelection {
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            automatic: false,
+            api_key: None,
+        };
+        set_route_selection(ctx.as_ref(), &sender_key, manual.clone(), &snapshot);
+
+        // Past the early gate still registered (the gate leaves
+        // non-revoked entries in place); the ack timeout then fires before
+        // the command handler runs.
+        let _delivery_ack = crate::model_picker_delivery::register(&msg.id);
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+        crate::model_picker_delivery::revoke(&msg.id);
+
+        let handled = handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&channel)).await;
+
+        assert!(
+            handled,
+            "revoked selection must be reported handled so it is not re-dispatched to the agent"
+        );
+        let retained = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
         assert_eq!(retained, manual);
         assert!(!retained.automatic);
         assert!(

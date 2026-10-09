@@ -243,8 +243,11 @@ impl HasPropKind for CloudEscalationPolicy {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.effort_routing"]
 pub struct EffortRoutingConfig {
+    /// Exact `[[model_routes]].hint` used for simple and standard turns.
     pub local_hint: String,
+    /// Exact `[[model_routes]].hint` eligible for complex turns.
     pub cloud_hint: String,
+    /// Whether complex turns may select `cloud_hint`; defaults to `never`.
     #[serde(default)]
     pub cloud_escalation: CloudEscalationPolicy,
 }

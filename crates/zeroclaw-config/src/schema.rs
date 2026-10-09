@@ -23812,6 +23812,13 @@ impl Config {
                 );
             }
             if let Some(policy) = &profile.effort_routing {
+                if profile.auto_classify.is_some() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing"),
+                        "runtime_profiles.{profile_alias}.effort_routing cannot be combined with runtime_profiles.{profile_alias}.auto_classify"
+                    );
+                }
                 let local_hint = policy.local_hint.trim();
                 let cloud_hint = policy.cloud_hint.trim();
                 if local_hint.is_empty() {
@@ -49576,6 +49583,17 @@ model_provider = \"ollama.default\"
     async fn effort_routing_requires_two_existing_distinct_hints() {
         let config = effort_routing_config();
         config.validate().expect("valid effort routing config");
+
+        let mut overlapping_classifier = config.clone();
+        overlapping_classifier
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .auto_classify = Some(crate::scattered_types::AutoClassifyConfig::default());
+        let error = overlapping_classifier
+            .validate()
+            .expect_err("effort routing and auto-classify must not compete on one profile");
+        assert!(error.to_string().contains("cannot be combined"));
 
         let mut missing = config.clone();
         missing

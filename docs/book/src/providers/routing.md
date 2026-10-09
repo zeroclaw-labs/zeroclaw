@@ -48,13 +48,17 @@ cloud_hint = "cloud"
 cloud_escalation = "auto"
 ```
 
-The first implementation uses ZeroClaw's deterministic complexity estimator. It does not send the prompt to another model for classification. Simple and standard turns select `local_hint`. Complex turns select `cloud_hint` only when `cloud_escalation = "auto"`; the default `"never"` keeps every automatic decision local.
+The first implementation uses ZeroClaw's deterministic complexity estimator. It does not send the prompt to another model for classification. The estimator counts UTF-8 bytes: text under 50 bytes with no reasoning keyword is simple, text over 200 bytes, containing a code fence, or containing at least two English reasoning keywords is complex, and the remainder is standard. Simple and standard turns select `local_hint`. Complex turns select `cloud_hint` only when `cloud_escalation = "auto"`; the default `"never"` keeps every automatic decision local. Channel turns classify the user's pre-enrichment text with attachment markers removed, so fetched link summaries and encoded media bytes do not trigger cloud escalation.
 
 The routing decision is per turn. Logs include the selected target, complexity tier, escalation policy, and message length, but not the message text. A local decision restricts provider attempts to the configured local provider, including stream-to-nonstream recovery, so an availability fallback cannot silently disclose that turn to cloud. A cloud decision permits the configured local and cloud provider references.
 
 Operator choices take precedence over automatic effort routing. CLI `--provider` or `--model` overrides bypass it. A channel `/model <model-or-hint>` choice remains selected instead of being replaced on the next classifiable turn. Use `/model auto` to clear the sender-session choice and restore configured automatic routing; scoped `/model --user auto` and `/model --agent auto` clear those scoped choices. Structured session provider or model overrides remain explicit for that session. A model-issued `model_switch` remains subject to the active effort policy and can select only a provider profile allowed for that turn.
 
+`effort_routing` replaces `auto_classify` and channel `query_classification` for that agent. Configuration validation rejects a runtime profile that sets both `effort_routing` and `auto_classify`. For an agent with `effort_routing`, channel commands reserve `auto` for restoring automatic routing. Agents without `effort_routing` retain the existing model and route selection behavior, including a model or route hint named `auto`.
+
 This slice does not provide an ask-before-cloud mode, escalation-frequency limits, or a separate cost cap. Use `cloud_escalation = "never"` to keep effort-routed model-provider attempts local, and use provider budgets and normal observability for cost controls. This setting does not govern separate network or provider calls made by unrelated tools or media preprocessing.
+
+When the selected provider lacks vision and an image turn needs the configured `vision_model_provider`, that provider must resolve to one of the local or cloud provider references allowed for the turn. The turn fails closed when the dedicated vision provider falls outside that set.
 
 Effort routing has a deliberately narrow relationship to adjacent work:
 
