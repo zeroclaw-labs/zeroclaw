@@ -3941,38 +3941,49 @@ impl RpcDispatcher {
 
     /// Decide, on the owner the ingress is about to queue to, whether this
     /// connection may deliver there. The caller's channel selector must name
-    /// the owning channel instance, and neither that instance nor an agent
-    /// that handles it may refuse injected webhooks
+    /// the owning channel instance, the live config must still bind that
+    /// instance (`[channels.plugin.<alias>]`), and neither the instance nor an
+    /// agent that handles it may refuse injected webhooks
     /// (`accept_injected_webhooks = false`), whatever the caller's grants. A
-    /// refusal is audited and answered FORBIDDEN.
+    /// refusal is audited and answered FORBIDDEN. A caller the channel is not
+    /// granted to is not told which channel owns the path; the audit record
+    /// names it.
     fn admit_plugin_webhook(
         &self,
         owner: &zeroclaw_api::webhook::PluginWebhookOwner,
     ) -> Result<(), JsonRpcError> {
         let channel = plugin_webhook_channel(owner);
-        let refusal = if self
+        if self
             .auth
             .as_ref()
             .is_some_and(|auth| !auth.grants.may_use_channel(&channel))
         {
-            Some(crate::i18n::get_required_cli_string_with_args(
-                "rpc-plugin-webhook-channel-not-granted",
-                &[("channel", &channel)],
-            ))
-        } else {
-            let config = self.ctx.config.read();
-            if config
-                .channels
-                .plugin
-                .get(owner.channel_alias())
-                .is_some_and(|instance| !instance.accept_injected_webhooks)
-            {
-                Some(crate::i18n::get_required_cli_string_with_args(
-                    "rpc-plugin-webhook-channel-refuses",
+            return Err(self.refuse_plugin_webhook(
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-plugin-webhook-channel-not-granted-audit",
                     &[("channel", &channel)],
-                ))
-            } else {
-                config
+                ),
+                Some(crate::i18n::get_required_cli_string(
+                    "rpc-plugin-webhook-channel-not-granted",
+                )),
+            ));
+        }
+        let refusal = {
+            let config = self.ctx.config.read();
+            match config.channels.plugin.get(owner.channel_alias()) {
+                // A route outlives a config write that removes its instance
+                // until the next reload; it takes nothing meanwhile.
+                None => Some(crate::i18n::get_required_cli_string_with_args(
+                    "rpc-plugin-webhook-channel-unbound",
+                    &[("channel", &channel)],
+                )),
+                Some(instance) if !instance.accept_injected_webhooks => {
+                    Some(crate::i18n::get_required_cli_string_with_args(
+                        "rpc-plugin-webhook-channel-refuses",
+                        &[("channel", &channel)],
+                    ))
+                }
+                Some(_) => config
                     .agents
                     .iter()
                     .filter(|(_, agent)| {
@@ -3989,17 +4000,25 @@ impl RpcDispatcher {
                             "rpc-plugin-webhook-agent-refuses",
                             &[("agent", agent), ("channel", &channel)],
                         )
-                    })
+                    }),
             }
         };
         match refusal {
             None => Ok(()),
-            Some(message) => {
-                let denied = crate::rpc::auth::AuthDenied::forbidden(message);
-                self.audit_auth_denial(Method::PluginWebhookDispatch, &denied);
-                Err(rpc_err(denied.code, denied.message))
-            }
+            Some(reason) => Err(self.refuse_plugin_webhook(reason, None)),
         }
+    }
+
+    /// Audit a dispatch refusal under `reason` and answer FORBIDDEN with
+    /// `answer`, or with `reason` itself when the caller may read it.
+    fn refuse_plugin_webhook(&self, reason: String, answer: Option<String>) -> JsonRpcError {
+        let audited = crate::rpc::auth::AuthDenied::forbidden(reason);
+        self.audit_auth_denial(Method::PluginWebhookDispatch, &audited);
+        let answered = match answer {
+            Some(message) => crate::rpc::auth::AuthDenied::forbidden(message),
+            None => audited,
+        };
+        rpc_err(answered.code, answered.message)
     }
 
     fn handle_plugin_webhook_routes(&self) -> RpcResult {
@@ -14197,10 +14216,32 @@ mod tests {
             Arc::new(PluginWebhookIngress::new(300, 64))
         }
 
+        /// The channel instances these tests publish routes for. A daemon
+        /// publishes routes only for bound instances, and dispatch refuses a
+        /// route whose instance the live config does not bind.
+        const BOUND_CHANNEL_ALIASES: &[&str] = &[
+            "a",
+            "a-alias",
+            "b-alias",
+            "fixture-alias",
+            "other-alias",
+            "z-alias",
+        ];
+
         fn ctx_with_ingress(
-            config: Config,
+            mut config: Config,
             ingress: Option<Arc<PluginWebhookIngress>>,
         ) -> Arc<RpcContext> {
+            for alias in BOUND_CHANNEL_ALIASES {
+                config
+                    .channels
+                    .plugin
+                    .entry((*alias).to_string())
+                    .or_insert_with(|| zeroclaw_config::schema::PluginChannelConfig {
+                        package: "fixture-plugin".into(),
+                        ..zeroclaw_config::schema::PluginChannelConfig::default()
+                    });
+            }
             let mut ctx = Arc::try_unwrap(enforcement_ctx(config))
                 .ok()
                 .expect("a fresh context has one owner");
@@ -15139,15 +15180,20 @@ mod tests {
             .await;
             assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
             let message = response["error"]["message"].as_str().unwrap_or_default();
-            assert!(message.contains("plugin.other-alias"), "{message}");
+            assert!(
+                !message.contains("other-alias") && !message.contains("fixture-plugin"),
+                "an ungranted caller must not learn which channel owns the path: {message}"
+            );
             // Other tests share the log stream and this roster principal, so
-            // pick this refusal's record by its reason too.
+            // pick this refusal's record by the channel its reason names.
             let audited: Vec<Value> = std::iter::from_fn(|| records.try_recv().ok())
                 .filter(|record| {
                     record["message"] == "RPC authorization denied"
                         && record["attributes"]["method"] == DISPATCH
                         && record["attributes"]["principal_id"] == principal_id
-                        && record["attributes"]["reason"] == message
+                        && record["attributes"]["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("plugin.other-alias"))
                 })
                 .collect();
             let [record] = audited.as_slice() else {
@@ -15173,9 +15219,9 @@ mod tests {
         }
 
         /// Config can close the path whatever the caller's grants: a channel
-        /// instance that refuses injected webhooks, or an agent handling it
-        /// that refuses them, turns the dispatch away before anything is
-        /// queued.
+        /// instance the live config no longer binds, one that refuses
+        /// injected webhooks, or an agent handling it that refuses them,
+        /// turns the dispatch away before anything is queued.
         #[tokio::test]
         async fn plugin_webhook_dispatch_honors_channel_and_agent_refusal() {
             use zeroclaw_config::schema::{AliasedAgentConfig, PluginChannelConfig};
@@ -15194,11 +15240,33 @@ mod tests {
                 .write()
                 .channels
                 .plugin
-                .insert("fixture-alias".into(), instance(false));
+                .remove("fixture-alias");
             let response = call(
                 &mut dispatcher,
                 &mut rx,
                 1,
+                DISPATCH,
+                params("unbound-1", "fixture"),
+            )
+            .await;
+            assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{response}");
+            let message = response["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("plugin.fixture-alias") && message.contains("no binding"),
+                "{message}"
+            );
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .channels
+                .plugin
+                .insert("fixture-alias".into(), instance(false));
+            let response = call(
+                &mut dispatcher,
+                &mut rx,
+                4,
                 DISPATCH,
                 params("refused-1", "fixture"),
             )

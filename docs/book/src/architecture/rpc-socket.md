@@ -278,8 +278,13 @@ route that changes owner meanwhile cannot redirect it.
 | Refusal | Config |
 |---|---|
 | The caller's profile does not name the route's channel instance | `[permission_profiles.<name>] allowed_channels` |
+| The live config no longer binds the route's channel instance | `[channels.plugin.<alias>]` removed |
 | The channel instance refuses injected webhooks | `[channels.plugin.<alias>] accept_injected_webhooks = false` |
 | An agent that handles the channel refuses them | `[agents.<alias>] accept_injected_webhooks = false` |
+
+The refusal for an ungranted channel does not say which channel owns the
+path; the audit record names it. A route outlives a config write that removes
+its channel instance until the next reload, and takes no dispatch meanwhile.
 
 Both `accept_injected_webhooks` fields default to `true`. They govern only
 webhooks delivered through `plugin-webhook/dispatch`, which a standalone

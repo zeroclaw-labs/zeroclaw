@@ -1429,7 +1429,9 @@ rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 rpc-plugin-webhook-local-ipc-only = { $method } is served only on the local IPC endpoint
-rpc-plugin-webhook-channel-not-granted = Principal is not granted channel { $channel } (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-not-granted = Principal is not granted the channel that owns this webhook path (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-not-granted-audit = Principal is not granted channel { $channel } (required by plugin-webhook/dispatch)
+rpc-plugin-webhook-channel-unbound = Channel { $channel } has no binding in the live config, so it takes no webhooks delivered over the RPC socket
 rpc-plugin-webhook-channel-refuses = Channel { $channel } refuses webhooks delivered over the RPC socket (accept_injected_webhooks = false)
 rpc-plugin-webhook-agent-refuses = Agent { $agent } refuses turns from webhooks delivered over the RPC socket (accept_injected_webhooks = false), so channel { $channel } cannot take them
 
