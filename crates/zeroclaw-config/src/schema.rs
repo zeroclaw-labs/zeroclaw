@@ -16006,11 +16006,23 @@ pub struct ChannelsConfig {
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
     /// Per-channel multiplier for the global channel message in-flight budget.
-    /// Runtime multiplies this value by the configured channel count, then
-    /// applies its global minimum and maximum bounds to one shared dispatcher
-    /// semaphore. Default: `4`.
+    /// Effective concurrency = `channel_count × max_concurrent_per_channel`,
+    /// clamped to [`min_in_flight_messages`, `max_in_flight_messages`] on one
+    /// shared dispatcher semaphore. Default: `4`.
     #[serde(default = "default_channel_max_concurrent_per_channel")]
     pub max_concurrent_per_channel: usize,
+    /// Lower bound for the global channel in-flight budget (the dispatcher
+    /// semaphore is never smaller). `0` is not supported: validation rejects
+    /// it and the runtime clamps any bypassed `0` to `1` to avoid a
+    /// zero-permit semaphore deadlock. Low-memory deployments set this below
+    /// the historical floor of `8`. Default: `8`.
+    #[serde(default = "default_channel_min_in_flight_messages")]
+    pub min_in_flight_messages: usize,
+    /// Upper bound (hard cap) for the global channel in-flight budget. Set
+    /// both this and `min_in_flight_messages` to `1` to force fully-serialized
+    /// channel processing. Default: `64`.
+    #[serde(default = "default_channel_max_in_flight_messages")]
+    pub max_in_flight_messages: usize,
     /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
@@ -16442,6 +16454,19 @@ fn default_channel_max_concurrent_per_channel() -> usize {
     4
 }
 
+fn default_channel_min_in_flight_messages() -> usize {
+    8
+}
+
+/// Absolute ceiling for `channels.max_in_flight_messages`. Kept as a shared
+/// constant so schema validation and the orchestrator's defensive clamp stay
+/// in sync when the ceiling is raised.
+pub const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 128;
+
+fn default_channel_max_in_flight_messages() -> usize {
+    64
+}
+
 fn default_session_backend() -> String {
     "sqlite".into()
 }
@@ -16488,6 +16513,8 @@ impl Default for ChannelsConfig {
             plugin: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
+            min_in_flight_messages: default_channel_min_in_flight_messages(),
+            max_in_flight_messages: default_channel_max_in_flight_messages(),
             ack_reactions: true,
             show_tool_calls: false,
             model_fallback_notice: ModelFallbackNotice::default(),
@@ -24195,6 +24222,27 @@ impl Config {
                 InvalidNumericRange,
                 "channels.max_concurrent_per_channel",
                 "channels.max_concurrent_per_channel must be greater than 0"
+            );
+        }
+        if self.channels.min_in_flight_messages == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.min_in_flight_messages",
+                "channels.min_in_flight_messages must be greater than 0"
+            );
+        }
+        if self.channels.min_in_flight_messages > self.channels.max_in_flight_messages {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_in_flight_messages",
+                "channels.max_in_flight_messages must be >= channels.min_in_flight_messages"
+            );
+        }
+        if self.channels.max_in_flight_messages > CHANNEL_MAX_IN_FLIGHT_MESSAGES {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_in_flight_messages",
+                "channels.max_in_flight_messages must be at most 128"
             );
         }
         // Typed-memory producers are a SQLite-only slice: the enabled write
@@ -32789,6 +32837,30 @@ auto_save = true
     }
 
     #[test]
+    async fn channels_in_flight_bounds_defaults_and_round_trips() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert_eq!(
+            parsed.min_in_flight_messages,
+            default_channel_min_in_flight_messages()
+        );
+        assert_eq!(
+            parsed.max_in_flight_messages,
+            default_channel_max_in_flight_messages()
+        );
+
+        let parsed: ChannelsConfig =
+            toml::from_str("cli = true\nmin_in_flight_messages = 1\nmax_in_flight_messages = 2")
+                .unwrap();
+        assert_eq!(parsed.min_in_flight_messages, 1);
+        assert_eq!(parsed.max_in_flight_messages, 2);
+
+        let toml_str = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reparsed.min_in_flight_messages, 1);
+        assert_eq!(reparsed.max_in_flight_messages, 2);
+    }
+
+    #[test]
     async fn validate_rejects_zero_channel_max_concurrent_per_channel() {
         let mut config = Config::default();
         config.channels.max_concurrent_per_channel = 0;
@@ -32799,6 +32871,69 @@ auto_save = true
         assert!(
             err.to_string()
                 .contains("channels.max_concurrent_per_channel must be greater than 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_channel_min_in_flight_messages() {
+        let mut config = Config::default();
+        config.channels.min_in_flight_messages = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero channel min in-flight budget must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.min_in_flight_messages must be greater than 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_min_greater_than_max_in_flight() {
+        let mut config = Config::default();
+        config.channels.min_in_flight_messages = 5;
+        config.channels.max_in_flight_messages = 4;
+
+        let err = config
+            .validate()
+            .expect_err("min > max in-flight bounds must fail validate");
+        assert!(
+            err.to_string().contains(
+                "channels.max_in_flight_messages must be >= channels.min_in_flight_messages"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_in_flight_boundary_values() {
+        let mut serialized = Config::default();
+        serialized.channels.min_in_flight_messages = 1;
+        serialized.channels.max_in_flight_messages = 1;
+        serialized
+            .validate()
+            .expect("min == max == 1 (fully serialized) must be valid");
+
+        let mut at_ceiling = Config::default();
+        at_ceiling.channels.max_in_flight_messages = CHANNEL_MAX_IN_FLIGHT_MESSAGES;
+        at_ceiling
+            .validate()
+            .expect("max == 128 (the global ceiling) must be valid");
+    }
+
+    #[test]
+    async fn validate_rejects_max_above_global_ceiling() {
+        let mut config = Config::default();
+        config.channels.max_in_flight_messages = CHANNEL_MAX_IN_FLIGHT_MESSAGES + 1;
+
+        let err = config
+            .validate()
+            .expect_err("in-flight ceiling above 128 must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.max_in_flight_messages must be at most 128"),
             "got: {err}"
         );
     }
@@ -33010,6 +33145,8 @@ auto_save = true
                 plugin: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
+                min_in_flight_messages: default_channel_min_in_flight_messages(),
+                max_in_flight_messages: default_channel_max_in_flight_messages(),
                 ack_reactions: true,
                 show_tool_calls: true,
                 model_fallback_notice: ModelFallbackNotice::default(),
@@ -35190,6 +35327,8 @@ allowed_users = ["@u:matrix.org"]
             plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
+            min_in_flight_messages: default_channel_min_in_flight_messages(),
+            max_in_flight_messages: default_channel_max_in_flight_messages(),
             ack_reactions: true,
             show_tool_calls: true,
             model_fallback_notice: ModelFallbackNotice::default(),
@@ -35809,6 +35948,8 @@ allowed_numbers = ["+1", "+2"]
             plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
+            min_in_flight_messages: default_channel_min_in_flight_messages(),
+            max_in_flight_messages: default_channel_max_in_flight_messages(),
             ack_reactions: true,
             show_tool_calls: true,
             model_fallback_notice: ModelFallbackNotice::default(),

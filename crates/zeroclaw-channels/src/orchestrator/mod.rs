@@ -275,8 +275,6 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
-const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 // matrix-sdk typing notices expire after four seconds and suppress resends for
 // the first three seconds. Refresh between those boundaries while the
@@ -7469,20 +7467,36 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
 fn compute_max_in_flight_messages(
     channel_count: usize,
     max_concurrent_per_channel: usize,
+    min_in_flight_messages: usize,
+    max_in_flight_messages: usize,
 ) -> usize {
+    // Single defensive choke point for the in-flight budget. It computes the
+    // natural budget (`channel_count × per_channel`) and normalizes
+    // out-of-domain config so a config that slips past validation cannot
+    // panic `clamp`, build a zero-permit semaphore, or exceed the global
+    // ceiling. `max_in_flight_messages` is the hard cap: when an inverted
+    // range (`min > max`) arrives, the configured maximum wins and the
+    // floor collapses to it.
+    let hi =
+        max_in_flight_messages.clamp(1, zeroclaw_config::schema::CHANNEL_MAX_IN_FLIGHT_MESSAGES);
+    let lo = min_in_flight_messages
+        .clamp(1, zeroclaw_config::schema::CHANNEL_MAX_IN_FLIGHT_MESSAGES)
+        .min(hi);
     channel_count
         .saturating_mul(max_concurrent_per_channel)
-        .clamp(
-            CHANNEL_MIN_IN_FLIGHT_MESSAGES,
-            CHANNEL_MAX_IN_FLIGHT_MESSAGES,
-        )
+        .clamp(lo, hi)
 }
 
 fn max_in_flight_messages_for_config(
     channel_count: usize,
     config: &zeroclaw_config::schema::ChannelsConfig,
 ) -> usize {
-    compute_max_in_flight_messages(channel_count, config.max_concurrent_per_channel)
+    compute_max_in_flight_messages(
+        channel_count,
+        config.max_concurrent_per_channel,
+        config.min_in_flight_messages,
+        config.max_in_flight_messages,
+    )
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
@@ -22170,8 +22184,8 @@ temperature = 0.3
 
     #[test]
     fn compute_max_in_flight_messages_uses_configured_per_channel_budget() {
-        assert_eq!(compute_max_in_flight_messages(3, 4), 12);
-        assert_eq!(compute_max_in_flight_messages(3, 8), 24);
+        assert_eq!(compute_max_in_flight_messages(3, 4, 8, 64), 12);
+        assert_eq!(compute_max_in_flight_messages(3, 8, 8, 64), 24);
     }
 
     #[test]
@@ -22185,15 +22199,61 @@ temperature = 0.3
     }
 
     #[test]
+    fn max_in_flight_messages_for_config_uses_configured_bounds() {
+        let config = zeroclaw_config::schema::ChannelsConfig {
+            max_concurrent_per_channel: 4,
+            min_in_flight_messages: 1,
+            max_in_flight_messages: 1,
+            ..Default::default()
+        };
+        assert_eq!(max_in_flight_messages_for_config(2, &config), 1);
+    }
+
+    #[test]
     fn compute_max_in_flight_messages_preserves_global_bounds() {
-        assert_eq!(
-            compute_max_in_flight_messages(1, 1),
-            CHANNEL_MIN_IN_FLIGHT_MESSAGES
-        );
-        assert_eq!(
-            compute_max_in_flight_messages(100, 4),
-            CHANNEL_MAX_IN_FLIGHT_MESSAGES
-        );
+        assert_eq!(compute_max_in_flight_messages(1, 1, 8, 64), 8);
+        assert_eq!(compute_max_in_flight_messages(100, 4, 8, 64), 64);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_forces_low_memory_ceiling() {
+        // A low ceiling wins over the natural budget.
+        assert_eq!(compute_max_in_flight_messages(2, 1, 1, 1), 1);
+        assert_eq!(compute_max_in_flight_messages(20, 4, 1, 1), 1);
+        assert_eq!(compute_max_in_flight_messages(2, 4, 1, 2), 2);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_normalizes_invalid_min_max() {
+        // min > max must not panic: the configured hard cap (max) wins and
+        // the floor collapses to it, so an operator-set ceiling is honored.
+        assert_eq!(compute_max_in_flight_messages(2, 4, 5, 4), 4);
+        // Zero-permit input must not deadlock every worker: floor at 1.
+        assert_eq!(compute_max_in_flight_messages(1, 1, 0, 0), 1);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_handles_pinched_and_extreme_bounds() {
+        // min == max forces the exact value regardless of the natural budget.
+        assert_eq!(compute_max_in_flight_messages(2, 4, 64, 64), 64);
+        // Wide bounds let the natural budget through untouched.
+        assert_eq!(compute_max_in_flight_messages(2, 4, 1, 64), 8);
+        // Single channel, per_channel=1, default bounds → floor 8 preserved.
+        assert_eq!(compute_max_in_flight_messages(1, 1, 8, 64), 8);
+        // A max that slips past validation (>128) is still clamped to the
+        // 128-message global ceiling.
+        assert_eq!(compute_max_in_flight_messages(100, 4, 1, 200), 128);
+        assert_eq!(compute_max_in_flight_messages(2, 4, 129, 200), 128);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_edge_channel_and_bounds() {
+        // Zero channel count must not panic (natural budget = 0 → floor).
+        assert_eq!(compute_max_in_flight_messages(0, 4, 8, 64), 8);
+        // min == max == 128 forces the ceiling exactly.
+        assert_eq!(compute_max_in_flight_messages(2, 4, 128, 128), 128);
+        // min = 0 with a valid max is clamped up to 1 (deadlock guard).
+        assert_eq!(compute_max_in_flight_messages(2, 4, 0, 8), 8);
     }
 
     #[test]
