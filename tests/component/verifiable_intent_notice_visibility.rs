@@ -338,6 +338,116 @@ fn enabling_the_section_through_config_patch_records_the_notice_once() {
     );
 }
 
+fn assert_config_patch_notice_flush_failure(
+    json: bool,
+    locale: &str,
+    expected_message: &str,
+    disk_catalog: Option<&str>,
+) {
+    let dir = tempfile::TempDir::new().expect("temp config dir");
+    let blocked_log = dir.path().join("blocked-runtime-log");
+    std::fs::create_dir(&blocked_log).expect("occupy the log destination with a directory");
+    let log_path = toml::Value::String(blocked_log.to_string_lossy().into_owned());
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "schema_version = 3\nlocale = \"{locale}\"\n\n\
+             [observability]\nlog_persistence = \"rolling\"\nlog_persistence_path = {log_path}\n\n\
+             [verifiable_intent]\nenabled = false\n"
+        ),
+    )
+    .expect("write config.toml");
+    if let Some(catalog) = disk_catalog {
+        let locale_dir = dir.path().join("data").join("ftl").join(locale);
+        std::fs::create_dir_all(&locale_dir).expect("create isolated locale directory");
+        std::fs::write(locale_dir.join("cli.ftl"), catalog).expect("write CLI locale override");
+    }
+    let patch = dir.path().join("patch.json");
+    std::fs::write(
+        &patch,
+        r#"[{"op":"replace","path":"/verifiable_intent/enabled","value":true}]"#,
+    )
+    .expect("write patch.json");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zeroclaw"));
+    command
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .env_remove("ZEROCLAW_DATA_DIR")
+        .env_remove("ZEROCLAW_WORKSPACE")
+        .env("RUST_LOG", "warn")
+        .args(["config", "patch"])
+        .arg(&patch);
+    if json {
+        command.arg("--json");
+    }
+    let out = command.output().expect("run enabling config patch");
+    let stdout = String::from_utf8(out.stdout).expect("CLI stdout is UTF-8");
+    let stderr = String::from_utf8(out.stderr).expect("CLI stderr is UTF-8");
+    let evidence = format!(
+        "locale={locale}, json={json}, status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
+    );
+
+    let saved: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&config_path).expect("read config after the command exits"),
+    )
+    .expect("saved config parses");
+    assert_eq!(
+        saved["verifiable_intent"]["enabled"].as_bool(),
+        Some(true),
+        "the config must be committed despite the logging failure\n{evidence}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the post-save flush must fail normally rather than succeed or terminate by signal\n{evidence}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "a post-save flush failure must not print the human or JSON success result\n{evidence}"
+    );
+    assert!(
+        stderr.starts_with(&format!("Error: {expected_message}\n")),
+        "the real CLI must render the saved-config Fluent context\n{evidence}"
+    );
+    assert!(
+        stderr.contains("opening log file")
+            && stderr.contains(&blocked_log.display().to_string()),
+        "the error must identify this log destination rather than an unrelated failure\n{evidence}"
+    );
+    assert!(
+        blocked_log.is_dir(),
+        "the failed append must leave the directory fixture intact\n{evidence}"
+    );
+}
+
+/// A log-open failure happens after the patch commits. Removing the post-save
+/// flush must make this fail on exit status, even if the background write fails.
+#[test]
+fn config_patch_notice_flush_failure_reports_saved_config_in_human_mode() {
+    assert_config_patch_notice_flush_failure(
+        false,
+        "en",
+        "Config patch was saved, but its notice could not be flushed",
+        None,
+    );
+}
+
+/// Exercise the actual Fluent disk overlay in a fresh CLI process. JSON mode
+/// currently returns the same post-save error instead of a saved-result envelope.
+#[test]
+fn config_patch_notice_flush_failure_reports_localized_saved_config_in_json_mode() {
+    assert_config_patch_notice_flush_failure(
+        true,
+        "fr",
+        "Le patch a été enregistré, mais son avis ne peut pas être vidé",
+        Some(
+            "cli-config-patch-notice-flush-failed = Le patch a été enregistré, mais son avis ne peut pas être vidé\n",
+        ),
+    );
+}
+
 /// A patch that leaves an already-enabled section alone must not add a second
 /// record. This is the control for the test above: without it, reporting the
 /// transition could be implemented by recording on every patch, which restores
