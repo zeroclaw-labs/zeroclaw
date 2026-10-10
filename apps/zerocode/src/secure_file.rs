@@ -71,6 +71,13 @@ pub(crate) fn sync_dir_where_supported(dir: &Path) -> Result<()> {
 /// and the file is set to `0600` again in case an unusual umask narrowed it
 /// further.
 ///
+/// The rename is `std::fs::rename`, not `tempfile`'s `persist`, because a
+/// reader such as a second zerocode may have the target open. On Windows
+/// `persist` is a bare `MoveFileExW`, which cannot replace a file that any
+/// reader holds open. `std::fs::rename` retries that refusal with POSIX
+/// semantics, which swap the name while open readers keep the old contents,
+/// as long as they opened it with delete sharing (std's own opens do).
+///
 /// On platforms without Unix mode bits the permission work is a no-op and the
 /// directory ACL is the guard, matching the enrollment path's stance.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
