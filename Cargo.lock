@@ -14101,6 +14101,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-channel-websocket-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-channels"
 version = "0.8.5"
 dependencies = [
@@ -14298,6 +14306,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "cap-std",
  "chrono",
  "directories",
  "futures-util",

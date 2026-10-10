@@ -639,6 +639,36 @@ mod tests {
     }
 
     #[test]
+    fn missing_completion_hint_fits_default_queue_dock_in_all_locales() {
+        use unicode_width::UnicodeWidthStr;
+
+        let available_cells = 80 - crate::config::SidebarSection::default().width as usize - 2;
+        for (locale, source) in [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ] {
+            let bundle = build_ftl_bundle(source, locale);
+            for chord in ["Alt+p", "Option+p"] {
+                let hint = format_ftl_message(
+                    &bundle,
+                    "zc-queue-missing-completion-ghost",
+                    &[("key", chord)],
+                )
+                .unwrap_or_else(|| panic!("recovery hint must format for {locale}"));
+                assert!(hint.contains(chord), "{locale}: {hint}");
+                assert!(
+                    hint.width() <= available_cells,
+                    "{locale}/{chord}: {} cells exceed {available_cells}: {hint}",
+                    hint.width()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),

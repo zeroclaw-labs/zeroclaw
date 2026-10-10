@@ -6748,26 +6748,31 @@ mod tests {
         loop {
             if let Ok(Some((state, view, error))) = tool.read_background_view(task_id, true).await {
                 if !state.is_pending() {
-                    if state == BackgroundResultState::Completed {
+                    if matches!(
+                        state,
+                        BackgroundResultState::Completed | BackgroundResultState::Failed
+                    ) {
                         let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
                         let artifact = std::fs::read_to_string(&artifact_path)
                             .unwrap_or_else(|read_error| {
                                 panic!(
-                                    "completed background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
+                                    "terminal background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
                                 )
                             });
                         let artifact: BackgroundDelegateOutput = serde_json::from_str(&artifact)
                             .unwrap_or_else(|parse_error| {
                                 panic!(
-                                    "completed background task {task_id} has an invalid output artifact: {parse_error}"
+                                    "terminal background task {task_id} has an invalid output artifact: {parse_error}"
                                 )
                             });
                         assert_eq!(artifact.task_id, task_id);
                         assert_eq!(artifact.output.as_deref(), view["output"].as_str());
-                        assert!(
-                            error.is_none(),
-                            "completed task has retrieval error: {error:?}"
-                        );
+                        if state == BackgroundResultState::Completed {
+                            assert!(
+                                error.is_none(),
+                                "completed task has retrieval error: {error:?}"
+                            );
+                        }
                     }
                     let status = match state {
                         BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
@@ -12638,6 +12643,163 @@ mod tests {
         assert!(tool.cancellation_token().is_cancelled());
     }
 
+    async fn background_persistence_failure_fixture(
+        workspace: &Path,
+    ) -> (DelegateTool, wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"message": "background persistence fixture provider failure"}
+            })))
+            .mount(&server)
+            .await;
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some(server.uri()),
+            ..Default::default()
+        };
+        let tool = with_in_memory_task_store(
+            DelegateTool::new_with_options(sample_agents(), None, test_security(), options)
+                .with_workspace_dir(workspace.to_path_buf()),
+        );
+        (tool, server)
+    }
+
+    async fn assert_background_persistence_fixture_error(
+        tool: &DelegateTool,
+        task_id: &str,
+        server: &wiremock::MockServer,
+        result: &BackgroundDelegateResult,
+    ) {
+        let requests = server
+            .received_requests()
+            .await
+            .expect("owned provider requests");
+        assert_eq!(requests.len(), 1, "the real typed provider dispatched once");
+        assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("typed provider JSON request");
+        assert_eq!(body["model"], "");
+        assert_eq!(result.task_id, task_id);
+        assert_eq!(result.agent, "researcher");
+        assert_eq!(result.status, BackgroundTaskStatus::Failed);
+        assert_eq!(result.output, None);
+        assert!(result.finished_at.is_some());
+        let error = result
+            .error
+            .as_deref()
+            .expect("fixture provider failure retained");
+        assert!(error.contains("Ollama API error (400 Bad Request)"));
+        assert!(error.contains("background persistence fixture provider failure"));
+        let snapshot = tool
+            .background_control_plane()
+            .await
+            .unwrap()
+            .store
+            .get_snapshot(task_id)
+            .await
+            .unwrap()
+            .expect("the current background task has a persisted row");
+        assert_eq!(snapshot.task.id, task_id);
+        assert_eq!(snapshot.task.kind, TaskKind::Delegate);
+        assert_eq!(snapshot.task.agent, result.agent);
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert_eq!(snapshot.error, result.error);
+        assert_eq!(snapshot.task.started_at, result.started_at);
+        assert_eq!(snapshot.task.finished_at, result.finished_at);
+    }
+
+    enum FailedArtifactCorruption {
+        Missing,
+        InvalidJson,
+        WrongTask,
+        StaleOutput,
+    }
+
+    async fn assert_failed_background_artifact_rejected(corruption: FailedArtifactCorruption) {
+        let workspace = TempDir::new().unwrap();
+        let (tool, provider_fixture) =
+            background_persistence_failure_fixture(workspace.path()).await;
+        let tool = Arc::new(tool);
+        let launch = tool
+            .execute(json!({
+                "agent": "researcher",
+                "prompt": "terminal artifact control",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(launch.success);
+        let task_id = launch
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let terminal = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &terminal)
+            .await;
+        let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
+        let original = std::fs::read(&artifact_path).unwrap();
+        let artifact: BackgroundDelegateOutput = serde_json::from_slice(&original).unwrap();
+        assert_eq!(artifact.task_id, task_id);
+        assert_eq!(artifact.output, None);
+
+        match corruption {
+            FailedArtifactCorruption::Missing => std::fs::remove_file(&artifact_path).unwrap(),
+            FailedArtifactCorruption::InvalidJson => {
+                std::fs::write(&artifact_path, b"{").unwrap();
+            }
+            FailedArtifactCorruption::WrongTask => {
+                let mut stale = artifact;
+                stale.task_id = uuid::Uuid::new_v4().to_string();
+                std::fs::write(&artifact_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            }
+            FailedArtifactCorruption::StaleOutput => {
+                let mut stale = artifact;
+                stale.output = Some("output from a different task".to_string());
+                std::fs::write(&artifact_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+            }
+        }
+        let reader = Arc::clone(&tool);
+        let read_task_id = task_id.clone();
+        let observed = zeroclaw_spawn::spawn!(async move {
+            wait_for_terminal_background_result(&reader, &read_task_id).await
+        })
+        .await;
+        std::fs::write(&artifact_path, original).unwrap();
+        assert!(
+            observed.is_err_and(|error| error.is_panic()),
+            "the terminal wait accepted a missing, corrupt, or stale Failed artifact"
+        );
+        let restored = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &restored)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_missing_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::Missing).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_corrupt_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::InvalidJson).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_another_tasks_artifact() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::WrongTask).await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_wait_rejects_stale_output() {
+        assert_failed_background_artifact_rejected(FailedArtifactCorruption::StaleOutput).await;
+    }
+
     #[tokio::test]
     async fn background_task_result_persisted_to_disk() {
         let workspace = std::env::temp_dir().join(format!(
@@ -12646,10 +12808,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         let result = tool
             .execute(json!({
@@ -12682,13 +12841,12 @@ mod tests {
 
         // Read and parse the result
         let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&tool, task_id, &provider_fixture, &bg_result)
+            .await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
-        // The task will have failed because ollama isn't running, but it should be persisted
-        assert!(
-            bg_result.status == BackgroundTaskStatus::Completed
-                || bg_result.status == BackgroundTaskStatus::Failed
-        );
+        // The owned provider fixture fails; terminal state must still be persisted.
+        assert_eq!(bg_result.status, BackgroundTaskStatus::Failed);
         assert!(bg_result.finished_at.is_some());
 
         let _ = std::fs::remove_dir_all(workspace);
@@ -12702,10 +12860,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start background task
         let result = tool
@@ -12727,7 +12882,9 @@ mod tests {
             .to_string();
 
         // Wait for background task
-        let _ = wait_for_terminal_background_result(&tool, &task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_background_persistence_fixture_error(&tool, &task_id, &provider_fixture, &bg_result)
+            .await;
 
         // Check result
         let check = tool
@@ -12741,6 +12898,22 @@ mod tests {
         // The output should contain the serialized result
         assert!(check.output.contains(&task_id));
         assert!(check.output.contains("researcher"));
+        assert!(!check.success);
+        assert_eq!(check.error, bg_result.error);
+        let checked: serde_json::Value = serde_json::from_str(&check.output).unwrap();
+        assert_eq!(checked["task_id"], task_id);
+        assert_eq!(checked["agent"], "researcher");
+        assert_eq!(checked["status"], "failed");
+        assert!(checked["output"].is_null());
+        assert_eq!(checked["error"].as_str(), bg_result.error.as_deref());
+        assert_eq!(
+            checked["started_at"].as_str(),
+            Some(bg_result.started_at.as_str())
+        );
+        assert_eq!(
+            checked["finished_at"].as_str(),
+            bg_result.finished_at.as_deref()
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -12824,10 +12997,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = with_in_memory_task_store(
-            DelegateTool::new(sample_agents(), None, test_security())
-                .with_workspace_dir(workspace.clone()),
-        );
+        let (tool, provider_fixture) = background_persistence_failure_fixture(&workspace).await;
 
         // Start a background task
         let result = tool
@@ -12848,7 +13018,9 @@ mod tests {
             .trim();
 
         // Wait for task to complete
-        let _ = wait_for_terminal_background_result(&tool, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_background_persistence_fixture_error(&tool, task_id, &provider_fixture, &bg_result)
+            .await;
 
         // List results
         let list = tool
@@ -12858,6 +13030,20 @@ mod tests {
 
         assert!(list.success);
         assert!(list.output.contains("researcher"));
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&list.output).unwrap();
+        assert_eq!(listed.len(), 1, "only the current task is listed");
+        assert_eq!(listed[0]["task_id"], task_id);
+        assert_eq!(listed[0]["agent"], "researcher");
+        assert_eq!(listed[0]["status"], "failed");
+        assert_eq!(listed[0]["error"].as_str(), bg_result.error.as_deref());
+        assert_eq!(
+            listed[0]["started_at"].as_str(),
+            Some(bg_result.started_at.as_str())
+        );
+        assert_eq!(
+            listed[0]["finished_at"].as_str(),
+            bg_result.finished_at.as_deref()
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }

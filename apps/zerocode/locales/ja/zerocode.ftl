@@ -160,6 +160,7 @@ zc-queue-full = キューが満杯です（最大 { $cap } 件）。メッセー
 zc-queue-title = キュー（{ $count }）
 zc-queue-empty-list = キュー済みメッセージはありません。
 zc-queue-paused-ghost = キューは一時停止中 — { $key } を押すかメッセージを送信して再開
+zc-queue-missing-completion-ghost = 完了は未確認。{ $key } または送信で再開。
 zc-queue-item-injected = （即時送信）
 zc-queue-resumed = キューを再開しました。
 zc-queue-clear-empty = キューはすでに空です。

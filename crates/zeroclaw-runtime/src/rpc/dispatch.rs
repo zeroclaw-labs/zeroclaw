@@ -21633,7 +21633,9 @@ mod tests {
             drop(lock);
             successor
         };
-        let (result, successor) = tokio::join!(operation, replace);
+        // Poll the replacement first: without its real Pending signal this
+        // control must reject early rather than depending on scheduler timing.
+        let (successor, result) = tokio::join!(biased; replace, operation);
         let err = result.expect_err("a replaced session cannot be configured by the old owner");
         assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
         assert!(err.message.contains("Session changed while queued"));

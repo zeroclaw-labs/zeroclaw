@@ -2281,12 +2281,36 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .collect()
 }
 
-/// Strip image markers from older messages (oldest first) until the total image
-/// count is within `max_images`. Keeps the text content of each message.
+/// How many of `total` images survive the per-request cap of `max_images`.
 ///
-/// Eviction is per image, not per message: exactly `total - max_images` images
-/// are dropped, so a message holding more images than the budget allows keeps
-/// its newest ones instead of losing all of them.
+/// Under the cap every image survives. Past it, eviction drops to a low-water
+/// mark of `max_images - max_images / 2` (4 -> 2, 8 -> 4, 16 -> 8), then lets
+/// the count climb back to the cap before the next eviction. Evicting an image
+/// rewrites the message that held it, which invalidates a provider's cached
+/// prompt prefix from that message on; evicting in batches means a session
+/// past the cap pays that rewrite once every `max_images / 2 + 1` new images
+/// instead of on every one.
+///
+/// The result depends only on `total`, never on earlier requests: while the
+/// count stays within one batch, the same oldest images are evicted and the
+/// earlier messages of the request are unchanged.
+fn images_kept_under_cap(total: usize, max_images: usize) -> usize {
+    if total <= max_images {
+        return total;
+    }
+    let low_water = max_images - max_images / 2;
+    let batch = max_images / 2 + 1;
+    low_water + (total - max_images - 1) % batch
+}
+
+/// Strip image markers from older messages (oldest first) until the total
+/// image count is down to [`images_kept_under_cap`]. Keeps the text content of
+/// each message.
+///
+/// Eviction is per image, not per message: exactly the oldest
+/// `total - images_kept_under_cap(total, max_images)` images are dropped, so a
+/// message holding more images than remain to drop keeps its newest ones
+/// instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
     let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
@@ -2304,13 +2328,13 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
 
     // Determine how many images to drop (from the oldest messages).
     let total: usize = image_positions.iter().map(|(_, c)| c).sum();
-    let mut to_drop = total.saturating_sub(max_images);
+    let mut to_drop = total - images_kept_under_cap(total, max_images);
 
     // Record how many images to drop per message, oldest first. A message is
     // only partially trimmed when it holds more images than remain to drop:
     // marking the whole message would evict images the budget still allows and
-    // leave the request under `max_images` (a single message holding more than
-    // `max_images` would otherwise lose all of them).
+    // leave the request under the kept count (a single message holding more
+    // than `max_images` would otherwise lose all of them).
     let mut drop_counts = std::collections::HashMap::new();
     for &(idx, count) in &image_positions {
         if to_drop == 0 {
@@ -8956,7 +8980,7 @@ mod tests {
         for index in 0..5 {
             let image_path = temp.path().join(format!("shot-{index}.png"));
             // A real decodable PNG: content validation rejects bytes that
-            // only carry the magic signature, so the retained four must
+            // only carry the magic signature, so the retained images must
             // actually load for the assertions below to hold.
             std::fs::write(&image_path, valid_png()).unwrap();
             marker_paths.push(image_path.display().to_string());
@@ -9011,7 +9035,7 @@ mod tests {
         let refs = carrier_image_targets(&prepared.messages[0].content);
         assert_eq!(
             refs.len(),
-            config.max_images,
+            images_kept_under_cap(5, config.max_images),
             "exactly the budgeted images are retained, in the attachments array"
         );
         assert!(
@@ -10221,7 +10245,8 @@ mod tests {
     #[tokio::test]
     async fn prepare_messages_trims_excess_images_from_older_messages() {
         // 3 messages, each with 1 image — max is 2.
-        // The oldest message's image should be stripped.
+        // Past the cap the count drops to the low-water mark of 1, so the two
+        // oldest images are stripped.
         let messages = vec![
             ChatMessage::user("[IMAGE:/tmp/old.png]\nOld caption".to_string()),
             ChatMessage::user("[IMAGE:/tmp/mid.png]\nMid caption".to_string()),
@@ -10229,9 +10254,9 @@ mod tests {
         ];
 
         // Should not error — instead trims oldest. (Will error on
-        // normalize_image_reference for the surviving images since
-        // /tmp/mid.png and /tmp/new.png don't exist, but the trimming
-        // itself should succeed.)
+        // normalize_image_reference for the surviving image since
+        // /tmp/new.png doesn't exist, but the trimming itself should
+        // succeed.)
         let trimmed = trim_old_images(&messages, 2);
         assert_eq!(trimmed.len(), 3);
 
@@ -10240,9 +10265,10 @@ mod tests {
         assert!(refs0.is_empty(), "oldest image should be stripped");
         assert!(trimmed[0].content.contains("Old caption"));
 
-        // Newer messages keep their images
+        // The middle image goes in the same batch; only the newest survives.
         let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert_eq!(refs1.len(), 1);
+        assert!(refs1.is_empty(), "middle image should be stripped");
+        assert!(trimmed[1].content.contains("Mid caption"));
         let (_, refs2) = parse_image_markers(&trimmed[2].content);
         assert_eq!(refs2.len(), 1);
     }
@@ -10284,42 +10310,66 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_drops_exactly_the_overflow() {
-        // The invariant the cap exists to enforce: whatever the per-message
-        // distribution, the survivors equal the budget rather than undershoot.
+    fn images_kept_under_cap_evicts_in_batches_down_to_the_low_water_mark() {
+        // Under or at the cap nothing is evicted.
+        for total in 0..=4 {
+            assert_eq!(images_kept_under_cap(total, 4), total);
+        }
+        // Past a cap of 4 the count drops to 2, climbs back to 4, and drops
+        // again: one eviction per three new images.
+        let kept: Vec<usize> = (5..=11).map(|t| images_kept_under_cap(t, 4)).collect();
+        assert_eq!(kept, vec![2, 3, 4, 2, 3, 4, 2]);
+        // A cap of 1 has no room for a batch: every new image evicts one.
+        for total in 1..=6 {
+            assert_eq!(images_kept_under_cap(total, 1), 1);
+        }
+        // The largest cap the config allows: 17 -> 8, back up to 16 at 25.
+        assert_eq!(images_kept_under_cap(17, 16), 8);
+        assert_eq!(images_kept_under_cap(25, 16), 16);
+        assert_eq!(images_kept_under_cap(26, 16), 8);
+        // Odd caps round the mark up: 3 -> 2, 5 -> 3.
+        assert_eq!(images_kept_under_cap(4, 3), 2);
+        assert_eq!(images_kept_under_cap(6, 5), 3);
+    }
+
+    #[test]
+    fn trim_old_images_keeps_exactly_the_low_water_count() {
+        // Whatever the per-message distribution, the survivors equal
+        // `images_kept_under_cap`: the trim neither overshoots nor undershoots
+        // the batch rule.
         let messages = vec![
             ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nPair".to_string()),
             ChatMessage::user("[IMAGE:/tmp/c.png]\nSingle".to_string()),
             ChatMessage::user("[IMAGE:/tmp/d.png]\n[IMAGE:/tmp/e.png]\nAnother pair".to_string()),
         ];
 
-        for max_images in 1..=5 {
+        for (max_images, expected) in [(1, 1), (2, 1), (3, 3), (4, 2), (5, 5)] {
             let trimmed = trim_old_images(&messages, max_images);
             assert_eq!(
                 count_image_markers(&trimmed),
-                max_images,
-                "max_images={max_images} must keep exactly that many images"
+                expected,
+                "max_images={max_images} over five images must keep {expected}"
             );
         }
     }
 
     #[test]
     fn trim_old_images_keeps_the_newest_images_across_messages() {
+        // Four images against a cap of 3 drop to the mark of 2: the two oldest
+        // go, one of them partway through the first message.
         let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nOld".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\nNew".to_string()),
+            ChatMessage::user(
+                "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nOld".to_string(),
+            ),
+            ChatMessage::user("[IMAGE:/tmp/d.png]\nNew".to_string()),
         ];
 
         let trimmed = trim_old_images(&messages, 3);
 
-        // Oldest single image evicted; everything newer survives.
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert_eq!(refs0, vec!["/tmp/b.png".to_string()]);
+        assert_eq!(refs0, vec!["/tmp/c.png".to_string()]);
         let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert_eq!(
-            refs1,
-            vec!["/tmp/c.png".to_string(), "/tmp/d.png".to_string()]
-        );
+        assert_eq!(refs1, vec!["/tmp/d.png".to_string()]);
     }
 
     #[test]
@@ -10423,16 +10473,18 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 2);
         assert_eq!(trimmed.len(), 5);
-        // Oldest user image stripped
+        // Three images against a cap of 2 drop to the mark of 1: both older
+        // user images stripped, their text kept.
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
         assert!(refs0.is_empty());
         assert!(trimmed[0].content.contains("Look at this"));
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert!(refs2.is_empty());
+        assert!(trimmed[2].content.contains("What about this?"));
         // Assistant messages untouched
         assert_eq!(trimmed[1].content, "I see a photo.");
         assert_eq!(trimmed[3].content, "That's a chart.");
-        // Two newest user images kept
-        let (_, refs2) = parse_image_markers(&trimmed[2].content);
-        assert_eq!(refs2.len(), 1);
+        // Newest user image kept
         let (_, refs4) = parse_image_markers(&trimmed[4].content);
         assert_eq!(refs4.len(), 1);
     }
@@ -10458,8 +10510,8 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_messages_trims_then_normalizes_surviving_images() {
-        // End-to-end: 3 images, max 2. After trimming the oldest, the two
-        // surviving images should be normalized (base64-encoded) successfully.
+        // End-to-end: 3 images, max 2. The cap drops to the low-water mark of
+        // 1, and the surviving newest image is normalized (base64-encoded).
         let temp = tempfile::tempdir().unwrap();
         let mut paths = Vec::new();
         for name in ["old.png", "mid.png", "new.png"] {
@@ -10490,8 +10542,9 @@ mod tests {
         // First message should have image stripped, text preserved
         assert!(!result.messages[0].content.contains("data:image"));
         assert!(result.messages[0].content.contains("Old"));
-        // Second and third should have base64-encoded images
-        assert!(result.messages[1].content.contains("data:image"));
+        // Second goes in the same batch; only the third is base64-encoded
+        assert!(!result.messages[1].content.contains("data:image"));
+        assert!(result.messages[1].content.contains("Mid"));
         assert!(result.messages[2].content.contains("data:image"));
     }
 
@@ -10523,26 +10576,27 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // Output is capped to exactly max_images...
+        // Nine images against a cap of 4: the batch rule keeps
+        // 2 + (9 - 5) % 3 = 3.
         let surviving = result
             .messages
             .iter()
             .filter(|m| m.content.contains("data:image"))
             .count();
-        assert_eq!(surviving, 4, "output should keep exactly max_images");
+        assert_eq!(surviving, 3, "output should keep the batch-rule count");
         assert_eq!(
             result.submitted_image_ids,
             provider_image_ids(&result.messages)
         );
-        assert_eq!(result.submitted_image_ids.len(), 4);
+        assert_eq!(result.submitted_image_ids.len(), 3);
         assert_eq!(
             result.newest_user_image_ids,
             provider_image_ids_in_message(&result.messages[8])
         );
 
-        // ...and it is the newest four that survive; the oldest five are stripped.
+        // ...and it is the newest three that survive; the oldest six are stripped.
         for (i, m) in result.messages.iter().enumerate() {
-            if i < 5 {
+            if i < 6 {
                 assert!(
                     !m.content.contains("data:image"),
                     "oldest message {i} should be capped out"
@@ -10557,14 +10611,17 @@ mod tests {
         }
     }
 
-    /// At the cap, one new image rewrites exactly the oldest image-bearing
-    /// message; an image-free follow-up produces a byte-identical provider
-    /// view; the next new image evicts the next-oldest image. This pins the
-    /// bounded, deterministic eviction the cap events report, for persistent
-    /// user images with age trimming disabled and no tool-result images.
-    /// Outside that scope, a current-turn tool image going stale undoes its
-    /// eviction of a user image on the next turn, and `max_image_turns` can
-    /// age out an image on an image-free turn.
+    /// Past the cap, a new image evicts down to the low-water mark in one
+    /// bounded mutation of the oldest image-bearing messages; an image-free
+    /// follow-up produces a byte-identical provider view; the next two new
+    /// images change no earlier message; the one after that evicts the next
+    /// batch. With `max_images = 4` that is one cache rewrite per three new
+    /// images. This pins the deterministic eviction the cap events report, for
+    /// persistent user images with age trimming disabled and no tool-result
+    /// images. Outside that scope, a current-turn tool image going stale
+    /// lowers the count on the next turn and can restore an evicted user
+    /// image, and `max_image_turns` can age out an image on an image-free
+    /// turn.
     #[tokio::test]
     async fn image_cap_eviction_is_bounded_and_prefix_stable() {
         let temp = tempfile::tempdir().unwrap();
@@ -10597,8 +10654,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Fifth image arrives: only the oldest image message is rewritten, and
-        // it keeps its caption while losing the image.
+        // Fifth image arrives: the count drops to the mark of two in one
+        // mutation of the three oldest image messages. Captioned ones keep
+        // their caption; the image-only one becomes the removal placeholder.
         history.push(ChatMessage::user(format!(
             "[IMAGE:{}]\ncaption 4",
             img(4).display()
@@ -10616,7 +10674,7 @@ mod tests {
                 .count()
         };
         assert_eq!(inlined(&p0), 4, "all four fixtures inline before the cap");
-        assert_eq!(inlined(&p1), 4, "the cap keeps exactly four inlined images");
+        assert_eq!(inlined(&p1), 2, "the cap evicts down to the mark of two");
         let changed1: Vec<usize> = p0
             .messages
             .iter()
@@ -10627,11 +10685,14 @@ mod tests {
             .collect();
         assert_eq!(
             changed1,
-            vec![1],
-            "fifth image mutates only the oldest image message"
+            vec![1, 3, 5],
+            "fifth image mutates only the three oldest image messages"
         );
         assert!(p1.messages[1].content.contains("caption 0"));
         assert!(!p1.messages[1].content.contains("data:image"));
+        assert_eq!(p1.messages[3].content, "[image removed from history]");
+        assert!(p1.messages[5].content.contains("caption 2"));
+        assert!(!p1.messages[5].content.contains("data:image"));
 
         // Following image-free request: the provider view is byte-stable.
         history.push(ChatMessage::assistant("saw 4"));
@@ -10646,8 +10707,8 @@ mod tests {
             .all(|(x, y)| x.role == y.role && x.content == y.content);
         assert!(prefix_equal, "image-free follow-up must be byte-stable");
 
-        // Sixth image: the next mutation lands on the second-oldest image
-        // message, the image-only one, which becomes the removal placeholder.
+        // Sixth and seventh images fit under the cap again: neither changes
+        // an earlier message.
         history.push(ChatMessage::assistant("ok"));
         history.push(ChatMessage::user(format!(
             "[IMAGE:{}]\ncaption 5",
@@ -10656,13 +10717,43 @@ mod tests {
         let p3 = prepare_messages_for_provider(&history, &config)
             .await
             .unwrap();
-        let d3 = trimmed_span(&p2.messages, &p3.messages);
+        assert_eq!(inlined(&p3), 3);
         assert_eq!(
-            d3,
-            Some((3, 3)),
-            "sixth image mutates the second-oldest image message"
+            trimmed_span(&p2.messages, &p3.messages),
+            None,
+            "sixth image changes no earlier message"
         );
-        assert_eq!(p3.messages[3].content, "[image removed from history]");
+        history.push(ChatMessage::assistant("saw 5"));
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 6",
+            img(6).display()
+        )));
+        let p4 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        assert_eq!(inlined(&p4), 4);
+        assert_eq!(
+            trimmed_span(&p3.messages, &p4.messages),
+            None,
+            "seventh image changes no earlier message"
+        );
+
+        // Eighth image takes the count past the cap again: the next batch,
+        // images 3, 4 and 5, is evicted in one mutation.
+        history.push(ChatMessage::assistant("saw 6"));
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 7",
+            img(7).display()
+        )));
+        let p5 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        assert_eq!(inlined(&p5), 2);
+        assert_eq!(
+            trimmed_span(&p4.messages, &p5.messages),
+            Some((7, 13)),
+            "eighth image evicts the next batch, from image 3 to image 5"
+        );
     }
 
     #[tokio::test]
@@ -10740,9 +10831,11 @@ mod tests {
             }
         }
         let frame = found.expect("cap WARN frame with max_images 3 and images_before_cap 4");
+        // Four images against a cap of 3 drop to the mark of 2: the two oldest
+        // image messages are rewritten.
         assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
-        assert_eq!(frame["attributes"]["last_trimmed_index"], 1);
-        assert_eq!(frame["attributes"]["images_evicted"], 1);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 3);
+        assert_eq!(frame["attributes"]["images_evicted"], 2);
 
         // Scenario 2: five images against `max_images: 2` evicts several
         // images in one trim; the pair (2, 5) is likewise unique to this
@@ -10775,10 +10868,11 @@ mod tests {
         }
         let frame = found.expect("cap WARN frame with max_images 2 and images_before_cap 5");
         // The span covers every message the trim rewrote: first is the
-        // oldest image message, last the newest evicted one.
+        // oldest image message, last the newest evicted one. Five images
+        // against a cap of 2 keep 1 + (5 - 3) % 2 = 1, so four go.
         assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
-        assert_eq!(frame["attributes"]["last_trimmed_index"], 5);
-        assert_eq!(frame["attributes"]["images_evicted"], 3);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 7);
+        assert_eq!(frame["attributes"]["images_evicted"], 4);
     }
 
     #[tokio::test]

@@ -4,9 +4,9 @@
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::{StreamProviderFailure, consume_provider_streaming_response};
@@ -350,33 +350,20 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new(), false)
                         }
                         Err(stream_err) => {
-                            let streamed_refusal = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| match &error.source {
-                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                        refusal,
-                                    ) => Some((**refusal).clone()),
-                                    _ => None,
-                                })
-                                .or_else(|| {
-                                    stream_err.chain().find_map(|cause| {
-                                        if let Some(
-                                            zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                                refusal,
-                                            ),
-                                        ) = cause.downcast_ref::<
-                                            zeroclaw_api::model_provider::StreamError,
-                                        >() {
-                                            Some((**refusal).clone())
-                                        } else {
-                                            cause
-                                                .downcast_ref::<
-                                                    zeroclaw_api::model_provider::ModelRefusalError,
-                                                >()
-                                                .cloned()
-                                        }
-                                    })
-                                });
+                            let streamed_refusal = stream_err.chain().find_map(|cause| {
+                                if let Some(
+                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal),
+                                ) = cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+                                {
+                                    Some((**refusal).clone())
+                                } else {
+                                    cause
+                                        .downcast_ref::<
+                                            zeroclaw_api::model_provider::ModelRefusalError,
+                                        >()
+                                        .cloned()
+                                }
+                            });
                             if let Some(usage) = streamed_refusal
                                 .as_ref()
                                 .and_then(|refusal| refusal.usage.as_deref().cloned())
@@ -388,13 +375,8 @@ pub(crate) async fn call_provider(
                             {
                                 scope.record_stream_semantic_rejection_usage(usage);
                             } else if let Some(usage) = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| error.usage.clone())
-                                .or_else(|| {
-                                    stream_err
-                                        .downcast_ref::<StreamProviderFailure>()
-                                        .and_then(StreamProviderFailure::usage)
-                                })
+                                .downcast_ref::<StreamProviderFailure>()
+                                .and_then(StreamProviderFailure::usage)
                             {
                                 scope.record_stream_interruption_usage(usage);
                             }
@@ -406,16 +388,8 @@ pub(crate) async fn call_provider(
                             }
                             scope.record_stream_recovery_failure(&stream_err);
                             let terminal_stream_error = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .is_some_and(|error| {
-                                    matches!(
-                                        &error.source,
-                                        zeroclaw_providers::traits::StreamError::Terminal(_)
-                                    )
-                                })
-                                || stream_err
-                                    .downcast_ref::<StreamProviderFailure>()
-                                    .is_some_and(StreamProviderFailure::is_terminal);
+                                .downcast_ref::<StreamProviderFailure>()
+                                .is_some_and(StreamProviderFailure::is_terminal);
                             if terminal_stream_error {
                                 ::zeroclaw_log::record!(
                                     WARN,

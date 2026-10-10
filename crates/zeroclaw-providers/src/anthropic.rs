@@ -11143,7 +11143,8 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let p0 = convert_stripped(&history, &config).await;
 
-        // Fifth image arrives: the oldest image message loses its image.
+        // Fifth image arrives: the count drops to the mark of two, so the
+        // three oldest image messages lose their images.
         history.push(ChatMessage::user(format!(
             "[IMAGE:{}]\ncaption 4",
             img(4).display()
@@ -11160,8 +11161,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
         assert_eq!(
             image_blocks(&p1),
-            4,
-            "the cap keeps exactly four image blocks"
+            2,
+            "the cap evicts down to two image blocks"
         );
 
         // Image-free follow-up.
@@ -11177,8 +11178,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             "the image-free follow-up must not change any prior native message"
         );
 
-        // Exactly one message differs from before the fifth image: the
-        // position holding the oldest image, the first user message.
+        // Exactly three messages differ from before the fifth image: the
+        // positions holding the three oldest images, the first three user
+        // messages.
         let changed: Vec<usize> = p0
             .iter()
             .zip(p1.iter())
@@ -11188,8 +11190,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             .collect();
         assert_eq!(
             changed,
-            vec![0],
-            "the fifth image must rewrite only the oldest image message"
+            vec![0, 2, 4],
+            "the fifth image must rewrite only the three oldest image messages"
         );
     }
 }

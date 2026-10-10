@@ -1312,6 +1312,7 @@ cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short
 cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
@@ -1454,3 +1455,5 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+skill-http-request-timeout = HTTP request timed out

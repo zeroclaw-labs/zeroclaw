@@ -426,8 +426,28 @@ struct ModelEntry {
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
     /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
-    #[serde(default)]
+    /// Vendors also use `pricing` for other shapes (xAI image models send an
+    /// array of per-tier objects); those read as unknown pricing rather than
+    /// failing the whole listing.
+    #[serde(default, deserialize_with = "deserialize_lenient_pricing")]
     pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
+}
+
+/// Accept only the per-token object shape for `pricing`; any other shape (an
+/// array, a scalar, an object with non-string rates) is `None`. Arrays must be
+/// rejected explicitly: serde would otherwise read them positionally into the
+/// struct.
+fn deserialize_lenient_pricing<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeroclaw_api::model_provider::ModelPricing>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(object @ serde_json::Value::Object(_)) => serde_json::from_value(object).ok(),
+        _ => None,
+    })
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -12631,9 +12651,10 @@ mod tests {
     async fn provider_boundary_honours_the_configured_multimodal_policy() {
         // The provider boundary re-normalizes messages, and that pass now
         // decodes pixels and applies `max_images`. Under
-        // `MultimodalConfig::default()` it would trim to 4 images, silently
-        // discarding one the runtime had already accepted under a configured
-        // `max_images = 8`. The configured policy must reach the provider.
+        // `MultimodalConfig::default()` it would evict down to 2 images,
+        // silently discarding three the runtime had already accepted under a
+        // configured `max_images = 8`. The configured policy must reach the
+        // provider.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut markers = String::from("compare these");
         for index in 0..5 {
@@ -12670,15 +12691,16 @@ mod tests {
         assert_eq!(
             surviving, 5,
             "all five images must survive the configured max_images = 8; \
-             a default-config boundary pass would have trimmed to 4: {content}"
+             a default-config boundary pass would have evicted down to 2: {content}"
         );
 
-        // The default policy is what the boundary used before this fix. With
-        // per-image eviction the same five-image message is trimmed to the
-        // default cap of 4 — the oldest image is evicted even though the
-        // operator's configuration had accepted all five. That boundary-side
-        // re-trim is the data loss the configured policy prevents, so pin it
-        // so a regression cannot quietly restore the default-config pass.
+        // The default policy is what the boundary used before this fix. The
+        // same five-image message is past the default cap of 4, so the
+        // boundary evicts down to the low-water mark of 2, discarding three
+        // images the operator's configuration had accepted. That
+        // boundary-side re-trim is the data loss the configured policy
+        // prevents, so pin it so a regression cannot quietly restore the
+        // default-config pass.
         let default_provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("Test")
             .base_url("https://example.invalid/v1")
@@ -12694,8 +12716,8 @@ mod tests {
             .matches("[IMAGE:data:image/png;base64,")
             .count();
         assert_eq!(
-            default_surviving, 4,
-            "under the default max_images = 4 the boundary pass evicts the oldest image; \
+            default_surviving, 2,
+            "under the default max_images = 4 the boundary pass evicts down to two images; \
              that re-trim is what the configured policy prevents"
         );
     }
@@ -16221,6 +16243,67 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    /// xAI's `/v1/models` mixes chat models (flat integer price fields, no
+    /// `pricing`) with image models whose `pricing` is an array of per-tier
+    /// objects. One unrecognized `pricing` shape must not fail the listing.
+    const XAI_MODELS_WITH_TIERED_IMAGE_PRICING: &str = r#"{
+        "data": [
+            {"id": "grok-4.6", "aliases": [], "context_length": 256000,
+             "created": 1768003200, "object": "model", "owned_by": "xai",
+             "prompt_text_token_price": 20000, "completion_text_token_price": 80000,
+             "capabilities": {"reasoning_effort": ["low", "high"]}},
+            {"id": "grok-imagine-image", "aliases": [], "created": 1769472000,
+             "object": "model", "owned_by": "xai", "image_price": 200000000,
+             "pricing": [
+                 {"quality": "medium", "resolution": "1k", "image_price": 200000000},
+                 {"quality": "high", "resolution": "2k", "image_price": 400000000}
+             ]}
+        ],
+        "object": "list"
+    }"#;
+
+    #[test]
+    fn model_ids_parse_despite_tiered_array_pricing() {
+        let ids = parse_model_ids_from_bytes(XAI_MODELS_WITH_TIERED_IMAGE_PRICING.as_bytes())
+            .expect("array-shaped pricing must not fail the model list");
+        assert_eq!(ids, vec!["grok-4.6", "grok-imagine-image"]);
+    }
+
+    #[test]
+    fn models_with_pricing_drop_unrecognized_pricing_shape() {
+        let body: ModelsResponse =
+            serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
+        let models = normalize_models_with_pricing(body);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "a pricing shape we cannot read is unknown pricing, not a parse failure"
+        );
+    }
+
+    #[test]
+    fn models_with_pricing_keep_object_pricing() {
+        // OpenRouter/Kilo object shape must still parse; a malformed object
+        // (non-string rate) degrades that entry to unknown pricing only.
+        let body: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "b", "pricing": {"prompt": {"tier": 1}}},
+                {"id": "c", "pricing": null}
+            ]}"#,
+        )
+        .unwrap();
+        let models = normalize_models_with_pricing(body);
+        let a = models[0]
+            .pricing
+            .as_ref()
+            .expect("object pricing preserved");
+        assert_eq!(a.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(a.completion.as_deref(), Some("0.000015"));
+        assert!(models[1].pricing.is_none());
+        assert!(models[2].pricing.is_none());
     }
 
     #[test]
