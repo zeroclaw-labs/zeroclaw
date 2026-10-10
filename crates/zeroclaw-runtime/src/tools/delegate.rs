@@ -23685,6 +23685,11 @@ command = "rm independent-delegate-marker"
     /// the sealed ceiling. An instance the downcast cannot resolve - here a
     /// stand-in with no `as_any`, the same shape as a wrapped tool - is omitted
     /// rather than reused as the caller's own instance.
+    ///
+    /// With a root config attached, the omission also follows from the names
+    /// not being in `SAFE_FOR_BOUNDED_REUSE`, so this test guards that list
+    /// membership; the name-based drop is guarded by the variant below, where
+    /// nothing else would omit them.
     #[tokio::test]
     async fn bounded_target_omits_sop_tools_the_downcast_cannot_rebind() {
         let tmp = TempDir::new().unwrap();
@@ -23711,7 +23716,8 @@ command = "rm independent-delegate-marker"
         for sop in ["sop_execute", "sop_advance"] {
             assert!(
                 !names.iter().any(|n| n == sop),
-                "`{sop}` whose downcast does not resolve must be omitted, never                  reused as the caller's instance, got {names:?}"
+                "`{sop}` whose downcast does not resolve must be omitted, never \
+                 reused as the caller's instance, got {names:?}"
             );
         }
     }
@@ -23743,7 +23749,8 @@ command = "rm independent-delegate-marker"
         for sop in ["sop_execute", "sop_advance"] {
             assert!(
                 !names.iter().any(|n| n == sop),
-                "`{sop}` whose downcast does not resolve must be omitted even                  without a root config, got {names:?}"
+                "`{sop}` whose downcast does not resolve must be omitted even \
+                 without a root config, got {names:?}"
             );
         }
     }

@@ -964,11 +964,10 @@ pub(crate) fn browser_tool(
 ///   they are built by `build_mcp_capability_tools`, outside
 ///   `all_tools_with_runtime`.
 /// - The four `a2a_*` tools are built `A2aXTool::new(client, security.clone())`:
-///   each captures the CALLER's `SecurityPolicy`, and the shared client holds
-///   the caller's live config handle, so peer endpoints and their credentials
-///   resolve from the caller's configuration. That fails the admission test of
-///   `SAFE_FOR_BOUNDED_REUSE`, and no factory rebuilds them against a target's
-///   policy. They were left unclassified by the maximal-registry fixture, which
+///   each captures the CALLER's `SecurityPolicy`. That fails the admission test
+///   of `SAFE_FOR_BOUNDED_REUSE`, and no factory rebuilds them against a
+///   target's policy. (The shared client resolves peers from the live config,
+///   which is not caller-specific; the policy capture alone decides this.) They were left unclassified by the maximal-registry fixture, which
 ///   never enabled `[a2a.client]`; this records the decision the fallback was
 ///   already making for them.
 pub const BOUNDED_DENIED_TOOL_NAMES: &[&str] = &[
@@ -4266,6 +4265,8 @@ mod tests {
                 None,
                 None,
                 None,
+                // No caller ceiling: this registry is not bounded by a caller.
+                None,
             )
         };
         let error = build(cycle.clone(), true)
@@ -6746,11 +6747,13 @@ permissions = ["http_client"]
             ),
             (
                 "execute_pipeline",
-                "minted by the scoped assembly from the config it is given; the bounded                  assembly runs with `Config::default()`, so it is never in the registry",
+                "minted by the scoped assembly from the config it is given; the bounded \
+                 assembly runs with `Config::default()`, so it is never in the registry",
             ),
             (
                 "tool_search",
-                "minted by the scoped assembly behind deferred MCP loading, which the                  bounded assembly leaves off (`connect_mcp: false`, no MCP registry)",
+                "minted by the scoped assembly behind deferred MCP loading, which the \
+                 bounded assembly leaves off (`connect_mcp: false`, no MCP registry)",
             ),
         ];
         for (name, reason) in never_reaches_the_classifier {
@@ -6790,7 +6793,8 @@ permissions = ["http_client"]
         }
         assert!(
             unclassified.is_empty(),
-            "these inventoried tools belong to no bounded-delegation category; classify              each one (rebuilt / safe to reuse / rebound / denied): {unclassified:?}"
+            "these inventoried tools belong to no bounded-delegation category; classify \
+             each one (rebuilt / safe to reuse / rebound / denied): {unclassified:?}"
         );
         assert!(
             duplicated.is_empty(),

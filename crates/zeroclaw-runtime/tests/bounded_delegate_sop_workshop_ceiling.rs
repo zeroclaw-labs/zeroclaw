@@ -325,13 +325,16 @@ fn a_bounded_targets_sop_workshop_refuses_persisting_actions_but_keeps_list() {
 
     assert!(
         results.len() >= 2,
-        "the chain must reach both `sop_workshop` calls (propose, then list) — either          the model never called them or delegate.rs's Bounded assembly omitted the          tool; {report}"
+        "the chain must reach both `sop_workshop` calls (propose, then list) — either \
+         the model never called them or delegate.rs's Bounded assembly omitted the \
+         tool; {report}"
     );
 
     // Negative half: the persisting action is refused with the ceiling text.
     assert!(
         results[0].contains(REFUSAL),
-        "a bounded target's sop_workshop `propose` must be refused under the caller          ceiling, not stored; got: {}; {report}",
+        "a bounded target's sop_workshop `propose` must be refused under the caller \
+         ceiling, not stored; got: {}; {report}",
         results[0]
     );
 

@@ -205,7 +205,9 @@ impl Tool for SopWorkshopTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!(
-                    "sop_workshop `{}` is not available under a caller tool ceiling: it                      persists a proposal or SOP definition that runs later, outside that                      ceiling. `list` and `inspect` remain available.",
+                    "sop_workshop `{}` is not available under a caller tool ceiling: it \
+                     persists a proposal or SOP definition that runs later, outside that \
+                     ceiling. `list` and `inspect` remain available.",
                     action.wire_name()
                 )),
             });

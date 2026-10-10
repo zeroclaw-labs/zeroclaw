@@ -224,7 +224,7 @@ The scheduler itself validates a stored command with the owning agent's policy, 
 
 A deferred **agent** job has no command yet, so there is nothing to judge when it is written. A bounded registration therefore refuses any stored `allowed_tools` list that keeps `shell`, whether it names `shell` or inherits it from a ceiling that holds it; list the tools the job needs without `shell`. A `SubAgentOverrides::policy` override cannot shed a bound its parent carries (`EscalationViolation::CallerCommandBoundDroppedByChild`).
 
-`sop_workshop` leaves state that outlives the turn: `apply` writes a SOP definition and reloads the shared engine, and `propose`, `capture_run`, `reject` and `quarantine` save proposals. A bounded target, and any registry built under a caller tool ceiling, therefore keeps only its read-only `list` and `inspect` actions; the other actions are refused.
+`sop_workshop` leaves state that outlives the turn: `apply` writes a SOP definition and reloads the shared engine, and `propose`, `capture_run`, `reject` and `quarantine` save proposals. A bounded target therefore keeps only its read-only `list` and `inspect` actions; the other actions are refused. The same holds for any registry assembled with a caller tool ceiling: a job or SOP step replayed under a stored `allowed_tools` list, including an operator-authored one. It does not hold for an RPC principal session that restricts tools by name, which builds its registry with no ceiling (a declared gap).
 
 ### `delegate`: output strings the model sees
 

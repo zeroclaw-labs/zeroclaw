@@ -330,9 +330,10 @@ impl Default for PerSenderTracker {
 /// command for later, a `spawn_subagent` child that inherits the policy, a
 /// further delegation hop) is bound without having to know about it.
 ///
-/// Only the four fields `validate_command_execution_for_shell` reads are
-/// carried: paths, roots and sandbox stay the target's, so a command is still
-/// judged against the target's workspace, never the caller's.
+/// Only the four fields that decide WHICH commands may run are carried. The
+/// other fields the validator reads (paths, roots, sandbox) stay the target's,
+/// so a command is still judged against the target's workspace, never the
+/// caller's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallerCommandBound {
     pub autonomy: AutonomyLevel,
