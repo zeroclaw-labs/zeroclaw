@@ -6463,14 +6463,27 @@ fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
 /// supporting `*` (single segment) and `**` (recursive) wildcards via the
 /// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+///
+/// Both sides are compared with every platform separator spelled `/`. Watchers
+/// report Windows paths with `\`, which the nested-path check would otherwise
+/// never see as a separator; on Unix `\` is an ordinary filename character and
+/// is left alone.
 pub(crate) fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
-    if let Ok(compiled) = glob::Pattern::new(pattern)
-        && compiled.matches(path)
+    let pattern = with_forward_separators(pattern);
+    let path = with_forward_separators(path);
+    if let Ok(compiled) = glob::Pattern::new(&pattern)
+        && compiled.matches(&path)
     {
         return true;
     }
     let prefix = pattern.trim_end_matches('/');
     path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn with_forward_separators(path: &str) -> String {
+    path.chars()
+        .map(|c| if std::path::is_separator(c) { '/' } else { c })
+        .collect()
 }
 
 /// Whether the payload's `event` field names one of the trigger's listed kinds.
@@ -7276,6 +7289,40 @@ mod tests {
         assert!(mqtt_topic_matches("#", "a/b/c"));
         assert!(mqtt_topic_matches("a/#", "a/b/c"));
         assert!(!mqtt_topic_matches("b/#", "a/b/c"));
+    }
+
+    #[test]
+    fn filesystem_path_matching_directories_and_globs() {
+        assert!(filesystem_path_matches("/w/in", "/w/in"));
+        assert!(filesystem_path_matches("/w/in", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in", "/w/inbox/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/*.pdf", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/**/*.pdf", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in/*.pdf", "/w/in/a.txt"));
+    }
+
+    /// Watchers report Windows paths with `\`, so a directory trigger must
+    /// treat it as a separator there, whichever separator the trigger uses.
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_path_matching_accepts_windows_separators() {
+        assert!(filesystem_path_matches(r"C:\w\in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(r"C:\w\in\", r"C:\w\in\sub\a.pdf"));
+        assert!(filesystem_path_matches("C:/w/in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(
+            r"\\?\C:\w\in",
+            r"\\?\C:\w\in\a.pdf"
+        ));
+        assert!(filesystem_path_matches(r"C:\w\in\*.pdf", r"C:\w\in\a.pdf"));
+        assert!(!filesystem_path_matches(r"C:\w\in", r"C:\w\inbox\a.pdf"));
+    }
+
+    /// On Unix `\` is an ordinary filename character, not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_path_matching_keeps_backslash_literal_on_unix() {
+        assert!(!filesystem_path_matches("/w/in", r"/w/in\a.pdf"));
     }
 
     // ── Calendar trigger matching ─────────────────────
