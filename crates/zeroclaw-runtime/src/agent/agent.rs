@@ -8014,6 +8014,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_tool_rounds_rpc_transcript_matches_final_renderer_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/single-tool-rounds.json"
+        )))
+        .unwrap();
+        let notice = crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+        assert_eq!(fixture["unsupported_notice"], notice);
+        for streaming in [false, true] {
+            for capable in [true, false] {
+                let (mut agent, _, executions) = round_agent(
+                    vec![
+                        round_response("before-first", &["call-one"], 10),
+                        round_response("after-first", &["call-two"], 20),
+                        round_response("done", &[], 30),
+                    ],
+                    streaming,
+                    capable,
+                    Some(true),
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed("perform two steps", tx, None)
+                    .await
+                    .unwrap();
+                assert_eq!(executions.load(Ordering::SeqCst), 2);
+                // Only transcript events affect this fixture; usage has separate coverage.
+                let notifications = std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            TurnEvent::Chunk { .. }
+                                | TurnEvent::ToolCall { .. }
+                                | TurnEvent::ToolResult { .. }
+                        )
+                    })
+                    .map(|event| {
+                        let encoded = crate::rpc::dispatch::notification_for_turn_event_for_test(
+                            "sess-1", &event,
+                        )
+                        .unwrap();
+                        serde_json::from_str::<serde_json::Value>(&encoded).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected = fixture["updates"].as_array().unwrap().clone();
+                if !capable {
+                    expected.insert(0, serde_json::json!({
+                        "jsonrpc": "2.0", "method": "session/update",
+                        "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                    }));
+                }
+                assert_eq!(
+                    notifications, expected,
+                    "streaming={streaming}, capable={capable}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn single_tool_round_violation_rejects_native_and_normalized_calls_without_history_or_replay()
      {
         use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE};
