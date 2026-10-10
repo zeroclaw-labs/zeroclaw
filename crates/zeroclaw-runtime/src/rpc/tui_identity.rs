@@ -329,6 +329,48 @@ mod tests {
     }
 
     #[test]
+    fn config_signing_key_is_used_when_runtime_data_lives_elsewhere() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config_store = zeroclaw_config::secrets::SecretStore::new(&config_dir, true);
+        config_store.encrypt("synthetic-config-secret").unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: config_dir.join("config.toml"),
+            data_dir: data_dir.clone(),
+            ..Default::default()
+        };
+        assert!(!data_dir.join(".secret_key").exists());
+        let registry = TuiRegistry::for_config(&config);
+        let signature = registry
+            .sign("tui_test")
+            .expect("config key enables signing");
+        assert!(TuiRegistry::new(&config_dir).verify("tui_test", &signature));
+
+        // A stale key in the runtime-data directory is neither preferred nor
+        // used as a fallback when the canonical key is unavailable.
+        let data_store = zeroclaw_config::secrets::SecretStore::new(&data_dir, true);
+        data_store.encrypt("synthetic-unrelated-secret").unwrap();
+        assert!(!TuiRegistry::new(&data_dir).verify("tui_test", &signature));
+        assert!(TuiRegistry::for_config(&config).verify("tui_test", &signature));
+        let colocated = zeroclaw_config::schema::Config {
+            data_dir: config_dir.clone(),
+            ..config.clone()
+        };
+        assert!(TuiRegistry::for_config(&colocated).verify("tui_test", &signature));
+        // Upstream provisions missing keys. A corrupt canonical key must still
+        // fail closed instead of falling back to the valid, unrelated data key.
+        std::fs::write(config_dir.join(".secret_key"), "corrupt-canonical-key").unwrap();
+        assert!(!TuiRegistry::for_config(&config).signing_is_enabled());
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join(".secret_key")).unwrap(),
+            "corrupt-canonical-key"
+        );
+    }
+
+    #[test]
     fn generate_tui_id_format() {
         let id = TuiRegistry::generate_tui_id();
         assert!(id.starts_with("tui_"), "expected tui_ prefix, got {id}");
