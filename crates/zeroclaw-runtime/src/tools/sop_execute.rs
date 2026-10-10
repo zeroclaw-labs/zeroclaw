@@ -61,6 +61,13 @@ impl SopExecuteTool {
         self.caller_ceiling.is_some()
     }
 
+    /// Whether this instance records an initiating agent on the runs it
+    /// starts. Test-only, like [`Self::has_caller_ceiling`].
+    #[cfg(test)]
+    pub(crate) fn has_initiator(&self) -> bool {
+        self.initiator.is_some()
+    }
+
     /// A fresh instance sharing this one's live `engine`/`audit` handles
     /// (the same shared SOP engine, not a rebuild — there is only one), bound
     /// to `ceiling`. Used by the `Bounded` delegate rebuild in `delegate.rs`,

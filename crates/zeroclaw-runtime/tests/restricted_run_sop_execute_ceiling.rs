@@ -303,8 +303,9 @@ fn an_unrestricted_runs_sop_execute_still_parks_the_run() {
         "sop_execute produced no tool result at all; {report}"
     );
     assert!(
-        !results[0].contains("cancelled"),
-        "without a ceiling the run must not be cancelled; got: {}; {report}",
+        !results[0].contains("cancelled") && results[0].contains("waiting for approval"),
+        "without a ceiling the run must start and wait for approval, not be cancelled; \
+         got: {}; {report}",
         results[0]
     );
 }

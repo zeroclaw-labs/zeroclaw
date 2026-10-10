@@ -10883,13 +10883,32 @@ mod tests {
             require_approval_for_medium_risk: false,
             risk_profile_name: "target-profile".into(),
             workspace_dir: std::path::PathBuf::from("/target/workspace"),
-            workspace_only: true,
+            // The default is `true`, so the target takes the other value.
+            workspace_only: false,
             forbidden_paths: vec!["/target/forbidden".into()],
             allowed_roots: vec![std::path::PathBuf::from("/target/root")],
             max_actions_per_hour: 7,
             max_cost_per_day_cents: 11,
             shell_timeout_secs: 13,
             allowed_tools: Some(vec!["shell".into()]),
+            // Every other field gets a value the caller's default does not
+            // have, so an `overlay` that substitutes a default for any of them
+            // shows up in the whole-value comparison below.
+            config_path: Some(std::path::PathBuf::from("/target/config.toml")),
+            data_dir: Some(std::path::PathBuf::from("/target/data")),
+            allowed_roots_read_only: vec![std::path::PathBuf::from("/target/ro")],
+            allowed_roots_write_only: vec![std::path::PathBuf::from("/target/wo")],
+            shell_env_passthrough: vec!["TARGET_ENV".into()],
+            excluded_tools: Some(vec!["target_excluded".into()]),
+            auto_approve: vec!["target_approved".into()],
+            always_ask: vec!["target_asked".into()],
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("target-backend".into()),
+            firejail_args: vec!["--target-arg".into()],
+            sandbox_image: Some("target-image".into()),
+            delegation_policy: crate::autonomy::DelegationPolicy {
+                mode: crate::autonomy::DelegationMode::Allow,
+            },
             ..SecurityPolicy::default()
         };
         // The target's own chain is the caller's business, not the overlay's.
@@ -10904,6 +10923,42 @@ mod tests {
             max_actions_per_hour: 99,
             ..SecurityPolicy::default()
         };
+
+        // The comparison can only see a substitution on a field whose value
+        // differs between the target and the caller.
+        macro_rules! differ {
+            ($($field:ident),+ $(,)?) => {$(
+                assert_ne!(
+                    format!("{:?}", target.$field),
+                    format!("{:?}", caller.$field),
+                    concat!("`", stringify!($field), "` must differ between target and caller"),
+                );
+            )+};
+        }
+        differ!(
+            risk_profile_name,
+            workspace_dir,
+            workspace_only,
+            forbidden_paths,
+            allowed_roots,
+            max_actions_per_hour,
+            max_cost_per_day_cents,
+            shell_timeout_secs,
+            allowed_tools,
+            config_path,
+            data_dir,
+            allowed_roots_read_only,
+            allowed_roots_write_only,
+            shell_env_passthrough,
+            excluded_tools,
+            auto_approve,
+            always_ask,
+            sandbox_enabled,
+            sandbox_backend,
+            firejail_args,
+            sandbox_image,
+            delegation_policy,
+        );
 
         let overlaid = CallerCommandBound::from_caller(&caller).overlay(&target);
 

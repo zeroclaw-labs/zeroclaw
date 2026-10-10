@@ -966,10 +966,12 @@ pub(crate) fn browser_tool(
 /// - The four `a2a_*` tools are built `A2aXTool::new(client, security.clone())`:
 ///   each captures the CALLER's `SecurityPolicy`. That fails the admission test
 ///   of `SAFE_FOR_BOUNDED_REUSE`, and no factory rebuilds them against a
-///   target's policy. (The shared client resolves peers from the live config,
-///   which is not caller-specific; the policy capture alone decides this.) They were left unclassified by the maximal-registry fixture, which
-///   never enabled `[a2a.client]`; this records the decision the fallback was
-///   already making for them.
+///   target's policy. (The shared client resolves peers from the live config
+///   handle, or from a snapshot of the root config the registry was built with
+///   when none was passed; neither is specific to the caller's policy, so the
+///   policy capture alone decides this.) They were left unclassified by the
+///   maximal-registry fixture, which never enabled `[a2a.client]`; this records
+///   the decision the fallback was already making for them.
 pub const BOUNDED_DENIED_TOOL_NAMES: &[&str] = &[
     "model_switch",
     "mcp_resources",
@@ -3499,17 +3501,29 @@ fn all_tools_with_runtime_on_thread(
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        // Under a ceiling a run that would park is cancelled, so the initiating
+        // agent (who a parked run resumes as, with its full policy and no
+        // ceiling) is recorded only without one. `rebound_with_ceiling` does the
+        // same: if a cancellation cannot be persisted, an unowned run fails
+        // closed at resume instead of running as the caller.
+        let sop_initiator = if caller_ceiling.is_none() {
+            agent_alias
+        } else {
+            ""
+        };
         if let Some(ref sop_audit) = sop_audit {
             // `sop_execute` and `sop_advance` can leave a run parked for an
             // external resume that no ceiling follows, so under a ceiling they
             // cancel it (see their `caller_ceiling` guards). Every registry
-            // built here with a ceiling - a restricted `run`, a peer relay, a
-            // cron-fired job, a re-assembled SOP step - gets that guard, not
-            // only the bounded delegate rebuild.
+            // built here with a ceiling - a restricted `run` (and with it a
+            // `spawn_subagent` child or a cron-fired job) and a peer relay -
+            // gets that guard, not only the bounded delegate rebuild. A SOP
+            // step turn never holds these two tools: `SOP_CONTROL_TOOLS`
+            // excludes them by name.
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
                     .with_audit(Arc::clone(sop_audit))
-                    .with_initiator(agent_alias)
+                    .with_initiator(sop_initiator)
                     .with_caller_ceiling(caller_ceiling.clone()),
             ));
             tool_arcs.push(Arc::new(
@@ -3525,7 +3539,7 @@ fn all_tools_with_runtime_on_thread(
         } else {
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
-                    .with_initiator(agent_alias)
+                    .with_initiator(sop_initiator)
                     .with_caller_ceiling(caller_ceiling.clone()),
             ));
             tool_arcs.push(Arc::new(
@@ -5603,11 +5617,13 @@ permissions = ["http_client"]
     }
 
     /// Every registry the factory builds under a ceiling must hand out
-    /// `sop_execute` and `sop_advance` that carry it: a restricted `run`, a peer
-    /// relay, a cron-fired job and a re-assembled SOP step all come through
-    /// here, and each of them would otherwise get the instance whose parked run
-    /// resumes outside the ceiling. Both construction branches (with and
-    /// without an audit logger) are exercised.
+    /// `sop_execute` and `sop_advance` that carry it: a restricted `run` (and
+    /// with it a `spawn_subagent` child or a cron-fired job) and a peer relay
+    /// come through here, and each of them would otherwise get the instance
+    /// whose parked run resumes outside the ceiling. A SOP step turn is not
+    /// one of them: it excludes both tools by name. Under a ceiling `sop_execute`
+    /// also records no initiating agent, as in the bounded rebuild. Both
+    /// construction branches (with and without an audit logger) are exercised.
     #[test]
     fn sop_execute_and_advance_built_under_a_caller_ceiling_carry_it() {
         let tmp = TempDir::new().unwrap();
@@ -5689,6 +5705,11 @@ permissions = ["http_client"]
                     advance.has_caller_ceiling(),
                     expect,
                     "sop_advance (audit: {with_audit}, ceiling: {expect})"
+                );
+                assert_eq!(
+                    execute.has_initiator(),
+                    !expect,
+                    "sop_execute initiator (audit: {with_audit}, ceiling: {expect})"
                 );
             }
         }

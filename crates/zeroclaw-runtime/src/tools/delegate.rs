@@ -23757,8 +23757,9 @@ command = "rm independent-delegate-marker"
 
     /// The caller's command chain travels in the target's policy for a bounded
     /// target and for no other mode: an independent target resolves its own
-    /// policy from config and carries neither the chain nor the caller's
-    /// ceiling. `delegation.md` states this; the test pins it.
+    /// policy from config and carries no chain. `delegation.md` also says it
+    /// carries no ceiling; this test pins the command-chain half only, and the
+    /// ceiling half is the `None` the independent registry is built with.
     #[tokio::test]
     async fn policy_for_target_attaches_the_command_chain_only_for_a_bounded_target() {
         use zeroclaw_config::schema::{DelegateExecutionMode, DelegateTargetConfig};
