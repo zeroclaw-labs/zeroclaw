@@ -5587,6 +5587,96 @@ permissions = ["http_client"]
         );
     }
 
+    /// The registry factory is where a ceiling enters a turn that is not a
+    /// bounded delegate (a restricted run, a SOP step, a cron-fired job), so
+    /// `sop_workshop` must pick it up there too, not only through the bounded
+    /// delegate rebuild.
+    #[tokio::test]
+    async fn sop_workshop_built_under_a_caller_ceiling_refuses_persisting_actions() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.sop.procedural_memory_enabled = true;
+        let engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig {
+                sops_dir: Some(tmp.path().join("sops").display().to_string()),
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        )));
+
+        let propose = serde_json::json!({
+            "action": "propose",
+            "sop_name": "left-behind",
+            "description": "d",
+            "procedure_markdown": "## Steps\n\n1. **Check** - Do it.\n",
+        });
+        let mut outcomes = Vec::new();
+        for ceiling in [
+            None,
+            Some(Arc::new(std::sync::OnceLock::from(vec![
+                "sop_workshop".to_string(),
+            ]))),
+        ] {
+            let tools = all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                Arc::clone(&mem),
+                None,
+                None,
+                &browser,
+                &http,
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                Some(Arc::clone(&engine)),
+                None,
+                None,
+                ceiling,
+            )
+            .expect("tool registry builds")
+            .tools;
+            let workshop = tools
+                .iter()
+                .find(|t| t.name() == "sop_workshop")
+                .expect("sop_workshop registers when procedural memory is enabled");
+            outcomes.push(workshop.execute(propose.clone()).await.unwrap());
+        }
+
+        // Control first: with no ceiling the same call stores a proposal, so the
+        // refusal below is the ceiling and not a broken fixture.
+        assert!(outcomes[0].success, "no ceiling: {:?}", outcomes[0].error);
+        assert!(!outcomes[1].success);
+        assert!(
+            outcomes[1]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not available under a caller tool ceiling")),
+            "built under a ceiling, got {:?}",
+            outcomes[1].error
+        );
+    }
+
     #[test]
     fn shared_sop_engine_arc_is_observed_by_multiple_registrations() {
         let tmp = TempDir::new().unwrap();

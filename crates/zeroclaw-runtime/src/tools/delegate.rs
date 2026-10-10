@@ -23748,6 +23748,53 @@ command = "rm independent-delegate-marker"
         }
     }
 
+    /// The caller's command chain travels in the target's policy for a bounded
+    /// target and for no other mode: an independent target resolves its own
+    /// policy from config and carries neither the chain nor the caller's
+    /// ceiling. `delegation.md` states this; the test pins it.
+    #[tokio::test]
+    async fn policy_for_target_attaches_the_command_chain_only_for_a_bounded_target() {
+        use zeroclaw_config::schema::{DelegateExecutionMode, DelegateTargetConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let bounded_config = bounded_reuse_config(&["calculator"], false, &tmp);
+        let mut independent = (*bounded_config).clone();
+        independent
+            .agents
+            .get_mut("caller")
+            .expect("caller agent exists")
+            .delegates = vec![DelegateTargetConfig {
+            agent: "target".to_string(),
+            mode: DelegateExecutionMode::Independent,
+        }];
+        let independent_config = Arc::new(independent);
+
+        let policy_for = |config: &Arc<zeroclaw_config::schema::Config>| {
+            let caller_policy = Arc::new(
+                SecurityPolicy::for_agent(config, "caller").expect("caller policy resolves"),
+            );
+            DelegateTool::new(config.agents.clone(), None, caller_policy)
+                .with_root_config(Arc::clone(config))
+                .with_caller_alias("caller")
+                .with_risk_profiles(config.risk_profiles.clone())
+                .with_runtime_profiles(config.runtime_profiles.clone())
+                .policy_for_target("target")
+                .expect("target policy resolves")
+        };
+
+        let bounded = policy_for(&bounded_config);
+        assert_eq!(
+            bounded.caller_command_bounds.len(),
+            1,
+            "a bounded target carries the caller's command bound"
+        );
+        let independent = policy_for(&independent_config);
+        assert!(
+            independent.caller_command_bounds.is_empty(),
+            "an independent target must not inherit the caller's command chain"
+        );
+    }
+
     /// Sharing a risk profile is NOT a reason to hand over caller instances.
     ///
     /// Two same-profile agents still have different aliases, and the

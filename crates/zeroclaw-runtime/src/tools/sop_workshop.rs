@@ -505,4 +505,125 @@ mod tests {
             "reload must surface the newly applied SOP"
         );
     }
+
+    fn sealed(names: &[&str]) -> crate::tools::caller_ceiling::CallerCeiling {
+        let handle: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        handle
+            .set(names.iter().map(|n| (*n).to_string()).collect())
+            .expect("fresh handle");
+        handle
+    }
+
+    fn unsealed() -> crate::tools::caller_ceiling::CallerCeiling {
+        Arc::new(std::sync::OnceLock::new())
+    }
+
+    const REFUSAL: &str = "not available under a caller tool ceiling";
+
+    /// Under a ceiling - sealed or not - every action that persists is refused
+    /// and nothing reaches the store, while the two read-only actions keep
+    /// working on the same instance. Each persisting action is exercised by name
+    /// so one of them cannot slip out of the allow-list unnoticed.
+    #[tokio::test]
+    async fn under_a_ceiling_every_persisting_action_is_refused_and_stores_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let sops_root = install_root.join("shared").join("sops");
+        std::fs::create_dir_all(&sops_root).unwrap();
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig {
+            sops_dir: Some("shared/sops".to_string()),
+            ..SopConfig::default()
+        })));
+        let unrestricted = SopWorkshopTool::new(Arc::clone(&engine), install_root.to_path_buf());
+
+        // A proposal that exists before the bounded tool acts, so apply / reject
+        // / quarantine / inspect have a real target.
+        let proposed = unrestricted
+            .execute(json!({
+                "action": "propose",
+                "sop_name": "pre-existing",
+                "description": "made outside the ceiling",
+                "procedure_markdown": "## Steps\n\n1. **Check** - Do it.\n",
+            }))
+            .await
+            .unwrap();
+        assert!(proposed.success, "{:?}", proposed.error);
+        let id = serde_json::from_str::<serde_json::Value>(&proposed.output).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let listing_before = unrestricted
+            .execute(json!({"action": "list"}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+
+        for (label, ceiling) in [
+            ("sealed", sealed(&["sop_workshop"])),
+            ("unsealed", unsealed()),
+        ] {
+            let bound = unrestricted.rebound_with_ceiling(ceiling);
+            let attempts = [
+                json!({"action": "propose", "sop_name": "left-behind", "description": "d",
+                       "procedure_markdown": "## Steps\n\n1. **x** - y.\n"}),
+                json!({"action": "capture_run", "source_run_id": "run-1"}),
+                json!({"action": "apply", "id": id}),
+                json!({"action": "reject", "id": id, "reason": "r"}),
+                json!({"action": "quarantine", "id": id, "reason": "r"}),
+            ];
+            for args in attempts {
+                let action = args["action"].as_str().unwrap().to_string();
+                let result = bound.execute(args).await.unwrap();
+                assert!(!result.success, "{label}: `{action}` must be refused");
+                assert!(
+                    result.error.as_deref().is_some_and(|e| e.contains(REFUSAL)),
+                    "{label}: `{action}` must be refused for the ceiling, got {:?}",
+                    result.error
+                );
+            }
+
+            // Read-only actions stay available.
+            let listed = bound.execute(json!({"action": "list"})).await.unwrap();
+            assert!(
+                listed.success,
+                "{label}: list must work: {:?}",
+                listed.error
+            );
+            let inspected = bound
+                .execute(json!({"action": "inspect", "id": id}))
+                .await
+                .unwrap();
+            assert!(
+                inspected.success && inspected.output.contains("pre-existing"),
+                "{label}: inspect must work: {:?}",
+                inspected.error
+            );
+        }
+
+        // Nothing was stored or written by any refused attempt.
+        let listing_after = unrestricted
+            .execute(json!({"action": "list"}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert_eq!(
+            listing_before, listing_after,
+            "a refused action stored a proposal"
+        );
+        assert!(
+            !sops_root.join("pre-existing").exists(),
+            "a refused apply wrote a SOP definition"
+        );
+
+        // Control: the same apply on the unrestricted instance does write it.
+        let applied = unrestricted
+            .execute(json!({"action": "apply", "id": id}))
+            .await
+            .unwrap();
+        assert!(applied.success, "{:?}", applied.error);
+        assert!(sops_root.join("pre-existing").join("SOP.md").exists());
+    }
 }

@@ -10869,6 +10869,58 @@ mod tests {
     }
 
     #[test]
+    fn overlay_takes_the_command_fields_from_the_caller_and_everything_else_from_the_target() {
+        // The compile-time guard on `overlay` forces a decision for each new
+        // field; this pins the decision for the fields that exist today. The
+        // expected value is built from the target with only the four command
+        // fields replaced, so a field `overlay` takes from the wrong side shows
+        // up in the whole-value comparison.
+        let mut target = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+            risk_profile_name: "target-profile".into(),
+            workspace_dir: std::path::PathBuf::from("/target/workspace"),
+            workspace_only: true,
+            forbidden_paths: vec!["/target/forbidden".into()],
+            allowed_roots: vec![std::path::PathBuf::from("/target/root")],
+            max_actions_per_hour: 7,
+            max_cost_per_day_cents: 11,
+            shell_timeout_secs: 13,
+            allowed_tools: Some(vec!["shell".into()]),
+            ..SecurityPolicy::default()
+        };
+        // The target's own chain is the caller's business, not the overlay's.
+        target.caller_command_bounds = vec![bound_of(&["ls"])];
+        let caller = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["echo".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+            risk_profile_name: "caller-profile".into(),
+            workspace_dir: std::path::PathBuf::from("/caller/workspace"),
+            max_actions_per_hour: 99,
+            ..SecurityPolicy::default()
+        };
+
+        let overlaid = CallerCommandBound::from_caller(&caller).overlay(&target);
+
+        let expected = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["echo".into()],
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: true,
+            caller_command_bounds: Vec::new(),
+            ..target.clone()
+        };
+        assert_eq!(format!("{overlaid:?}"), format!("{expected:?}"));
+        assert_eq!(overlaid.workspace_dir, target.workspace_dir);
+        assert_eq!(overlaid.max_actions_per_hour, 7);
+        assert_ne!(overlaid.risk_profile_name, caller.risk_profile_name);
+    }
+
+    #[test]
     fn a_caller_bound_narrows_a_wider_target() {
         // The escape: the target admits `touch`, the caller does not.
         let mut target = command_policy(&["*"]);
