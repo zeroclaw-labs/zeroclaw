@@ -160,6 +160,7 @@ zc-queue-full = La cola está llena ({ $cap } máx.). Espera a que se envíen lo
 zc-queue-title = Cola ({ $count })
 zc-queue-empty-list = No hay mensajes en cola.
 zc-queue-paused-ghost = Cola en pausa — presiona { $key } o envía un mensaje para reanudar
+zc-queue-missing-completion-ghost = Fin sin confirmar. { $key } o envía para reanudar.
 zc-queue-item-injected = (inyectado)
 zc-queue-resumed = Cola reanudada.
 zc-queue-clear-empty = La cola ya está vacía.
