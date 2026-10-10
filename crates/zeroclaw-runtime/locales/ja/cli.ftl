@@ -1141,6 +1141,7 @@ cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{
 channel-approval-heading = ツールの承認が必要です
 channel-approval-heading-shout = 承認が必要です
 channel-approval-tool-label = ツール
+channel-approval-independent-delegate = {$caller} からの独立した委任先 {$target}
 channel-approval-args-label = 引数
 channel-approval-btn-approve = 承認
 channel-approval-btn-deny = 拒否

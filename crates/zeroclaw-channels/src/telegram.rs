@@ -24049,7 +24049,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+    async fn approval_card_preserves_delegate_identity_and_batch_position_in_html_and_plain_fallback()
+     {
         use wiremock::matchers::{body_string_contains, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -24087,9 +24088,16 @@ mod tests {
         .with_mock_api_base(mock_server.uri())
         .with_approval_timeout_secs(1);
 
+        let target = format!("{:?}", "target<&");
+        let caller = format!("{:?}", "caller>");
+        let attribution = i18n::get_required_cli_string_with_args(
+            "channel-approval-independent-delegate",
+            &[("target", &target), ("caller", &caller)],
+        );
+        let summary = format!("{attribution}\npwd");
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".to_string(),
-            arguments_summary: "ls -la".to_string(),
+            arguments_summary: summary.clone(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
         };
@@ -24116,6 +24124,9 @@ mod tests {
             "the first send is the HTML card"
         );
         let html_text = html["text"].as_str().unwrap();
+        assert!(html_text.contains(&TelegramChannel::escape_html(&summary)));
+        assert!(html_text.contains("<code>shell</code>"));
+        println!("Telegram HTML API output: {html_text}");
         assert!(
             html_text.contains(escaped.as_str()),
             "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
@@ -24133,6 +24144,9 @@ mod tests {
             "the retry is the plain-text fallback"
         );
         let plain_text = plain["text"].as_str().unwrap();
+        assert!(plain_text.contains(&summary));
+        assert!(plain_text.contains("shell"));
+        println!("Telegram plain API output: {plain_text}");
         assert!(
             plain_text.contains(raw),
             "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"

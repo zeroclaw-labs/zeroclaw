@@ -1146,6 +1146,7 @@ cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ 
 channel-approval-heading = Approbation de l'outil requise
 channel-approval-heading-shout = APPROBATION REQUISE
 channel-approval-tool-label = Outil
+channel-approval-independent-delegate = Délégué indépendant {$target} de {$caller}
 channel-approval-args-label = Arguments
 channel-approval-btn-approve = Approuver
 channel-approval-btn-deny = Refuser

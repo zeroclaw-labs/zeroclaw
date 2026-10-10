@@ -1142,6 +1142,7 @@ cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ 
 channel-approval-heading = 需要工具批准
 channel-approval-heading-shout = 需要批准
 channel-approval-tool-label = 工具
+channel-approval-independent-delegate = 来自 {$caller} 的独立委派代理 {$target}
 channel-approval-args-label = 参数
 channel-approval-btn-approve = 批准
 channel-approval-btn-deny = 拒绝

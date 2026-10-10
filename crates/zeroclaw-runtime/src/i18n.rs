@@ -2430,6 +2430,22 @@ mod tests {
                 assert!(!value.is_empty(), "{locale}: {key} should not be empty");
             }
 
+            let attribution = format_ftl_message(
+                source,
+                locale,
+                "channel-approval-independent-delegate",
+                &[("caller", "caller<&"), ("target", "target>")],
+            )
+            .unwrap_or_else(|| {
+                panic!("{locale}: channel-approval-independent-delegate should be defined")
+            });
+            for alias in ["caller<&", "target>"] {
+                assert!(
+                    attribution.contains(alias),
+                    "{locale}: attribution should preserve {alias:?}; got {attribution:?}"
+                );
+            }
+
             let title =
                 format_ftl_message(source, locale, "channel-approval-title", &[("tool", "git")])
                     .unwrap_or_else(|| {
