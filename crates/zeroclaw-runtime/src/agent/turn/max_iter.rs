@@ -339,11 +339,17 @@ pub(crate) async fn finish_after_max_iterations(
                     );
                 }
                 if floor {
+                    // The summary call is tools-free, so the schemas cost nothing here.
                     return Err(super::context_window_exceeded_error(
                         (provider_name, &selected_model),
                         context_limits,
                         tokens,
                         token_counter.source(),
+                        (
+                            crate::agent::history::estimate_history_tokens(&messages),
+                            crate::agent::history::estimate_system_floor_tokens(&messages),
+                            0,
+                        ),
                     ));
                 }
                 break;

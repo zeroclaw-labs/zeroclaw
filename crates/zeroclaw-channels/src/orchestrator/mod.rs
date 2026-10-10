@@ -10852,8 +10852,13 @@ async fn process_channel_message_body(
                 } else {
                     zeroclaw_providers::sanitize_api_error(&e.to_string())
                 };
+                // `safe_error` is deliberately empty for a capacity failure, so
+                // the journal needs the typed breakdown instead: without it
+                // this line read "Turn error after Nms:" and nothing else.
+                let journal_error = context_window_exceeded
+                    .map_or_else(|| safe_error.clone(), |exceeded| exceeded.breakdown());
                 eprintln!(
-                    "  ❌ Turn error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {journal_error}",
                     started_at.elapsed().as_millis(),
                 );
 
@@ -10891,6 +10896,9 @@ async fn process_channel_message_body(
                     error_attributes["error_kind"] = "context_window_exceeded".into();
                     error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                     error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                    error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                    error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                     error_attributes["provider_attempted"] = false.into();
                 } else {
                     error_attributes["error_kind"] = "provider_error".into();
@@ -19847,6 +19855,9 @@ pub(crate) mod tests {
         let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
         })
         .context("maximum context length; private provider diagnostics");
         assert!(!is_context_window_overflow_error(&error));

@@ -1205,6 +1205,9 @@ async fn run_agent_job(
                 error_attributes["error_kind"] = "context_window_exceeded".into();
                 error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                 error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                 error_attributes["provider_attempted"] = false.into();
             } else {
                 error_attributes["error_kind"] = "agent_error".into();
@@ -2541,6 +2544,9 @@ mod tests {
         let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
         })
         .context("maximum context length; https://private.invalid/?key=secret");
         let provider =
