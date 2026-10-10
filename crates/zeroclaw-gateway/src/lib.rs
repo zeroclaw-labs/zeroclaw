@@ -1033,6 +1033,106 @@ pub async fn run_gateway_with_authority(
     .await
 }
 
+/// Select the install-wide gateway seed. Entries without a model cannot serve
+/// as a seed, so this keeps the provider and its matching model coherent.
+fn gateway_boot_provider_inputs(
+    config: &Config,
+) -> Option<(
+    String,
+    String,
+    &zeroclaw_config::schema::ModelProviderConfig,
+)> {
+    config
+        .providers
+        .models
+        .first_entry_with_model()
+        .map(|(family, alias, entry)| (family.to_string(), alias.to_string(), entry))
+}
+
+/// Construct the selected gateway seed through the alias-aware, non-resilient
+/// factory. The seed establishes gateway readiness; per-agent routed calls own
+/// fallback behavior. A broken fallback on the chosen seed must not put every
+/// unrelated agent into needs-Quickstart mode.
+fn build_gateway_boot_provider(
+    config: &Config,
+    family: &str,
+    alias: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let provider_ref = format!("{family}.{alias}");
+    zeroclaw_providers::create_model_provider_from_ref(config, &provider_ref)
+}
+
+/// Gateway-local state derived from the configured boot seed.
+///
+/// A missing model is ordinary first-run state. Keep that case explicit here
+/// so the gateway never fabricates a provider reference before Quickstart can
+/// configure one.
+struct GatewayBootState<'a> {
+    model_provider: Arc<dyn ModelProvider>,
+    fallback: Option<&'a zeroclaw_config::schema::ModelProviderConfig>,
+    model: String,
+}
+
+fn initialize_gateway_boot_state<'a>(
+    config: &'a Config,
+    display_addr: &str,
+) -> GatewayBootState<'a> {
+    match gateway_boot_provider_inputs(config) {
+        Some((boot_family, boot_alias, boot_entry)) => {
+            let model_provider_ref = format!("{boot_family}.{boot_alias}");
+            match build_gateway_boot_provider(config, &boot_family, &boot_alias) {
+                Ok(provider) => GatewayBootState {
+                    model_provider: Arc::from(provider),
+                    fallback: Some(boot_entry),
+                    model: boot_entry
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": model_provider_ref,
+                                "alias": boot_alias,
+                                "error": format!("{e}"),
+                            })),
+                        "Gateway: seed model_provider failed to construct; booting in \
+                         needs_quickstart mode so /quickstart and /admin/reload stay \
+                         reachable. Fix the [providers.models.<type>.<alias>] entry \
+                         and POST /admin/reload."
+                    );
+                    GatewayBootState {
+                        model_provider: Arc::new(UnconfiguredModelProvider),
+                        fallback: Some(boot_entry),
+                        model: String::new(),
+                    }
+                }
+            }
+        }
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                )
+            );
+            GatewayBootState {
+                model_provider: Arc::new(UnconfiguredModelProvider),
+                fallback: None,
+                model: String::new(),
+            }
+        }
+    }
+}
+
 /// Run the supervised gateway with the daemon generation's channel-plugin
 /// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
@@ -1117,73 +1217,17 @@ pub async fn run_gateway_with_plugin_webhooks(
     // model coherent — the previous "first entry, whatever it is" pick could
     // build the provider from one entry while `resolve_default_model` sourced
     // the model from another.
-    let (boot_family, boot_alias, boot_entry) = config
-        .providers
-        .models
-        .first_entry_with_model()
-        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
-        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
-    let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
-    let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
-        match zeroclaw_providers::create_resilient_model_provider_from_ref(
-            &config,
-            model_provider_name,
-            fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_for_alias(
-                &config,
-                &boot_family,
-                &boot_alias,
-            ),
-        ) {
-            Ok(p) => (Arc::from(p), false),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": model_provider_name,
-                            "alias": boot_alias,
-                            "error": format!("{e}"),
-                        })),
-                    "Gateway: seed model_provider failed to construct; booting in \
-                     needs_quickstart mode so /quickstart and /admin/reload stay \
-                     reachable. Fix the [providers.models.<type>.<alias>] entry \
-                     and POST /admin/reload."
-                );
-                (
-                    Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
-                    true,
-                )
-            }
-        };
-    let model = if boot_provider_failed {
-        String::new()
-    } else {
-        // `first_entry_with_model` guarantees a non-empty model for the boot
-        // entry, so reaching the empty fallback means no entry declares a
-        // model at all — the needs_quickstart onboarding path.
-        let model = fallback
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(ToString::to_string);
-        if model.is_none() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                &format!(
-                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                )
-            );
-        }
-        model.unwrap_or_default()
-    };
+    // The same selected entry also provides the install-wide temperature and
+    // memory API key below; retaining it keeps those boot defaults coherent
+    // with the alias passed to the provider factory. When no entry has a
+    // model, do not invent a provider reference: that is ordinary first-run
+    // state, not a broken alias, and must reach the established Quickstart
+    // admission path.
+    let GatewayBootState {
+        model_provider,
+        fallback,
+        model,
+    } = initialize_gateway_boot_state(&config, &display_addr);
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
@@ -5316,6 +5360,148 @@ mod tests {
         assert_eq!(dotted, "gw_team.alpha");
         assert_eq!(underscored, "gw_team_alpha");
         assert_ne!(dotted, underscored);
+    }
+
+    #[test]
+    fn gateway_boot_keeps_the_configured_anthropic_oauth_alias() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured OAuth alias must be selected for gateway boot");
+        let provider = build_gateway_boot_provider(&config, &family, &alias)
+            .expect("the gateway boot path must build the configured OAuth alias");
+
+        assert_eq!(family, "anthropic");
+        assert_eq!(alias, "subscription");
+        assert_eq!(
+            provider.alias(),
+            "subscription",
+            "gateway boot must enter the typed alias factory rather than the bare family factory"
+        );
+    }
+
+    #[test]
+    fn gateway_boot_rejects_a_noncanonical_anthropic_oauth_alias() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured OAuth alias must be selected for gateway boot");
+        let error = match build_gateway_boot_provider(&config, &family, &alias) {
+            Ok(_) => panic!("gateway boot must reject an OAuth alias that cannot name a profile"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires a canonical alias"),
+            "unexpected gateway construction error: {error}"
+        );
+    }
+
+    #[test]
+    fn gateway_boot_with_a_broken_oauth_seed_stays_unconfigured() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617");
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.model.is_empty());
+        assert_eq!(
+            state
+                .fallback
+                .expect("the rejected seed remains available for reload diagnostics")
+                .model
+                .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn gateway_boot_ignores_a_seed_fallback_that_is_not_auth_ready() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "main".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig::default(),
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured Anthropic alias must be selected for gateway boot");
+        let provider = build_gateway_boot_provider(&config, &family, &alias)
+            .expect("gateway seed must not construct its routed fallback chain");
+        assert_eq!(provider.alias(), "main");
+    }
+
+    #[test]
+    fn gateway_boot_without_a_model_does_not_invent_a_provider_alias() {
+        use zeroclaw_api::attribution::Attributable;
+
+        let config = Config::default();
+
+        assert!(
+            gateway_boot_provider_inputs(&config).is_none(),
+            "a first-run config must use needs_quickstart rather than construct a synthetic provider"
+        );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617");
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.fallback.is_none());
+        assert!(state.model.is_empty());
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.

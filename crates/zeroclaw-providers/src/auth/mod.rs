@@ -173,11 +173,53 @@ impl AuthService {
         profile_override: Option<&str>,
     ) -> Result<Option<AuthProfile>> {
         let model_provider = normalize_model_provider(model_provider)?;
-        let data = self.store.load().await?;
+        let mut data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, &model_provider, profile_override) else {
             return Ok(None);
         };
-        Ok(data.profiles.get(&profile_id).cloned())
+        let Some(profile) = data.profiles.remove(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.model_provider != model_provider {
+            anyhow::bail!(
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
+            );
+        }
+        Ok(Some(profile))
+    }
+
+    /// Return the profile with this provider-local name exactly as written.
+    ///
+    /// Unlike [`Self::get_profile`], this does not accept a fully-qualified
+    /// profile ID. Alias-bound callers use it when the provider-local name
+    /// must remain literal rather than being treated as a user-supplied
+    /// fully-qualified profile override.
+    pub(crate) async fn get_profile_by_name(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+    ) -> Result<Option<AuthProfile>> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        if profile_name != profile_name.trim() {
+            anyhow::bail!(
+                "Profile name must not have leading or trailing whitespace when resolved by exact name"
+            );
+        }
+        let profile_id = profile_id(&model_provider, profile_name);
+        let mut data = self.store.load().await?;
+        let Some(profile) = data.profiles.remove(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.model_provider != model_provider {
+            anyhow::bail!(
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
+            );
+        }
+        Ok(Some(profile))
     }
 
     pub async fn get_provider_bearer_token(
@@ -1945,6 +1987,51 @@ mod tests {
         assert_eq!(
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_profile_rejects_an_explicit_profile_owned_by_another_provider() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            "openai-codex",
+            "default",
+            "token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store profile");
+
+        let error = auth
+            .get_profile("anthropic", Some("openai-codex:default"))
+            .await
+            .expect_err("cross-provider profile lookup must fail closed");
+        assert!(error.to_string().contains("belongs to model_provider"));
+    }
+
+    #[tokio::test]
+    async fn get_profile_by_name_rejects_whitespace_that_would_change_the_profile_id() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            "anthropic",
+            "work",
+            "token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store profile");
+
+        let error = auth
+            .get_profile_by_name("anthropic", " work")
+            .await
+            .expect_err("exact-name lookup must reject a selector that trims to another profile");
+        assert!(
+            error.to_string().contains("leading or trailing whitespace"),
+            "the failed lookup must describe the exact-name boundary: {error}"
         );
     }
 

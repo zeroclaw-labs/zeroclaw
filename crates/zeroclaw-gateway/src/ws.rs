@@ -4402,6 +4402,39 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[test]
+    fn ws_consolidation_model_keeps_configured_anthropic_oauth_alias() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, ModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "anthropic.subscription", "")
+                .expect("the configured OAuth alias must remain resolvable for consolidation");
+
+        assert_eq!(model, "claude-sonnet-4-6");
+        assert_eq!(temperature, None);
+        assert_eq!(
+            provider.alias(),
+            "subscription",
+            "WebSocket consolidation must construct the configured OAuth alias"
+        );
+    }
+
+    #[test]
     fn needs_onboarding_ws_error_points_to_onboard() {
         let config = zeroclaw_config::schema::Config::default();
         let frame = needs_onboarding_ws_error(&config)
