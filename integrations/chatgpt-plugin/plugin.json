@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "zeroclaw-chatgpt",
+  "version": "0.1.0",
+  "description": "Set up a local ZeroClaw agent with a signed ChatGPT plan grant and an explicit risk preset.",
+  "author": { "name": "ZeroClaw Labs" },
+  "repository": "https://github.com/zeroclaw-labs/zeroclaw",
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/onboard/SKILL.md",
+      "interface": {
+        "displayName": "ZeroClaw with ChatGPT",
+        "shortDescription": "Local agents, ChatGPT plan",
+        "longDescription": "Create a fresh local ZeroClaw instance in ChatGPT Work or Codex with terminal and browser access. Sign in with ChatGPT, choose a risk preset for this instance, and bind an agent to the signed plan grant. Validation consumes the selected account's ChatGPT allowance. Requires a ZeroClaw release with native-onboard and ChatGPT plan function tools. No hosted infrastructure or credential import.",
+        "developerName": "ZeroClaw Labs",
+        "category": "Developer Tools",
+        "capabilities": ["Local agent setup"],
+        "composerIcon": "./assets/icon.svg",
+        "logo": "./assets/icon.svg",
+        "defaultPrompt": "Set up a new local ZeroClaw instance using my ChatGPT plan."
+      }
+    }
+  }
+}

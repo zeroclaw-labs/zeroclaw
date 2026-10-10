@@ -1,0 +1,12 @@
+{
+  "name": "zeroclaw-chatgpt-local",
+  "interface": { "displayName": "ZeroClaw ChatGPT setup" },
+  "plugins": [
+    {
+      "name": "zeroclaw-chatgpt",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Developer Tools"
+    }
+  ]
+}
