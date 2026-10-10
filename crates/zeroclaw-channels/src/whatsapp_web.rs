@@ -482,6 +482,7 @@ struct WhatsAppInboundContext {
     transcription_config: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    workspace_dir: Option<PathBuf>,
 }
 
 impl WhatsAppWebChannel {
@@ -1231,6 +1232,14 @@ impl WhatsAppWebChannel {
 
         let mut attachments = Vec::new();
         Self::collect_media_attachments(client, msg, "", false, &mut attachments).await;
+        if let Some(workspace_dir) = context.workspace_dir.as_deref()
+            && let Some(phone) =
+                Self::sender_phone_digits(&sender_jid, sender_alt.as_ref(), mapped_phone.as_deref())
+        {
+            let stem = Self::inbound_file_stem(&phone, &info.id);
+            let markers = Self::save_inbound_images(workspace_dir, &stem, &mut attachments).await;
+            content = Self::content_with_image_markers(content, &markers, msg);
+        }
         if let Some(quoted) = Self::extract_quoted_message(msg) {
             Self::collect_media_attachments(client, quoted, "quoted-", true, &mut attachments)
                 .await;
@@ -1595,6 +1604,127 @@ impl WhatsAppWebChannel {
             "jpeg" => "jpg".to_string(),
             "svg+xml" => "svg".to_string(),
             other => other.to_string(),
+        }
+    }
+
+    /// The sender's phone number, digits only, used to name the files saved
+    /// for them. Never the LID: a LID is not the number operators and tools
+    /// know the person by, so the sender JID counts only when it is itself a
+    /// phone-number JID, then the alternate JID, then the LID→phone mapping.
+    #[cfg(feature = "whatsapp-web")]
+    fn sender_phone_digits(
+        sender: &wacore_binary::jid::Jid,
+        sender_alt: Option<&wacore_binary::jid::Jid>,
+        mapped_phone: Option<&str>,
+    ) -> Option<String> {
+        let digits = |user: &str| {
+            let digits: String = user.chars().filter(char::is_ascii_digit).collect();
+            (!digits.is_empty()).then_some(digits)
+        };
+        if sender.is_pn() {
+            return digits(sender.user_base());
+        }
+        if let Some(alt) = sender_alt.filter(|alt| alt.is_pn()) {
+            return digits(alt.user_base());
+        }
+        let mapped = mapped_phone?;
+        digits(mapped.split(['@', ':']).next().unwrap_or(mapped))
+    }
+
+    /// `<phone>_<message id>`, reduced to characters that are safe in a file
+    /// name whatever the message id contains.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_file_stem(phone_digits: &str, message_id: &str) -> String {
+        let id: String = message_id
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        format!("{phone_digits}_{id}")
+    }
+
+    /// Saves every provider-loadable image in `attachments` as
+    /// `<workspace>/whatsapp_files/<stem>_<n>.<ext>` and marks it, the way
+    /// Telegram saves to `telegram_files/`, so the agent keeps a path to the
+    /// original after the turn. Returns the rendered `[IMAGE:<path>]` markers.
+    ///
+    /// Best effort: an attachment that cannot be written keeps `marker: None`
+    /// and reaches the agent exactly as it did before files were saved.
+    #[cfg(feature = "whatsapp-web")]
+    async fn save_inbound_images(
+        workspace_dir: &Path,
+        stem: &str,
+        attachments: &mut [MediaAttachment],
+    ) -> Vec<String> {
+        let warn = |error: &std::io::Error, what: &str| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": zeroclaw_runtime::security::scrub(&error.to_string()),
+                    })),
+                what
+            );
+        };
+
+        if !attachments
+            .iter()
+            .any(|a| a.provider_loadable_image_mime().is_some())
+        {
+            return Vec::new();
+        }
+        let save_dir = workspace_dir.join("whatsapp_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            warn(&e, "failed to create whatsapp_files directory");
+            return Vec::new();
+        }
+        // The multimodal loader accepts only absolute paths.
+        let save_dir = match tokio::fs::canonicalize(&save_dir).await {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn(&e, "failed to resolve whatsapp_files directory");
+                return Vec::new();
+            }
+        };
+
+        let mut markers = Vec::new();
+        for (n, attachment) in attachments.iter_mut().enumerate() {
+            let Some(mime) = attachment.provider_loadable_image_mime() else {
+                continue;
+            };
+            let ext = Self::mime_extension(mime, "jpg");
+            let path = save_dir.join(format!("{stem}_{n}.{ext}"));
+            if let Err(e) = tokio::fs::write(&path, &attachment.data).await {
+                warn(&e, "failed to save WhatsApp image attachment");
+                continue;
+            }
+            let target = path.display().to_string();
+            markers.push(format!("[IMAGE:{target}]"));
+            attachment.marker = Some(zeroclaw_api::media::RenderedMarker {
+                target,
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            });
+        }
+        markers
+    }
+
+    /// Puts the saved images' markers in front of the text. A media-only
+    /// message's placeholder (`[Image]`, `[Sticker]`) is replaced, since the
+    /// marker now says what it said.
+    #[cfg(feature = "whatsapp-web")]
+    fn content_with_image_markers(
+        content: String,
+        markers: &[String],
+        msg: &waproto::whatsapp::Message,
+    ) -> String {
+        if markers.is_empty() {
+            return content;
+        }
+        let markers = markers.join("\n");
+        if content.is_empty() || content == Self::media_fallback_content(String::new(), msg) {
+            markers
+        } else {
+            format!("{markers}\n\n{content}")
         }
     }
 
@@ -3905,6 +4035,7 @@ impl Channel for WhatsAppWebChannel {
                 transcription_config: self.transcription.clone(),
                 transcription_manager: self.transcription_manager.clone(),
                 voice_chats: self.voice_chats.clone(),
+                workspace_dir: self.workspace_dir.clone(),
             };
             let configured_push_name = self.push_name.clone();
             // The SDK detaches event callbacks. Fence their config writes
@@ -6051,6 +6182,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         };
         let message_event = |lid: &str| {
             single_message_event(
@@ -6195,6 +6327,7 @@ mod tests {
                     transcription_config: None,
                     transcription_manager: None,
                     voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                    workspace_dir: None,
                 }
             };
 
@@ -6322,6 +6455,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         };
 
         WhatsAppWebChannel::handle_inbound_message_event(&batch, &client, &context).await;
@@ -6421,6 +6555,7 @@ mod tests {
                 transcription_config: None,
                 transcription_manager: None,
                 voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                workspace_dir: None,
             };
 
         // Personal mode: the operator's own self-chat is admitted even though
@@ -6516,6 +6651,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         };
 
         let outbound_echo = event(OPERATOR, true, "outbound delivery mirror");
@@ -7043,6 +7179,144 @@ mod tests {
         let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
             .expect("sticker reply should expose the quoted message");
         assert!(quoted.image_message.is_set());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn sender_phone_digits_never_uses_the_lid() {
+        let pn_device: Jid = "15551234567:12@s.whatsapp.net".parse().unwrap();
+        assert_eq!(
+            WhatsAppWebChannel::sender_phone_digits(&pn_device, None, None).as_deref(),
+            Some("15551234567"),
+            "the device suffix is not part of the number"
+        );
+
+        let lid = Jid::lid("76188559093817");
+        let alt = Jid::pn("15557654321");
+        assert_eq!(
+            WhatsAppWebChannel::sender_phone_digits(&lid, Some(&alt), None).as_deref(),
+            Some("15557654321")
+        );
+        assert_eq!(
+            WhatsAppWebChannel::sender_phone_digits(&lid, None, Some("15550001111@s.whatsapp.net"))
+                .as_deref(),
+            Some("15550001111")
+        );
+        assert_eq!(
+            WhatsAppWebChannel::sender_phone_digits(&lid, Some(&Jid::lid("999")), None),
+            None,
+            "a LID with no phone behind it names no file"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_file_stem_keeps_only_safe_message_id_characters() {
+        assert_eq!(
+            WhatsAppWebChannel::inbound_file_stem("15551234567", "3EB0../A1/b2"),
+            "15551234567_3EB0A1b2"
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_image(file_name: &str, mime: &str) -> MediaAttachment {
+        MediaAttachment {
+            file_name: file_name.to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4],
+            mime_type: Some(mime.to_string()),
+            marker: None,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn save_inbound_images_writes_and_marks_loadable_images() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut attachments = vec![
+            inbound_image("whatsapp-image.jpg", "image/jpeg"),
+            MediaAttachment {
+                file_name: "whatsapp-video.mp4".to_string(),
+                data: vec![0, 0, 0, 0x18],
+                mime_type: Some("video/mp4".to_string()),
+                marker: None,
+            },
+        ];
+
+        let markers = WhatsAppWebChannel::save_inbound_images(
+            workspace.path(),
+            "15551234567_3EB0",
+            &mut attachments,
+        )
+        .await;
+
+        let expected = workspace
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("whatsapp_files/15551234567_3EB0_0.jpg");
+        assert_eq!(std::fs::read(&expected).unwrap(), attachments[0].data);
+        assert_eq!(markers, vec![format!("[IMAGE:{}]", expected.display())]);
+        let marker = attachments[0].marker.as_ref().expect("image is marked");
+        assert_eq!(marker.target, expected.display().to_string());
+        assert_eq!(marker.kind, zeroclaw_api::media::MarkerKind::Image);
+        assert!(attachments[1].marker.is_none(), "video stays in memory");
+        assert_eq!(
+            std::fs::read_dir(workspace.path().join("whatsapp_files"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn save_inbound_images_failure_leaves_the_attachment_in_memory() {
+        let workspace = tempfile::tempdir().unwrap();
+        // A file where the directory should be makes create_dir_all fail.
+        std::fs::write(workspace.path().join("whatsapp_files"), b"").unwrap();
+        let mut attachments = vec![inbound_image("whatsapp-image.jpg", "image/jpeg")];
+
+        let markers = WhatsAppWebChannel::save_inbound_images(
+            workspace.path(),
+            "15551234567_X",
+            &mut attachments,
+        )
+        .await;
+
+        assert!(markers.is_empty());
+        assert!(attachments[0].marker.is_none());
+        assert_eq!(attachments[0].data.len(), 8, "bytes are still delivered");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn content_with_image_markers_replaces_only_the_placeholder() {
+        let image_only = waproto::whatsapp::Message {
+            image_message: waproto::whatsapp::message::ImageMessage::default().into(),
+            ..Default::default()
+        };
+        let markers = vec!["[IMAGE:/ws/whatsapp_files/1_a_0.jpg]".to_string()];
+
+        assert_eq!(
+            WhatsAppWebChannel::content_with_image_markers(
+                "[Image]".to_string(),
+                &markers,
+                &image_only
+            ),
+            "[IMAGE:/ws/whatsapp_files/1_a_0.jpg]"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::content_with_image_markers(
+                "log this".to_string(),
+                &markers,
+                &image_only
+            ),
+            "[IMAGE:/ws/whatsapp_files/1_a_0.jpg]\n\nlog this"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::content_with_image_markers("[Image]".to_string(), &[], &image_only),
+            "[Image]"
+        );
     }
 
     #[test]
@@ -7812,6 +8086,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         };
 
         let reply_event = single_message_event(
@@ -7927,6 +8202,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         };
 
         for (word, expected) in [
@@ -8630,6 +8906,7 @@ mod tests {
                 transcription_config: None,
                 transcription_manager: None,
                 voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                workspace_dir: None,
             }
         };
 
