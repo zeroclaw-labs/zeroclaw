@@ -13545,13 +13545,34 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             model_context_window,
             cost_usd: _,
             accepted: true,
+            estimated_input_tokens,
             ..
-        } => SessionUpdateEvent::ContextUsage {
-            session_id: session_id.to_string(),
-            input_tokens: *input_tokens,
-            max_context_tokens: *context_token_budget,
-            model_context_window: *model_context_window,
-        },
+        } => {
+            // Display numerator: prefer the provider-reported count, and fall
+            // back to the runtime estimate only when the provider omitted it.
+            // The estimate is labelled so a client never renders it as a
+            // measured value; accounting and persistence consumers keep
+            // reading the provider-only `input_tokens` off the event itself.
+            let (displayed_input_tokens, input_tokens_source) =
+                match (*input_tokens, *estimated_input_tokens) {
+                    (Some(measured), _) => (
+                        Some(measured),
+                        Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                    ),
+                    (None, Some(estimated)) => (
+                        Some(estimated),
+                        Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    ),
+                    (None, None) => (None, None),
+                };
+            SessionUpdateEvent::ContextUsage {
+                session_id: session_id.to_string(),
+                input_tokens: displayed_input_tokens,
+                input_tokens_source,
+                max_context_tokens: *context_token_budget,
+                model_context_window: *model_context_window,
+            }
+        }
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
@@ -27256,6 +27277,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -27346,6 +27368,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         if let TurnEvent::Usage {
             context_token_budget,
@@ -27502,6 +27525,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         if let TurnEvent::Usage {
@@ -27592,6 +27616,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-b".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let model_ctx_window = if let TurnEvent::Usage {
             provider_ref,
@@ -27644,6 +27669,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         // budget = trim budget (fills toward), window = full model capacity.
         let json = notification_for_turn_event("s1", &event).unwrap();
@@ -27661,6 +27687,120 @@ mod tests {
         assert_eq!(v["params"]["model_context_window"], 200_000);
     }
 
+    /// Boundary: when the provider omits usage, the meter must still receive
+    /// a numerator, and it must be labelled `estimate` so a client never
+    /// renders a derived value as provider-reported.
+    #[test]
+    fn estimated_usage_reaches_context_usage_labelled_as_an_estimate() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".to_string(),
+            model: "local-model".to_string(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 4_200,
+            "estimate must supply the display numerator"
+        );
+        assert_eq!(
+            v["params"]["input_tokens_source"], "estimate",
+            "estimated numerators must be labelled, not passed off as measured"
+        );
+        assert_eq!(v["params"]["max_context_tokens"], 180_000);
+    }
+
+    /// Boundary: a provider-reported count is labelled `provider` and the
+    /// estimate never competes with it.
+    #[test]
+    fn provider_reported_usage_reaches_context_usage_labelled_as_provider() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "openai.default".to_string(),
+            model: "model-a".to_string(),
+            accepted: true,
+            estimated_input_tokens: None,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["input_tokens"], 100);
+        assert_eq!(v["params"]["input_tokens_source"], "provider");
+    }
+
+    /// Boundary: cached-only provider usage keeps the measured total unknown,
+    /// and the display numerator it forwards must not fall below the proven
+    /// cached subset. This exercises the real cached-plus-estimate pairing the
+    /// producer emits, not an estimate-free event.
+    #[test]
+    fn cached_only_usage_forwards_a_numerator_at_or_above_its_cached_subset() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: Some(80_000),
+            output_tokens: Some(7),
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "anthropic.default".to_string(),
+            model: "model-c".to_string(),
+            accepted: true,
+            // What `record_accepted_chat_response` actually produces for this
+            // response: the history estimate floored at the cached subset.
+            estimated_input_tokens: Some(80_000),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 80_000,
+            "display numerator must respect the known cached minimum"
+        );
+        assert_eq!(
+            v["params"]["input_tokens_source"], "estimate",
+            "a floored value is still an estimate, not a measured total"
+        );
+    }
+
+    /// Boundary: with no measured total and no estimate at all, the numerator
+    /// stays absent rather than being back-filled.
+    #[test]
+    fn unknown_total_without_an_estimate_stays_absent() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: Some(7),
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "anthropic.default".to_string(),
+            model: "model-c".to_string(),
+            accepted: true,
+            estimated_input_tokens: None,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert!(
+            v["params"].get("input_tokens").is_none(),
+            "an unknown measured total must stay absent, not be back-filled"
+        );
+        assert!(
+            v["params"].get("input_tokens_source").is_none(),
+            "absent numerator must carry no provenance label"
+        );
+    }
+
     #[test]
     fn rejected_usage_event_does_not_advance_context_snapshot() {
         let event = TurnEvent::Usage {
@@ -27673,6 +27813,7 @@ mod tests {
             provider_ref: "openai.fallback".to_string(),
             model: "model-b".to_string(),
             accepted: false,
+            estimated_input_tokens: None,
         };
 
         assert!(
@@ -27826,6 +27967,7 @@ mod tests {
             provider_ref: "custom.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27853,6 +27995,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27876,6 +28019,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27900,6 +28044,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);

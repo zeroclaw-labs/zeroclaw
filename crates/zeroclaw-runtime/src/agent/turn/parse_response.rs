@@ -400,11 +400,40 @@ pub(crate) async fn record_accepted_chat_response(
     // usage data, so terminal identity and context-window accounting always
     // describe the accepted serving provider/model. The caller settles
     // rejected physical attempts separately and never reaches this point.
+    //
+    // `input_tokens` stays strictly provider-reported: `None` here means the
+    // provider reported nothing, and every accounting/persistence consumer
+    // depends on that. Local OpenAI-compatible servers (llama.cpp and
+    // similar) routinely omit `usage`, which would leave the context meter
+    // with a budget but no numerator, so publish a *separate*, explicitly
+    // estimated value for display only.
+    //
+    // Deliberately computed only when the provider omitted `input_tokens`.
+    // Substituting an estimate into `input_tokens` would break the documented
+    // invariant that `cached_input_tokens` is a subset of the total: a
+    // cached-only response (total absent, cached 80_000) would otherwise
+    // publish a total of ~5 alongside a cached subset of 80_000.
+    //
+    // When the provider proved a cached subset without a total, that subset is
+    // a known minimum for the prompt. Floor the display estimate at it so the
+    // meter cannot read near-zero against a prompt already known to be large
+    // (a 5-token history estimate beside 80_000 cached tokens would otherwise
+    // render 0% on a 200_000-token window despite a known 40% floor). The
+    // result stays labelled as an estimate and the measured total stays
+    // unknown.
     if let Some(tx) = ctx.event_tx {
+        let cached_input_tokens = usage.and_then(|u| u.cached_input_tokens);
+        let estimated_input_tokens = if input_tokens.is_none() {
+            let history_estimate = crate::agent::history::estimate_history_tokens(history) as u64;
+            let floored = history_estimate.max(cached_input_tokens.unwrap_or(0));
+            (floored > 0).then_some(floored)
+        } else {
+            None
+        };
         let _ = tx
             .send(TurnEvent::Usage {
                 input_tokens,
-                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                cached_input_tokens,
                 output_tokens,
                 cost_usd,
                 context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
@@ -415,6 +444,7 @@ pub(crate) async fn record_accepted_chat_response(
                 provider_ref: effective_provider.to_string(),
                 model: effective_model.to_string(),
                 accepted: true,
+                estimated_input_tokens,
             })
             .await;
     }
@@ -1054,5 +1084,265 @@ mod cost_usd_regression_tests {
             rx.try_recv().is_err(),
             "malformed output must not emit accepted Usage"
         );
+    }
+
+    /// Build a `TurnCtx` for the estimate tests. Neutral, project-scoped
+    /// fixture values only.
+    fn estimate_test_ctx<'a>(
+        tx: &'a tokio::sync::mpsc::Sender<TurnEvent>,
+        pacing: &'a zeroclaw_config::schema::PacingConfig,
+        provider_name: &'a str,
+        model: &'a str,
+        turn_id: &'a str,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name,
+            model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            channel_name: "rpc",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            agent_alias: Some("test_agent"),
+            turn_id,
+            serving_provider_name: None,
+            serving_model: None,
+        }
+    }
+
+    /// Local OpenAI-compatible servers (llama.cpp, older ollama, etc.) often
+    /// omit `usage` entirely. The accepted event must still carry a numerator
+    /// for the context meter, but it must arrive on the display-only
+    /// `estimated_input_tokens` field — never as measured `input_tokens`.
+    #[tokio::test]
+    async fn missing_provider_usage_publishes_estimate_off_the_measured_field() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-no-usage");
+
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("Explain how context windows work in local models."),
+        ];
+        let expected_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+        assert!(
+            expected_estimate > 0,
+            "fixture must produce a usable estimate"
+        );
+
+        record_accepted_chat_response(
+            &ctx,
+            "llamacpp",
+            "local-model",
+            "Local models often omit usage.",
+            &[],
+            0,
+            None,
+            &history,
+            std::time::Instant::now(),
+            0,
+            None,
+        )
+        .await;
+
+        match rx.try_recv().expect("accepted response must emit Usage") {
+            TurnEvent::Usage {
+                input_tokens,
+                estimated_input_tokens,
+                cached_input_tokens,
+                cost_usd,
+                accepted,
+                ..
+            } => {
+                assert_eq!(
+                    input_tokens, None,
+                    "measured input_tokens must stay absent when the provider reported nothing"
+                );
+                assert_eq!(
+                    estimated_input_tokens,
+                    Some(expected_estimate),
+                    "display estimate must carry the history estimate"
+                );
+                assert_eq!(cached_input_tokens, None);
+                assert_eq!(cost_usd, None, "an estimate must not invent a cost");
+                assert!(accepted);
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "must emit exactly one Usage event");
+    }
+
+    /// `cached_input_tokens` is documented as a subset of `input_tokens`.
+    /// When a provider reports the cached subset but omits the total, the
+    /// measured total must stay unknown — and the *display* estimate must be
+    /// floored at the proven cached subset, so the meter cannot read
+    /// near-zero for a prompt already known to be large.
+    #[tokio::test]
+    async fn cached_only_usage_floors_the_display_estimate_at_the_cached_minimum() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-cached-only");
+
+        // Deliberately tiny history: its raw estimate is far below the cached
+        // subset the provider proved.
+        let history = vec![ChatMessage::user("hi")];
+        let raw_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+        assert!(
+            raw_estimate < 80_000,
+            "fixture must exercise the impossible-total case"
+        );
+        let usage = TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(7),
+            cached_input_tokens: Some(80_000),
+            cache_creation_input_tokens: None,
+        };
+
+        record_accepted_chat_response(
+            &ctx,
+            "llamacpp",
+            "local-model",
+            "ok",
+            &[],
+            0,
+            Some(&usage),
+            &history,
+            std::time::Instant::now(),
+            0,
+            None,
+        )
+        .await;
+
+        match rx.try_recv().expect("accepted response must emit Usage") {
+            TurnEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                estimated_input_tokens,
+                ..
+            } => {
+                assert_eq!(
+                    input_tokens, None,
+                    "cached-only usage must leave the measured total unknown"
+                );
+                assert_eq!(cached_input_tokens, Some(80_000));
+                assert_eq!(
+                    estimated_input_tokens,
+                    Some(80_000),
+                    "display estimate must be floored at the proven cached minimum, \
+                     not the {raw_estimate}-token history estimate"
+                );
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+    }
+
+    /// A history larger than the cached subset must win: the floor raises a
+    /// too-small estimate, it never caps a legitimate one.
+    #[tokio::test]
+    async fn cached_floor_does_not_cap_a_larger_history_estimate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-cached-small");
+
+        let history = vec![ChatMessage::user(
+            "A considerably longer prompt so the history estimate clears the cached subset.",
+        )];
+        let raw_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+        let usage = TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(7),
+            cached_input_tokens: Some(3),
+            cache_creation_input_tokens: None,
+        };
+        assert!(raw_estimate > 3, "fixture must exceed the cached subset");
+
+        record_accepted_chat_response(
+            &ctx,
+            "llamacpp",
+            "local-model",
+            "ok",
+            &[],
+            0,
+            Some(&usage),
+            &history,
+            std::time::Instant::now(),
+            0,
+            None,
+        )
+        .await;
+
+        match rx.try_recv().expect("accepted response must emit Usage") {
+            TurnEvent::Usage {
+                estimated_input_tokens,
+                ..
+            } => assert_eq!(
+                estimated_input_tokens,
+                Some(raw_estimate),
+                "a larger history estimate must not be capped by a small cached floor"
+            ),
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+    }
+
+    /// A provider-reported count is authoritative and suppresses the estimate
+    /// entirely, so no consumer has to choose between two numerators.
+    #[tokio::test]
+    async fn provider_usage_suppresses_the_estimate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = estimate_test_ctx(&tx, &pacing, "openai", "gpt-test", "turn-real-usage");
+
+        let history = vec![ChatMessage::user("hi")];
+        let usage = TokenUsage {
+            input_tokens: Some(1234),
+            output_tokens: Some(56),
+            cached_input_tokens: Some(10),
+            cache_creation_input_tokens: None,
+        };
+
+        record_accepted_chat_response(
+            &ctx,
+            "openai",
+            "gpt-test",
+            "hello",
+            &[],
+            0,
+            Some(&usage),
+            &history,
+            std::time::Instant::now(),
+            0,
+            None,
+        )
+        .await;
+
+        match rx.try_recv().expect("accepted response must emit Usage") {
+            TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                estimated_input_tokens,
+                ..
+            } => {
+                assert_eq!(input_tokens, Some(1234));
+                assert_eq!(output_tokens, Some(56));
+                assert_eq!(cached_input_tokens, Some(10));
+                assert_eq!(
+                    estimated_input_tokens, None,
+                    "provider-reported usage must suppress the estimate"
+                );
+            }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
     }
 }
