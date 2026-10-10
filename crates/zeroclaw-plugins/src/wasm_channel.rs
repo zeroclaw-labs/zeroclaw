@@ -19,16 +19,18 @@ use crate::host::AdmittedComponent;
 use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::Instant;
 use wasmtime::Store;
 use wasmtime::component::Component;
 use wasmtime::component::Linker;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ListenerHealth,
+    SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_api::webhook::{
@@ -53,6 +55,10 @@ pub struct WasmChannel {
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
     poll_healthy: AtomicBool,
+    /// The guest's latest `health-check` answer, recorded by the listener and
+    /// read by `listener_health`. Only kept for a component that advertises
+    /// `HEALTH_CHECK`.
+    guest_health: std::sync::Mutex<GuestHealth>,
     /// Applied at the final host boundary for polling and webhook delivery.
     sender_authorizer: SenderAuthorizer,
     /// Drain end of the bounded gateway-to-plugin queue. Set once by runtime
@@ -98,6 +104,104 @@ fn poll_health_ok(flag: &AtomicBool) -> bool {
 
 fn mark_poll_healthy(flag: &AtomicBool, healthy: bool) {
     flag.store(healthy, Ordering::Relaxed);
+}
+
+/// How often a listening channel asks the guest's `health-check` export. It
+/// matches the channel supervisor's health heartbeat, so each heartbeat reads
+/// an answer at most one interval old, and it bounds the guest's cost to one
+/// extra call per interval however busy the poll loop is.
+const GUEST_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The longest wait between asks while asks keep failing. A failed ask
+/// discards the instance and the next call rebuilds it with `configure`, which
+/// reconnects a gateway-style plugin, so a check that always fails must not
+/// trigger that every interval.
+const GUEST_HEALTH_MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+/// The wait before the next ask: the regular interval after an ask that
+/// completed, and twice the previous wait, up to the cap, after one that
+/// failed.
+fn next_guest_health_interval(previous: Duration, completed: bool) -> Duration {
+    if completed {
+        GUEST_HEALTH_INTERVAL
+    } else {
+        previous.saturating_mul(2).min(GUEST_HEALTH_MAX_BACKOFF)
+    }
+}
+
+/// How long a `health-check` answer stays evidence. The next answer is due one
+/// interval after the last and lands after a poll and an ask that may each run
+/// up to the call deadline; one more interval absorbs waits behind other calls
+/// on the same instance. A listener with no answer for longer has stalled.
+fn guest_health_stale_after(call_timeout: Duration) -> Duration {
+    GUEST_HEALTH_INTERVAL
+        .saturating_add(call_timeout)
+        .saturating_mul(2)
+}
+
+/// The guest's latest `health-check` answer, as the listener recorded it.
+///
+/// `listener_health` is synchronous and must not reach the guest: guest calls
+/// share one warm store behind an async lock and a call deadline, so the
+/// listener asks between polls and leaves its answer here to be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestHealth {
+    /// The guest has not answered yet.
+    Unasked,
+    /// The guest's only answer so far was `false`. A plugin that connects over
+    /// several polls answers so until it is connected, so the host waits for a
+    /// second answer before calling it unhealthy.
+    Unconfirmed(Instant),
+    /// An answer that stands, and when it arrived.
+    Answered { healthy: bool, at: Instant },
+}
+
+impl GuestHealth {
+    /// The state after the guest answers `healthy` at `at`.
+    fn answered(self, healthy: bool, at: Instant) -> Self {
+        if !healthy && self == Self::Unasked {
+            Self::Unconfirmed(at)
+        } else {
+            Self::Answered { healthy, at }
+        }
+    }
+
+    /// The state after an ask traps, misses its deadline, or cannot rebuild
+    /// the instance. The host saw that failure itself, so it is not the
+    /// plugin's own "not connected yet" and gets no second chance.
+    fn failed(at: Instant) -> Self {
+        Self::Answered { healthy: false, at }
+    }
+
+    fn observe(self, now: Instant, stale_after: Duration) -> ListenerHealth {
+        match self {
+            Self::Unasked => ListenerHealth::Pending,
+            Self::Unconfirmed(at) | Self::Answered { healthy: true, at }
+                if now.saturating_duration_since(at) >= stale_after =>
+            {
+                ListenerHealth::Unhealthy
+            }
+            Self::Unconfirmed(_) => ListenerHealth::Pending,
+            Self::Answered { healthy: true, .. } => ListenerHealth::Healthy,
+            Self::Answered { healthy: false, .. } => ListenerHealth::Unhealthy,
+        }
+    }
+}
+
+/// Combine the two health signals a plugin channel has. A trapping poll bridge
+/// is unhealthy whatever the guest last answered, and whether or not the guest
+/// answers at all; `guest` is `None` for a component without `HEALTH_CHECK`,
+/// which otherwise offers no signal.
+fn listener_verdict(
+    poll_ok: bool,
+    guest: Option<GuestHealth>,
+    now: Instant,
+    stale_after: Duration,
+) -> Option<ListenerHealth> {
+    if !poll_ok {
+        return Some(ListenerHealth::Unhealthy);
+    }
+    guest.map(|guest| guest.observe(now, stale_after))
 }
 
 fn deny_all_senders() -> SenderAuthorizer {
@@ -210,6 +314,7 @@ impl WasmChannel {
             cached_self_addressed_mention: instance.self_addressed_mention,
             cached_multi_message_delay_ms: instance.multi_message_delay_ms,
             poll_healthy: AtomicBool::new(true),
+            guest_health: std::sync::Mutex::new(GuestHealth::Unasked),
             sender_authorizer: deny_all_senders(),
             webhook_rx: std::sync::Mutex::new(None),
         })
@@ -238,6 +343,72 @@ impl WasmChannel {
             );
         }
         Ok(instance.state)
+    }
+
+    /// Whether the listener asks the guest's `health-check` export at all.
+    fn asks_guest_health(&self) -> bool {
+        self.capabilities
+            .contains(ChannelCapabilities::HEALTH_CHECK)
+    }
+
+    fn guest_health(&self) -> GuestHealth {
+        *self
+            .guest_health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Call the guest's `health-check` export on the warm instance. The export
+    /// returns a bare `bool`, so any error is a trap or a failed host call, and
+    /// the instance is discarded rather than handed back unusable.
+    async fn call_guest_health_check(&self) -> Result<bool> {
+        call_channel!(
+            self,
+            discard_on_error,
+            async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                wt(
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_health_check(store)
+                        .await,
+                    "channel.health-check failed",
+                )
+            }
+        )
+    }
+
+    /// Ask the guest for its health and record the answer for
+    /// `listener_health`. Returns whether the call completed; a call that did
+    /// not has discarded the instance.
+    async fn ask_guest_health(&self) -> bool {
+        let answer = self.call_guest_health_check().await;
+        let now = Instant::now();
+        if let Err(error) = &answer {
+            // The error may come from an earlier poll or send trap: a store
+            // that trapped refuses every call, including this one.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "channel": self.endpoint.channel_type(),
+                        "channel_alias": self.endpoint.alias(),
+                        "error": bounded_webhook_detail(format!("{error:#}")),
+                        "error_key": "plugin_channel_health_check_failed",
+                    })),
+                "Channel plugin health-check did not complete; replacing the instance and reporting the listener unhealthy"
+            );
+        }
+        let completed = answer.is_ok();
+        let mut recorded = self
+            .guest_health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *recorded = match answer {
+            Ok(healthy) => recorded.answered(healthy, now),
+            Err(_) => GuestHealth::failed(now),
+        };
+        completed
     }
 
     /// Handle to this channel's inbound queue. A host-run listener clones it and
@@ -778,6 +949,13 @@ impl Channel for WasmChannel {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
             const MAX_BACKOFF: Duration = Duration::from_millis(500);
             let mut backoff = INITIAL_BACKOFF;
+            // The first ask follows the first poll, so a plugin that connects
+            // lazily has had one poll to start; later asks wait a full
+            // interval, longer while asks keep failing. Asking on this task
+            // keeps it between polls, so it never overlaps `poll-message` and a
+            // busy poll loop cannot skip it.
+            let mut next_health_ask = self.asks_guest_health().then(Instant::now);
+            let mut health_ask_interval = GUEST_HEALTH_INTERVAL;
             loop {
                 let polled: Result<Option<WitInboundMessage>> = call_channel!(
                     self,
@@ -791,6 +969,14 @@ impl Channel for WasmChannel {
                         )
                     }
                 );
+                if let Some(due) = next_health_ask
+                    && Instant::now() >= due
+                {
+                    let completed = self.ask_guest_health().await;
+                    health_ask_interval =
+                        next_guest_health_interval(health_ask_interval, completed);
+                    next_health_ask = Some(Instant::now() + health_ask_interval);
+                }
                 match polled {
                     Ok(Some(wit_msg)) => {
                         mark_poll_healthy(&self.poll_healthy, true);
@@ -918,25 +1104,26 @@ impl Channel for WasmChannel {
         if !poll_health_ok(&self.poll_healthy) {
             return false;
         }
-        if !self
-            .capabilities
-            .contains(ChannelCapabilities::HEALTH_CHECK)
-        {
+        if !self.asks_guest_health() {
             return true;
         }
-        let result: Result<bool> = call_channel!(
-            self,
-            async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_health_check(store)
-                        .await,
-                    "channel.health-check failed",
-                )
-            }
-        );
-        result.unwrap_or(false)
+        self.call_guest_health_check().await.unwrap_or(false)
+    }
+
+    /// Read what the listener last recorded, without calling the guest: the
+    /// poll bridge's latest outcome, and for a component that advertises
+    /// `HEALTH_CHECK`, the guest's latest `health-check` answer. The
+    /// listener asks for that answer every `GUEST_HEALTH_INTERVAL` (less often
+    /// while asks fail, which already reads as unhealthy); an answer older
+    /// than `guest_health_stale_after` means the listener has stalled, and
+    /// reads as unhealthy.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        listener_verdict(
+            poll_health_ok(&self.poll_healthy),
+            self.asks_guest_health().then(|| self.guest_health()),
+            Instant::now(),
+            guest_health_stale_after(self.factory.limits.call_timeout),
+        )
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -1396,6 +1583,159 @@ mod tests {
         // A subsequent successful poll clears the condition.
         mark_poll_healthy(&flag, true);
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
+    }
+
+    const STALE: Duration = Duration::from_secs(90);
+
+    #[test]
+    fn guest_health_is_pending_until_the_guest_answers() {
+        let now = Instant::now();
+        assert_eq!(
+            GuestHealth::Unasked.observe(now, STALE),
+            ListenerHealth::Pending
+        );
+        assert_eq!(
+            GuestHealth::Unasked.observe(now + STALE * 10, STALE),
+            ListenerHealth::Pending,
+            "no answer is no evidence either way, however long it takes"
+        );
+    }
+
+    #[test]
+    fn a_healthy_answer_holds_until_it_goes_stale() {
+        let asked = Instant::now();
+        let health = GuestHealth::Unasked.answered(true, asked);
+
+        assert_eq!(health.observe(asked, STALE), ListenerHealth::Healthy);
+        assert_eq!(
+            health.observe(asked + STALE - Duration::from_secs(1), STALE),
+            ListenerHealth::Healthy
+        );
+        assert_eq!(
+            health.observe(asked + STALE, STALE),
+            ListenerHealth::Unhealthy,
+            "an answer nobody has refreshed stops vouching for the channel"
+        );
+    }
+
+    #[test]
+    fn a_first_false_answer_waits_for_the_next_one() {
+        let first = Instant::now();
+        let connecting = GuestHealth::Unasked.answered(false, first);
+        assert_eq!(connecting, GuestHealth::Unconfirmed(first));
+        assert_eq!(
+            connecting.observe(first, STALE),
+            ListenerHealth::Pending,
+            "a plugin still connecting has not failed yet"
+        );
+        assert_eq!(
+            connecting.observe(first + STALE, STALE),
+            ListenerHealth::Unhealthy,
+            "the grace ends when no second answer arrives"
+        );
+
+        let second = first + GUEST_HEALTH_INTERVAL;
+        assert_eq!(
+            connecting.answered(false, second).observe(second, STALE),
+            ListenerHealth::Unhealthy,
+            "a second false answer is a verdict"
+        );
+        assert_eq!(
+            connecting.answered(true, second).observe(second, STALE),
+            ListenerHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn a_false_answer_after_a_healthy_one_is_unhealthy_at_once() {
+        let asked = Instant::now();
+        let later = asked + GUEST_HEALTH_INTERVAL;
+        let health = GuestHealth::Unasked
+            .answered(true, asked)
+            .answered(false, later);
+
+        assert_eq!(health.observe(later, STALE), ListenerHealth::Unhealthy);
+        assert_eq!(
+            health
+                .answered(true, later + GUEST_HEALTH_INTERVAL)
+                .observe(later + GUEST_HEALTH_INTERVAL, STALE),
+            ListenerHealth::Healthy,
+            "a later healthy answer recovers the channel"
+        );
+    }
+
+    #[test]
+    fn a_failed_ask_is_unhealthy_without_the_startup_grace() {
+        let asked = Instant::now();
+        assert_eq!(
+            GuestHealth::failed(asked).observe(asked, STALE),
+            ListenerHealth::Unhealthy
+        );
+    }
+
+    #[test]
+    fn a_failing_poll_bridge_is_unhealthy_whatever_the_guest_answered() {
+        let now = Instant::now();
+        let healthy = GuestHealth::Unasked.answered(true, now);
+
+        assert_eq!(
+            listener_verdict(false, Some(healthy), now, STALE),
+            Some(ListenerHealth::Unhealthy)
+        );
+        assert_eq!(
+            listener_verdict(false, None, now, STALE),
+            Some(ListenerHealth::Unhealthy),
+            "a component without a health check still reports its poll failures"
+        );
+        assert_eq!(
+            listener_verdict(true, Some(healthy), now, STALE),
+            Some(ListenerHealth::Healthy)
+        );
+    }
+
+    #[test]
+    fn a_component_without_a_health_check_offers_no_signal_while_polls_succeed() {
+        assert_eq!(listener_verdict(true, None, Instant::now(), STALE), None);
+    }
+
+    #[test]
+    fn failed_asks_back_off_to_a_cap_and_a_completed_ask_resets_the_wait() {
+        let mut wait = GUEST_HEALTH_INTERVAL;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            wait = next_guest_health_interval(wait, false);
+            waits.push(wait.as_secs());
+        }
+        assert_eq!(waits, [60, 120, 240, 480, 600, 600, 600]);
+        assert_eq!(
+            next_guest_health_interval(wait, true),
+            GUEST_HEALTH_INTERVAL
+        );
+        assert_eq!(
+            next_guest_health_interval(GUEST_HEALTH_INTERVAL, true),
+            GUEST_HEALTH_INTERVAL,
+            "asks that keep completing stay on the regular interval"
+        );
+    }
+
+    #[test]
+    fn answers_outlive_the_slowest_cadence_that_has_not_stalled() {
+        let call_timeout = Duration::from_secs(30);
+        let stale_after = guest_health_stale_after(call_timeout);
+        assert_eq!(stale_after, (GUEST_HEALTH_INTERVAL + call_timeout) * 2);
+
+        // The next answer is due one interval later and can land after a poll
+        // and an ask that each ran right up to the call deadline, plus the
+        // poll loop's longest idle back-off.
+        let asked = Instant::now();
+        let slowest_next_answer =
+            asked + GUEST_HEALTH_INTERVAL + call_timeout * 2 + Duration::from_millis(500);
+        assert_eq!(
+            GuestHealth::Unasked
+                .answered(true, asked)
+                .observe(slowest_next_answer, stale_after),
+            ListenerHealth::Healthy
+        );
     }
 
     #[test]

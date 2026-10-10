@@ -3,6 +3,7 @@
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
+use crate::rpc::types::{ProviderUsageTotals, TurnUsageTotals};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,9 @@ pub enum TurnOutcome {
         text: String,
         messages: Vec<ConversationMessage>,
         safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
+        /// Capacity and trim budget of the route that served the final call.
+        /// `None` when no call was served (for example a cache hit).
+        final_context_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
     },
     Cancelled {
         partial_text: String,
@@ -28,7 +32,30 @@ pub enum TurnError {
         diagnostic: String,
         user_message: String,
     },
+    /// The turn's caller was refused on the Agent guard the turn would have
+    /// run under, so the turn never started.
+    Refused(TurnRefusal),
 }
+
+/// Why a turn's caller may not run it, as the JSON-RPC error it receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRefusal {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for TurnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TurnRefusal {}
+
+/// Judges a turn's caller on the Agent guard the turn runs under, after the
+/// last wait before the turn, and applies the caller's tool posture to that
+/// Agent. A refusal stops the turn before it touches the Agent.
+pub type TurnAdmission = Box<dyn FnOnce(&mut Agent) -> Result<(), TurnRefusal> + Send>;
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,6 +65,7 @@ impl std::fmt::Display for TurnError {
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
+            Self::Refused(refusal) => write!(f, "Turn refused: {refusal}"),
         }
     }
 }
@@ -50,7 +78,7 @@ impl TurnError {
     pub fn user_message(&self) -> Option<&str> {
         match self {
             Self::TerminalCompletion { user_message, .. } => Some(user_message),
-            Self::Panicked(_) | Self::AgentError(_) => None,
+            Self::Panicked(_) | Self::AgentError(_) | Self::Refused(_) => None,
         }
     }
 }
@@ -73,6 +101,8 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -89,7 +119,19 @@ where
         // only schedules that drop; provider and tool cleanup still runs after
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
+        let mut steering_rx = steering_rx;
         let mut guard = agent.lock().await;
+        // Judged on this guard, with no await before the turn starts under
+        // it: every earlier check predates at least this lock wait.
+        if let Some(admit) = admission
+            && let Err(refusal) = admit(&mut guard)
+        {
+            return Err(StreamedTurnError {
+                error: anyhow::Error::new(refusal),
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            });
+        }
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
@@ -110,7 +152,7 @@ where
                             &prompt,
                             event_tx,
                             Some(cancel_clone),
-                            None,
+                            steering_rx.as_mut(),
                         )
                         .instrument(span),
                 )
@@ -298,11 +340,13 @@ fn outcome_from_task_result(
             response,
             new_messages,
             safeguard_fallback,
+            final_context_limits,
             ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
             safeguard_fallback,
+            final_context_limits,
         }),
         Err(StreamedTurnError {
             error,
@@ -317,6 +361,10 @@ fn outcome_from_task_result(
             messages: new_messages,
         }),
         Err(StreamedTurnError { error, .. }) => {
+            let error = match error.downcast::<TurnRefusal>() {
+                Ok(refusal) => return Err(TurnError::Refused(refusal)),
+                Err(error) => error,
+            };
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
@@ -372,6 +420,127 @@ where
     }
 }
 
+/// Per-turn fold of `TurnEvent::Usage` into the totals carried on
+/// `TurnComplete`. It follows the `TurnEvent::Usage` contract: billing totals
+/// and the per-provider breakdown count every billable attempt, while the
+/// serving snapshot (`last_*`, context limits) advances on accepted events
+/// only, so a billed rejected attempt cannot re-point the terminal identity.
+#[derive(Debug, Default)]
+pub(crate) struct TurnUsageFold {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    last_provider_ref: Option<String>,
+    last_model: Option<String>,
+    last_input_tokens: Option<u64>,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
+    by_provider: std::collections::HashMap<(String, String), ProviderUsageTotals>,
+    saw_usage: bool,
+}
+
+impl TurnUsageFold {
+    pub(crate) fn apply(&mut self, event: &TurnEvent) {
+        let TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cost_usd,
+            context_token_budget,
+            model_context_window,
+            provider_ref,
+            model,
+            accepted,
+        } = event
+        else {
+            return;
+        };
+        self.saw_usage = true;
+        if let Some(it) = input_tokens {
+            self.input_tokens = Some(self.input_tokens.unwrap_or(0).saturating_add(*it));
+        }
+        if let Some(ot) = output_tokens {
+            self.output_tokens = Some(self.output_tokens.unwrap_or(0).saturating_add(*ot));
+        }
+        if *accepted {
+            self.last_provider_ref = Some(provider_ref.clone());
+            self.last_model = Some(model.clone());
+            self.last_context_token_budget = *context_token_budget;
+            self.last_model_context_window = *model_context_window;
+            // An accepted call without usage clears the previous route's
+            // snapshot rather than rendering it against this route's window.
+            self.last_input_tokens = *input_tokens;
+        }
+        let entry = self
+            .by_provider
+            .entry((provider_ref.clone(), model.clone()))
+            .or_insert_with_key(|(provider_ref, model)| ProviderUsageTotals {
+                provider_ref: provider_ref.clone(),
+                model: model.clone(),
+                ..Default::default()
+            });
+        if let Some(it) = input_tokens {
+            entry.input_tokens = entry.input_tokens.saturating_add(*it);
+        }
+        if let Some(ot) = output_tokens {
+            entry.output_tokens = entry.output_tokens.saturating_add(*ot);
+        }
+        if let Some(ct) = cached_input_tokens {
+            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(*ct);
+        }
+        if let Some(cu) = cost_usd {
+            entry.cost_usd += cu;
+        }
+    }
+
+    /// Build the wire totals. `final_limits` is the serving route's resolved
+    /// limits and wins over the last accepted usage event's; `None` when no
+    /// usage event arrived and no route served the turn.
+    pub(crate) fn totals(
+        &self,
+        final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    ) -> Option<TurnUsageTotals> {
+        if !self.saw_usage && final_limits.is_none() {
+            return None;
+        }
+        // Sorted so the wire order, and the float sum below, are stable.
+        let mut usage_by_provider: Vec<ProviderUsageTotals> =
+            self.by_provider.values().cloned().collect();
+        usage_by_provider.sort_by(|a, b| {
+            (a.provider_ref.as_str(), a.model.as_str())
+                .cmp(&(b.provider_ref.as_str(), b.model.as_str()))
+        });
+        // Same rule as the gateway `done` frame: an unpriced turn has no cost.
+        let cost_sum: f64 = usage_by_provider.iter().map(|e| e.cost_usd).sum();
+        let cost_usd = (cost_sum > 0.0).then_some(cost_sum);
+        let tokens_used = match (self.input_tokens, self.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
+        };
+        let (max_context_tokens, model_context_window) = match final_limits {
+            Some(limits) => (
+                Some(limits.context_token_budget as u64),
+                limits.configured_model_context_window().map(|w| w as u64),
+            ),
+            None => (
+                self.last_context_token_budget,
+                self.last_model_context_window,
+            ),
+        };
+        Some(TurnUsageTotals {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            tokens_used,
+            cost_usd,
+            provider_ref: self.last_provider_ref.clone(),
+            model: self.last_model.clone(),
+            last_input_tokens: self.last_input_tokens,
+            max_context_tokens,
+            model_context_window,
+            usage_by_provider,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +548,87 @@ mod tests {
 
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {
         std::future::ready(())
+    }
+
+    fn usage(
+        provider_ref: &str,
+        model: &str,
+        input: Option<u64>,
+        output: Option<u64>,
+        cost: Option<f64>,
+        accepted: bool,
+    ) -> TurnEvent {
+        TurnEvent::Usage {
+            input_tokens: input,
+            cached_input_tokens: None,
+            output_tokens: output,
+            cost_usd: cost,
+            context_token_budget: Some(1000),
+            model_context_window: Some(4000),
+            provider_ref: provider_ref.into(),
+            model: model.into(),
+            accepted,
+        }
+    }
+
+    #[test]
+    fn usage_fold_bills_rejected_attempts_but_reports_the_accepted_route() {
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&usage(
+            "b.fallback",
+            "m2",
+            Some(7),
+            Some(1),
+            Some(0.5),
+            false,
+        ));
+        fold.apply(&usage(
+            "a.primary",
+            "m1",
+            Some(10),
+            Some(3),
+            Some(0.25),
+            true,
+        ));
+        fold.apply(&TurnEvent::Chunk {
+            delta: "ignored".into(),
+        });
+
+        let totals = fold.totals(None).expect("usage arrived");
+        assert_eq!(totals.input_tokens, Some(17));
+        assert_eq!(totals.output_tokens, Some(4));
+        assert_eq!(totals.tokens_used, Some(21));
+        assert_eq!(totals.cost_usd, Some(0.75));
+        assert_eq!(totals.provider_ref.as_deref(), Some("a.primary"));
+        assert_eq!(totals.model.as_deref(), Some("m1"));
+        assert_eq!(totals.last_input_tokens, Some(10));
+        assert_eq!(totals.max_context_tokens, Some(1000));
+        assert_eq!(totals.model_context_window, Some(4000));
+        let order: Vec<_> = totals
+            .usage_by_provider
+            .iter()
+            .map(|e| e.provider_ref.as_str())
+            .collect();
+        assert_eq!(order, ["a.primary", "b.fallback"], "sorted wire order");
+    }
+
+    #[test]
+    fn usage_fold_prefers_the_serving_route_limits_and_is_absent_without_usage() {
+        assert!(TurnUsageFold::default().totals(None).is_none());
+
+        let limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget: 150_000,
+        };
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&usage("a.primary", "m1", None, None, None, true));
+        let totals = fold.totals(Some(limits)).expect("a route served the turn");
+        assert_eq!(totals.max_context_tokens, Some(150_000));
+        assert_eq!(totals.model_context_window, Some(200_000));
+        assert_eq!(totals.tokens_used, None, "no counts reported is not zero");
+        assert_eq!(totals.cost_usd, None, "an unpriced turn carries no cost");
     }
 
     // ── Matrix test support items (module-level) ──────────────────────────
@@ -824,6 +1074,7 @@ mod tests {
             text,
             messages: outcome_messages,
             safeguard_fallback,
+            ..
         } = outcome
         else {
             panic!("successful turn must complete");
@@ -1032,6 +1283,8 @@ mod tests {
             },
             Some(cost_context),
             None,
+            None,
+            None,
             noop,
         )
         .await
@@ -1184,6 +1437,8 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
+            None,
             None,
             None,
             move |event| {
@@ -1357,6 +1612,8 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
+                None,
                 None,
                 None,
                 move |event| {
@@ -1621,6 +1878,8 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
+            None,
             None,
             None,
             move |event| {
@@ -1900,6 +2159,8 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
+                None,
                 noop,
             )
             .await;

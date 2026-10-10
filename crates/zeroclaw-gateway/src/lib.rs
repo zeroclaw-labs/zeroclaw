@@ -81,7 +81,7 @@ use axum::{
     },
     routing::{delete, get, post, put},
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -668,33 +668,26 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .min()
 }
 
-/// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
-/// a handler can release it explicitly at its commit point, or pass it by
-/// value into a delegated helper without lifetime coupling.
-pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+/// Serialization witness for config authorization and retained persistence.
+pub(crate) type ConfigWriteGuard = zeroclaw_runtime::live_config_authority::ConfigCommit;
 
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<RwLock<Config>>,
+    /// Read-only live config handle: HTTP readers observe the published
+    /// config and its revision as one pair and cannot bypass publication
+    /// with a raw write. Mutating handlers admit through
+    /// `AppState::begin_config_commit` instead.
+    pub config: zeroclaw_config::live::LiveConfigHandle,
 
-    /// Serializes the read-mutate-save-swap critical section of every HTTP
-    /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
-    /// create/delete/rename, channel bind, config migrate, section select,
-    /// quickstart apply, cron settings patch, pairing-token persistence). A
-    /// tokio mutex, not `parking_lot`, because the guard must survive the
-    /// `.await` on config-save I/O. Mirrors
-    /// `RpcContext::config_write_lock` in the RPC path.
-    ///
-    /// Invariant: every mutation of `config` must happen while holding this
-    /// mutex, acquired before the first `config` read-for-modify and held
-    /// through the swap that installs the mutated snapshot. Never acquire it
-    /// while holding a `config` guard — lock order is this mutex first,
-    /// `config` second, always. A writer that bypasses this lock and swaps
-    /// the live config while a concurrent writer's save is in flight loses
-    /// that writer's change — clobbered in memory and, if its save hadn't
-    /// landed yet, on disk too.
-    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The live-config authority owning this gateway run's publication
+    /// transaction: the process-wide writer mutex, the config-write
+    /// lifecycle lease, and the published pair. Every HTTP config writer
+    /// serializes through it before cloning the current config; the
+    /// irreversible save-and-publish phase of each commit runs retained,
+    /// so request cancellation cannot abandon a dispatched commit. Mirrors
+    /// `RpcContext::config_authority` in the RPC path.
+    pub config_authority: zeroclaw_runtime::LiveConfigAuthority,
     pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
@@ -811,6 +804,16 @@ impl AppState {
         zeroclaw_runtime::live_config_authority::AgentAdmissionError,
     > {
         self.agent_lifecycle.reserve_turn_at(alias, generation)
+    }
+    /// Admit one serialized config write on this gateway's authority.
+    /// Fails closed once the daemon generation is closing.
+    pub(crate) async fn begin_config_commit(
+        &self,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::ConfigCommit,
+        zeroclaw_runtime::live_config_authority::ConfigCommitError,
+    > {
+        self.config_authority.begin_config_commit().await
     }
 }
 
@@ -1080,10 +1083,8 @@ pub async fn run_gateway_with_plugin_webhooks(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    // Supervised runs read and write the daemon's live configuration, the
-    // one the RPC context holds, so a persist through either surface is the
-    // state the other next reads and compiles policy from.
-    let config_state = shared_config.unwrap_or_else(|| authority.config());
+    // Supervised HTTP and RPC readers share the daemon's published config.
+    let config_state = shared_config.unwrap_or_else(|| authority.live_handle());
 
     let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
@@ -1266,7 +1267,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let all_tools_result = tools::all_tools_with_runtime(
+            match tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
@@ -1294,56 +1295,73 @@ pub async fn run_gateway_with_plugin_webhooks(
                 // below passes `caller_allowed: None` for the same reason — so
                 // there is no inherited ceiling to cap stored jobs by.
                 None,
-            )?;
-            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-                config: &config,
-                agent_alias,
-                security: &security,
-                built: all_tools_result,
-                // The gateway registers no skills today; unifying the two
-                // skill loaders through this seam is the Epic F follow-up.
-                skills: &[],
-                runtime: Arc::clone(&runtime),
-                caller_allowed: None,
-                connect_mcp: true,
-                // Gateway tool-listing path: short-lived, no cross-turn reuse
-                // contract, so the per-call connect is correct.
-                mcp_registry: None,
-                // Listing-only registry: loading peripherals physically opens
-                // hardware (exclusive serial holds) that the live turn paths
-                // need. Never connect them for a registry no turn runs against.
-                connect_peripherals: false,
-                emit_assembly_logs: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: true,
-            })
-            .await;
-            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
-            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
-                &config,
-                &assembled.ask_user_handle,
-                &assembled.channel_room_handle,
-                &reaction_handle_gw_opt,
-                &assembled.poll_handle,
-                &assembled.escalate_handle,
-            );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
-                    &format!(
-                        "Registered {} channel(s) for dashboard agent",
-                        channel_names.len()
-                    ),
-                );
+            ) {
+                Ok(all_tools_result) => {
+                    let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias,
+                        security: &security,
+                        built: all_tools_result,
+                        // The gateway registers no skills today; unifying the two
+                        // skill loaders through this seam is the Epic F follow-up.
+                        skills: &[],
+                        runtime: Arc::clone(&runtime),
+                        caller_allowed: None,
+                        connect_mcp: true,
+                        // Gateway tool-listing path: short-lived, no cross-turn reuse
+                        // contract, so the per-call connect is correct.
+                        mcp_registry: None,
+                        // Listing-only registry: loading peripherals physically opens
+                        // hardware (exclusive serial holds) that the live turn paths
+                        // need. Never connect them for a registry no turn runs against.
+                        connect_peripherals: false,
+                        emit_assembly_logs: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: true,
+                    })
+                    .await;
+                    let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
+                    let channel_names =
+                        zeroclaw_channels::orchestrator::register_channels_for_tools(
+                            &config,
+                            &assembled.ask_user_handle,
+                            &assembled.channel_room_handle,
+                            &reaction_handle_gw_opt,
+                            &assembled.poll_handle,
+                            &assembled.escalate_handle,
+                        );
+                    if !channel_names.is_empty() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                            &format!(
+                                "Registered {} channel(s) for dashboard agent",
+                                channel_names.len()
+                            ),
+                        );
+                    }
+                    // Listing-only registry: no turn runs against it, so the
+                    // deferred-MCP prompt section and activation handle returned by
+                    // `assemble` have no consumer here (live gateway chat resolves
+                    // its tools inside process_message).
+                    (assembled.registry.into_inner(), assembled.delegate_handle)
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{e}")})),
+                        "Gateway: agent tool registry failed to build; booting with empty tools registry. Fix via /admin/reload or /quickstart."
+                    );
+                    (Vec::new(), None)
+                }
             }
-            // Listing-only registry: no turn runs against it, so the
-            // deferred-MCP prompt section and activation handle returned by
-            // `assemble` have no consumer here (live gateway chat resolves
-            // its tools inside process_message).
-            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1404,7 +1422,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 continue;
             }
         };
-        let agent_tools_result = tools::all_tools_with_runtime(
+        let agent_tools_result = match tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1431,7 +1449,23 @@ pub async fn run_gateway_with_plugin_webhooks(
             // Listing-only registry for an agent's own tools: no inherited
             // ceiling, matching the `caller_allowed: None` of its assembly.
             None,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent tool registry failed to build; exposing an empty /api/tools listing. Fix via /admin/reload or /quickstart."
+                );
+                // An absent alias falls back to the default agent's tools.
+                tools_registry_by_agent.insert(alias, Arc::new(Vec::new()));
+                continue;
+            }
+        };
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel
@@ -1778,6 +1812,40 @@ pub async fn run_gateway_with_plugin_webhooks(
             Ok(url) => {
                 println!("🌐 Tunnel active: {url}");
                 tunnel_url = Some(url);
+                // The WSS RPC plane and enrollment endpoint terminate their
+                // own TLS; publish them as raw TCP passthrough where the
+                // provider supports it. Resolved from this run's config, the
+                // same source the daemon starts those listeners from.
+                let services = zeroclaw_runtime::tunnel::daemon_tcp_services(&config);
+                match tun.publish_tcp_services(&services).await {
+                    Ok(published) => {
+                        for p in &published {
+                            println!(
+                                "{}",
+                                i18n::get_required_cli_string_with_args(
+                                    "cli-tunnel-tcp-service-published",
+                                    &[("service", p.service.name), ("endpoint", &p.endpoint)],
+                                )
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "tunnel_provider": tun.name(),
+                                "error": format!("{e}"),
+                            })),
+                            "Gateway: tunnel could not publish WSS/enrollment listeners; \
+                             they remain reachable only at their configured bind"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 println!("⚠️  Tunnel failed to start: {e}");
@@ -1951,7 +2019,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
-    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_config_state = config_state.clone();
     let mdns_peer_registry =
         nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
     let mdns_task = if config.nodes.mdns.enabled
@@ -2038,7 +2106,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: authority.config_write_lock(),
+        config_authority: authority.clone(),
         agent_lifecycle: authority.agent_lifecycle(),
         model_provider,
         model,
@@ -2569,6 +2637,31 @@ pub async fn run_gateway_with_plugin_webhooks(
         .await?;
     }
 
+    // Withdraw the tunnel before slower teardown below: the daemon allows a
+    // short grace window before aborting the gateway. An early error return
+    // above still drops the tunnel, which kills its processes without waiting.
+    if let Some(tun) = tunnel {
+        if let Err(e) = tun.stop().await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": tun.name(),
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel did not stop cleanly"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"tunnel_provider": tun.name()})),
+                "Gateway: tunnel stopped"
+            );
+        }
+    }
+
     if let Some(task) = mdns_task {
         let mut task = task;
         tokio::select! {
@@ -2822,13 +2915,7 @@ async fn handle_pair(
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
                 }
             }
-            if let Err(err) = Box::pin(persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            ))
-            .await
-            {
+            if let Err(err) = Box::pin(persist_pairing_tokens(&state)).await {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2882,32 +2969,37 @@ async fn handle_pair(
     }
 }
 
-pub(crate) async fn persist_pairing_tokens(
-    config: Arc<RwLock<Config>>,
-    pairing: &PairingGuard,
-    config_write_lock: Arc<tokio::sync::Mutex<()>>,
-) -> Result<()> {
+pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
-    // acquires the witness itself rather than taking it as a param. Held
-    // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
-    debug_assert!(
-        config_write_lock.try_lock().is_err(),
-        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
-    );
-    let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.read().clone() };
+    // admits its own commit rather than taking one as a param. The
+    // admitted commit (writer guard + config-work lease) is held across
+    // the whole read-modify-save-publish below and runs the irreversible
+    // phase retained, so a cancelled request cannot strand a committed
+    // token write without its publication.
+    let commit = state.begin_config_commit().await?;
+    let paired_tokens = state.pairing.tokens();
+    let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg.mark_dirty("gateway.paired_tokens");
-    updated_cfg
-        .save_dirty()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.write() = updated_cfg;
+    // Checked revision before the irreversible save.
+    let revision = commit
+        .next_revision()
+        .context("Failed to allocate a config revision for paired tokens")?;
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let mut config = updated_cfg;
+            config
+                .save_dirty()
+                .await
+                .context("Failed to persist paired tokens to config.toml")?;
+            // Keep the published pair in sync with the persisted tokens.
+            commit
+                .publish(revision, config)
+                .context("Failed to publish paired tokens to the live config")?;
+            Ok::<(), anyhow::Error>(())
+        }));
+    task.await
+        .context("Paired-token persistence task failed")??;
     Ok(())
 }
 
@@ -3066,7 +3158,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
         let requested_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
         let execution_capability =
             zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                std::sync::Arc::clone(&state.config),
+                state.config.clone(),
                 state.agent_lifecycle.clone(),
             );
         let execution_admission = execution_capability
@@ -3109,7 +3201,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::loop_::process_message_with_live_config_and_admission(
                     config,
-                    Arc::clone(&state.config),
+                    state.config.clone(),
                     &agent_alias,
                     message,
                     session_id,
@@ -3215,8 +3307,8 @@ fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
 
 /// Immutable snapshot of the credential policy applied to ONE request.
 ///
-/// `AppState::config` is a live `Arc<RwLock<Config>>` that the config
-/// PUT/PATCH handlers and `POST /admin/reload` legitimately mutate while a
+/// `AppState::config` is a live, published config that the config
+/// PUT/PATCH handlers and `POST /admin/reload` legitimately replace while a
 /// request is in flight. Reading the policy twice therefore lets a single
 /// request straddle two security states: a headerless request can pass an
 /// "unconfigured" read and then satisfy a "configured" read after an operator
@@ -4128,7 +4220,7 @@ async fn dispatch_gateway_turn_streaming_with_agent(
     let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
     let mut agent =
         zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-            Arc::clone(&state.config),
+            state.config.clone(),
             &agent_alias,
             None,
             true,
@@ -5034,13 +5126,7 @@ async fn handle_admin_paircode_new(
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
             }
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            if let Err(e) = persist_pairing_tokens(&state).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -5091,13 +5177,7 @@ async fn handle_admin_paircode_new(
                 }
             };
             state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            if let Err(e) = persist_pairing_tokens(&state).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -5173,13 +5253,25 @@ pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
 
 #[cfg(test)]
 mod tests {
+    impl AppState {
+        /// Install a mutated config as the next publication — the test
+        /// stand-in for the raw handle write this state type no longer
+        /// exposes. Unsynchronized on purpose: tests that exercise writer
+        /// serialization hold real admitted commits instead.
+        pub(super) fn publish_test_config(&self, mutate: impl FnOnce(&mut Config)) {
+            let mut next = self.config.snapshot();
+            mutate(&mut next);
+            self.config_authority.publish_for_test(next);
+        }
+    }
+
     use super::*;
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{HeaderValue, Request, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::{Mutex, RwLock};
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5648,10 +5740,11 @@ mod tests {
             ..Config::default()
         };
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5772,7 +5865,7 @@ path = "{trigger_path}"
         let mut sop_config = state.config.read().sop.clone();
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
-        state.config.write().sop = sop_config.clone();
+        state.publish_test_config(|c| c.sop = sop_config.clone());
         let data_dir = state.config.read().data_dir.clone();
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
@@ -5829,7 +5922,7 @@ path = "{trigger_path}"
         let mut sop_config = state.config.read().sop.clone();
         sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         sop_config.persist_runs = false;
-        state.config.write().sop = sop_config.clone();
+        state.publish_test_config(|c| c.sop = sop_config.clone());
         let data_dir = state.config.read().data_dir.clone();
         let install_root = state.config.read().install_root_dir();
         let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
@@ -5851,7 +5944,7 @@ path = "{trigger_path}"
     /// a SOP run can start.
     fn with_webhook_secret(state: AppState) -> (AppState, String) {
         let secret = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret.clone()));
         (state, secret)
     }
 
@@ -6023,7 +6116,7 @@ path = "{trigger_path}"
 
         // Boot weak: six numeric digits, the legacy shape.
         let weak = PairingCodePolicy::numeric_compat();
-        state.config.write().gateway.pairing_code = weak;
+        state.publish_test_config(|c| c.gateway.pairing_code = weak);
         let guard_before = Arc::as_ptr(&state.pairing);
 
         let (status, json) = admin_paircode_response_json(
@@ -6046,7 +6139,7 @@ path = "{trigger_path}"
 
         // Operator strengthens the policy. No restart, no new guard.
         let strong = PairingCodePolicy::new(28, PairingCodeCharset::Unambiguous).unwrap();
-        state.config.write().gateway.pairing_code = strong;
+        state.publish_test_config(|c| c.gateway.pairing_code = strong);
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
@@ -6804,6 +6897,142 @@ path = "{trigger_path}"
         handle.abort();
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn run_gateway_isolates_failed_seatbelt_tool_listings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        for failed_default in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cycle = tmp.path().join("cycle");
+            std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+            let mut config = Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            config.gateway.require_pairing = false;
+            config.memory.backend = "none".into();
+            config.risk_profiles.insert(
+                "healthy".into(),
+                RiskProfileConfig {
+                    sandbox_enabled: Some(true),
+                    sandbox_backend: Some("sandbox-exec".into()),
+                    ..RiskProfileConfig::default()
+                },
+            );
+            let mut failed_profile = config.risk_profiles["healthy"].clone();
+            failed_profile.allowed_roots = vec![cycle.display().to_string()];
+            config.risk_profiles.insert("failed".into(), failed_profile);
+            let (failed_alias, healthy_alias) = if failed_default {
+                ("a-failed", "z-healthy")
+            } else {
+                ("z-failed", "a-healthy")
+            };
+            for (alias, profile) in [(failed_alias, "failed"), (healthy_alias, "healthy")] {
+                config.agents.insert(
+                    alias.into(),
+                    AliasedAgentConfig {
+                        enabled: true,
+                        risk_profile: profile.into(),
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            assert_eq!(
+                default_agent_alias(&config).as_deref(),
+                Some(if failed_default {
+                    failed_alias
+                } else {
+                    healthy_alias
+                })
+            );
+
+            let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+            let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+                let _ = ready_tx.send(Some(addr));
+            });
+            let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+            let (reload_tx, _) = tokio::sync::watch::channel(false);
+            let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+                shutdown_tx.clone(),
+                reload_tx,
+            );
+            let server = zeroclaw_spawn::spawn!(async move {
+                run_gateway(
+                    "127.0.0.1",
+                    0,
+                    config,
+                    None,
+                    Some(controls),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(readiness),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                ready_rx.wait_for(Option::is_some).await.unwrap();
+            })
+            .await
+            .expect("failed listing must not prevent gateway readiness");
+            let addr = ready_rx.borrow().unwrap();
+            let get = |path: String| async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                    stream.write_all(request.as_bytes()).await.unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).await.unwrap();
+                    assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+                    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()
+                })
+                .await
+                .expect("gateway must serve the HTTP response")
+            };
+            get("/health".into()).await;
+            get("/api/config".into()).await;
+            let failed = get(format!("/api/tools?agent={failed_alias}")).await;
+            assert_eq!(failed["tools"], serde_json::json!([]));
+            let healthy = get(format!("/api/tools?agent={healthy_alias}")).await;
+            assert!(
+                healthy["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "shell")
+            );
+            let default = get("/api/tools".into()).await;
+            assert_eq!(
+                default["tools"],
+                if failed_default {
+                    failed["tools"].clone()
+                } else {
+                    healthy["tools"].clone()
+                }
+            );
+
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("gateway should shut down")
+                .expect("gateway task should not panic")
+                .expect("gateway shutdown should succeed");
+        }
+    }
+
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
         // `run_gateway` binds the process-global pricing config handle.
@@ -6992,10 +7221,11 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7080,10 +7310,11 @@ path = "{trigger_path}"
         );
 
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7303,19 +7534,12 @@ path = "{trigger_path}"
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(RwLock::new(config));
-        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
-        Box::pin(persist_pairing_tokens(
-            shared_config.clone(),
-            &guard,
-            config_write_lock,
-        ))
-        .await
-        .unwrap();
+        let state = pairing_persistence_state(config, guard);
+        Box::pin(persist_pairing_tokens(&state)).await.unwrap();
 
-        // In-memory tokens should remain as plaintext 64-char hex hashes.
+        // The published pair keeps tokens as plaintext 64-char hex hashes.
         let plaintext = {
-            let in_memory = shared_config.read();
+            let in_memory = state.config.read();
             assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
             in_memory.gateway.paired_tokens[0].clone()
         };
@@ -7333,17 +7557,16 @@ path = "{trigger_path}"
         );
     }
 
-    /// Unlike the `persist_and_swap` callers (which pre-acquire the witness
-    /// before their own read-for-modify), `persist_pairing_tokens` acquires
-    /// `config_write_lock` internally since it is self-contained. This
-    /// proves that internal acquisition still serializes it against a
-    /// second, concurrent config mutation the same way. A single Pending
-    /// poll wouldn't distinguish "blocked on `config_write_lock`" from
-    /// "transiently Pending on unrelated I/O", so this polls repeatedly
-    /// with a no-op waker while the witness stays held and asserts the
-    /// future never completes -- proving it stays parked on the lock for as
-    /// long as it's held. Once the lock is released both changes land —
-    /// neither clobbers the other.
+    /// `persist_pairing_tokens` admits its own config commit since it is
+    /// self-contained. This proves that internal admission still
+    /// serializes it against a second, concurrent config writer: while an
+    /// admitted commit holds the writer guard, the pairing persistence
+    /// stays parked on commit admission; once the in-flight commit
+    /// publishes and releases, both publications land — neither clobbers
+    /// the other. A single Pending poll wouldn't distinguish "blocked on
+    /// commit admission" from "transiently Pending on unrelated I/O", so
+    /// this polls repeatedly with a no-op waker while the commit stays
+    /// held.
     #[tokio::test]
     async fn persist_pairing_tokens_serializes_against_concurrent_config_write() {
         let temp = tempfile::tempdir().unwrap();
@@ -7359,22 +7582,18 @@ path = "{trigger_path}"
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(RwLock::new(config));
-        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let state = pairing_persistence_state(config, guard);
 
-        // Simulate another in-flight config mutation already holding the
-        // witness for its own read-mutate-save-swap section.
-        let held_guard = Arc::clone(&config_write_lock).lock_owned().await;
+        // Simulate another in-flight config commit already holding the
+        // writer serialization for its own read-mutate-save-publish
+        // section.
+        let held_commit = state.begin_config_commit().await.unwrap();
 
-        let mut persist_fut = Box::pin(persist_pairing_tokens(
-            shared_config.clone(),
-            &guard,
-            config_write_lock.clone(),
-        ));
+        let mut persist_fut = Box::pin(persist_pairing_tokens(&state));
 
-        // Bounded, sleep-free: `persist_pairing_tokens` acquires the witness
+        // Bounded, sleep-free: `persist_pairing_tokens` admits its commit
         // as its very first action, so poll with a no-op waker 50 times
-        // while `held_guard` stays live and assert Pending every time,
+        // while `held_commit` stays live and assert Pending every time,
         // rather than resolving synchronously or racing ahead after a
         // single yield.
         let waker = std::task::Waker::noop();
@@ -7382,21 +7601,24 @@ path = "{trigger_path}"
         for _ in 0..50 {
             assert!(
                 std::future::Future::poll(persist_fut.as_mut(), &mut cx).is_pending(),
-                "persist_pairing_tokens must stay parked on config_write_lock \
-                 acquisition for as long as another writer holds it"
+                "persist_pairing_tokens must stay parked on commit admission \
+                 for as long as another writer holds the serialization"
             );
         }
 
-        // Land a distinct, concurrent write directly on live config while
-        // persist_pairing_tokens is parked waiting for the lock.
-        shared_config.write().gateway.port = 55555;
+        // The concurrent writer's own publication: it holds the same
+        // serialization, so it lands before the pairing persistence.
+        let mut concurrent = held_commit.current_config();
+        concurrent.gateway.port = 55555;
+        let revision = held_commit.next_revision().unwrap();
+        held_commit.publish(revision, concurrent).unwrap();
+        drop(held_commit);
 
-        drop(held_guard);
         persist_fut
             .await
             .expect("persist_pairing_tokens must still succeed once unblocked");
 
-        let live = shared_config.read();
+        let live = state.config.read();
         assert_eq!(
             live.gateway.port, 55555,
             "the concurrent writer's change must survive — no lost update"
@@ -7406,6 +7628,21 @@ path = "{trigger_path}"
             1,
             "persist_pairing_tokens' own token write must also land"
         );
+    }
+
+    /// Minimal AppState carrying one pairing guard, for the pairing
+    /// persistence serialization test. The pairing guard cannot be
+    /// cloned with its tokens; the test re-pairs inside the fresh guard
+    /// before calling this.
+    fn pairing_persistence_state(config: Config, guard: PairingGuard) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        AppState {
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
+            pairing: Arc::new(guard),
+            ..crate::api::tests::test_state(Config::default())
+        }
     }
 
     #[test]
@@ -7752,10 +7989,12 @@ path = "{trigger_path}"
     /// Minimal AppState for webhook-SSE regressions.
     fn sse_test_state(model_provider: Arc<dyn ModelProvider>) -> AppState {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -8504,8 +8743,7 @@ data: [DONE]\n\n";
         .await;
         let tmp = tempfile::tempdir().expect("production receipt fixture temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config
                 .risk_profiles
                 .get_mut("fixture")
@@ -8525,7 +8763,7 @@ data: [DONE]\n\n";
                 show_in_response: true,
                 ..ToolReceiptsConfig::default()
             };
-        }
+        });
 
         let text = collect_production_sse(&state, "receipt stream", "production-receipt").await;
 
@@ -9338,10 +9576,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9592,7 +9831,7 @@ data: [DONE]\n\n";
         let protected_tmp = tempfile::tempdir().unwrap();
         let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
         let secret = generate_test_secret();
-        protected.config.write().gateway.webhook_secret = Some(secret);
+        protected.publish_test_config(|c| c.gateway.webhook_secret = Some(secret));
         let unauthorized = api_sop_webhook::handle_sop_webhook(
             State(protected),
             test_connect_info(),
@@ -9779,7 +10018,7 @@ data: [DONE]\n\n";
             .expect("no configured control -> authorization itself passes");
 
         // Concurrent operator action lands between authorization and dispatch.
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
 
         // The dispatch decision must come from the snapshot, not the new config.
         let rejection = require_sop_dispatch_credentials(verdict)
@@ -9815,7 +10054,7 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().unwrap();
         let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
         let secret_a = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret_a.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret_a.clone()));
 
         let verdict = authorize_webhook_request(
             &state,
@@ -9826,7 +10065,7 @@ data: [DONE]\n\n";
 
         // Rotation lands between authorization and dispatch.
         let secret_b = generate_test_secret();
-        state.config.write().gateway.webhook_secret = Some(secret_b.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(secret_b.clone()));
 
         assert!(
             require_sop_dispatch_credentials(verdict).is_ok(),
@@ -9870,7 +10109,7 @@ data: [DONE]\n\n";
             api_sop_webhook::has_matching_webhook_sop(&state, "/webhook").unwrap(),
             "fixture must load a matching /webhook trigger"
         );
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
 
         assert!(
             require_sop_dispatch_credentials(verdict).is_err(),
@@ -9917,7 +10156,7 @@ data: [DONE]\n\n";
         let before = require_sop_dispatch_credentials(unconfigured).is_ok();
 
         // Flip the live config to the opposite policy in every way we can.
-        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(generate_test_secret()));
         let after = require_sop_dispatch_credentials(unconfigured).is_ok();
 
         assert_eq!(
@@ -10259,10 +10498,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10382,10 +10622,11 @@ data: [DONE]\n\n";
             },
         );
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -10484,10 +10725,11 @@ data: [DONE]\n\n";
         let tracking_impl = Arc::new(TrackingMemory::default());
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10603,8 +10845,7 @@ data: [DONE]\n\n";
     fn gateway_webhook_secret_uses_one_live_config_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_paircode_state(&tmp, false, false);
-        {
-            let mut config = state.config.write();
+        state.publish_test_config(|config| {
             config.channels.webhook.insert(
                 "enabled-a".into(),
                 zeroclaw_config::schema::WebhookConfig {
@@ -10629,7 +10870,7 @@ data: [DONE]\n\n";
                     ..Default::default()
                 },
             );
-        }
+        });
         assert_eq!(
             configured_gateway_webhook_secret_hash(&state),
             None,
@@ -10643,7 +10884,7 @@ data: [DONE]\n\n";
         );
 
         let startup_secret = "synthetic-startup-gateway-secret".to_string();
-        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(startup_secret.clone()));
         assert!(
             authorize_webhook_request(
                 &state,
@@ -10663,7 +10904,7 @@ data: [DONE]\n\n";
         );
 
         let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
-        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        state.publish_test_config(|c| c.gateway.webhook_secret = Some(rotated_secret.clone()));
         assert!(
             authorize_webhook_request(
                 &state,
@@ -10693,10 +10934,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10782,10 +11024,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10876,10 +11119,11 @@ data: [DONE]\n\n";
         let mut config = Config::default();
         config.gateway.webhook_secret = Some(secret.clone());
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         let state = AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10975,10 +11219,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11071,10 +11316,11 @@ data: [DONE]\n\n";
         let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
         let invalid_signature = "deadbeef";
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11173,10 +11419,11 @@ data: [DONE]\n\n";
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11315,10 +11562,11 @@ data: [DONE]\n\n";
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
         let signature = compute_nextcloud_signature_hex(secret, random, body);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -11951,7 +12199,7 @@ data: [DONE]\n\n";
         tokens: &[String],
     ) -> AppState {
         let mut state = admin_paircode_state(tmp, require_pairing, false);
-        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.publish_test_config(|c| c.gateway.allow_remote_admin = allow_remote_admin);
         state.pairing = Arc::new(PairingGuard::new(
             require_pairing,
             tokens,
@@ -12211,10 +12459,11 @@ data: [DONE]\n\n";
             linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
         }
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12298,10 +12547,11 @@ data: [DONE]\n\n";
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12912,10 +13162,11 @@ data: [DONE]\n\n";
     fn webhook_baseline_state() -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -13365,7 +13616,7 @@ data: [DONE]\n\n";
         let state = admin_paircode_state(&tmp, true, false);
         let blocker = tmp.path().join("legacy-pair-blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
-        state.config.write().config_path = blocker.join("config.toml");
+        state.publish_test_config(|c| c.config_path = blocker.join("config.toml"));
 
         let code = state
             .pairing

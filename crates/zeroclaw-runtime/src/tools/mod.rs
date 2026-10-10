@@ -11,6 +11,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+mod delegate_progress;
 pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
@@ -1053,7 +1054,7 @@ pub(crate) fn escalate_to_human_tool(
 pub(crate) fn send_via_tool(
     security: Arc<SecurityPolicy>,
     root_config: &Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     agent_alias: &str,
     handle: PerToolChannelHandle,
 ) -> Arc<dyn Tool> {
@@ -1774,7 +1775,7 @@ pub(crate) fn schedule_tool(
 pub(crate) fn send_message_to_peer_tool(
     config: Arc<zeroclaw_config::schema::Config>,
     agent_alias: &str,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
 ) -> Arc<dyn Tool> {
@@ -2430,7 +2431,7 @@ fn plugin_egress_policy(
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
     zeroclaw_plugins::egress::EgressHostService::new(
         zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
@@ -2494,7 +2495,7 @@ fn plugin_config_values(
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
     let data_dir = config.data_dir.clone();
     let config_dir = config
@@ -2563,7 +2564,6 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 
@@ -2608,7 +2608,7 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     // Forwarded verbatim to `all_tools_with_runtime_and_acp_sessions` — see its
     // own doc-comment on this parameter for why it matters.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
@@ -2670,7 +2670,7 @@ pub(crate) fn all_tools_with_runtime_context(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
     // The per-run caller ceiling, when this registry is being built for a loop
@@ -2740,13 +2740,13 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        Ok(match handle.join() {
+        match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        })
+        }
     })
 }
 
@@ -2780,7 +2780,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     acp_sessions: Option<AcpSessionReadView>,
     // Forwarded to `all_tools_with_runtime_context`: the per-run caller ceiling
     // the scheduler / `spawn_subagent` / `send_message_to_peer` tools carry.
@@ -2843,7 +2843,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     // See the doc-comment on this parameter on `all_tools_with_runtime_context`.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
@@ -2903,14 +2903,14 @@ fn all_tools_with_runtime_on_thread(
     tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
     // See the doc-comment on this same parameter on
     // `all_tools_with_runtime_and_acp_sessions`, which forwards it here
     // verbatim through the builder closure above.
     caller_ceiling: Option<caller_ceiling::CallerCeiling>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -2918,6 +2918,10 @@ fn all_tools_with_runtime_on_thread(
         shell_tool,
         sandbox,
     } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
+    sandbox.check_initialization().map_err(|error| {
+        let context = format!("agents.{agent_alias}: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -3166,9 +3170,9 @@ fn all_tools_with_runtime_on_thread(
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
     if root_config.a2a.client.enabled {
-        let live = live_config
-            .clone()
-            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        let live = live_config.clone().unwrap_or_else(|| {
+            zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
+        });
         // The zeroclaw dir (config file parent) + secrets.encrypt enable
         // decrypting encrypted peer tokens via the canonical SecretStore,
         // the same path http_request uses for its auth_secret values.
@@ -3561,7 +3565,7 @@ fn all_tools_with_runtime_on_thread(
         // Preserved fail-fast: a client_credentials flow with no secret
         // aborts the whole registry rather than registering anything else.
         Microsoft365Registration::AbortRegistry => {
-            return AllToolsResult {
+            return Ok(AllToolsResult {
                 unfiltered_tool_arcs: tool_arcs.clone(),
                 tools: boxed_registry_from_arcs(tool_arcs),
                 delegate_handle: None,
@@ -3572,7 +3576,7 @@ fn all_tools_with_runtime_on_thread(
                 reaction_handle,
                 poll_handle: Some(poll_handle),
                 escalate_handle,
-            };
+            });
         }
     }
 
@@ -3755,7 +3759,7 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
-    AllToolsResult {
+    Ok(AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
@@ -3766,7 +3770,7 @@ fn all_tools_with_runtime_on_thread(
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
-    }
+    })
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -4173,6 +4177,74 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registry_reports_seatbelt_initialization_before_tool_execution() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cycle = tmp.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let cfg = test_config(&tmp);
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "none".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let build = |root, enabled| {
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: tmp.path().to_path_buf(),
+                allowed_roots_read_only: vec![root],
+                ..SecurityPolicy::default()
+            });
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(enabled),
+                sandbox_backend: Some("sandbox-exec".into()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(zeroclaw_config::platform::NativeRuntime::new()),
+                memory.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let error = build(cycle.clone(), true)
+            .err()
+            .expect("registry must reject failed Seatbelt initialization");
+        assert!(
+            error
+                .to_string()
+                .starts_with("agents.test-agent: Seatbelt initialization failed: Seatbelt root symlink limit exceeded")
+        );
+        assert!(build(tmp.path().to_path_buf(), true).is_ok());
+        assert!(build(cycle, false).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
@@ -4286,20 +4358,18 @@ const = true
             entry(&instance_key, "true"),
             entry(&backup_instance_key, "false"),
         ];
-        let live = Arc::new(parking_lot::RwLock::new(current));
-        let services = plugin_host_services(
-            Arc::clone(&host),
-            Arc::new(snapshot),
-            Some(Arc::clone(&live)),
-        );
+        let live = zeroclaw_config::live::LiveConfig::new(current);
+        let services =
+            plugin_host_services(Arc::clone(&host), Arc::new(snapshot), Some(live.handle()));
 
         assert!(services.resolve_config(&scope).is_ok());
         assert!(
             services.resolve_config(&backup_scope).is_err(),
             "backup must use its invalid canonical entry, not a valid raw-name decoy"
         );
+        let mut updated = live.snapshot();
         for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
-            live.write()
+            updated
                 .plugins
                 .entries
                 .iter_mut()
@@ -4308,6 +4378,8 @@ const = true
                 .config
                 .insert("enabled".to_string(), enabled.to_string());
         }
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert!(
             services.resolve_config(&scope).is_err(),
             "work must observe its own canonical key's live update"
@@ -7683,7 +7755,7 @@ permissions = ["http_client"]
             allowed_private_hosts: vec!["127.0.0.1".into()],
             ..FileDownloadConfig::default()
         };
-        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(root_config.clone());
 
         let tools = all_tools_with_runtime(
             Arc::new(root_config.clone()),
@@ -7706,7 +7778,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
-            Some(live_config.clone()),
+            Some(live_config.handle()),
             None,
         )
         .expect("tool registry should build")
@@ -7720,11 +7792,11 @@ permissions = ["http_client"]
         let first = file_download.execute(args.clone()).await.unwrap();
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut revoked = live_config.snapshot();
+        revoked.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), revoked)
+            .unwrap();
 
         let second = file_download.execute(args).await.unwrap();
         assert!(
@@ -7736,6 +7808,279 @@ permissions = ["http_client"]
                 .error
                 .unwrap_or_default()
                 .contains("file_download.allowed_private_hosts")
+        );
+    }
+
+    #[test]
+    fn every_reentrant_agent_tool_is_inventoried() {
+        let missing: Vec<&str> = REENTRANT_AGENT_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "REENTRANT_AGENT_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
+    /// Names in the scoped registry assembled with every built-in tool family a
+    /// unit test can switch on. The data, config, and workspace directories, the
+    /// knowledge database, the security playbook and report directories, the
+    /// project report directory, and the plugin directory all point under `tmp`.
+    /// Nothing reaches the network: tool construction only records endpoints and
+    /// placeholder credentials, and the MCP registry is a test stub whose one
+    /// server is never contacted.
+    async fn maximal_registry_names(tmp: &TempDir) -> std::collections::BTreeSet<String> {
+        use zeroclaw_config::schema::{
+            DiscordConfig, McpBundleConfig, McpServerConfig, McpTransport, Microsoft365Config,
+            OpenAIModelProviderConfig, SkillsPromptInjectionMode,
+        };
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(tmp);
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        // Plugin tools are outside the inventory, so plugins stay off, and the
+        // plugin directory points under `tmp` as well.
+        cfg.plugins.enabled = false;
+        cfg.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        cfg.pipeline.enabled = true;
+        cfg.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        cfg.sop.procedural_memory_enabled = true;
+        cfg.browser_delegate.enabled = true;
+        cfg.text_browser.enabled = true;
+        cfg.web_search.enabled = true;
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "inventory-placeholder".into();
+        cfg.jira.enabled = true;
+        cfg.jira.base_url = "https://jira.example.invalid".into();
+        cfg.jira.api_token = "inventory-placeholder".into();
+        cfg.project_intel.enabled = true;
+        cfg.project_intel.report_output_dir =
+            tmp.path().join("project-reports").display().to_string();
+        cfg.security_ops.enabled = true;
+        cfg.security_ops.playbooks_dir = tmp.path().join("playbooks").display().to_string();
+        cfg.security_ops.report_output_dir =
+            tmp.path().join("security-reports").display().to_string();
+        cfg.backup.enabled = true;
+        cfg.data_retention.enabled = true;
+        cfg.cloud_ops.enabled = true;
+        cfg.google_workspace.enabled = true;
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        cfg.claude_code_runner.enabled = true;
+        cfg.linkedin.enabled = true;
+        cfg.image_gen.enabled = true;
+        cfg.file_upload.url = Some("https://upload.example.invalid/files".into());
+        cfg.file_upload_bundle.url = Some("https://upload.example.invalid/bundles".into());
+        cfg.file_download.url = Some("https://download.example.invalid/files".into());
+        cfg.a2a.client.enabled = true;
+        cfg.microsoft365 = Microsoft365Config {
+            enabled: true,
+            tenant_id: Some("inventory-tenant".into()),
+            client_id: Some("inventory-client".into()),
+            // The device-code flow registers without a client secret.
+            auth_flow: "device_code".into(),
+            token_cache_encrypted: false,
+            ..Microsoft365Config::default()
+        };
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+        cfg.channels.email.insert(
+            "inventory".into(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        cfg.channels.discord.insert(
+            "inventory".into(),
+            DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+        // `llm_task` needs a provider for the calling agent, and the agent's MCP
+        // bundle grants the server that the stub registry below stands in for.
+        cfg.providers
+            .models
+            .openai
+            .insert("inventory".into(), OpenAIModelProviderConfig::default());
+        cfg.mcp.enabled = true;
+        cfg.mcp.deferred_loading = true;
+        cfg.mcp.servers = vec![McpServerConfig {
+            name: "inventory".into(),
+            transport: McpTransport::Stdio,
+            command: "inventory-mcp-server-never-started".into(),
+            ..Default::default()
+        }];
+        cfg.mcp_bundles.insert(
+            "inventory".into(),
+            McpBundleConfig {
+                servers: vec!["inventory".into()],
+                exclude: Vec::new(),
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.inventory".into(),
+                mcp_bundles: vec!["inventory".into()],
+                ..Default::default()
+            },
+        );
+        let delegate_targets = HashMap::from([(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.inventory".into(),
+                ..Default::default()
+            },
+        )]);
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let web_fetch = zeroclaw_config::schema::WebFetchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
+        let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
+
+        let built = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("inventory-placeholder"),
+            None,
+            &browser,
+            &http,
+            &web_fetch,
+            &workspace,
+            &delegate_targets,
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(sop_engine),
+            Some(sop_audit),
+            None,
+            // No caller ceiling: this fixture reads the names of the widest
+            // registry, which no caller bounds.
+            None,
+        )
+        .expect("tool registry builds");
+
+        // The scoped assembly mints `execute_pipeline` and the MCP capability
+        // tools. `acp_delivery` keeps `deliver_file`, which only ACP turns admit.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &cfg,
+            agent_alias: "test-agent",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(Arc::new(McpRegistry::for_test_with_server_count(1))),
+        })
+        .await;
+        assembled
+            .registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_registered_builtin_is_inventoried() {
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        assert!(
+            registered.contains("shell"),
+            "positive control: the maximal registry must be populated; got {registered:?}"
+        );
+
+        let uninventoried: Vec<&String> = registered
+            .iter()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the registry registers tools missing from BUILTIN_TOOLS in \
+             crates/zeroclaw-tools/src/inventory.rs; add each one there and to the \
+             tier tables in docs/book/src/developing/tool-inventory.md: {uninventoried:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_inventoried_tool_registers_under_a_maximal_config() {
+        // Rows a unit test cannot construct, with the reason.
+        let unconstructible = std::collections::BTreeMap::from([(
+            "tool_search",
+            "assembly mints it only behind two gates: `mcp.deferred_loading`, which \
+             defaults to false and is on here, and an MCP registry that advertises at \
+             least one tool, which only a connected MCP server does",
+        )]);
+        for name in unconstructible.keys() {
+            assert!(
+                zeroclaw_tools::inventory::is_builtin_tool_name(name),
+                "`{name}` is allowlisted as unconstructible but is not inventoried"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        let missing: Vec<&str> = zeroclaw_tools::inventory::BUILTIN_TOOLS
+            .iter()
+            .map(|spec| spec.name)
+            .filter(|name| !unconstructible.contains_key(name) && !registered.contains(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "inventoried tools that did not register under the maximal config; switch each \
+             one's gate on in maximal_registry_names or allowlist it with a reason: {missing:?}"
+        );
+
+        let now_constructible: Vec<&str> = unconstructible
+            .keys()
+            .copied()
+            .filter(|name| registered.contains(*name))
+            .collect();
+        assert!(
+            now_constructible.is_empty(),
+            "allowlisted tools now register under the maximal config; drop them from the \
+             allowlist: {now_constructible:?}"
         );
     }
 }

@@ -28,7 +28,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    ContextRecovery, record_llm_failure, try_recover_context_overflow,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -67,7 +69,9 @@ pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
     CollectedResults, check_identical_output_abort, collect_tool_results,
 };
-pub use steering::drain_steering_messages;
+pub use steering::{
+    SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture, drain_steering_messages,
+};
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
@@ -83,7 +87,7 @@ use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -207,6 +211,323 @@ pub type ContextLimitsResolver =
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+const PROVIDER_IMAGE_ROUTE_MAX_ENTRIES: usize = 8;
+const PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES: usize = 32;
+const PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES: usize = 32;
+
+type ProviderImageId = zeroclaw_providers::multimodal::ProviderImageId;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderImageRoute {
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Default)]
+struct ProviderImageRouteState {
+    accepted: VecDeque<ProviderImageId>,
+    quarantined: VecDeque<ProviderImageId>,
+}
+
+/// Provider-facing replay state. Canonical conversation history remains the
+/// only durable message source; this state only materializes a route-local view.
+#[derive(Debug, Default)]
+pub(crate) struct ProviderImageState {
+    routes: VecDeque<(ProviderImageRoute, ProviderImageRouteState)>,
+}
+
+impl ProviderImageState {
+    fn route(provider: &str, model: &str) -> ProviderImageRoute {
+        ProviderImageRoute {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    fn touch_route(&mut self, route: &ProviderImageRoute) -> Option<&ProviderImageRouteState> {
+        let index = self
+            .routes
+            .iter()
+            .position(|(candidate, _)| candidate == route)?;
+        let entry = self.routes.remove(index)?;
+        self.routes.push_back(entry);
+        self.routes.back().map(|(_, state)| state)
+    }
+
+    fn route_mut(&mut self, route: ProviderImageRoute) -> &mut ProviderImageRouteState {
+        if let Some(index) = self
+            .routes
+            .iter()
+            .position(|(candidate, _)| candidate == &route)
+            && let Some(entry) = self.routes.remove(index)
+        {
+            self.routes.push_back(entry);
+        } else {
+            if self.routes.len() >= PROVIDER_IMAGE_ROUTE_MAX_ENTRIES {
+                self.routes.pop_front();
+            }
+            self.routes
+                .push_back((route, ProviderImageRouteState::default()));
+        }
+        &mut self.routes.back_mut().expect("route was just inserted").1
+    }
+
+    fn retain_recent(
+        ids: &mut VecDeque<ProviderImageId>,
+        incoming: &[ProviderImageId],
+        max_entries: usize,
+    ) {
+        for image in incoming {
+            if let Some(index) = ids.iter().position(|candidate| candidate == image) {
+                ids.remove(index);
+            }
+            ids.push_back(*image);
+        }
+        while ids.len() > max_entries {
+            ids.pop_front();
+        }
+    }
+
+    fn accepted(&mut self, route: &ProviderImageRoute) -> Vec<ProviderImageId> {
+        self.touch_route(route)
+            .map(|state| state.accepted.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn quarantined(&mut self, route: &ProviderImageRoute) -> Vec<ProviderImageId> {
+        self.touch_route(route)
+            .map(|state| state.quarantined.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_success(
+        &mut self,
+        route: ProviderImageRoute,
+        accepted: &[ProviderImageId],
+        retried: &[ProviderImageId],
+    ) {
+        let state = self.route_mut(route);
+        Self::retain_recent(
+            &mut state.accepted,
+            accepted,
+            PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES,
+        );
+        for image in retried {
+            if accepted.contains(image) {
+                state.quarantined.retain(|candidate| candidate != image);
+            }
+        }
+    }
+
+    fn record_recovery(
+        &mut self,
+        route: ProviderImageRoute,
+        retained: &[ProviderImageId],
+        replaced: &[ProviderImageId],
+    ) {
+        let state = self.route_mut(route);
+        Self::retain_recent(
+            &mut state.accepted,
+            retained,
+            PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES,
+        );
+        Self::retain_recent(
+            &mut state.quarantined,
+            replaced,
+            PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES,
+        );
+    }
+}
+
+fn suppress_quarantined_provider_images(
+    messages: &[ChatMessage],
+    quarantined: &[zeroclaw_providers::multimodal::ProviderImageId],
+    has_new_user_input: bool,
+) -> Vec<ChatMessage> {
+    let newest_user_message = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| {
+            message.role == "user" && !message.content.trim_start().starts_with("[Tool results]")
+        })
+        .map(|(index, message)| (index, message.clone()));
+    let mut filtered =
+        zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
+    if has_new_user_input
+        && let Some((index, message)) = newest_user_message
+        && let Some(slot) = filtered.get_mut(index)
+    {
+        *slot = message;
+    }
+    filtered
+}
+
+fn prepare_provider_image_recovery_view(
+    messages: &[ChatMessage],
+    submitted: &[ProviderImageId],
+    accepted: &[ProviderImageId],
+) -> Option<(Vec<ChatMessage>, Vec<ProviderImageId>)> {
+    let replaced: Vec<_> = submitted
+        .iter()
+        .copied()
+        .filter(|image| !accepted.contains(image))
+        .collect();
+    if submitted.is_empty() || replaced.is_empty() {
+        return None;
+    }
+
+    Some((
+        zeroclaw_providers::multimodal::omit_provider_image_ids(messages, &replaced),
+        replaced,
+    ))
+}
+
+#[cfg(test)]
+mod provider_image_state_tests {
+    use super::*;
+
+    fn image_id(payload: &str) -> zeroclaw_providers::multimodal::ProviderImageId {
+        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(format!(
+            "[IMAGE:data:image/png;base64,{payload}]"
+        ))])[0]
+    }
+
+    fn image_ids(prefix: &str, count: usize) -> Vec<ProviderImageId> {
+        (0..count)
+            .map(|index| image_id(&format!("{prefix}{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn acceptance_and_quarantine_are_route_local_and_retry_clears_on_success() {
+        let accepted = image_id("AAAA");
+        let rejected = image_id("BBBB");
+        let route_a = ProviderImageState::route("compatible.primary", "model-a");
+        let route_b = ProviderImageState::route("compatible.primary", "model-b");
+        let mut state = ProviderImageState::default();
+
+        state.record_recovery(route_a.clone(), &[accepted], &[rejected]);
+        assert!(state.accepted(&route_a).contains(&accepted));
+        assert_eq!(state.quarantined(&route_a), vec![rejected]);
+        assert!(state.accepted(&route_b).is_empty());
+        assert!(state.quarantined(&route_b).is_empty());
+
+        state.record_success(route_a.clone(), &[rejected], &[rejected]);
+        assert!(state.accepted(&route_a).contains(&rejected));
+        assert!(state.quarantined(&route_a).is_empty());
+    }
+
+    #[test]
+    fn route_state_evicts_the_oldest_route_and_reads_refresh_recency() {
+        let mut state = ProviderImageState::default();
+        let routes: Vec<_> = (0..PROVIDER_IMAGE_ROUTE_MAX_ENTRIES)
+            .map(|index| ProviderImageState::route("compatible.primary", &format!("model-{index}")))
+            .collect();
+        for route in &routes {
+            state.record_success(route.clone(), &[], &[]);
+        }
+
+        state.accepted(&routes[0]);
+        let newest = ProviderImageState::route("compatible.primary", "model-new");
+        state.record_success(newest.clone(), &[], &[]);
+
+        assert_eq!(state.routes.len(), PROVIDER_IMAGE_ROUTE_MAX_ENTRIES);
+        assert!(state.routes.iter().any(|(route, _)| route == &routes[0]));
+        assert!(!state.routes.iter().any(|(route, _)| route == &routes[1]));
+        assert_eq!(state.routes.back().map(|(route, _)| route), Some(&newest));
+    }
+
+    #[test]
+    fn identity_state_evicts_oldest_entries_and_duplicates_refresh_recency() {
+        let route = ProviderImageState::route("compatible.primary", "model-a");
+        let accepted = image_ids("accepted-", PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES);
+        let quarantined = image_ids("quarantined-", PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES);
+        let accepted_new = image_id("accepted-new");
+        let quarantined_new = image_id("quarantined-new");
+        let mut state = ProviderImageState::default();
+
+        state.record_recovery(route.clone(), &accepted, &quarantined);
+        state.record_recovery(
+            route.clone(),
+            &[accepted[0], accepted_new],
+            &[quarantined[0], quarantined_new],
+        );
+
+        let accepted_after = state.accepted(&route);
+        assert_eq!(accepted_after.len(), PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES);
+        assert!(accepted_after.contains(&accepted[0]));
+        assert!(!accepted_after.contains(&accepted[1]));
+        assert_eq!(accepted_after.last(), Some(&accepted_new));
+        let quarantined_after = state.quarantined(&route);
+        assert_eq!(
+            quarantined_after.len(),
+            PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES
+        );
+        assert!(quarantined_after.contains(&quarantined[0]));
+        assert!(!quarantined_after.contains(&quarantined[1]));
+        assert_eq!(quarantined_after.last(), Some(&quarantined_new));
+    }
+
+    #[test]
+    fn quarantine_notice_describes_images_from_the_rejected_request() {
+        let singular = crate::i18n::get_english_cli_string_with_args(
+            "turn-provider-images-quarantined",
+            &[("count", "1"), ("count_plural", "one")],
+        );
+        let plural = crate::i18n::get_english_cli_string_with_args(
+            "turn-provider-images-quarantined",
+            &[("count", "2"), ("count_plural", "other")],
+        );
+
+        assert!(singular.contains("1 image that had not previously succeeded"));
+        assert!(plural.contains("2 images that had not previously succeeded"));
+        assert!(singular.contains("Send an omitted image again in a new message"));
+    }
+
+    #[test]
+    fn provider_image_recovery_view_includes_newest_unaccepted_image() {
+        let image = "data:image/png;base64,AAAA";
+        let messages = vec![ChatMessage::user(format!("new [IMAGE:{image}]"))];
+        let submitted = zeroclaw_providers::multimodal::provider_image_ids(&messages);
+
+        let (recovery_messages, replaced) =
+            prepare_provider_image_recovery_view(&messages, &submitted, &[])
+                .expect("newest unaccepted image is recoverable");
+
+        assert_eq!(replaced, submitted);
+        assert!(!recovery_messages[0].content.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn newest_user_resubmission_bypasses_only_its_own_suppression() {
+        let image = "data:image/png;base64,AAAA";
+        let messages = vec![
+            ChatMessage::user(format!("old [IMAGE:{image}]")),
+            ChatMessage::assistant("retry it"),
+            ChatMessage::user(format!("new [IMAGE:{image}]")),
+        ];
+        let id = image_id("AAAA");
+
+        let filtered = suppress_quarantined_provider_images(&messages, &[id], true);
+
+        assert!(!filtered[0].content.contains("[IMAGE:"));
+        assert!(filtered[2].content.contains("[IMAGE:"));
+
+        let continued = suppress_quarantined_provider_images(&messages, &[id], false);
+        assert!(
+            continued
+                .iter()
+                .all(|message| !message.content.contains("[IMAGE:"))
+        );
+    }
+}
+
+pub struct ToolLoopImageState<'a> {
+    pub cache: &'a mut zeroclaw_providers::multimodal::LocalImageCache,
+    pub(crate) provider_state: &'a mut ProviderImageState,
+}
 
 async fn emit_unforwarded_native_narration(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -357,9 +678,9 @@ pub struct ToolLoop<'a> {
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
-    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
+    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<SteeringInput>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
-    pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
+    pub image_cache: Option<ToolLoopImageState<'a>>,
     pub ingress: IngressContext,
     /// The per-turn memory half for unified memory-context injection: the
     /// handle, raw recall query, session scopes, and spawn-site suppression.
@@ -981,7 +1302,7 @@ impl<'a> TurnState<'a> {
         &mut self,
         assistant_history_content: String,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
-        individual_results: &[(Option<String>, String)],
+        individual_results: &[results_collect::ToolRoundResult],
         tool_results: &str,
         use_native_tools: bool,
     ) {
@@ -1066,12 +1387,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         served_route_sink,
         sop_reassembly,
     } = p;
+    let image_recovery_has_owner = image_cache.is_some();
     let mut loop_local_image_cache = None;
+    let mut loop_local_provider_image_state = ProviderImageState::default();
     let mut image_cache = Some(match image_cache {
-        Some(cache) => cache,
-        None => {
-            loop_local_image_cache.insert(zeroclaw_providers::multimodal::LocalImageCache::new())
-        }
+        Some(state) => state,
+        None => ToolLoopImageState {
+            cache: loop_local_image_cache
+                .insert(zeroclaw_providers::multimodal::LocalImageCache::new()),
+            provider_state: &mut loop_local_provider_image_state,
+        },
     });
     let ResolvedAgentExecution {
         model_access:
@@ -1221,6 +1546,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Text withheld by the streaming text guard on a previous attempt,
+    // stored with its trailing whitespace trimmed. A repeat that is
+    // identical up to trailing whitespace means the model produced the same
+    // protocol-shaped prose again; another retry would suppress it again,
+    // so the turn ends with a notice instead of spending more provider
+    // calls.
+    let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -1263,6 +1595,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
 
     for iteration in 0..max_iterations {
+        let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
         //
         // A step's scope is resolved by name, so it can only narrow tools that
@@ -1289,7 +1622,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             });
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
 
-        for steering_message in drain_steering_messages(&mut steering) {
+        for steering_input in drain_steering_messages(&mut steering) {
+            // This loop cannot narrow its registry mid-run, so it admits only
+            // a sender that is still authorized and whose posture narrows
+            // nothing; anything else is dropped rather than run with more
+            // than the sender now holds.
+            match steering_input.admit() {
+                SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
+                _ => continue,
+            }
+            let steering_message = steering_input.into_text();
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
                 IngressDecision::Loop => {}
@@ -1307,6 +1649,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 IngressDecision::Drop { .. } => continue,
             }
             let msg = ChatMessage::user(steering_message);
+            has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
             turn_state.push_dual(msg);
         }
 
@@ -1325,6 +1668,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 Ok(ExecutionTreeReservation::FinalCompletion) => {
                     let mut final_knobs = knobs.clone();
                     final_knobs.max_iteration_behavior = MaxIterationBehavior::GracefulSummary;
+                    let (summary_image_cache, summary_provider_image_state) = match image_cache
+                        .as_mut()
+                    {
+                        Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
+                        None => (None, None),
+                    };
                     let summary_result = finish_after_max_iterations(
                         injected_memory_preamble,
                         model_provider,
@@ -1346,7 +1695,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         multimodal_config,
                         security,
                         hooks,
-                        image_cache.as_deref_mut(),
+                        summary_image_cache,
+                        summary_provider_image_state,
                         |provider, selected_model| {
                             resolve_context_limits_for_call(
                                 context_limits_resolver.as_ref(),
@@ -1450,10 +1800,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 turn_state.history,
                 multimodal_config,
                 degrade_strip_images,
-                image_cache.as_deref_mut(),
+                image_cache.as_mut().map(|state| &mut *state.cache),
             )
             .await?;
         let mut provider_request_messages = prepared_messages.messages;
+        let newest_user_image_ids = prepared_messages.newest_user_image_ids;
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
 
@@ -1516,6 +1867,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // between durable turns and the post-hook request.
         let hook_structural_mutation = !hook_appended_suffix_only;
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        let image_route =
+            ProviderImageState::route(active_model_provider_name, provider_request_model);
+        let quarantined_image_ids = image_cache
+            .as_mut()
+            .map(|state| state.provider_state.quarantined(&image_route))
+            .unwrap_or_default();
+        provider_request_messages = suppress_quarantined_provider_images(
+            &provider_request_messages,
+            &quarantined_image_ids,
+            has_new_user_input,
+        );
         // The wire selector for `call_provider`: routed providers may need a
         // `hint:<name>` selector distinct from the resolved `model` used for
         // attribution above, so this cannot just reuse `provider_request_model`.
@@ -1573,7 +1935,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
-
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -1863,6 +2224,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             ));
         }
 
+        // Recovery must use the final dispatch population, never a snapshot
+        // containing turns removed by the pre-dispatch budget trim.
+        let submitted_image_ids =
+            zeroclaw_providers::multimodal::provider_image_ids(&provider_request_messages);
+        let accepted_image_ids = image_cache
+            .as_mut()
+            .map(|state| state.provider_state.accepted(&image_route))
+            .unwrap_or_default();
+        let image_recovery_view = if image_recovery_has_owner {
+            prepare_provider_image_recovery_view(
+                &provider_request_messages,
+                &submitted_image_ids,
+                &accepted_image_ids,
+            )
+        } else {
+            None
+        };
+        let (image_recovery_messages, recovery_replaced_image_ids) = match image_recovery_view {
+            Some((messages, replaced)) => (Some(messages), replaced),
+            None => (None, Vec::new()),
+        };
+        let recovery_submitted_image_ids = image_recovery_messages
+            .as_deref()
+            .map(zeroclaw_providers::multimodal::provider_image_ids)
+            .unwrap_or_default();
+
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
@@ -1942,6 +2329,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
+            image_recovery_succeeded,
         } = call_provider(
             &ctx,
             active_model_provider,
@@ -1949,11 +2337,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_request_model,
             provider_dispatch_model,
             &provider_request_messages,
+            image_recovery_messages.as_deref(),
             request_tools,
             should_consume_provider_stream,
             iteration,
         )
         .await?;
+        let accepted_request_messages = if image_recovery_succeeded {
+            image_recovery_messages
+                .as_deref()
+                .unwrap_or(&provider_request_messages)
+        } else {
+            &provider_request_messages
+        };
 
         // Reliable reports its actually served candidate; direct providers
         // use the vision/post-hook identity when present, otherwise retain the
@@ -2053,7 +2449,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &served_provider,
                     &served_model,
                     resp,
-                    &provider_request_messages,
+                    accepted_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     iteration,
@@ -2095,7 +2491,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut turn_state.crumb_present,
                 )
                 .await;
-                if recovered {
+                if recovered.recovered() {
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the
@@ -2124,7 +2520,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ));
                     turn_state.push_dual(msg);
                 }
-                return Err(e);
+                return Err(if recovered == ContextRecovery::Unrecoverable {
+                    zeroclaw_api::turn_stop::tag(
+                        e,
+                        zeroclaw_api::turn_stop::TurnStop::fatal(
+                            zeroclaw_api::turn_stop::TurnStopCode::ContextOverflow,
+                            "context window exceeded and history cannot be trimmed further",
+                        ),
+                    )
+                } else {
+                    e
+                });
             }
         };
 
@@ -2173,6 +2579,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     })),
                 "tool_call_parse_feedback_details"
             );
+
+            if protocol_suppressed {
+                // Trailing whitespace is not a semantic difference: the same
+                // suppressed envelope with or without a final newline is
+                // still the same reply, so compare trimmed ends and store
+                // the trimmed form. The delivered text is not rewritten.
+                let suppressed_text = response_text.trim_end().to_string();
+                if last_guard_suppressed_text.as_deref() == Some(suppressed_text.as_str()) {
+                    // The guard withheld the same text twice: retrying cannot
+                    // recover prose the guard keeps suppressing, so end the
+                    // turn with a notice instead of another provider call.
+                    let notice = crate::i18n::get_required_cli_string(
+                        "cli-agent-error-protocol-guard-withheld",
+                    );
+                    accumulated_display_text.push_str(&notice);
+                    // The notice is synthesized here, never streamed live: an
+                    // event consumer that already flushed streamed prose
+                    // would otherwise hide it, like the malformed fallback.
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(StreamDelta::Text(notice.to_string())).await;
+                    }
+                    let msg = ChatMessage::assistant(notice.to_string());
+                    turn_state.push_dual(msg);
+                    return Ok(accumulated_display_text);
+                }
+                last_guard_suppressed_text = Some(suppressed_text);
+            }
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
@@ -2225,7 +2659,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &native_tool_calls,
             tool_calls.len(),
             response_usage.as_ref(),
-            &provider_request_messages,
+            accepted_request_messages,
             llm_started_at,
             iteration,
             accepted_route.as_ref(),
@@ -2258,6 +2692,44 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
         zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+
+        if let Some(image_state) = image_cache.as_mut() {
+            if image_recovery_succeeded {
+                image_state.provider_state.record_recovery(
+                    image_route,
+                    &recovery_submitted_image_ids,
+                    &recovery_replaced_image_ids,
+                );
+            } else {
+                image_state.provider_state.record_success(
+                    image_route,
+                    &submitted_image_ids,
+                    &newest_user_image_ids,
+                );
+            }
+        }
+
+        if image_recovery_succeeded {
+            let replaced_count = recovery_replaced_image_ids.len().to_string();
+            let replaced_count_plural = if recovery_replaced_image_ids.len() == 1 {
+                "one"
+            } else {
+                "other"
+            };
+            let notice = crate::i18n::get_required_cli_string_with_args(
+                "turn-provider-images-quarantined",
+                &[
+                    ("count", replaced_count.as_str()),
+                    ("count_plural", replaced_count_plural),
+                ],
+            );
+            accumulated_display_text.push_str(&notice);
+            accumulated_display_text.push_str("\n\n");
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &format!("{notice}\n\n")).await;
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(StreamDelta::Text(format!("{notice}\n\n"))).await;
+            }
+        }
 
         if tool_calls.is_empty() {
             ::zeroclaw_log::record!(
@@ -2312,7 +2784,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_id,
                     multimodal_config,
                     degrade_strip_images,
-                    image_cache.as_deref_mut(),
+                    image_cache.as_mut().map(|state| &mut *state.cache),
                     use_native_tools,
                     0,
                     &mut turn_state.crumb_present,
@@ -2341,8 +2813,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 !native_tool_calls.is_empty(),
             )
             .await;
-            // `protocol_suppressed` withholds the whole turn; the empty-remainder
-            // skip below handles the guard-passed case where the live stream already forwarded every byte.
+            // `protocol_suppressed` withholds from the suppressed candidate onward; the prose
+            // ahead of it is already delivered, and the empty-remainder skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && !remainder.is_empty()
@@ -2516,6 +2988,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             output: crate::i18n::get_required_cli_string(
                                 "turn-tool-interrupted-before-result",
                             ),
+                            attachments: Vec::new(),
                             success: false,
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
@@ -2541,6 +3014,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         output: crate::i18n::get_required_cli_string(
                             "turn-tool-interrupted-before-result",
                         ),
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: None,
                         duration: std::time::Duration::ZERO,
@@ -2637,7 +3111,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 collected_receipts,
                 event_tx.clone(),
                 turn_state.canonical.as_deref_mut(),
-                image_cache.as_deref_mut(),
+                if image_recovery_has_owner {
+                    image_cache.as_mut()
+                } else {
+                    None
+                },
                 agent_alias,
                 parent_agent_alias,
                 sop_reassembly.clone(),
@@ -2659,6 +3137,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         budget.reserve()?;
     }
 
+    let (summary_image_cache, summary_provider_image_state) = match image_cache.as_mut() {
+        Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
+        None => (None, None),
+    };
     let summary_result = finish_after_max_iterations(
         injected_memory_preamble,
         model_provider,
@@ -2680,7 +3162,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         multimodal_config,
         security,
         hooks,
-        image_cache,
+        summary_image_cache,
+        summary_provider_image_state,
         |provider, selected_model| {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
@@ -2818,7 +3301,7 @@ pub struct SopStepReassembly<'a> {
     /// caller allowlist; every other construction site has no caller ceiling to
     /// forward and passes `None`.
     pub caller_allowed: Option<&'a [String]>,
-    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    pub live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -2910,7 +3393,7 @@ impl OwnedAgentExecution {
 #[cfg(test)]
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -2932,7 +3415,7 @@ pub(crate) async fn assemble_owned_execution(
 
 pub(crate) async fn assemble_owned_execution_with_admission(
     config: &zeroclaw_config::schema::Config,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -3226,7 +3709,7 @@ async fn drive_live_sop_actions(
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
-    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    mut image_cache: Option<&mut ToolLoopImageState<'_>>,
     agent_alias: Option<&str>,
     parent_agent_alias: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
@@ -3548,6 +4031,16 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
+                            let mut child_provider_image_state = ProviderImageState::default();
+                            let nested_image_state =
+                                image_cache.as_deref_mut().map(|state| ToolLoopImageState {
+                                    cache: &mut *state.cache,
+                                    provider_state: if owned.is_some() {
+                                        &mut child_provider_image_state
+                                    } else {
+                                        &mut *state.provider_state
+                                    },
+                                });
                             // Owned here, not a `&mut None` temporary: the step
                             // future is built inside the run-attribution scope and
                             // awaited after it, so a temporary would be dropped
@@ -3644,7 +4137,7 @@ async fn drive_live_sop_actions(
                                     } else {
                                         Some(&mut inner_new_msgs)
                                     },
-                                    image_cache: image_cache.as_deref_mut(),
+                                    image_cache: nested_image_state,
                                     memory: None,
                                     ingress: IngressContext::sub_turn(),
                                     // Attribution follows the EFFECTIVE agent:
@@ -5425,7 +5918,7 @@ mod active_route_context_tests {
             axum::serve(listener, app).await.expect("vision serves");
         });
 
-        // A tempfile PNG the injected marker points at, so image preparation
+        // A tempfile PNG the declared attachment points at, so image preparation
         // has a real file to load.
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("shot.png");
@@ -5462,7 +5955,7 @@ vision_model_provider = "custom.vision"
         // Text primary: iteration 0 emits a native tool call; iteration 1 (after
         // the tool injects an image and the route switches to vision) ends the
         // turn. `ProviderCapabilities::default()` has `vision = false`, so the
-        // image marker forces the vision route.
+        // declared image forces the vision route.
         struct TextPrimary {
             calls: Arc<AtomicUsize>,
         }
@@ -5470,7 +5963,7 @@ vision_model_provider = "custom.vision"
         impl ModelProvider for TextPrimary {
             fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
                 // Native tool calling so the structured `tool_calls` below are
-                // honored; vision stays false so an image marker forces routing.
+                // honored; vision stays false so a declared image forces routing.
                 zeroclaw_api::model_provider::ProviderCapabilities {
                     native_tool_calling: true,
                     ..Default::default()
@@ -5544,7 +6037,14 @@ vision_model_provider = "custom.vision"
                 serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
-                Ok(ToolResult::ok(format!("here it is [IMAGE:{}]", self.path)))
+                // The producer declares its image; under the attachment
+                // contract nothing in the result text is promoted.
+                Ok(ToolResult::ok("here it is").with_attachment(
+                    zeroclaw_api::media::RenderedMarker {
+                        target: self.path.clone(),
+                        kind: zeroclaw_api::media::MarkerKind::Image,
+                    },
+                ))
             }
         }
         impl zeroclaw_api::attribution::Attributable for AttachImage {
@@ -5602,6 +6102,7 @@ vision_model_provider = "custom.vision"
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
         let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut provider_image_state = ProviderImageState::default();
         let turn_id = "b3-two-iteration";
 
         let _ = run_tool_call_loop(ToolLoop {
@@ -5655,7 +6156,10 @@ vision_model_provider = "custom.vision"
             event_tx: Some(event_tx),
             steering: None,
             new_messages_out: None,
-            image_cache: Some(&mut image_cache),
+            image_cache: Some(ToolLoopImageState {
+                cache: &mut image_cache,
+                provider_state: &mut provider_image_state,
+            }),
             memory: None,
             ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
             agent_alias: Some("coder"),
@@ -6111,14 +6615,14 @@ mod sop_step_reassembly_tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
         let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             SopConfig::default(),
         )));
 
         let owned = assemble_owned_execution(
             &config,
-            Some(Arc::clone(&live_config)),
+            Some(live_config.handle()),
             "stepper",
             Arc::clone(&engine),
             None,
@@ -6140,11 +6644,11 @@ mod sop_step_reassembly_tests {
             .expect("first run");
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut reloaded = live_config.snapshot();
+        reloaded.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         let second = file_download.execute(args).await.expect("second run");
         assert!(
@@ -6573,6 +7077,7 @@ mod sop_step_reassembly_tests {
             max_tool_iterations,
             None,
             None,
+            None,
         )
         .await
     }
@@ -6586,6 +7091,7 @@ mod sop_step_reassembly_tests {
         max_tool_iterations: usize,
         security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
+        image_cache: Option<ToolLoopImageState<'_>>,
     ) -> Result<String> {
         let observer = crate::observability::NoopObserver {};
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
@@ -6650,7 +7156,7 @@ mod sop_step_reassembly_tests {
             event_tx: None,
             steering: None,
             new_messages_out: None,
-            image_cache: None,
+            image_cache,
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: Some("budget-test"),
@@ -6663,7 +7169,7 @@ mod sop_step_reassembly_tests {
 
     #[tokio::test]
     async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
-        struct SummaryProbe(Arc<AtomicUsize>, &'static str);
+        struct SummaryProbe(Arc<AtomicUsize>, &'static str, bool);
         impl zeroclaw_api::attribution::Attributable for SummaryProbe {
             fn role(&self) -> zeroclaw_api::attribution::Role {
                 zeroclaw_api::attribution::Attributable::role(&TextProvider)
@@ -6698,11 +7204,13 @@ mod sop_step_reassembly_tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(model, self.1);
                 assert!(request.tools.is_none());
-                assert!(
+                assert_eq!(
                     request
                         .messages
                         .iter()
-                        .any(|m| m.content.contains("data:image/png;base64,"))
+                        .any(|m| m.content.contains("data:image/png;base64,")),
+                    self.2,
+                    "summary must apply quarantine for the hook-selected model"
                 );
                 assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
                 Ok(ChatResponse {
@@ -6758,6 +7266,20 @@ mod sop_step_reassembly_tests {
         )
         .unwrap();
         let prompt = format!("describe [IMAGE:{}]", image.display());
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let mut id_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let prepared = prepare_messages_for_iteration(
+            &[ChatMessage::user(prompt.clone())],
+            &multimodal,
+            false,
+            Some(&mut id_cache),
+        )
+        .await
+        .expect("summary image must prepare");
+        let image_id = zeroclaw_providers::multimodal::provider_image_ids(&prepared.messages)
+            .into_iter()
+            .next()
+            .expect("prepared summary request must contain an image");
         let security = crate::security::SecurityPolicy {
             workspace_dir: tmp.path().to_path_buf(),
             ..Default::default()
@@ -6772,6 +7294,7 @@ mod sop_step_reassembly_tests {
                 } else {
                     "hint:budget-test"
                 },
+                !change_model,
             );
             let mut hooks = crate::hooks::HookRunner::new();
             hooks.register(Box::new(SummaryHook {
@@ -6780,6 +7303,17 @@ mod sop_step_reassembly_tests {
             }));
             let budget = ExecutionTreeBudget::root(1);
             let mut history = vec![ChatMessage::user(prompt.clone())];
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = ProviderImageState::default();
+            provider_image_state.record_recovery(
+                ProviderImageState::route("budget-test", "hook-selected-model"),
+                &[],
+                &[image_id],
+            );
+            let image_state = ToolLoopImageState {
+                cache: &mut image_cache,
+                provider_state: &mut provider_image_state,
+            };
             let result = run_budgeted_test_loop_with_hooks(
                 &provider,
                 &mut history,
@@ -6789,6 +7323,7 @@ mod sop_step_reassembly_tests {
                 10,
                 None,
                 Some(&hooks),
+                Some(image_state),
             )
             .await;
             assert_eq!(budget.remaining(), 0);
@@ -6823,6 +7358,7 @@ mod sop_step_reassembly_tests {
             CancellationToken::new(),
             10,
             Some(&security),
+            None,
             None,
         )
         .await;
@@ -8692,13 +9228,14 @@ mod tool_lifecycle_abandonment_tests {
             cancellation_token,
             history,
             0,
+            None,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn run_scripted_loop_with_budget(
-        provider: &ScriptedProvider,
+        provider: &dyn ModelProvider,
         tools_registry: &crate::tools::scoped::ScopedToolRegistry,
         observer: &NoopObserver,
         hooks: Option<&crate::hooks::HookRunner>,
@@ -8708,6 +9245,7 @@ mod tool_lifecycle_abandonment_tests {
         cancellation_token: Option<CancellationToken>,
         history: &mut Vec<ChatMessage>,
         context_token_budget: usize,
+        image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
         let mut injected_preamble = None;
@@ -8760,7 +9298,7 @@ mod tool_lifecycle_abandonment_tests {
             event_tx: None,
             steering: None,
             new_messages_out: None,
-            image_cache: None,
+            image_cache,
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8774,6 +9312,264 @@ mod tool_lifecycle_abandonment_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    struct ImageRecoveryProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        error_message: &'static str,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ImageRecoveryProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "trim-image-recovery"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ImageRecoveryProvider {
+        fn supports_vision(&self) -> bool {
+            true
+        }
+
+        fn supports_exact_request_replay(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+        ) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("structured chat is used")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut requests = self.requests.lock().expect("request lock");
+            requests.push(request.messages.to_vec());
+            if requests.len() == 1 {
+                return Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                    status: 400,
+                    message: self.error_message.into(),
+                }
+                .into());
+            }
+            Ok(text_response())
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_does_not_restore_pre_dispatch_trimmed_history() {
+        let provider = ImageRecoveryProvider {
+            requests: Mutex::new(Vec::new()),
+            error_message: "rejected request",
+        };
+        let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let mut history = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user(format!("discarded-old-turn {}", "old ".repeat(10_000))),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user(retained_user),
+        ];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut provider_state = ProviderImageState::default();
+        let result = run_scripted_loop_with_budget(
+            &provider,
+            &registry_with(Vec::new()),
+            &NoopObserver,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            "trim-image-recovery",
+            false,
+            None,
+            &mut history,
+            // Fit the retained image, prompt framing and trim breadcrumb.
+            crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000,
+            Some(ToolLoopImageState {
+                cache: &mut cache,
+                provider_state: &mut provider_state,
+            }),
+        )
+        .await
+        .expect("trimmed request recovers without the image");
+
+        let notice = crate::i18n::get_required_cli_string_with_args(
+            "turn-provider-images-quarantined",
+            &[("count", "1"), ("count_plural", "one")],
+        );
+        assert_eq!(result, format!("{notice}\n\ndone"));
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        for messages in requests.iter() {
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains("discarded-old-turn"))
+            );
+        }
+        assert_eq!(
+            zeroclaw_providers::multimodal::provider_image_ids(&requests[0]).len(),
+            1
+        );
+        assert!(zeroclaw_providers::multimodal::provider_image_ids(&requests[1]).is_empty());
+        assert!(
+            history
+                .iter()
+                .all(|m| !m.content.contains("discarded-old-turn"))
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.role == "user" && m.content == retained_user)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_recovery_requires_caller_owned_state() {
+        for owned in [false, true] {
+            let provider = ImageRecoveryProvider {
+                requests: Mutex::new(Vec::new()),
+                error_message: "rejected request",
+            };
+            let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+            let mut history = vec![
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user(user),
+            ];
+            let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_state = ProviderImageState::default();
+            let registry = registry_with(Vec::new());
+            let result = run_scripted_loop_with_budget(
+                &provider,
+                &registry,
+                &NoopObserver,
+                None,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                "image-state-owner",
+                false,
+                None,
+                &mut history,
+                0,
+                owned.then_some(ToolLoopImageState {
+                    cache: &mut cache,
+                    provider_state: &mut provider_state,
+                }),
+            )
+            .await;
+            let requests = provider.requests.lock().expect("request lock");
+            assert_eq!(requests.len(), if owned { 2 } else { 1 });
+            assert_eq!(
+                zeroclaw_providers::multimodal::provider_image_ids(&requests[0]).len(),
+                1
+            );
+            if owned {
+                assert!(
+                    zeroclaw_providers::multimodal::provider_image_ids(&requests[1]).is_empty()
+                );
+                let notice = crate::i18n::get_required_cli_string_with_args(
+                    "turn-provider-images-quarantined",
+                    &[("count", "1"), ("count_plural", "one")],
+                );
+                assert_eq!(
+                    result.expect("owned recovery succeeds"),
+                    format!("{notice}\n\ndone")
+                );
+            } else {
+                let error = result.expect_err("stateless callers keep the original error");
+                assert!(error.to_string().contains("rejected request"));
+            }
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.role == "user" && message.content == user)
+            );
+            assert!(
+                history
+                    .iter()
+                    .filter(|message| message.role == "assistant")
+                    .all(|message| message.content == "done")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_leaves_context_overflow_to_history_trimming() {
+        let provider = ImageRecoveryProvider {
+            requests: Mutex::new(Vec::new()),
+            error_message: "prompt is too long",
+        };
+        let user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+        let mut history = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user(format!("old-context {}", "old ".repeat(10_000))),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user(user),
+        ];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut provider_state = ProviderImageState::default();
+        let registry = registry_with(Vec::new());
+        let result = run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &NoopObserver,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            "image-context-overflow",
+            false,
+            None,
+            &mut history,
+            0,
+            Some(ToolLoopImageState {
+                cache: &mut cache,
+                provider_state: &mut provider_state,
+            }),
+        )
+        .await
+        .expect("trimmed request succeeds with its image");
+        assert_eq!(result, "done");
+        let requests = provider.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .iter()
+                .any(|message| message.content.contains("old-context"))
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .all(|message| !message.content.contains("old-context"))
+        );
+        let image_ids = zeroclaw_providers::multimodal::provider_image_ids(&requests[0]);
+        assert_eq!(image_ids.len(), 1);
+        assert_eq!(
+            zeroclaw_providers::multimodal::provider_image_ids(&requests[1]),
+            image_ids
+        );
+        let route = ProviderImageState::route("scripted", "scripted-model");
+        assert!(provider_state.quarantined(&route).is_empty());
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "user" && message.content == user)
+        );
     }
 
     #[tokio::test]
@@ -8847,6 +9643,7 @@ mod tool_lifecycle_abandonment_tests {
             None,
             &mut history,
             budget,
+            None,
         )
         .await;
 

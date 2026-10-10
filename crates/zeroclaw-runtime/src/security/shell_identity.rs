@@ -145,7 +145,6 @@ fn probe_helper(helper: &Path, timeout: Duration) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn shell_identity_invocation_preserves_program_and_argument_bytes() {
@@ -212,22 +211,24 @@ mod tests {
 
     #[test]
     fn shell_identity_probe_rejects_unsupported_and_stalled_helpers() {
-        let dir = tempfile::tempdir().unwrap();
-        let helper = dir.path().join("env");
-        for (script, timeout, expected) in [
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (fixture, timeout, expected) in [
             (
-                "#!/bin/sh\nexit 1\n",
+                "shell-helper-unsupported.sh",
                 Duration::from_secs(2),
                 io::ErrorKind::Unsupported,
             ),
             (
-                "#!/bin/sh\nwhile :; do :; done\n",
+                "shell-helper-stalled.sh",
                 Duration::from_millis(100),
                 io::ErrorKind::TimedOut,
             ),
         ] {
-            std::fs::write(&helper, script).unwrap();
-            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let helper = dir.path().join("env");
+            // Symlink immutable bytes so concurrent forks cannot inherit a
+            // writable descriptor for the executable being probed.
+            std::os::unix::fs::symlink(fixtures.join(fixture), &helper).unwrap();
             let error = probe_helper(&helper, timeout).unwrap_err();
             assert_eq!(error.kind(), expected);
         }

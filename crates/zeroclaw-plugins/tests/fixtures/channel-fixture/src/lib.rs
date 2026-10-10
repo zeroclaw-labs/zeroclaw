@@ -3,7 +3,7 @@
 #[cfg(target_family = "wasm")]
 mod component {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
@@ -26,6 +26,17 @@ mod component {
     /// host tests can observe which config generation an instance was
     /// configured with (reconstruction must replay the constructor snapshot).
     static CONFIGURED_HANDLE: Mutex<Option<String>> = Mutex::new(None);
+    /// Guest-held health, flipped by host-enqueued `health:down` and
+    /// `health:up` messages the way a real plugin's connection state changes
+    /// during its polls. A rebuilt instance starts healthy again.
+    static HEALTHY: AtomicBool = AtomicBool::new(true);
+    /// `health-check` calls this instance has answered, reported by a
+    /// host-enqueued `health:count` message so host tests can bound how often
+    /// the host asks.
+    static HEALTH_CHECKS: AtomicU32 = AtomicU32::new(0);
+    /// Set by a host-enqueued `health:trap` message: the next `health-check`
+    /// traps, as a buggy plugin's would.
+    static TRAP_HEALTH_CHECK: AtomicBool = AtomicBool::new(false);
 
     fn current_public_config() -> Result<serde_json::Value, String> {
         let config = config_get().map_err(|_| "expected point-of-use public config".to_string())?;
@@ -155,11 +166,23 @@ mod component {
                     value = std::hint::black_box(value.wrapping_add(1));
                 }
             }
+            let content = match message.content.as_str() {
+                "health:down" | "health:up" => {
+                    HEALTHY.store(message.content == "health:up", Ordering::SeqCst);
+                    return None;
+                }
+                "health:trap" => {
+                    TRAP_HEALTH_CHECK.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                "health:count" => format!("health-checks:{}", HEALTH_CHECKS.load(Ordering::SeqCst)),
+                _ => message.content,
+            };
             Some(InboundMessage {
                 id: message.id,
                 sender: message.sender,
                 reply_target: message.reply_target,
-                content: message.content,
+                content,
                 // Deliberately untrusted: the host must replace both values
                 // with its admitted logical endpoint.
                 channel: "guest-channel".to_string(),
@@ -186,7 +209,12 @@ mod component {
         }
 
         fn health_check() -> bool {
-            true
+            HEALTH_CHECKS.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !TRAP_HEALTH_CHECK.load(Ordering::SeqCst),
+                "fixture health-check traps on request"
+            );
+            HEALTHY.load(Ordering::SeqCst)
         }
 
         fn self_handle() -> Option<String> {

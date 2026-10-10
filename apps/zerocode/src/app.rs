@@ -1285,7 +1285,7 @@ const MODES: &[Mode] = &[
 // ── Mode enum ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
+pub(crate) enum Mode {
     Dashboard,
     Config,
     Doctor,
@@ -1294,6 +1294,61 @@ enum Mode {
     Logs,
     Quickstart,
     Sop,
+}
+
+/// Draw the app's frame rows around pane content. Notices remain owned by the
+/// focused ChatState; this frame only resolves the active pane's current notice.
+pub(crate) fn draw_app_frame(
+    frame: &mut ratatui::Frame,
+    mode: Mode,
+    chat_pane: &mut chat::Chat,
+    acp_pane: &mut acp::Acp,
+    draw_body: impl FnOnce(&mut ratatui::Frame, [Rect; 3], &mut chat::Chat, &mut acp::Acp),
+) {
+    if let Some(style) = theme::backdrop_style() {
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(style),
+            frame.area(),
+        );
+    }
+    let info_message = match mode {
+        Mode::Chat => chat_pane.info_message().cloned(),
+        Mode::Acp => acp_pane.info_message().cloned(),
+        _ => None,
+    };
+    let has_info = info_message.is_some();
+    let constraints: Vec<Constraint> = if has_info {
+        vec![
+            Constraint::Length(1), // mode bar
+            Constraint::Min(0),    // content
+            Constraint::Length(1), // info bar
+            Constraint::Length(1), // status bar
+        ]
+    } else {
+        vec![
+            Constraint::Length(1), // mode bar
+            Constraint::Min(0),    // content
+            Constraint::Length(1), // status bar
+        ]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(frame.area());
+    let status_idx = if has_info { 3 } else { 2 };
+    draw_body(
+        frame,
+        [chunks[0], chunks[1], chunks[status_idx]],
+        chat_pane,
+        acp_pane,
+    );
+    if has_info {
+        let info_area = chunks[2];
+        let bar = crate::widgets::InfoBar::new(info_message.as_ref());
+        if let Some(widget) = bar.widget(info_area.width as usize) {
+            frame.render_widget(widget, info_area);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1938,118 +1993,79 @@ pub async fn run(
         crate::osc_status::sync(terminal_status, terminal_agent);
 
         term.draw(|frame| {
-            // Theme backdrop: paint the whole screen with the active
-            // theme's background first so every pane inherits it. The
-            // `terminal` theme returns None and the user's own shell
-            // colours show through.
-            if let Some(style) = theme::backdrop_style() {
-                frame.render_widget(
-                    ratatui::widgets::Block::default().style(style),
-                    frame.area(),
-                );
-            }
-            // The info bar appears as a dedicated row between the content and
-            // the status bar, only while the active pane has a message to show.
-            let info_message = match mode {
-                Mode::Chat => chat_pane.info_message().cloned(),
-                _ => None,
-            };
-            let has_info = info_message.is_some();
-            let constraints: Vec<Constraint> = if has_info {
-                vec![
-                    Constraint::Length(1), // mode bar
-                    Constraint::Min(0),    // content
-                    Constraint::Length(1), // info bar
-                    Constraint::Length(1), // status bar
-                ]
-            } else {
-                vec![
-                    Constraint::Length(1), // mode bar
-                    Constraint::Min(0),    // content
-                    Constraint::Length(1), // status bar
-                ]
-            };
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(frame.area());
-
-            mode_bar_layout = draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
-            // The dock shares the content row; the mode,
-            // info, and status bars stay full-width. Panes render into (and
-            // hit-test against) the remaining `content_area` untouched.
-            let dock_layout = dock.layout(chunks[1], mode, plan_visible);
-            content_area = dock_layout.conversation;
-            dock.draw_shell(frame);
-            sidebar.clear_geometry();
-            if let Some(sidebar_area) = dock_layout.sessions {
-                sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
-            }
-
-            match mode {
-                Mode::Dashboard => dashboard_pane.draw(
-                    frame,
-                    content_area,
-                    chrome_status.status.as_ref(),
-                    chrome_status.health.as_ref(),
-                    acp_pane.current_cwd(),
-                    chat_pane.current_cwd(),
-                ),
-                Mode::Config => config_app.draw_into(frame, content_area),
-                Mode::Doctor => doctor_pane.draw(frame, content_area),
-                Mode::Acp => acp_pane.draw_with_dock(
-                    frame,
-                    content_area,
-                    dock_layout.queue,
-                    dock_layout.plan,
-                ),
-                Mode::Chat => chat_pane.draw_with_dock(
-                    frame,
-                    content_area,
-                    dock_layout.queue,
-                    dock_layout.plan,
-                ),
-                Mode::Logs => logs_pane.draw(frame, content_area),
-                Mode::Quickstart => quickstart.draw(frame, content_area),
-                Mode::Sop => sop_pane.render(frame, content_area),
-            }
-
-            dock.draw_resize_handles(frame);
-            match mode {
-                Mode::Acp => acp_pane.draw_dock_overlay(frame),
-                Mode::Chat => chat_pane.draw_dock_overlay(frame),
-                _ => {}
-            }
-            let status_idx = if has_info {
-                // Render the info bar in its own row above the status bar.
-                let info_area = chunks[2];
-                let bar = crate::widgets::InfoBar::new(info_message.as_ref());
-                if let Some(widget) = bar.widget(info_area.width as usize) {
-                    frame.render_widget(widget, info_area);
-                }
-                3
-            } else {
-                2
-            };
-
-            let (ctx_input, ctx_max, ctx_model_window) = match mode {
-                Mode::Chat => chat_pane.ctx_tokens(),
-                Mode::Acp => acp_pane.ctx_tokens(),
-                _ => (None, None, None),
-            };
-            let browse_mode = match mode {
-                Mode::Chat => chat_pane.in_browse_mode(),
-                Mode::Acp => acp_pane.in_browse_mode(),
-                _ => false,
-            };
-            draw_status_bar(
+            draw_app_frame(
                 frame,
-                chunks[status_idx],
-                &conn_state,
-                rpc.tui_id(),
-                CtxBar::new(ctx_input, ctx_max, ctx_model_window),
-                needs_intervention,
-                browse_mode,
+                mode,
+                &mut chat_pane,
+                &mut acp_pane,
+                |frame, chunks, chat_pane, acp_pane| {
+                    mode_bar_layout =
+                        draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
+                    // The dock shares the content row; the mode,
+                    // info, and status bars stay full-width. Panes render into (and
+                    // hit-test against) the remaining `content_area` untouched.
+                    let dock_layout = dock.layout(chunks[1], mode, plan_visible);
+                    content_area = dock_layout.conversation;
+                    dock.draw_shell(frame);
+                    sidebar.clear_geometry();
+                    if let Some(sidebar_area) = dock_layout.sessions {
+                        sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
+                    }
+
+                    match mode {
+                        Mode::Dashboard => dashboard_pane.draw(
+                            frame,
+                            content_area,
+                            chrome_status.status.as_ref(),
+                            chrome_status.health.as_ref(),
+                            acp_pane.current_cwd(),
+                            chat_pane.current_cwd(),
+                        ),
+                        Mode::Config => config_app.draw_into(frame, content_area),
+                        Mode::Doctor => doctor_pane.draw(frame, content_area),
+                        Mode::Acp => acp_pane.draw_with_dock(
+                            frame,
+                            content_area,
+                            dock_layout.queue,
+                            dock_layout.plan,
+                        ),
+                        Mode::Chat => chat_pane.draw_with_dock(
+                            frame,
+                            content_area,
+                            dock_layout.queue,
+                            dock_layout.plan,
+                        ),
+                        Mode::Logs => logs_pane.draw(frame, content_area),
+                        Mode::Quickstart => quickstart.draw(frame, content_area),
+                        Mode::Sop => sop_pane.render(frame, content_area),
+                    }
+
+                    dock.draw_resize_handles(frame);
+                    match mode {
+                        Mode::Acp => acp_pane.draw_dock_overlay(frame),
+                        Mode::Chat => chat_pane.draw_dock_overlay(frame),
+                        _ => {}
+                    }
+                    let (ctx_input, ctx_max, ctx_model_window) = match mode {
+                        Mode::Chat => chat_pane.ctx_tokens(),
+                        Mode::Acp => acp_pane.ctx_tokens(),
+                        _ => (None, None, None),
+                    };
+                    let browse_mode = match mode {
+                        Mode::Chat => chat_pane.in_browse_mode(),
+                        Mode::Acp => acp_pane.in_browse_mode(),
+                        _ => false,
+                    };
+                    draw_status_bar(
+                        frame,
+                        chunks[2],
+                        &conn_state,
+                        rpc.tui_id(),
+                        CtxBar::new(ctx_input, ctx_max, ctx_model_window),
+                        needs_intervention,
+                        browse_mode,
+                    );
+                },
             );
 
             // Sidebar "+" picker modal: above the panes, below the help and
