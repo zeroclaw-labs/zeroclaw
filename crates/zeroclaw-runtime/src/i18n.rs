@@ -1565,6 +1565,82 @@ mod tests {
         }
     }
 
+    /// The install and remove refusals for something the host never admitted
+    /// at a package name.
+    ///
+    /// The install refusal exists to hand the operator the recovery command,
+    /// so every catalogue must carry the literal `zeroclaw plugin remove
+    /// <name>` invocation with the package name inlined. The remove refusal
+    /// must inline the host's reason verbatim, since it says why nothing was
+    /// deleted. The messages for retained install, recovery and staging files,
+    /// and for a changed namespace, must carry the retained path and the
+    /// host's reason. A catalogue that copies English fails as untranslated.
+    #[test]
+    fn plugin_unadmitted_package_strings_are_translated_in_every_locale() {
+        const REASON: &str =
+            "plugin 'tool-fixture' is unsigned and signature verification is required";
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        const PATH: &str = "/plugins/.tool-fixture.recovering-v1-0/package";
+        let cases: [ParityCase; 6] = [
+            (
+                "cli-plugin-install-unadmitted-package",
+                &[("name", "tool-fixture")],
+                &["`zeroclaw plugin remove tool-fixture`"],
+            ),
+            (
+                "cli-plugin-remove-unadmitted-package",
+                &[("name", "tool-fixture"), ("reason", REASON)],
+                &["`zeroclaw plugin remove`", "'tool-fixture'", REASON],
+            ),
+            (
+                "cli-plugin-install-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON],
+            ),
+            (
+                "cli-plugin-recovery-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON, "plugin remove"],
+            ),
+            ("cli-plugin-staging-retained", &[("path", PATH)], &[PATH]),
+            (
+                "cli-plugin-namespace-changed",
+                &[("reason", REASON)],
+                &[REASON],
+            ),
+        ];
+
+        for (key, args, expected_parts) in cases {
+            let english =
+                format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in en"));
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} must contain {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
         let cases = [
