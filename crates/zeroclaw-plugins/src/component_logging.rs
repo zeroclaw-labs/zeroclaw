@@ -104,34 +104,55 @@ const PLUGIN_LOG_QUEUE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 static DROPPED_PLUGIN_LOGS: AtomicU64 = AtomicU64::new(0);
 
 /// Guest-controlled bytes currently reserved by queued or in-flight records.
-static QUEUED_PLUGIN_LOG_BYTES: AtomicUsize = AtomicUsize::new(0);
+static QUEUED_PLUGIN_LOG_BYTES: PluginLogByteBudget = PluginLogByteBudget::new();
 
-/// Reserve `bytes` against [`PLUGIN_LOG_QUEUE_BYTE_BUDGET`]. A compare
-/// exchange loop keeps the accounting exact: concurrent enqueues can never
-/// overshoot the budget, only fail and drop.
-fn try_reserve_plugin_log_bytes(bytes: usize) -> bool {
-    let mut current = QUEUED_PLUGIN_LOG_BYTES.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = current.checked_add(bytes) else {
-            return false;
-        };
-        if next > PLUGIN_LOG_QUEUE_BYTE_BUDGET {
-            return false;
-        }
-        match QUEUED_PLUGIN_LOG_BYTES.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(actual) => current = actual,
-        }
-    }
+/// Guest-controlled bytes reserved against [`MAX_PLUGIN_LOG_RECORD_BYTES`]
+/// per record and [`PLUGIN_LOG_QUEUE_BYTE_BUDGET`] in aggregate. A type rather
+/// than a bare atomic so the accounting can be checked on an instance nothing
+/// else moves: the process-wide [`QUEUED_PLUGIN_LOG_BYTES`] changes whenever
+/// any record is enqueued or drained.
+struct PluginLogByteBudget {
+    reserved: AtomicUsize,
 }
 
-fn release_plugin_log_bytes(bytes: usize) {
-    QUEUED_PLUGIN_LOG_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+impl PluginLogByteBudget {
+    const fn new() -> Self {
+        Self {
+            reserved: AtomicUsize::new(0),
+        }
+    }
+
+    /// Reserve one record's `bytes`. An oversized record is refused before
+    /// the count is touched. Otherwise a compare exchange loop keeps the
+    /// accounting exact: concurrent enqueues can never overshoot the budget,
+    /// only fail and drop.
+    fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes > MAX_PLUGIN_LOG_RECORD_BYTES {
+            return false;
+        }
+        let mut current = self.reserved.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > PLUGIN_LOG_QUEUE_BYTE_BUDGET {
+                return false;
+            }
+            match self.reserved.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.reserved.fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
 fn plugin_log_queue() -> &'static SyncSender<QueuedPluginLog> {
@@ -154,12 +175,12 @@ fn plugin_log_queue() -> &'static SyncSender<QueuedPluginLog> {
 /// is observable without re-entering the blocked path.
 fn enqueue_plugin_log(log: QueuedPluginLog) {
     let bytes = log.guest_bytes();
-    if bytes > MAX_PLUGIN_LOG_RECORD_BYTES || !try_reserve_plugin_log_bytes(bytes) {
+    if !QUEUED_PLUGIN_LOG_BYTES.try_reserve(bytes) {
         DROPPED_PLUGIN_LOGS.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if plugin_log_queue().try_send(log).is_err() {
-        release_plugin_log_bytes(bytes);
+        QUEUED_PLUGIN_LOG_BYTES.release(bytes);
         DROPPED_PLUGIN_LOGS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -181,7 +202,7 @@ fn drain_plugin_logs(rx: &Receiver<QueuedPluginLog>) {
                 // Release only after the write: while the drain side is
                 // stalled on this record, its memory is still retained and
                 // must stay counted.
-                release_plugin_log_bytes(log.guest_bytes());
+                QUEUED_PLUGIN_LOG_BYTES.release(log.guest_bytes());
             }
             // Idle wake: fall through to the drop check so rejected records
             // are reported even when nothing accepted ever follows them.
@@ -437,9 +458,11 @@ mod tests {
         assert_eq!(attrs["raw"], "guest");
     }
 
-    /// One test on purpose: the byte accounting is process-global state, and
-    /// exercising the oversized-drop and reserve/release paths sequentially
-    /// keeps the assertions free of cross-test interleaving.
+    /// Byte accounting is asserted on a budget the test owns. The process-wide
+    /// [`QUEUED_PLUGIN_LOG_BYTES`] also moves whenever a test running in
+    /// parallel sends a record through the host `log-record` import, and again
+    /// when the drain thread writes it, so exact readings of it race. The drop
+    /// counter never decreases, so a lower bound on it holds.
     #[test]
     fn plugin_log_queue_enforces_byte_bounds() {
         let scope = crate::instance::test_scope(PluginCapability::Tool, "bounds", []);
@@ -460,32 +483,49 @@ mod tests {
         sized.raw_attrs = Some("a".repeat(20));
         assert_eq!(sized.guest_bytes(), "bounds::execute".len() + 10 + 20);
 
-        // An oversized record is dropped before reserving any budget.
+        // An oversized record lands in the drop counter...
         let drops_before = DROPPED_PLUGIN_LOGS.load(Ordering::Relaxed);
-        let bytes_before = QUEUED_PLUGIN_LOG_BYTES.load(Ordering::Relaxed);
         enqueue_plugin_log(record("x".repeat(MAX_PLUGIN_LOG_RECORD_BYTES + 1)));
         assert!(
             DROPPED_PLUGIN_LOGS.load(Ordering::Relaxed) > drops_before,
             "an oversized record must land in the drop counter"
         );
+
+        // ...and is refused before it reserves any budget bytes.
+        let budget = PluginLogByteBudget::new();
+        let reserved = || budget.reserved.load(Ordering::Relaxed);
+        assert!(!budget.try_reserve(MAX_PLUGIN_LOG_RECORD_BYTES + 1));
         assert_eq!(
-            QUEUED_PLUGIN_LOG_BYTES.load(Ordering::Relaxed),
-            bytes_before,
+            reserved(),
+            0,
             "an oversized record must not reserve budget bytes"
         );
 
-        // The aggregate budget is exact: a reservation holds its bytes until
+        // The aggregate budget is exact: reservations hold their bytes until
         // released, and a request that would cross the ceiling fails whole.
-        assert!(try_reserve_plugin_log_bytes(1024));
+        let mut unreserved = PLUGIN_LOG_QUEUE_BYTE_BUDGET - 1;
+        while unreserved > 0 {
+            let chunk = unreserved.min(MAX_PLUGIN_LOG_RECORD_BYTES);
+            assert!(
+                budget.try_reserve(chunk),
+                "reservations under the ceiling must succeed"
+            );
+            unreserved -= chunk;
+        }
         assert!(
-            !try_reserve_plugin_log_bytes(PLUGIN_LOG_QUEUE_BYTE_BUDGET),
-            "a partially reserved budget must reject a full-budget request"
+            !budget.try_reserve(2),
+            "a request that would cross the ceiling must fail"
         );
-        release_plugin_log_bytes(1024);
+        assert_eq!(
+            reserved(),
+            PLUGIN_LOG_QUEUE_BYTE_BUDGET - 1,
+            "a failed request must not reserve part of its bytes"
+        );
         assert!(
-            try_reserve_plugin_log_bytes(PLUGIN_LOG_QUEUE_BYTE_BUDGET - bytes_before),
-            "releasing must restore the reserved bytes"
+            budget.try_reserve(1),
+            "a request that exactly reaches the ceiling must succeed"
         );
-        release_plugin_log_bytes(PLUGIN_LOG_QUEUE_BYTE_BUDGET - bytes_before);
+        budget.release(PLUGIN_LOG_QUEUE_BYTE_BUDGET);
+        assert_eq!(reserved(), 0, "releasing must restore the reserved bytes");
     }
 }
