@@ -54,6 +54,10 @@ The service smoke builds `windows_service_smoke_fixture`, which owns its synthet
 
 The recovery tests run in parallel with compilation because their runtime unit-test harness cannot reuse `cargo check` output. Both jobs preserve the Windows build leg's master-seeded cache identity, and recovery never writes a cache of its own. An unselected job skips before allocating a Windows runner. `CI Required Gate` directly consumes the detector and each required Windows job, rejects missing selection outputs, and requires every selected job to succeed. A selected-but-skipped, failed or cancelled job cannot count as an intentional skip.
 
+### Code Analysis (`ci-code-analysis.yml`)
+
+Runs Semgrep on pull requests to `master` and pushes to `master`, then uploads SARIF. The job configures Docker to check Google's public `mirror.gcr.io` cache first, preserving existing daemon settings and other mirrors. The Semgrep image keeps its canonical Docker Hub name and pinned digest; Docker falls back to Docker Hub on a cache miss. No registry credentials or Google account are required, including for fork PRs. A cache miss can still encounter Docker Hub's pull limits.
+
 ### Label-gated Advisory Windows Tests (`windows-tests.yml`)
 
 Use `ci:windows` when executing tests on Windows can close a material gap left by compilation. Typical cases include process or service lifecycle changes, PowerShell execution, filesystem and path handling, encoding, native dependencies, and changes to Windows CI selection or execution. It is not a default label for every Rust PR, a docs-only change, or an unrelated Linux test failure.

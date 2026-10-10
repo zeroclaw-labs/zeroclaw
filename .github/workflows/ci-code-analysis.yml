@@ -43,6 +43,26 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0   # full history so diff-aware --baseline-commit can reach the PR base
+      - name: Configure Google Docker Hub mirror
+        run: |
+          set -euo pipefail
+          umask 077
+          docker_config="$(mktemp)"
+          if sudo test -f /etc/docker/daemon.json; then
+            sudo cp /etc/docker/daemon.json "$docker_config"
+          else
+            printf '{}\n' > "$docker_config"
+          fi
+          # Preserve the runner's settings and other mirrors. Docker falls back
+          # to Docker Hub when the requested image is absent from Google's cache.
+          jq --arg mirror 'https://mirror.gcr.io' \
+            '.["registry-mirrors"] = ([$mirror] + ((.["registry-mirrors"] // []) | map(select(. != $mirror))))' \
+            "$docker_config" > "${docker_config}.updated"
+          sudo mkdir -p /etc/docker
+          sudo cp "${docker_config}.updated" /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}' \
+            | jq --exit-status 'any(.[]; . == "https://mirror.gcr.io/" or . == "https://mirror.gcr.io")'
       - name: Run Semgrep CE (diff-aware on PRs, full scan on push)
         run: |
           set -euo pipefail
