@@ -13471,6 +13471,14 @@ fn plan_replay_notification(
     notification_for_turn_event(session_id, &event)
 }
 
+#[cfg(test)]
+pub(crate) fn notification_for_turn_event_for_test(
+    session_id: &str,
+    event: &TurnEvent,
+) -> Option<String> {
+    notification_for_turn_event(session_id, event)
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {

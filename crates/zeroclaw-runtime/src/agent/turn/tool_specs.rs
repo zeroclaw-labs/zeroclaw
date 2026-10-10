@@ -14,6 +14,20 @@ pub(crate) struct IterationToolSpecs {
 }
 
 impl IterationToolSpecs {
+    /// Count before known-tool filtering or execution preparation can hide a batch.
+    pub(crate) fn exceeds_single_tool_round(
+        &self,
+        response: &zeroclaw_providers::ChatResponse,
+        strict_tool_parsing: bool,
+    ) -> bool {
+        exceeds_single_tool_round(
+            response.text_or_empty(),
+            response.tool_calls.len(),
+            !self.tool_specs.is_empty(),
+            strict_tool_parsing,
+        )
+    }
+
     pub(crate) fn refresh_native_tool_mode(
         &mut self,
         model_provider: &dyn ModelProvider,
@@ -24,6 +38,24 @@ impl IterationToolSpecs {
             .native_tool_calling
             && !self.tool_specs.is_empty();
     }
+}
+
+pub(super) fn exceeds_single_tool_round(
+    text: &str,
+    native_calls: usize,
+    has_tools: bool,
+    strict_tool_parsing: bool,
+) -> bool {
+    if native_calls > 0 {
+        return native_calls > 1;
+    }
+    if !has_tools || strict_tool_parsing {
+        return false;
+    }
+    let text = zeroclaw_tool_call_parser::strip_think_tags(text);
+    let text = zeroclaw_tool_call_parser::strip_trailing_terminal_markers(&text);
+    !zeroclaw_tool_call_parser::looks_like_tool_protocol_example(&text)
+        && zeroclaw_tool_call_parser::parse_tool_calls(&text).1.len() > 1
 }
 
 pub(crate) fn build_iteration_tool_specs(

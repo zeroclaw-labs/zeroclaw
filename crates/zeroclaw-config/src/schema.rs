@@ -4628,6 +4628,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_single_tool_rounds(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|profile| profile.single_tool_rounds)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_execution_tree_iterations)
@@ -14727,6 +14734,8 @@ pub struct RuntimeProfileConfig {
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
+    /// Request one native tool call per provider response when supported. Default off.
+    pub single_tool_rounds: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -14781,6 +14790,7 @@ impl Default for RuntimeProfileConfig {
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
+            single_tool_rounds: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
@@ -33769,6 +33779,40 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_single_tool_rounds_defaults_off_and_resolves_by_agent() {
+        let mut parsed = parse_test_config(
+            r#"
+[runtime_profiles.interactive]
+single_tool_rounds = true
+[runtime_profiles.batch]
+single_tool_rounds = false
+[runtime_profiles.unset]
+[agents.enabled]
+runtime_profile = "interactive"
+[agents.disabled]
+runtime_profile = "batch"
+[agents.unset]
+runtime_profile = "unset"
+[agents.missing]
+runtime_profile = "missing"
+"#,
+        );
+        assert_eq!(RuntimeProfileConfig::default().single_tool_rounds, None);
+        assert!(parsed.effective_single_tool_rounds("enabled"));
+        for alias in ["disabled", "unset", "missing", "unknown"] {
+            assert!(!parsed.effective_single_tool_rounds(alias));
+        }
+        parsed
+            .runtime_profiles
+            .get_mut("interactive")
+            .unwrap()
+            .single_tool_rounds = Some(false);
+        assert!(!parsed.effective_single_tool_rounds("enabled"));
+        let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
+        assert!(serialized.contains("single_tool_rounds = false"));
     }
 
     #[test]

@@ -623,6 +623,29 @@ fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
+fn single_tool_round_error() -> anyhow::Error {
+    anyhow::Error::new(stream_consume::SingleToolRoundViolation::default())
+}
+
+/// Only adjust the runtime's tool protocol and transient request prompt.
+fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
+    let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        system.content = system.content.replace(
+            crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS,
+            &instruction,
+        );
+        if !system.content.ends_with(&instruction) {
+            system.content.push_str("\n\n");
+            system.content.push_str(&instruction);
+        }
+        false
+    } else {
+        messages.insert(0, ChatMessage::system(instruction));
+        true
+    }
+}
+
 fn replace_tool_protocol_section(
     prompt: &mut String,
     text_tools_section: &str,
@@ -1545,6 +1568,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
+    let mut single_tool_limitation_reported = false;
     let mut malformed_tool_protocol_retries: usize = 0;
     // Text withheld by the streaming text guard on a previous attempt,
     // stored with its trailing whitespace trimmed. A repeat that is
@@ -1795,7 +1819,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (prepared_messages, prepared_source_rows) =
+        let (prepared_messages, mut prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
                 turn_state.history,
                 multimodal_config,
@@ -1925,6 +1949,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             ..
         } = iteration_tool_specs;
 
+        let single_tool_rounds_requested = config
+            .zip(agent_alias)
+            .is_some_and(|(config, alias)| config.effective_single_tool_rounds(alias));
+        let policy = if single_tool_rounds_requested
+            && use_native_tools
+            && active_model_provider.supports_single_tool_rounds(provider_dispatch_model)
+        {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Single
+        } else {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+        };
+
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
         // chooses a different model; unscoped callers retain their own prompt.
@@ -1935,6 +1971,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
+        if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && apply_single_tool_round_prompt(&mut provider_request_messages)
+        {
+            // A request-only system row must survive whole-turn trimming.
+            prepared_source_rows.insert(0, usize::MAX);
+        }
+
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -2083,6 +2126,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut trimmed_post_hook,
                     use_native_tools,
                 );
+                if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single {
+                    apply_single_tool_round_prompt(&mut trimmed_post_hook);
+                }
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
@@ -2257,6 +2303,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // called.
         enforce_tool_loop_budget()?;
 
+        if single_tool_rounds_requested
+            && !tool_specs.is_empty()
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+            && !single_tool_limitation_reported
+        {
+            let notice =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+            let notice = format!("{notice}\n\n");
+            accumulated_display_text.push_str(&notice);
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+            if let Some(tx) = on_delta.as_ref() {
+                let _ = tx.send(StreamDelta::Text(notice)).await;
+            }
+            single_tool_limitation_reported = true;
+        }
+
         if strict_tool_parsing
             && !tool_specs.is_empty()
             && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
@@ -2336,10 +2398,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             active_model_provider_name,
             provider_request_model,
             provider_dispatch_model,
-            &provider_request_messages,
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &provider_request_messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             image_recovery_messages.as_deref(),
-            request_tools,
             should_consume_provider_stream,
+            policy,
             iteration,
         )
         .await?;
@@ -2423,6 +2492,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
+            if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                && iteration_tool_specs.exceeds_single_tool_round(&response, strict_tool_parsing)
+            {
+                return Err(single_tool_round_error());
+            }
             if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -4346,6 +4420,34 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    #[test]
+    fn single_tool_prompt_changes_only_owned_protocol_and_is_idempotent() {
+        let protocol = crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+        let user = ChatMessage::user(format!("Quote this unchanged: {protocol}"));
+        let mut messages = vec![
+            ChatMessage::system(format!(
+                "Personality stays.\n{protocol}Other instructions stay."
+            )),
+            user.clone(),
+        ];
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert!(messages[0].content.starts_with("Personality stays.\n"));
+        assert!(messages[0].content.contains("Other instructions stay."));
+        assert!(!messages[0].content.contains(protocol));
+        assert!(messages[0].content.ends_with(&instruction));
+        assert_eq!(messages[1].content, user.content);
+        let once = messages[0].content.clone();
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert_eq!(messages[0].content, once);
+
+        let mut no_system = vec![user.clone()];
+        assert!(apply_single_tool_round_prompt(&mut no_system));
+        assert_eq!(no_system[0].role, "system");
+        assert_eq!(no_system[0].content, instruction);
+        assert_eq!(no_system[1].content, user.content);
+    }
 
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(

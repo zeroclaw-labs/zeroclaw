@@ -3067,6 +3067,17 @@ impl ModelProvider for ReliableModelProvider {
         )))
     }
 
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        !self.model_providers.is_empty()
+            && self.model_chain(model).iter().all(|model| {
+                self.model_providers.iter().all(|entry| {
+                    entry
+                        .provider()
+                        .supports_single_tool_rounds(entry.served_model(model))
+                })
+            })
+    }
+
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers
@@ -3492,6 +3503,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -3568,10 +3595,11 @@ impl ModelProvider for ReliableModelProvider {
                     match with_exact_dispatch_route(
                         entry.cooldown_key.clone(),
                         entry.served_model(current_model).to_string(),
-                        ProviderDispatch::from_ref(entry.provider()).chat(
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_tool_round_policy(
                             req,
                             current_model,
                             temperature,
+                            policy,
                         ),
                     )
                     .await
@@ -3874,6 +3902,23 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         commit_safeguard_fallback(None);
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
@@ -3925,11 +3970,12 @@ impl ModelProvider for ReliableModelProvider {
             let stream = stream_with_exact_dispatch_route(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
-                ProviderDispatch::from_ref(model_provider).stream_chat(
+                ProviderDispatch::from_ref(model_provider).stream_chat_with_tool_round_policy(
                     req,
                     &served_model,
                     temperature,
                     options,
+                    policy,
                 ),
             );
             let stream = stream

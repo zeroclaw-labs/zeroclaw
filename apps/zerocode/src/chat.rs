@@ -29922,6 +29922,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_tool_rounds_notifications_reach_final_chat_and_code_cells_in_order() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/single-tool-rounds.json"
+        )))
+        .unwrap();
+        let notice = fixture["unsupported_notice"].as_str().unwrap();
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for unsupported in [false, true] {
+                for width in [120, 160] {
+                    let (mut chat, _writer_rx) = test_chat();
+                    chat.pane_kind = pane;
+                    let mut active = state();
+                    active.turn_in_flight = true;
+                    for id in ["call-one", "call-two"] {
+                        active
+                            .tool_disclosures
+                            .insert(id.into(), ToolDisclosure::Full);
+                    }
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let mut updates = fixture["updates"].as_array().unwrap().clone();
+                    if unsupported {
+                        updates.insert(0, serde_json::json!({
+                            "method": "session/update",
+                            "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                        }));
+                    }
+                    let area = Rect::new(0, 0, width, 48);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    let mut ordered = Vec::new();
+                    for update in &updates {
+                        chat.rpc.push_notification_for_test(
+                            update["method"].as_str().unwrap(),
+                            update["params"].clone(),
+                        );
+                        chat.tick_transport_events();
+                        terminal
+                            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+                            .unwrap();
+                        let params = &update["params"];
+                        let token = match params["type"].as_str().unwrap() {
+                            "agent_message_chunk" => params["text"].as_str().unwrap(),
+                            "tool_call" => "[tool: echo]",
+                            "tool_result" => params["raw_output"].as_str().unwrap(),
+                            _ => unreachable!(),
+                        };
+                        if !token.contains(notice) {
+                            ordered.push(token);
+                        }
+                        let rendered = overlay_text(&terminal, area);
+                        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let mut remainder = normalized.as_str();
+                        for token in &ordered {
+                            let offset = remainder.find(token).unwrap_or_else(|| {
+                                panic!(
+                                    "missing or out-of-order {token} at width {width}: {rendered}"
+                                )
+                            });
+                            remainder = &remainder[offset + token.len()..];
+                        }
+                        assert_eq!(
+                            normalized.matches(notice).count(),
+                            usize::from(unsupported),
+                            "notice count at width {width}: {rendered}"
+                        );
+                        assert_eq!(
+                            rendered.matches("[tool: echo]").count(),
+                            ordered
+                                .iter()
+                                .filter(|token| **token == "[tool: echo]")
+                                .count(),
+                            "wrong tool-card count at width {width}: {rendered}"
+                        );
+                        for token in [
+                            "before-first",
+                            "result-1",
+                            "after-first",
+                            "result-2",
+                            "done",
+                        ] {
+                            assert_eq!(
+                                rendered.matches(token).count(),
+                                usize::from(ordered.contains(&token)),
+                                "wrong count for {token}: {rendered}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prompt_completion_settles_turn_when_terminal_update_is_missing() {
         let (mut chat, mut writer_rx) = test_chat();
         let mut active = state();

@@ -13,7 +13,9 @@ use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
-use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+#[cfg(test)]
+use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::{ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, thiserror::Error)]
 #[error("model_provider stream error: {source}")]
@@ -56,6 +58,22 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct SingleToolRoundViolation {
+    pub(super) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for SingleToolRoundViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-single-tool-rounds-violation",
+        ))
+    }
+}
+
+impl std::error::Error for SingleToolRoundViolation {}
+
+#[cfg(test)]
 pub(crate) async fn consume_provider_streaming_response(
     model_provider: &dyn ModelProvider,
     messages: &[ChatMessage],
@@ -68,7 +86,8 @@ pub(crate) async fn consume_provider_streaming_response(
     strict_tool_parsing: bool,
     draft_reasoning: StreamReasoningMode,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
+    consume_provider_streaming_response_with_policy(
+        model_provider,
         ChatRequest {
             messages,
             tools: request_tools,
@@ -79,8 +98,37 @@ pub(crate) async fn consume_provider_streaming_response(
         },
         model,
         temperature,
-        zeroclaw_providers::traits::StreamOptions::new(true),
-    );
+        cancellation_token,
+        on_delta,
+        event_tx,
+        strict_tool_parsing,
+        draft_reasoning,
+        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+    )
+    .await
+}
+
+pub(crate) async fn consume_provider_streaming_response_with_policy(
+    model_provider: &dyn ModelProvider,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: Option<f64>,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    strict_tool_parsing: bool,
+    draft_reasoning: StreamReasoningMode,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+) -> Result<StreamedChatOutcome> {
+    let request_tools = request.tools;
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider)
+        .stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_providers::traits::StreamOptions::new(true),
+            policy,
+        );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
@@ -167,6 +215,19 @@ pub(crate) async fn consume_provider_streaming_response(
         let event = match event_result {
             Ok(event) => event,
             Err(err) => {
+                if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                    && super::tool_specs::exceeds_single_tool_round(
+                        &outcome.response_text,
+                        outcome.tool_calls.len(),
+                        request_tools.is_some_and(|tools| !tools.is_empty()),
+                        strict_tool_parsing,
+                    )
+                {
+                    return Err(SingleToolRoundViolation {
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
