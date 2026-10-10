@@ -34,6 +34,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+mod subprocess_memory;
 pub mod todo_write;
 pub mod verifiable_intent;
 
