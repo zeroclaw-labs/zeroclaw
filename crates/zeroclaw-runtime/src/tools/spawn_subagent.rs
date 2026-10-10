@@ -28,6 +28,11 @@ pub struct SpawnSubagentTool {
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
     execution_capability: Option<AgentExecutionCapability>,
+    /// The session memory of the registry this tool was assembled into. Once
+    /// that session is pinned to its owner's private plane, the child runs
+    /// over the same routed memory instead of building the agent's shared
+    /// memory for itself.
+    session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 }
 
 impl SpawnSubagentTool {
@@ -46,7 +51,29 @@ impl SpawnSubagentTool {
             security,
             is_subagent_caller: false,
             execution_capability: None,
+            session_memory: None,
         }
+    }
+
+    /// Share the session memory route of the registry this tool is assembled
+    /// into.
+    #[must_use]
+    pub fn with_session_memory(
+        mut self,
+        route: Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>,
+    ) -> Self {
+        self.session_memory = Some(route);
+        self
+    }
+
+    /// The memory a child of this tool's session runs over: the session's
+    /// routed memory once it is pinned, or `None` for an unowned session, in
+    /// which case the child builds the agent's memory as before.
+    fn child_memory(&self) -> Option<Arc<dyn zeroclaw_memory::Memory>> {
+        self.session_memory
+            .as_ref()
+            .and_then(|route| route.routed())
+            .map(|routed| Arc::clone(&routed.memory))
     }
 
     /// Mark this tool instance as belonging to a SubAgent's tool
@@ -76,10 +103,15 @@ impl SpawnSubagentTool {
 /// tools every step turn drops. The scope is carried, not resolved here — the
 /// child re-resolves it against its own registry, so a differently assembled
 /// child registry is narrowed by the same contract.
-fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
+fn child_run_overrides(
+    policy: Arc<SecurityPolicy>,
+    memory: Option<Arc<dyn zeroclaw_memory::Memory>>,
+) -> AgentRunOverrides {
     AgentRunOverrides {
         security: Some(policy),
-        memory: None,
+        // A pinned session's child stays on its owner's plane. `None` only for
+        // an unowned session, whose child builds the agent's shared memory.
+        memory,
         is_subagent: true,
         // Sub-turn origin already skips memory injection; explicit for
         // the same future-proofing reason as `is_subagent` above.
@@ -103,6 +135,15 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         // internal-turn contract; until then absence is explicit.
         internal_principal: None,
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: records the memory each child run is started with, so a
+    /// regression can observe what an assembled registry hands the child
+    /// without running a model.
+    pub(crate) static CHILD_MEMORY_SINK:
+        Arc<std::sync::Mutex<Option<Option<Arc<dyn zeroclaw_memory::Memory>>>>>;
 }
 
 #[async_trait]
@@ -246,8 +287,13 @@ impl Tool for SpawnSubagentTool {
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        let mut run_overrides =
+            child_run_overrides(subagent_ctx.policy.clone(), self.child_memory());
         run_overrides.execution_admission = execution_admission.clone();
+        #[cfg(test)]
+        let _ = CHILD_MEMORY_SINK.try_with(|sink| {
+            *sink.lock().unwrap() = Some(run_overrides.memory.clone());
+        });
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
@@ -759,7 +805,7 @@ mod tests {
 
         let inherited =
             crate::sop::active_scope::with_active_headless_step_scope(scoped_step(), async {
-                child_run_overrides(Arc::new(SecurityPolicy::default())).sop_step_scope
+                child_run_overrides(Arc::new(SecurityPolicy::default()), None).sop_step_scope
             })
             .await
             .expect("a child started inside a headless step must carry that step's scope");
@@ -781,11 +827,41 @@ mod tests {
         );
     }
 
+    /// Once the parent session is pinned, the child is
+    /// started over the session's routed memory; before the pin, and for an
+    /// unowned session, it is started with none and builds the agent's memory.
+    #[test]
+    fn a_pinned_sessions_child_is_started_over_the_routed_memory() {
+        let route = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_session_memory(Arc::clone(&route));
+        assert!(
+            tool.child_memory().is_none(),
+            "unpinned: the child builds its own"
+        );
+
+        let routed: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("routed"));
+        route
+            .pin(Arc::clone(&routed), Arc::new(SecurityPolicy::default()))
+            .unwrap();
+        let overrides =
+            child_run_overrides(Arc::new(SecurityPolicy::default()), tool.child_memory());
+        let handed = overrides
+            .memory
+            .expect("a pinned session hands its child memory");
+        assert!(Arc::ptr_eq(&handed, &routed));
+    }
+
     /// The inheritance is bounded by the step: an ordinary agent turn spawns a
     /// child with no step scope at all.
     #[tokio::test]
     async fn child_run_outside_a_headless_step_carries_no_scope() {
-        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()));
+        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()), None);
         assert!(overrides.sop_step_scope.is_none());
         assert!(
             overrides.is_subagent,

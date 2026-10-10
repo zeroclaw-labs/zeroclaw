@@ -303,8 +303,9 @@ impl AgentExecutionSelection {
 
 impl AgentExecutionCapability {
     pub fn capture_selection(&self) -> AgentExecutionSelection {
-        // Never nest the lifecycle mutex and config lock. A mutation between
-        // these reads changes the generation and is rejected at admission.
+        // Release the lifecycle mutex before acquiring config here. SOP RPC
+        // effects may already hold a config read guard; lifecycle operations
+        // never acquire config while retaining this mutex.
         let (generations, closing) = {
             let state = self.agent_lifecycle.state.lock();
             let generations: HashMap<_, _> = state
@@ -325,7 +326,9 @@ impl AgentExecutionCapability {
         };
         let generations = self
             .config
-            .read()
+            // A queued writer must not block this nested read behind the
+            // outer SOP effect guard that the writer itself is waiting on.
+            .read_recursive()
             .agents
             .keys()
             .map(|alias| {
@@ -1217,6 +1220,50 @@ impl From<zeroclaw_config::live::LiveConfigError> for ConfigCommitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_capture_finishes_while_a_writer_waits_for_an_effect_read() {
+        let mut config = Config::default();
+        config.agents.insert("alpha".into(), Default::default());
+        let authority = LiveConfigAuthority::new(config);
+        let config = authority.live_handle();
+        // Allocate before holding the effect guard so the worker's only lock
+        // acquisition is the actual publication write, not a preliminary read.
+        let next = authority.live.next_revision().unwrap();
+        let held = config.read();
+        let held_revision = held.revision();
+        let writer_live = authority.live.clone();
+        let mut replacement = held.clone();
+        replacement.agents.clear();
+        let writer = std::thread::spawn(move || writer_live.publish(next, replacement).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while config.try_read().is_some() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let queued = config.try_read().is_none();
+        let (sent, received) = std::sync::mpsc::channel();
+        let capability = authority.execution_capability();
+        let reader = std::thread::spawn(move || {
+            let selection = capability.capture_selection();
+            sent.send(selection.generations.contains_key("alpha"))
+                .unwrap();
+        });
+        let captured = received.recv_timeout(std::time::Duration::from_secs(2));
+        // Release and join even against the ordinary-read implementation so
+        // the regression fails instead of leaving a deadlocked test process.
+        assert_eq!(held.revision(), held_revision);
+        assert!(held.agents.contains_key("alpha"));
+        drop(held);
+        assert_eq!(writer.join().unwrap(), next);
+        reader.join().unwrap();
+        assert_eq!(config.revision(), next);
+        assert!(queued, "the writer must reach its real config lock");
+        assert!(captured.expect("capture must not wait behind the effect guard"));
+        assert!(
+            config.read().agents.is_empty(),
+            "the writer proceeds after the effect"
+        );
+    }
 
     #[test]
     fn cloned_authority_preserves_storage_epoch_and_write_lock_identity() {

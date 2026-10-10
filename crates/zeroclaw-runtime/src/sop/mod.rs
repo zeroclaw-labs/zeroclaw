@@ -832,6 +832,34 @@ fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static RUN_READ_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn notify_run_read_wait_for_test(sender: std::sync::mpsc::Sender<()>) {
+    RUN_READ_WAIT.with(|wait| *wait.borrow_mut() = Some(sender));
+}
+
+fn lock_run_read(engine: &Arc<Mutex<SopEngine>>) -> Result<std::sync::MutexGuard<'_, SopEngine>> {
+    #[cfg(test)]
+    RUN_READ_WAIT.with(|wait| {
+        if let Some(sender) = wait.borrow_mut().take() {
+            // Signal only after observing the real lock contention. The test
+            // publishes revocation before releasing this same engine lock.
+            if matches!(engine.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                let _ = sender.send(());
+            }
+        }
+    });
+    engine
+        .lock()
+        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))
+}
+
 /// Project the live run state for `run_id` onto `sop`'s graph. Errors if
 /// the run is unknown or the engine lock is poisoned.
 pub fn run_overlay_for(
@@ -839,9 +867,7 @@ pub fn run_overlay_for(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
 ) -> Result<RunOverlay> {
-    let guard = engine
-        .lock()
-        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let guard = lock_run_read(engine)?;
     let run = guard
         .get_run(run_id)
         .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))?;
@@ -857,9 +883,7 @@ pub fn run_detail_for(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
 ) -> Result<(crate::sop::types::SopRun, bool)> {
-    let guard = engine
-        .lock()
-        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let guard = lock_run_read(engine)?;
     let active = guard.active_runs().contains_key(run_id);
     guard
         .get_run(run_id)
@@ -875,9 +899,7 @@ pub fn run_summaries_for(
     engine: &Arc<Mutex<SopEngine>>,
     sop_name: Option<&str>,
 ) -> Result<Vec<SopRunSummary>> {
-    let guard = engine
-        .lock()
-        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let guard = lock_run_read(engine)?;
     Ok(guard.run_summaries(sop_name))
 }
 
