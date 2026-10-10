@@ -4786,9 +4786,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5958,9 +5956,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .try_lock_owned()
-            .ok();
+        let config_generation_guard = self.ctx.config_authority.try_lock_config_writer();
         let config = Box::new(self.ctx.config.read().clone());
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -6222,9 +6218,7 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _gate = ctx.config_authority.lock_config_writer().await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7468,9 +7462,7 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _config_write_guard = self.ctx.config_authority.lock_config_writer().await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -34856,11 +34848,18 @@ mod tests {
         dispatcher
     }
 
-    fn make_shared_sessions_dispatcher(
+    /// Another connection's dispatcher on `first`'s daemon: it shares the
+    /// session store and the config write lock, as every connection shares
+    /// the daemon's one context in production, so it queues behind a
+    /// transaction `first` holds open. Its config is its own, so a successor
+    /// it builds stays distinguishable from stale work built from `first`'s.
+    fn make_second_connection_dispatcher(
+        first: &RpcContext,
         config: zeroclaw_config::schema::Config,
-        sessions: Arc<crate::rpc::session::SessionStore>,
     ) -> RpcDispatcher {
-        let ctx = RpcContext::minimal(config, sessions);
+        let authority =
+            crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
+        let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
@@ -34881,7 +34880,7 @@ mod tests {
             }),
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = crate::LiveConfigAuthority::new(config);
+        let authority = crate::LiveConfigAuthority::for_tests(config);
         let data_dir = authority.live_handle().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
@@ -39659,7 +39658,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -39712,7 +39711,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -39901,7 +39900,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40466,9 +40465,7 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let guard = ctx.config_authority.lock_config_writer().await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -42931,6 +42928,7 @@ mod tests {
             "old-model"
         );
 
+        let first_ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
         let sid = session_id.clone();
@@ -42961,10 +42959,8 @@ mod tests {
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
-            make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
-        );
+        let dispatcher2 =
+            make_second_connection_dispatcher(&first_ctx, make_model_refresh_test_config(&tmp));
         let replace_sid = session_id.clone();
         let replace = zeroclaw_spawn::spawn!(async move {
             dispatcher2
@@ -43077,9 +43073,9 @@ mod tests {
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
+        let dispatcher2 = make_second_connection_dispatcher(
+            &dispatcher.ctx,
             make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
         let replace_sid = session_id.clone();
@@ -43853,9 +43849,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -43875,9 +43869,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let settled_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         drop(settled_gate);
 
         assert!(matches!(
