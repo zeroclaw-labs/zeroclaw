@@ -2688,8 +2688,11 @@ capabilities = ["tool"]
                 .unwrap();
         }
         std::fs::write(skill.join("notes.txt"), b"ordinary asset").unwrap();
-        std::fs::set_permissions(skill.join("notes.txt"), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
+        std::fs::set_permissions(
+            skill.join("notes.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let plugins = tempdir().unwrap();
         let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         host.install(package.to_str().unwrap()).unwrap();
@@ -2832,7 +2835,10 @@ capabilities = ["tool"]
         let dir = tempdir().unwrap();
         let mut target = std::fs::File::create(dir.path().join("partial")).unwrap();
         let error = copy_skill_data(&mut PartialRead(false), &mut target).unwrap_err();
-        assert_eq!(std::fs::read(dir.path().join("partial")).unwrap(), b"prefix");
+        assert_eq!(
+            std::fs::read(dir.path().join("partial")).unwrap(),
+            b"prefix"
+        );
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "asset became unreadable");
     }
@@ -2842,7 +2848,11 @@ capabilities = ["tool"]
         let source = tempdir().unwrap();
         write_skill_bundle_plugin(source.path(), "copy-error", &["fixture"]);
         let package = source.path().join("copy-error");
-        std::fs::write(package.join("skills/fixture/fail.bin"), vec![0x5a; 32 * 1024]).unwrap();
+        std::fs::write(
+            package.join("skills/fixture/fail.bin"),
+            vec![0x5a; 32 * 1024],
+        )
+        .unwrap();
         let before = package_bytes(&package);
         let plugins = tempdir().unwrap();
         let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
@@ -2850,7 +2860,9 @@ capabilities = ["tool"]
             let _fault = write_fault::arm(write_fault::Step::SkillRead);
             let error = host.install(package.to_str().unwrap()).unwrap_err();
             assert!(
-                error.to_string().contains("injected skill asset read fault"),
+                error
+                    .to_string()
+                    .contains("injected skill asset read fault"),
                 "{error:?}"
             );
         }
@@ -2871,8 +2883,11 @@ capabilities = ["tool"]
         let outside = tempdir().unwrap();
         std::fs::write(source.path().join("asset"), b"copied asset").unwrap();
         std::fs::write(outside.path().join("keep"), b"outside bytes").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("keep"), source.path().join("linked-file"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("keep"),
+            source.path().join("linked-file"),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(outside.path(), source.path().join("linked-dir")).unwrap();
         let dir = Dir::open_ambient_dir(target.path(), cap_std::ambient_authority()).unwrap();
         copy_skills_into(source.path(), &dir, Path::new("skills")).unwrap();
