@@ -352,7 +352,7 @@ impl Tool for DeliverFileTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_tools::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
 
     fn test_tool(workspace: std::path::PathBuf) -> DeliverFileTool {
         let security = Arc::new(SecurityPolicy {
@@ -414,7 +414,11 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = RateLimitedTool::new(
-            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                DeliverFileTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security.clone(),
         );
 

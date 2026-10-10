@@ -72,6 +72,61 @@ struct ValidatedRepository {
     git_dir: PathBuf,
 }
 
+/// Which side of the canonical policy a Git-affected path set is checked
+/// against. `GitOperationsTool` is registered without the `PathGuardedTool`
+/// wrapper, so these checks are the only enforcement of `deny_read` /
+/// `deny_write` over the working-tree files Git reads or changes. Git's own
+/// metadata is checked separately by `validate_metadata_closure`.
+#[derive(Clone, Copy)]
+enum GitAccess {
+    Read,
+    Write,
+}
+
+impl GitAccess {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// A per-file check found a path the canonical policy denies. Kept as its own
+/// error type so callers can tell a policy refusal (reported as a failed
+/// `ToolResult`) from a Git failure while listing the paths (propagated like
+/// any other Git error for that operation).
+#[derive(Debug)]
+struct PolicyDenial(String);
+
+impl std::fmt::Display for PolicyDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PolicyDenial {}
+
+/// Report a per-file check result the way the calling operation reports
+/// errors. A policy denial is always a failed `ToolResult`. Any other error
+/// (Git could not list the paths) is a failed `ToolResult` when
+/// `propagate_git_errors` is false, and is returned as `Err` otherwise, for
+/// operations (`diff`, `worktree`) that already propagate Git failures.
+fn preflight_outcome(
+    result: anyhow::Result<()>,
+    propagate_git_errors: bool,
+) -> anyhow::Result<Option<ToolResult>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(e) if propagate_git_errors && !e.is::<PolicyDenial>() => Err(e),
+        Err(e) => Ok(Some(ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(e.to_string()),
+        })),
+    }
+}
+
 const READ_GIT_CONFIG_OVERRIDES: &[&str] = &[
     "-c",
     "core.fsmonitor=false",
@@ -83,6 +138,56 @@ const READ_GIT_CONFIG_OVERRIDES: &[&str] = &[
     "log.mailmap=false",
 ];
 const GIT_LOG_FORMAT: &str = "--pretty=format:%H|%an|%ae|%ad|%s";
+
+/// The exact tree a `git checkout` or `git worktree add` will materialize,
+/// resolved by the tool before anything runs.
+///
+/// Git resolves a bare short name differently per command: `ls-tree`/`diff`
+/// follow rev-parse precedence (tags before branches before remotes) while
+/// `checkout` and `worktree add` interpret the same string branch-first,
+/// and both additionally dwim a not-found branch name to a unique
+/// remote-tracking branch. Passing the same bare string to a preflight
+/// listing and to the mutating command can therefore check one tree and
+/// write another (observed with Git 2.49/2.50: a tag/branch name collision,
+/// and `worktree.guessRemote` after a fetch). Resolving to a fully-spelled
+/// refname or SHA here — and handing THAT form to both commands — removes
+/// the selection ambiguity by construction: the mutating command performs
+/// no dwim of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedGitReference {
+    /// Check out this existing local branch (full `refs/heads/…` refname);
+    /// no branch is created.
+    Branch(String),
+    /// Git's dwim: the named branch does not exist locally, but exactly one
+    /// remote carries it. Create `new_branch` at this remote-tracking ref
+    /// (full `refs/remotes/…` refname) and mark it upstream — the
+    /// documented equivalent of the bare-name convenience.
+    RemoteTrack { refname: String, new_branch: String },
+    /// Any other commit-ish: a custom `refs/…` refname, a full
+    /// `refs/tags/…` refname, or a commit SHA. Both `git checkout` and
+    /// `git worktree add` detach HEAD at this commit — no branch is
+    /// created (basename-branch creation applies only to the omitted and
+    /// dwim selections above).
+    Commit(String),
+}
+
+/// A resolver selection pinned to the exact commit it designated when it
+/// was made. `reference` carries the form the mutating command and its
+/// messages need (attachment-correct spelling per variant), while
+/// `commit` is the immutable id the preflight lists and the post-exec
+/// verification demands, so a reference that moves or vanishes between
+/// resolution and execution cannot silently substitute a tree the
+/// preflight never checked.
+struct ResolvedReference {
+    reference: ResolvedGitReference,
+    commit: String,
+}
+
+/// The bare branch name Git attaches a checkout or new worktree to; only
+/// the short spelling keeps HEAD attached (`refs/heads/x` detaches).
+fn short_branch_name(refname: &str) -> &str {
+    refname.strip_prefix("refs/heads/").unwrap_or(refname)
+}
 
 impl GitOperationsTool {
     /// Construct the tool without a runtime execution boundary.
@@ -295,7 +400,7 @@ impl GitOperationsTool {
 
     fn metadata_path_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
         self.security.is_resolved_path_readable(path)
-            && (!requires_write_access || self.security.is_resolved_path_allowed(path))
+            && (!requires_write_access || self.security.is_resolved_managed_store_writable(path))
     }
 
     /// Validate the complete, currently reachable repository metadata tree before
@@ -969,6 +1074,20 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
+        let (_, stdout) = self.run_git_read_output(args, working_dir).await?;
+        Ok(String::from_utf8_lossy(&stdout).to_string())
+    }
+
+    /// Byte-preserving variant of [`Self::run_git_read_command`] that also
+    /// returns the validated repository root. Per-file checks use it: they
+    /// must authorize the EXACT pathnames Git will act on, so they split raw
+    /// NUL-delimited output and decode strictly, and they join root-relative
+    /// Git output onto the same root Git was bound to.
+    async fn run_git_read_output(
+        &self,
+        args: &[&str],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
         let repository = self
             .validated_repository_root_async(working_dir, false)
             .await?;
@@ -991,7 +1110,738 @@ impl GitOperationsTool {
             anyhow::bail!("Git command failed: {stderr}");
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok((repository.root, output.stdout))
+    }
+
+    /// Decode NUL-delimited `-z` pathset output into exact pathnames.
+    ///
+    /// Every entry must be strict UTF-8 and the stream must end with the
+    /// terminal NUL Git emits; anything else (undecodable bytes, an interior
+    /// empty entry, trailing non-NUL bytes) means the check cannot prove the
+    /// pathset, so the caller fails closed instead of guessing which pathname
+    /// Git actually holds. `String::from_utf8_lossy` plus newline splitting
+    /// would silently authorize a different path than Git will touch when a
+    /// name is non-UTF-8 or contains a newline (Git C-quotes those in
+    /// non-`-z` output).
+    fn decode_nul_path_list(bytes: &[u8], operation: &str) -> anyhow::Result<Vec<String>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bytes.last() != Some(&0) {
+            anyhow::bail!(
+                "{operation} blocked: preflight could not prove the affected pathset \
+                 (NUL-delimited git output ended with trailing non-NUL bytes)"
+            );
+        }
+        let entries: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+        // Drop the terminal NUL's empty tail; any OTHER empty entry is a
+        // malformed stream, not a pathname.
+        let interior = &entries[..entries.len() - 1];
+        let mut paths = Vec::with_capacity(interior.len());
+        for entry in interior {
+            if entry.is_empty() {
+                anyhow::bail!(
+                    "{operation} blocked: preflight could not prove the affected pathset \
+                     (empty entry inside NUL-delimited git output)"
+                );
+            }
+            match std::str::from_utf8(entry) {
+                Ok(path) => paths.push(path.to_string()),
+                Err(_) => {
+                    let lossy = String::from_utf8_lossy(entry).to_string();
+                    anyhow::bail!(
+                        "{operation} blocked: preflight could not prove the affected pathset \
+                         (repository path is not valid UTF-8: {lossy:?}); refusing to \
+                         authorize a pathname that cannot be matched exactly against the policy"
+                    );
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Run a read-classified Git listing and return its exact pathset with
+    /// the repository root every entry is relative to. Every listing below
+    /// asks Git for root-relative names (`--no-relative`, `--full-name`,
+    /// `--full-tree`) so the check never depends on the caller's
+    /// subdirectory.
+    async fn list_git_paths(
+        &self,
+        args: &[&str],
+        working_dir: &Path,
+        operation: &str,
+        what: &str,
+    ) -> anyhow::Result<(PathBuf, Vec<String>)> {
+        let (root, bytes) = self
+            .run_git_read_output(args, working_dir)
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "{operation} blocked: cannot determine which files it would {what}: {e}"
+                ))
+            })?;
+        let paths = Self::decode_nul_path_list(&bytes, operation)?;
+        Ok((root, paths))
+    }
+
+    /// Apply the canonical policy to a Git-reported path set before Git runs.
+    ///
+    /// `paths` are exact pathnames relative to `base`. Each is resolved and
+    /// checked in `mode` with the FULL policy check (working-tree files keep
+    /// the built-in write guardrails; only Git's own metadata uses
+    /// `is_resolved_managed_store_writable`). The first denial aborts the
+    /// whole operation, because a partially applied Git command cannot be
+    /// rolled back from here.
+    fn ensure_git_paths_allowed(
+        &self,
+        paths: &[String],
+        base: &Path,
+        mode: GitAccess,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        for relative in paths {
+            let candidate = base.join(relative);
+            let resolved = zeroclaw_config::policy::canonicalize_best_effort(&candidate);
+            let allowed = match mode {
+                GitAccess::Read => self.security.is_resolved_path_readable(&resolved),
+                GitAccess::Write => self.security.is_resolved_path_allowed(&resolved),
+            };
+            if !allowed {
+                return Err(anyhow::Error::new(PolicyDenial(format!(
+                    "{operation} blocked: '{relative}' is denied by the current {} policy",
+                    mode.noun()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// A diff prints file contents, so every file the pathspec selects has to
+    /// clear the canonical read policy before Git runs. Git expands the
+    /// pathspec itself (`--name-only -z` over the same arguments), so a glob
+    /// or directory that selects a denied file is caught. `--no-renames` keeps
+    /// rename detection from collapsing a rename to its destination, so the
+    /// deleted source is read-checked too. Fails closed when the set cannot
+    /// be listed.
+    async fn preflight_diff(
+        &self,
+        files: &str,
+        cached: bool,
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let mut args = vec![
+            "--no-optional-locks",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-relative",
+            "--no-renames",
+            "--ignore-submodules=dirty",
+            "--no-ext-diff",
+            "--no-textconv",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        args.push("--");
+        args.push(files);
+        let (root, paths) = self
+            .list_git_paths(&args, working_dir, "Diff", "read")
+            .await?;
+        self.ensure_git_paths_allowed(&paths, &root, GitAccess::Read, "Diff")
+    }
+
+    /// Staging copies a file's bytes into the object store, so `add` is a
+    /// read of every path it stages. `git add --dry-run` only renders quoted
+    /// display lines, so the set is listed through NUL-delimited `ls-files`:
+    /// cached, modified, deleted, and untracked-not-ignored entries matching
+    /// the pathspec are exactly what `add` stages content from.
+    async fn preflight_add(&self, pathspec: &[String], working_dir: &Path) -> anyhow::Result<()> {
+        let mut args: Vec<&str> = vec![
+            "--no-optional-locks",
+            "ls-files",
+            "-z",
+            "--full-name",
+            "--cached",
+            "--modified",
+            "--deleted",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(pathspec.iter().map(String::as_str));
+        let (root, paths) = self
+            .list_git_paths(&args, working_dir, "Add", "stage")
+            .await?;
+        self.ensure_git_paths_allowed(&paths, &root, GitAccess::Read, "Add")
+    }
+
+    /// Reject a `checkout` before it runs if any file that differs between
+    /// `HEAD` and the target would land on a `deny_write`-guarded path (for
+    /// example the `.env`/`.git/config` guardrails). `listing_ref` is the
+    /// caller-resolved rev the checkout is pinned to — never the bare
+    /// user-supplied name, whose tag/branch collisions `diff` and
+    /// `checkout` resolve differently. `--no-renames` is essential here:
+    /// with rename detection a rename lists only its destination, but
+    /// checkout also deletes the source, which must be checked. Fails
+    /// closed if the difference cannot be listed (unknown ref, unborn
+    /// `HEAD`).
+    async fn preflight_checkout(
+        &self,
+        branch_name: &str,
+        listing_ref: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let operation = format!("Checkout of '{branch_name}'");
+        let args = [
+            "--no-optional-locks",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-relative",
+            "--no-renames",
+            "--ignore-submodules=dirty",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--end-of-options",
+            "HEAD",
+            listing_ref,
+            "--",
+        ];
+        let (root, paths) = self
+            .list_git_paths(&args, working_dir, &operation, "overwrite")
+            .await?;
+        self.ensure_git_paths_allowed(&paths, &root, GitAccess::Write, &operation)
+    }
+
+    /// Check a stash action's mutation set against `deny_write`. `push`/`save`
+    /// revert tracked modifications (and, with `include_untracked`, remove
+    /// untracked files); `pop` writes the latest entry back, including the
+    /// untracked files it was created with (`git stash push -u`). Both halves
+    /// list with `--no-renames`: a stashed rename restores (pop) or reverts
+    /// (push) the source path as well as the destination, and rename detection
+    /// would list only the destination.
+    async fn preflight_stash(
+        &self,
+        action: &str,
+        include_untracked: bool,
+        pathspec: &[String],
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let operation = format!("Stash {action}");
+        if action == "pop" {
+            // `stash show` defaults to the entry `stash pop` restores.
+            // `--include-untracked` is required: without it Git lists only the
+            // tracked half, so files stored by `git stash push -u` would be
+            // restored over `deny_write` targets unchecked.
+            let args = [
+                "--no-optional-locks",
+                "stash",
+                "show",
+                "--name-only",
+                "--include-untracked",
+                "-z",
+                "--no-relative",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+            ];
+            let (root, paths) = self
+                .list_git_paths(&args, working_dir, &operation, "restore")
+                .await?;
+            return self.ensure_git_paths_allowed(&paths, &root, GitAccess::Write, &operation);
+        }
+
+        let mut tracked_args: Vec<&str> = vec![
+            "--no-optional-locks",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-relative",
+            "--no-renames",
+            "--ignore-submodules=dirty",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ];
+        tracked_args.extend(pathspec.iter().map(String::as_str));
+        let (root, paths) = self
+            .list_git_paths(&tracked_args, working_dir, &operation, "revert")
+            .await?;
+        self.ensure_git_paths_allowed(&paths, &root, GitAccess::Write, &operation)?;
+
+        if include_untracked {
+            let mut untracked_args: Vec<&str> = vec![
+                "--no-optional-locks",
+                "ls-files",
+                "-z",
+                "--full-name",
+                "--others",
+                "--exclude-standard",
+                "--",
+            ];
+            untracked_args.extend(pathspec.iter().map(String::as_str));
+            let (root, paths) = self
+                .list_git_paths(&untracked_args, working_dir, &operation, "remove")
+                .await?;
+            self.ensure_git_paths_allowed(&paths, &root, GitAccess::Write, &operation)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate refnames under `namespaces` through the read-classified
+    /// runner. Reference matching elsewhere compares these strings for EXACT
+    /// equality, so pattern characters in a user-supplied name can never
+    /// widen a match the way a `for-each-ref` pattern argument would.
+    async fn list_ref_names(
+        &self,
+        namespaces: &[&str],
+        working_dir: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut args: Vec<&str> =
+            vec!["--no-optional-locks", "for-each-ref", "--format=%(refname)"];
+        args.extend(namespaces.iter().copied());
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        let listing = String::from_utf8(stdout).map_err(|_| {
+            anyhow::Error::msg("Git reference listing is not valid UTF-8; refusing to guess")
+        })?;
+        Ok(listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// `checkout`/`worktree add` tracking setup requires the dwim's
+    /// `<remote>/<branch>` spelling — a full `refs/remotes/…` refname is
+    /// rejected as "not a branch". That short spelling resolves through
+    /// rev-parse precedence, so refuse it when anything under a
+    /// higher-precedence namespace (`refs/…`, `refs/heads/…`,
+    /// `refs/tags/…`) would shadow the remote-tracking ref it must map
+    /// back to.
+    fn ensure_unshadowed_remote_start_point(refs: &[String], refname: &str) -> anyhow::Result<()> {
+        let Some(short) = refname.strip_prefix("refs/remotes/") else {
+            anyhow::bail!("Internal error: '{refname}' is not a remote-tracking ref");
+        };
+        for shadow in [
+            format!("refs/{short}"),
+            format!("refs/heads/{short}"),
+            format!("refs/tags/{short}"),
+        ] {
+            if refs.contains(&shadow) {
+                anyhow::bail!(
+                    "Reference '{short}' is shadowed by '{shadow}'; refusing a \
+                     selection that cannot be named exactly"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Remote-tracking branches named exactly `name`
+    /// (`refs/remotes/<remote>/<name>`), excluding `<remote>/HEAD` symrefs,
+    /// which dwim never selects. Returns the FULL refnames. More than one
+    /// match is ambiguous: Git itself refuses the dwim unless
+    /// `checkout.defaultRemote` names one, and this tool refuses it
+    /// outright rather than guessing.
+    fn remote_tracking_matches<'a>(refs: &'a [String], name: &str) -> Vec<&'a str> {
+        refs.iter()
+            .filter(|found| {
+                found
+                    .strip_prefix("refs/remotes/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .is_some_and(|(_, branch)| branch == name && branch != "HEAD")
+            })
+            .map(|found| found.as_str())
+            .collect()
+    }
+
+    /// Read one boolean configuration value with the same hardened
+    /// subprocess configuration the mutating command will run under, so the
+    /// value the tool reasons about is the value Git will act on.
+    /// `Ok(None)` means the key is unset. A value Git cannot parse as a
+    /// boolean refuses the operation, since Git itself would fail on it
+    /// later — after a preflight that assumed something else.
+    async fn read_config_bool(
+        &self,
+        key: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<Option<bool>> {
+        let repository = self
+            .validated_repository_root_async(working_dir, false)
+            .await?;
+        let mut command = tokio::process::Command::new("git");
+        Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
+        command
+            .args(["config", "--null", "--includes", "--get", key])
+            .current_dir(Self::git_subprocess_current_dir(working_dir))
+            .stdin(std::process::Stdio::null());
+        self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
+        let output = command.output().await?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) {
+                return Ok(None);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Git configuration query for '{key}' failed: {stderr}");
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        let value = value.trim_end_matches('\0').trim();
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" | "" => Ok(Some(false)),
+            _ => anyhow::bail!(
+                "Git configuration value '{key}' is not a valid boolean \
+                 ('{value}'); refusing an operation whose selection it controls"
+            ),
+        }
+    }
+
+    /// Resolve a user-supplied checkout-ish name to the exact tree Git will
+    /// select, following the branch-first order `checkout` and
+    /// `worktree add` themselves use: an existing local branch, then the
+    /// unique-remote dwim, then tags and other commit-ishes. The returned
+    /// selection carries the attachment-correct execution form per variant
+    /// plus the commit id designated at resolution time: the preflight
+    /// lists that pinned id and the post-exec verification demands it, so
+    /// neither command re-derives (and mis-derives) the selection, and a
+    /// reference that moves or vanishes before execution fails the
+    /// operation instead of substituting an unchecked tree.
+    ///
+    /// The order replicates the mutating commands' own selection, verified
+    /// against Git 2.49/2.50: an existing local branch is checked out; a
+    /// name that resolves to any other ref (custom `refs/…` entry or tag)
+    /// detaches at that commit — the remote dwim is only consulted when the
+    /// name resolves to nothing else; a name matching remote-tracking
+    /// branches in exactly one remote dwims to a new tracking branch; and
+    /// anything left over must resolve through rev-parse to one commit id
+    /// or the operation is refused.
+    ///
+    /// `allow_remote_dwim` carries the caller's dwim gating: a supplied
+    /// name that is not a local branch dwims to a unique remote-tracking
+    /// branch for both commands regardless of `worktree.guessRemote`, but
+    /// `checkout.guess=false` disables that convenience for checkout — in
+    /// which case a remote-only name is refused rather than silently
+    /// reinterpreted as a detached commit.
+    async fn resolve_supplied_git_reference(
+        &self,
+        supplied: &str,
+        working_dir: &Path,
+        allow_remote_dwim: bool,
+    ) -> anyhow::Result<ResolvedReference> {
+        if supplied.is_empty() {
+            anyhow::bail!("Cannot resolve an empty Git reference");
+        }
+        let refs = self
+            .list_ref_names(&["refs/heads/", "refs/remotes/", "refs/tags/"], working_dir)
+            .await?;
+        let local = format!("refs/heads/{supplied}");
+        if refs.contains(&local) {
+            let commit = self.rev_parse_commit(&local, working_dir).await?;
+            return Ok(ResolvedReference {
+                reference: ResolvedGitReference::Branch(local),
+                commit,
+            });
+        }
+        // A name that resolves to any ref other than a branch detaches at
+        // that commit; the remote dwim below is only consulted when the
+        // name resolves to nothing else (verified with Git 2.49/2.50: a
+        // name that is both a tag and a unique remote-tracking branch
+        // detaches at the TAG).
+        for resolvable in [format!("refs/{supplied}"), format!("refs/tags/{supplied}")] {
+            if refs.contains(&resolvable) {
+                let commit = self.rev_parse_commit(&resolvable, working_dir).await?;
+                return Ok(ResolvedReference {
+                    reference: ResolvedGitReference::Commit(resolvable),
+                    commit,
+                });
+            }
+        }
+        let remotes = Self::remote_tracking_matches(&refs, supplied);
+        match remotes.as_slice() {
+            [] => {}
+            [only] => {
+                if !allow_remote_dwim {
+                    anyhow::bail!(
+                        "Reference '{supplied}' exists only as a remote-tracking branch \
+                         and remote guessing is disabled (checkout.guess=false); \
+                         refusing a tree that cannot be named exactly"
+                    );
+                }
+                Self::ensure_unshadowed_remote_start_point(&refs, only)?;
+                let commit = self.rev_parse_commit(only, working_dir).await?;
+                return Ok(ResolvedReference {
+                    reference: ResolvedGitReference::RemoteTrack {
+                        refname: (*only).to_string(),
+                        new_branch: supplied.to_string(),
+                    },
+                    commit,
+                });
+            }
+            _ => anyhow::bail!(
+                "Reference '{supplied}' exists as a remote-tracking branch in {} \
+                 remotes; refusing an ambiguous selection that cannot be checked \
+                 exactly",
+                remotes.len()
+            ),
+        }
+        // Not a branch, a remote dwim, or a tag: resolve the remaining
+        // commit-ish (SHA, ref expression) to a full commit id. The commit
+        // id is what both the preflight and execution use, so no later
+        // resolution step can disagree.
+        let rev = format!("{supplied}^{{commit}}");
+        let args = [
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &rev,
+        ];
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        let commit = String::from_utf8(stdout)
+            .map_err(|_| anyhow::Error::msg("Git revision output is not valid UTF-8"))?
+            .trim()
+            .to_string();
+        let hexadecimal = commit.chars().all(|c| c.is_ascii_hexdigit());
+        if !hexadecimal || (commit.len() != 40 && commit.len() != 64) {
+            anyhow::bail!(
+                "Reference '{supplied}' did not resolve to exactly one commit; \
+                 refusing a tree that cannot be named exactly"
+            );
+        }
+        Ok(ResolvedReference {
+            reference: ResolvedGitReference::Commit(commit.clone()),
+            commit,
+        })
+    }
+
+    /// Resolve a reference to the single commit id it designates right
+    /// now, on the hardened read path the preflight and verification use.
+    async fn rev_parse_commit(
+        &self,
+        reference: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<String> {
+        let designated = format!("{reference}^{{commit}}");
+        let args = [
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            designated.as_str(),
+        ];
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+
+    /// Resolve which tree `git worktree add -- <path>` materializes when the
+    /// branch argument is omitted. Git's convenience rule checks out an
+    /// EXISTING branch named after the path's basename when one exists; with
+    /// `worktree.guessRemote` enabled it instead bases a new branch on a
+    /// remote-tracking branch of the same name when exactly one remote
+    /// carries it, and only creates a new branch from `HEAD` otherwise — so
+    /// `HEAD` is not always the tree that gets written. `Ok(None)` is the
+    /// create-from-HEAD case. Any outcome that cannot be proven exactly
+    /// (non-UTF-8 basename, a basename matching more than one remote, or a
+    /// Git failure) refuses the operation instead of guessing.
+    async fn resolve_worktree_omitted_reference(
+        &self,
+        target: &Path,
+        working_dir: &Path,
+    ) -> anyhow::Result<Option<ResolvedReference>> {
+        let Some(basename) = target
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::to_string)
+        else {
+            anyhow::bail!(
+                "Worktree add blocked: cannot determine which branch the omitted branch \
+                 argument selects (the worktree path's basename is not valid UTF-8); \
+                 refusing to authorize a tree that cannot be named exactly"
+            );
+        };
+        let refs = self
+            .list_ref_names(&["refs/heads/", "refs/remotes/"], working_dir)
+            .await?;
+        let expected = format!("refs/heads/{basename}");
+        if refs.contains(&expected) {
+            let commit = self.rev_parse_commit(&expected, working_dir).await?;
+            return Ok(Some(ResolvedReference {
+                reference: ResolvedGitReference::Branch(expected),
+                commit,
+            }));
+        }
+        if self
+            .read_config_bool("worktree.guessRemote", working_dir)
+            .await?
+            .unwrap_or(false)
+        {
+            let remotes = Self::remote_tracking_matches(&refs, &basename);
+            match remotes.as_slice() {
+                [only] => {
+                    Self::ensure_unshadowed_remote_start_point(&refs, only)?;
+                    let commit = self.rev_parse_commit(only, working_dir).await?;
+                    return Ok(Some(ResolvedReference {
+                        reference: ResolvedGitReference::RemoteTrack {
+                            refname: (*only).to_string(),
+                            new_branch: basename,
+                        },
+                        commit,
+                    }));
+                }
+                [] => {}
+                _ => anyhow::bail!(
+                    "Worktree add blocked: the omitted branch argument is ambiguous \
+                     (basename '{basename}' matches a remote-tracking branch in {} \
+                     remotes); refusing to authorize a tree that cannot be named \
+                     exactly",
+                    remotes.len()
+                ),
+            }
+        }
+        Ok(None)
+    }
+
+    /// `symbolic-ref HEAD` (full refname form) for the repository Git would
+    /// act on from `working_dir`. `Ok(None)` means HEAD is detached; a query
+    /// that cannot run at all is also reported as detached, so the
+    /// verification caller fails closed instead of assuming attachment. The
+    /// full form is deliberate: with an ambiguous name (a tag and a branch
+    /// sharing it) Git's `--short` output is namespace-prefixed (`heads/x`),
+    /// while the full refname is stable.
+    async fn head_symbolic_ref(&self, working_dir: &Path) -> anyhow::Result<Option<String>> {
+        let args = ["--no-optional-locks", "symbolic-ref", "HEAD"];
+        match self.run_git_read_output(&args, working_dir).await {
+            Ok((_, stdout)) => Ok(Some(String::from_utf8_lossy(&stdout).trim().to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// After `checkout` or `worktree add` succeeds, assert the repository is
+    /// in the state the resolver selected: attached to the expected branch,
+    /// and at exactly the commit the resolution pinned (the same id the
+    /// preflight listed). Branch and dwim selections attach (Git only
+    /// attaches to a bare branch name, so those execute short while the
+    /// preflight listed the pinned id); tag and commit selections detach
+    /// (a fully-spelled positional detaches `checkout` and leaves a new
+    /// worktree detached too, creating no branch). A mismatch means a reference
+    /// moved or vanished between resolution and execution — which only an
+    /// actor with repository write access can do — and the tool reports a
+    /// hard failure instead of letting the agent commit on a silently
+    /// different checkout: a moved branch executes at its new tip, which
+    /// cannot equal the pinned id, and a vanished one either errors or
+    /// dwim-falls-through to a detached checkout the attachment check
+    /// rejects. Comparing against the pinned id (rather than re-resolving
+    /// the reference at verification time) is what detects the move.
+    async fn verify_checkout_result(
+        &self,
+        resolved: &Option<ResolvedReference>,
+        expected_branch: Option<&str>,
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(resolved) = resolved.as_ref() else {
+            // A plain `HEAD` re-checkout moves nothing; nothing to pin.
+            return Ok(());
+        };
+        let head = {
+            let args = ["--no-optional-locks", "rev-parse", "HEAD"];
+            let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+            String::from_utf8_lossy(&stdout).trim().to_string()
+        };
+        if let Some(expected) = expected_branch {
+            let attached = self.head_symbolic_ref(working_dir).await?;
+            if attached.as_deref() != Some(format!("refs/heads/{expected}").as_str()) {
+                anyhow::bail!(
+                    "HEAD is {} rather than attached to branch '{expected}'",
+                    attached.as_deref().unwrap_or("detached")
+                );
+            }
+        }
+        if head != resolved.commit {
+            anyhow::bail!(
+                "HEAD {head} is not commit '{}' the reference was pinned to at \
+                 resolution time",
+                resolved.commit
+            );
+        }
+        Ok(())
+    }
+
+    /// Check every file `git worktree add` would materialize under `target`.
+    /// The target root itself is checked by
+    /// [`Self::ensure_worktree_add_target_allowed`]; this covers the tree Git
+    /// writes underneath it, which a root-only check cannot see.
+    async fn preflight_worktree_add(
+        &self,
+        target: &Path,
+        reference: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let args = [
+            "--no-optional-locks",
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            "--full-tree",
+            "--end-of-options",
+            reference,
+        ];
+        let (_, paths) = self
+            .list_git_paths(&args, working_dir, "Worktree add", "materialize")
+            .await?;
+        self.ensure_git_paths_allowed(&paths, target, GitAccess::Write, "Worktree add")
+    }
+
+    /// Check everything `git worktree remove` would delete. Removal takes the
+    /// whole tree, not just tracked files, so this walks the real directory.
+    /// Symlinks are recorded but never followed, so the walk cannot escape the
+    /// worktree. Every name must be strict UTF-8; fails closed if the tree
+    /// cannot be listed. (`worktree prune` needs no equivalent: it only
+    /// deletes Git metadata, which `validate_metadata_closure` has already
+    /// checked for write before any write command runs.)
+    async fn preflight_worktree_remove(&self, target: &Path) -> anyhow::Result<()> {
+        let mut affected: Vec<String> = Vec::new();
+        let mut pending = vec![target.to_path_buf()];
+
+        while let Some(dir) = pending.pop() {
+            let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree remove blocked: cannot enumerate '{}': {e}",
+                    dir.display()
+                ))
+            })?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree remove blocked: cannot enumerate '{}': {e}",
+                    dir.display()
+                ))
+            })? {
+                let path = entry.path();
+                let meta = tokio::fs::symlink_metadata(&path).await.map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "Worktree remove blocked: cannot inspect '{}': {e}",
+                        path.display()
+                    ))
+                })?;
+                let relative = path.strip_prefix(target).unwrap_or(&path);
+                let name = relative.to_str().ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "Worktree remove blocked: preflight could not prove the affected \
+                         pathset (path is not valid UTF-8: {:?}); refusing to authorize a \
+                         pathname that cannot be matched exactly against the policy",
+                        path.to_string_lossy()
+                    ))
+                })?;
+                affected.push(name.to_string());
+                if meta.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+
+        self.ensure_git_paths_allowed(&affected, target, GitAccess::Write, "Worktree remove")
     }
 
     /// Return all Git filter drivers defined by the effective configuration.
@@ -1371,6 +2221,12 @@ impl GitOperationsTool {
         // Validate files argument against injection patterns
         self.sanitize_git_args(files)?;
 
+        if let Some(refused) =
+            preflight_outcome(self.preflight_diff(files, cached, working_dir).await, true)?
+        {
+            return Ok(refused);
+        }
+
         let mut git_args = vec![
             "--no-optional-locks",
             "diff",
@@ -1645,6 +2501,12 @@ impl GitOperationsTool {
             anyhow::bail!("No paths to stage");
         }
 
+        if let Some(refused) =
+            preflight_outcome(self.preflight_add(&sanitized, working_dir).await, false)?
+        {
+            return Ok(refused);
+        }
+
         let mut git_args: Vec<&str> = vec!["add", "--"];
         git_args.extend(sanitized.iter().map(String::as_str));
 
@@ -1694,16 +2556,145 @@ impl GitOperationsTool {
             anyhow::bail!("Branch name contains invalid characters");
         }
 
-        let output = self
-            .run_git_command(&["checkout", branch_name], working_dir)
-            .await;
+        // Resolve the exact tree `git checkout <branch_name>` materializes
+        // and pin execution to it: a bare short name that collides across
+        // namespaces (tag vs branch) resolves differently in `diff` than in
+        // `checkout`, and checkout additionally dwims a not-found branch to
+        // a unique remote-tracking branch (unless checkout.guess=false).
+        // `HEAD` re-checks out the current branch and moves nothing, so it
+        // passes through as-is — the same string reaches both commands.
+        // A name that cannot be resolved exactly is refused, not run.
+        let resolved = if branch_name == "HEAD" {
+            None
+        } else {
+            let allow_remote_dwim = match self.read_config_bool("checkout.guess", working_dir).await
+            {
+                Ok(guess) => guess.unwrap_or(true),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout failed: {e}")),
+                    });
+                }
+            };
+            match self
+                .resolve_supplied_git_reference(branch_name, working_dir, allow_remote_dwim)
+                .await
+            {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "branch": branch_name,
+                            })),
+                        "git_operations: checkout reference refused before Git ran"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout failed: {e}")),
+                    });
+                }
+            }
+        };
+        // The preflight lists the pinned commit id, not the live refname,
+        // so the tree that gets checked is the tree the resolution
+        // selected even if the reference moves afterward.
+        let listing_ref = resolved
+            .as_ref()
+            .map(|resolved| resolved.commit.as_str())
+            .unwrap_or("HEAD");
+
+        if let Some(refused) = preflight_outcome(
+            self.preflight_checkout(branch_name, listing_ref, working_dir)
+                .await,
+            false,
+        )? {
+            return Ok(refused);
+        }
+
+        // Execution uses the attachment-correct spelling of the SAME
+        // resolution the preflight listed: a branch checkout stays attached
+        // only when Git receives the bare branch name (`checkout
+        // refs/heads/x` detaches), so the resolved branch runs short with
+        // remote guessing disabled, while tag/commit references keep the
+        // exact fully-spelled detached form. The residual race — the branch
+        // vanishing between resolution and execution so the bare name
+        // falls through to a same-named tag — cannot be closed by
+        // spelling; the post-exec verification below asserts the
+        // attachment and tree and fails loudly instead.
+        let mut checkout_args: Vec<String> = vec!["checkout".to_string()];
+        let mut expected_branch: Option<String> = None;
+        let mut detached_at: Option<String> = None;
+        match resolved.as_ref().map(|resolved| &resolved.reference) {
+            None => checkout_args.push("HEAD".to_string()),
+            Some(ResolvedGitReference::Branch(refname)) => {
+                checkout_args.push("--no-guess".to_string());
+                checkout_args.push(short_branch_name(refname).to_string());
+                expected_branch = Some(short_branch_name(refname).to_string());
+            }
+            Some(ResolvedGitReference::Commit(refname)) => {
+                checkout_args.push(refname.clone());
+                detached_at = Some(refname.clone());
+            }
+            Some(ResolvedGitReference::RemoteTrack {
+                refname,
+                new_branch,
+            }) => {
+                checkout_args.push("--track".to_string());
+                checkout_args.push("-b".to_string());
+                checkout_args.push(new_branch.clone());
+                // Tracking setup needs the `<remote>/<branch>` spelling;
+                // resolution verified it maps back to `refname` alone.
+                let start_point = refname
+                    .strip_prefix("refs/remotes/")
+                    .unwrap_or(refname.as_str());
+                checkout_args.push(start_point.to_string());
+                expected_branch = Some(new_branch.clone());
+            }
+        }
+        let checkout_args: Vec<&str> = checkout_args.iter().map(String::as_str).collect();
+        let output = self.run_git_command(&checkout_args, working_dir).await;
 
         match output {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                output: format!("Switched to branch: {branch_name}").into(),
-                error: None,
-            }),
+            Ok(_) => {
+                let expected = expected_branch.as_deref();
+                if let Err(e) = self
+                    .verify_checkout_result(&resolved, expected, working_dir)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "branch": branch_name,
+                            })),
+                        "git_operations: checkout result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout verification failed: {e}")),
+                    });
+                }
+                let message = if let Some(branch) = &expected_branch {
+                    format!("Switched to branch: {branch}")
+                } else if let Some(reference) = &detached_at {
+                    format!("Detached HEAD at: {reference}")
+                } else {
+                    format!("Switched to branch: {branch_name}")
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output: message.into(),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1743,6 +2734,20 @@ impl GitOperationsTool {
                     .unwrap_or("")
                     .trim()
                     .to_string();
+                let pathspec: Vec<String> = paths_raw
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+                // `stash push` reverts tracked modifications (and removes
+                // untracked files with `-u`), so its mutation set is checked
+                // against `deny_write` first, like `checkout`.
+                if let Some(refused) = preflight_outcome(
+                    self.preflight_stash(action, include_untracked, &pathspec, working_dir)
+                        .await,
+                    false,
+                )? {
+                    return Ok(refused);
+                }
                 let mut cmd: Vec<String> =
                     vec!["stash".into(), "push".into(), "-m".into(), message];
                 if keep_index {
@@ -1760,7 +2765,16 @@ impl GitOperationsTool {
                 let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
                 self.run_git_command(&cmd_refs, working_dir).await
             }
-            "pop" => self.run_git_command(&["stash", "pop"], working_dir).await,
+            "pop" => {
+                // `pop` always restores the entry's untracked half too.
+                if let Some(refused) = preflight_outcome(
+                    self.preflight_stash(action, true, &[], working_dir).await,
+                    false,
+                )? {
+                    return Ok(refused);
+                }
+                self.run_git_command(&["stash", "pop"], working_dir).await
+            }
             "list" => {
                 self.run_git_read_command(&["--no-optional-locks", "stash", "list"], working_dir)
                     .await
@@ -1925,15 +2939,131 @@ impl GitOperationsTool {
                     .get("branch")
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
-                let mut git_args = vec!["worktree", "add", "--", git_worktree_path];
-                if !branch.is_empty() {
+                // Resolve the exact tree this add materializes BEFORE
+                // anything runs — the omitted-branch dwim (basename branch,
+                // `worktree.guessRemote` remote match, or HEAD) or the
+                // supplied reference (branch-first, then other resolvable
+                // refs which detach, then the unique-remote dwim) — and pin
+                // execution to the resolution: the preflight lists the
+                // pinned commit id, the command below receives the
+                // attachment-correct spelling, and the post-exec
+                // verification demands the pinned id, so the checked tree
+                // is the tree that gets written.
+                let resolved = if branch.is_empty() {
+                    self.resolve_worktree_omitted_reference(&worktree_path, working_dir)
+                        .await?
+                } else {
                     self.sanitize_git_args(branch)?;
-                    git_args.push(branch);
+                    Some(
+                        self.resolve_supplied_git_reference(branch, working_dir, true)
+                            .await?,
+                    )
+                };
+                // The preflight lists the pinned commit id, not the live
+                // refname, so the tree that gets checked is the tree the
+                // resolution selected even if the reference moves afterward.
+                let listing_ref = resolved
+                    .as_ref()
+                    .map(|resolved| resolved.commit.as_str())
+                    .unwrap_or("HEAD");
+                if let Some(refused) = preflight_outcome(
+                    self.preflight_worktree_add(&worktree_path, listing_ref, working_dir)
+                        .await,
+                    true,
+                )? {
+                    return Ok(refused);
                 }
+                // Options precede `--`; what follows is tool-built. Like
+                // checkout, execution uses the attachment-correct spelling
+                // of the SAME resolution the preflight pinned: an existing
+                // branch is handed to Git by its bare name so the new
+                // worktree attaches to it (`worktree add refs/heads/x`
+                // detaches), with remote guessing disabled; tag and commit
+                // references keep the exact fully-spelled form, which
+                // creates a DETACHED worktree (the basename-branch
+                // convenience applies only to bare short names, which the
+                // resolver never passes for these). The post-exec
+                // verification below asserts attachment and pinned commit
+                // in the new worktree, closing the residual race where a
+                // vanishing branch would let the bare name fall through to
+                // a different commit-ish.
+                let mut git_args: Vec<String> = vec!["worktree".to_string(), "add".to_string()];
+                let mut positional: Option<String> = None;
+                let mut expected_branch: Option<String> = None;
+                match resolved.as_ref().map(|resolved| &resolved.reference) {
+                    Some(ResolvedGitReference::Branch(refname)) => {
+                        // Pinning --no-guess-remote keeps execution on this
+                        // resolution even if the branch vanishes and a
+                        // remote-tracking branch of the same name exists.
+                        git_args.push("--no-guess-remote".to_string());
+                        positional = Some(short_branch_name(refname).to_string());
+                        expected_branch = Some(short_branch_name(refname).to_string());
+                    }
+                    Some(ResolvedGitReference::Commit(refname)) => {
+                        positional = Some(refname.clone());
+                    }
+                    Some(ResolvedGitReference::RemoteTrack {
+                        refname,
+                        new_branch,
+                    }) => {
+                        git_args.push("--track".to_string());
+                        git_args.push("-b".to_string());
+                        git_args.push(new_branch.clone());
+                        // Tracking setup needs the `<remote>/<branch>` spelling;
+                        // resolution verified it maps back to `refname` alone.
+                        let start_point = refname
+                            .strip_prefix("refs/remotes/")
+                            .unwrap_or(refname.as_str());
+                        positional = Some(start_point.to_string());
+                        expected_branch = Some(new_branch.clone());
+                    }
+                    None => {
+                        // Create the basename branch from HEAD. Pinning
+                        // --no-guess-remote keeps execution on this
+                        // resolution even if a remote-tracking branch of
+                        // the same name exists.
+                        git_args.push("--no-guess-remote".to_string());
+                    }
+                }
+                git_args.push("--".to_string());
+                git_args.push(git_worktree_path.to_string());
+                if let Some(positional) = positional {
+                    git_args.push(positional);
+                }
+                let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
                 self.run_git_command(&git_args, working_dir).await?;
+                if let Err(e) = self
+                    .verify_checkout_result(
+                        &resolved,
+                        expected_branch.as_deref(),
+                        Path::new(git_worktree_path),
+                    )
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "worktree_path": git_worktree_path,
+                            })),
+                        "git_operations: worktree add result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Worktree add verification failed: {e}")),
+                    });
+                }
+                let message = match &expected_branch {
+                    Some(branch) => {
+                        format!("Worktree added at: {git_worktree_path} (branch: {branch})")
+                    }
+                    None => format!("Worktree added at: {git_worktree_path}"),
+                };
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree added at: {git_worktree_path}").into(),
+                    output: message.into(),
                     error: None,
                 })
             }
@@ -1950,6 +3080,11 @@ impl GitOperationsTool {
                 let git_worktree_path = git_worktree_path.to_str().ok_or_else(|| {
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
+                if let Some(refused) =
+                    preflight_outcome(self.preflight_worktree_remove(&worktree_path).await, true)?
+                {
+                    return Ok(refused);
+                }
                 self.run_git_command(&["worktree", "remove", git_worktree_path], working_dir)
                     .await?;
                 Ok(ToolResult {
@@ -5546,6 +6681,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_deny_write_on_git_dir_still_refuses_git_writes() {
+        // Git metadata checks skip the built-in write guardrails
+        // (`.git/config`, `.git/hooks/`) but an operator `deny_write` entry
+        // stays absolute: denying the repository's `.git` directory must
+        // refuse every Git write while reads keep working.
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".git").canonicalize().unwrap()],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let add = tool
+            .execute(json!({"operation": "add", "paths": "a.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            !add.success,
+            "an operator deny_write on .git must refuse Git writes"
+        );
+
+        let status = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            status.success,
+            "reads must not need write access to metadata: {:?}",
+            status.error
+        );
+    }
+
+    #[tokio::test]
     async fn add_stages_multiple_space_separated_paths() {
         let tmp = TempDir::new().unwrap();
         git_init_no_sign(tmp.path(), &[]);
@@ -5638,6 +6808,2584 @@ mod tests {
             include_str!("../locales/en/tools.ftl")
                 .contains("tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots"),
             "the canonical English boundary diagnostic must remain distinct from the not-in-repository message"
+        );
+    }
+
+    // ── Per-file canonical checks ──
+
+    #[tokio::test]
+    async fn checkout_rejects_branch_that_would_overwrite_mandatory_deny_write_target() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+
+        // Branch that changes the tracked .env content relative to master.
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join(".env"), "MALICIOUS=1").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "change env"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        // Back on master so the tool's checkout actually switches branches.
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "feature"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when the target branch would overwrite a deny_write path"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains(".env"),
+            "error should name the denied path, got: {:?}",
+            result.error
+        );
+
+        // Must not have partially executed: still on master with the
+        // original .env content untouched.
+        let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(
+            content, "initial",
+            ".env must be unchanged after a blocked checkout"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "master");
+    }
+
+    #[tokio::test]
+    async fn checkout_succeeds_when_target_branch_touches_no_denied_paths() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "docs.txt"]).await;
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "docs"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("docs.txt"), "updated docs").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "update docs"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "docs"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "checkout touching only non-denied paths should succeed: {:?}",
+            result.error
+        );
+        let content = std::fs::read_to_string(tmp.path().join("docs.txt")).unwrap();
+        assert_eq!(content, "updated docs");
+    }
+
+    // ── Branch attachment: branch operations stay on the branch ──
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed during test setup or verification: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn checkout_of_an_existing_branch_stays_attached_and_advances_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("docs.txt"), "on topic").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "topic work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "an existing-branch checkout must keep HEAD attached to the branch"
+        );
+
+        // A follow-up commit must land on the branch the agent believes it
+        // is on, not on a detached HEAD.
+        std::fs::write(root.join("docs.txt"), "more topic").unwrap();
+        let added = tool
+            .execute(json!({"operation": "add", "paths": "docs.txt"}))
+            .await
+            .unwrap();
+        assert!(added.success, "add failed: {added:?}");
+        let committed = tool
+            .execute(json!({"operation": "commit", "message": "more topic"}))
+            .await
+            .unwrap();
+        assert!(committed.success, "commit failed: {:?}", committed.error);
+        let branch_tip = run_git(&root, &["rev-parse", "refs/heads/topic"]);
+        let head = run_git(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            branch_tip, head,
+            "the commit must advance refs/heads/topic itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_of_an_existing_branch_stays_attached_and_advances_it() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("docs.txt"), "on topic").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "topic work",
+            ],
+        );
+        // Leave HEAD on master so the topic branch is free to attach the
+        // new worktree.
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "worktree add of an existing branch must attach to it, not detach"
+        );
+
+        std::fs::write(worktree.join("docs.txt"), "from worktree").unwrap();
+        let added = tool
+            .execute(json!({
+                "operation": "add",
+                "path": worktree.to_str().unwrap(),
+                "paths": "docs.txt",
+            }))
+            .await
+            .unwrap();
+        assert!(added.success, "add in worktree failed: {added:?}");
+        let committed = tool
+            .execute(json!({
+                "operation": "commit",
+                "path": worktree.to_str().unwrap(),
+                "message": "from worktree",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            committed.success,
+            "commit in worktree failed: {:?}",
+            committed.error
+        );
+        let branch_tip = run_git(&root, &["rev-parse", "refs/heads/topic"]);
+        let worktree_head = run_git(&worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            branch_tip, worktree_head,
+            "the worktree commit must advance refs/heads/topic itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_checks_out_an_existing_basename_branch_attached() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("docs.txt"), "on feature").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "feature work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("feature");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/feature",
+            "the omitted-branch dwim must attach the existing basename branch"
+        );
+        let content = std::fs::read_to_string(worktree.join("docs.txt")).unwrap();
+        assert_eq!(content, "on feature");
+    }
+
+    #[tokio::test]
+    async fn checkout_of_a_tag_branch_collision_attaches_to_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "topic"]);
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch work").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "branch work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "a tag/branch collision must stay attached to the branch, matching the resolver's branch-first order"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_of_a_tag_branch_collision_attaches_to_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "topic"]);
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch work").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "branch work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "a tag/branch collision must attach the branch, matching the resolver's branch-first order"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_of_a_tag_reference_detaches_head() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "v1"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "v1"}))
+            .await
+            .unwrap();
+        assert!(result.success, "tag checkout failed: {:?}", result.error);
+        let symbolic = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !symbolic.status.success(),
+            "a tag reference must detach HEAD, not attach a branch"
+        );
+    }
+
+    // ── Resolution-to-execution drift fails loudly ──
+
+    /// Simulates an actor with repository write access racing the tool: on
+    /// the FIRST mutating command the boundary wraps (the resolver and
+    /// preflight use the read path, so that command is the checkout or
+    /// worktree add under test), it runs `action` against the repository
+    /// before letting the wrapped command proceed.
+    struct RacingActorBoundary {
+        root: std::path::PathBuf,
+        action: Vec<String>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl GitCommandBoundary for RacingActorBoundary {
+        fn wrap_command(&self, _command: &mut std::process::Command) -> anyhow::Result<()> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let args: Vec<&str> = self.action.iter().map(String::as_str).collect();
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(&args)
+                    .output()
+                    .expect("racing actor git invocation must run");
+                assert!(
+                    output.status.success(),
+                    "racing actor action failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+    }
+
+    fn racing_tool(root: &std::path::Path, action: &[&str]) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new_with_command_boundary(
+            security,
+            Arc::new(RacingActorBoundary {
+                root: root.to_path_buf(),
+                action: action.iter().map(|s| s.to_string()).collect(),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn checkout_fails_loudly_when_the_branch_moves_between_resolution_and_execution() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "moved tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        // The actor repoints refs/heads/topic at master after the tool
+        // resolved and preflighted the original tip, so the checkout
+        // materializes a tree the preflight never listed.
+        let tool = racing_tool(&root, &["branch", "-f", "topic", "master"]);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a moved branch must fail the checkout, not pass silently"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pinned"),
+            "the failure must come from the pin verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_fails_loudly_when_the_branch_vanishes_and_a_tag_shares_its_name() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        // A same-named tag at a different commit: once the racing actor
+        // deletes the branch, the bare name falls through to the tag and
+        // would detach there silently.
+        run_git(&root, &["checkout", "master"]);
+        run_git(&root, &["tag", "topic", "master"]);
+
+        let tool = racing_tool(&root, &["branch", "-D", "topic"]);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a vanished branch with a same-named tag must fail, not detach at the tag"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("attached"),
+            "the failure must come from the attachment verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_fails_loudly_when_the_branch_moves_between_resolution_and_execution() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "moved tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = racing_tool(&root, &["branch", "-f", "topic", "master"]);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a moved branch must fail the worktree add, not pass silently"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pinned"),
+            "the failure must come from the pin verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_checkout_result_rejects_a_pin_head_does_not_match() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let tool = test_tool(&root);
+        let resolved = Some(ResolvedReference {
+            reference: ResolvedGitReference::Branch("refs/heads/master".to_string()),
+            commit: "0".repeat(40),
+        });
+        let error = tool
+            .verify_checkout_result(&resolved, Some("master"), &root)
+            .await
+            .expect_err("a pin that does not match HEAD must fail");
+        assert!(
+            error.to_string().contains("pinned"),
+            "the error must name the pin: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_symbolic_ref_reports_detached_head_as_none() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "--detach"]);
+        let tool = test_tool(&root);
+        let symbolic = tool.head_symbolic_ref(&root).await.unwrap();
+        assert_eq!(symbolic, None, "a detached HEAD must read as None");
+    }
+
+    // ── Git tool policy boundary: deny_read on reads, deny_write on mutations ──
+
+    /// Build a tool whose policy denies reads of `denied` (a repo-relative
+    /// path). The workspace is canonicalized because the tool resolves Git's
+    /// reported paths through `canonicalize_best_effort`; comparing those
+    /// against a symlinked `/var` temp root would make the denial never match
+    /// and the regression pass vacuously.
+    fn deny_read_git_tool(root: &std::path::Path, denied: &str) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            forbidden_paths: vec![root.join(denied).display().to_string()],
+            ..SecurityPolicy::default()
+        });
+        test_tool_with_security(security)
+    }
+
+    fn deny_write_git_tool(root: &std::path::Path, denied: &str) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            deny_write: vec![root.join(denied)],
+            ..SecurityPolicy::default()
+        });
+        test_tool_with_security(security)
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_pathspec_that_would_read_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".env"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "diff of a deny_read target must be refused"
+        );
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("SECRET=leaked"),
+            "a refused diff must not surface the denied file's content: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_from_a_subdirectory_checks_the_real_file_path() {
+        // `git diff --name-only` prints repository-root-relative names. The
+        // check must join them onto the repository root, not the caller's
+        // subdirectory, or it would test `sub/sub/secret.txt` (allowed,
+        // nonexistent) instead of `sub/secret.txt` (denied).
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/secret.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "sub/secret.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "sub"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("sub/secret.txt"), "SECRET=leaked").unwrap();
+
+        let tool = deny_read_git_tool(&root, "sub/secret.txt");
+        let result = tool
+            .execute(json!({"operation": "diff", "path": "sub", "files": "."}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "diff run from a subdirectory must still refuse the denied file"
+        );
+        assert!(!format!("{result:?}").contains("SECRET=leaked"));
+    }
+
+    #[tokio::test]
+    async fn checkout_of_an_option_like_ref_is_refused_before_git_runs() {
+        // The per-file listing passes the ref after `--end-of-options`, so a
+        // branch spelled like an option is looked up as a ref (and fails)
+        // instead of changing what the listing command does.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let head_before = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "--orphan"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "an option-like ref must not be checked out"
+        );
+        let head_after = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(head_before.stdout, head_after.stdout);
+    }
+
+    #[tokio::test]
+    async fn cached_diff_rejects_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".env", "cached": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "the cached diff path must apply the same read policy"
+        );
+        assert!(
+            !format!("{result:?}").contains("SECRET=leaked"),
+            "a refused cached diff must not surface denied content"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_fails_closed_when_a_multi_file_pathspec_includes_a_denied_file() {
+        // The default "." pathspec expands to several files. One denied entry
+        // must abort the whole diff rather than emitting the rest — Git prints
+        // all matched files in one pass, so partial filtering is not available.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": "."}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a pathspec selecting a denied file must fail closed"
+        );
+        let rendered = format!("{result:?}");
+        assert!(
+            !rendered.contains("SECRET=leaked") && !rendered.contains("public change"),
+            "failing closed must emit neither the denied nor the permitted diff: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_still_reports_a_permitted_file_under_the_same_policy() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a permitted pathspec must still diff normally: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_push_rejected_when_it_would_revert_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when it would revert a deny_write path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "SECRET=modified",
+            "a blocked stash must leave the protected file untouched"
+        );
+        let stashes = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stashes.stdout).trim().is_empty(),
+            "a blocked stash must not have created a stash entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_rejected_when_it_would_restore_over_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Create the stash entry directly through git so the tool's own
+        // push-side preflight is not what this test exercises.
+        std::fs::write(root.join(".env"), "SECRET=stashed").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when it would write a deny_write path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "initial",
+            "a blocked pop must not restore the stashed contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_rejected_when_it_would_restore_a_denied_untracked_file() {
+        // `git stash show --name-only` reports only the tracked half of an
+        // entry, so an entry created with `-u` can carry a `deny_write` path
+        // that never appears in the mutation set unless untracked entries are
+        // enumerated explicitly.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        // `.env` is untracked here, so only `git stash push -u` captures it.
+        std::fs::write(root.join(".env"), "SECRET=stashed").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "fixture precondition: the untracked file must be in the stash, not the worktree"
+        );
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry's untracked half writes a deny_write path"
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked pop must not restore the untracked protected file"
+        );
+    }
+
+    // ── Pathset-identity regressions (NUL-delimited strict decoding) ─────────
+    //
+    // Git C-quotes newline-bearing names in non-`-z` output and cannot
+    // represent non-UTF-8 names in a String at all; a lossy newline parse
+    // authorizes a DIFFERENT pathname than Git acts on. These pin the exact
+    // identity rule across every preflight surface.
+
+    #[tokio::test]
+    async fn stash_push_rejected_when_a_newline_named_denied_file_would_revert() {
+        // A file literally named "a\nb.txt" sits under deny_write. The old
+        // lossy line-split turned Git's quoted single line into two bogus
+        // siblings ("a" and "b.txt") and authorized the stash; the NUL-delimited
+        // preflight must see the exact name and block.
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[newline_name]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(newline_name), "modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when the exact newline-bearing name is denied"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(newline_name),
+            "the denial must name the exact pathname, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(newline_name)).unwrap(),
+            "modified",
+            "a blocked stash must leave the protected file untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_rejected_when_a_newline_named_denied_file_would_overwrite() {
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[newline_name]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(newline_name), "branch-version").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "change on feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "feature"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when switching would overwrite the exact newline-bearing \
+             denied name"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(newline_name),
+            "the denial must name the exact pathname, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_and_non_ascii_names_round_trip_exactly_through_the_diff_preflight() {
+        // Characters Git C-quotes in line output (quote, backslash) plus
+        // non-ASCII must survive the preflight as the exact name, so a
+        // deny_read on that name is honored and a deny on a LOOKALIKE
+        // spelled-through-lossy-decoding is not needed.
+        let weird = "we\"ird\\name-文件.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[weird]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(weird), "modified").unwrap();
+
+        let tool = deny_read_git_tool(&root, weird);
+        let result = tool
+            .execute(json!({"operation": "diff", "files": weird}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "diff of a deny_read target whose name Git would C-quote must be refused"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(weird),
+            "the denial must name the exact pathname, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_nul_path_list_fails_closed_on_bad_input() {
+        // Exact-identity decoding rules, exercised without a repository:
+        // strict UTF-8 per entry, terminal NUL required, no interior empty
+        // entries. Each failure must say the pathset could not be proven so
+        // operators can tell identity failure from a policy denial.
+        assert_eq!(
+            GitOperationsTool::decode_nul_path_list(b"ok.txt\0dir/n.txt\0", "Op").unwrap(),
+            vec!["ok.txt".to_string(), "dir/n.txt".to_string()]
+        );
+        assert!(
+            GitOperationsTool::decode_nul_path_list(b"", "Op")
+                .unwrap()
+                .is_empty()
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"ok.txt\0bad\xff.txt\0", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not valid UTF-8") && err.contains("could not prove"),
+            "undecodable entry must fail closed with the precise reason, got: {err}"
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"ok.txt", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("trailing non-NUL bytes"),
+            "missing terminal NUL must fail closed, got: {err}"
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"a.txt\0\0b.txt\0", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("empty entry"),
+            "interior empty entry must fail closed, got: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_repository_name_fails_the_preflight_closed() {
+        use std::os::unix::ffi::OsStrExt;
+        // A repository path that is not valid UTF-8 cannot be matched exactly
+        // against the policy; the preflight must refuse the operation with a
+        // precise error rather than authorize a lossy rendering of the name.
+        // Linux-only: APFS and several other filesystems reject non-UTF-8
+        // names at creat time, so the fixture cannot be built there; the
+        // decoder rules themselves are covered on every platform by
+        // `decode_nul_path_list_fails_closed_on_bad_input`.
+        let raw_name = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(raw_name), "modified").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add non-utf8 name"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(raw_name), "modified again").unwrap();
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a non-UTF-8 repository name must fail the stash preflight closed"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("not valid UTF-8"),
+            "the refusal must say the pathset could not be proven, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_rejected_when_a_newline_named_untracked_file_is_denied() {
+        // Stash-pop identity: the entry's untracked half carries a
+        // newline-bearing name; the restored-set enumeration must see the
+        // exact name, not two split halves of a quoted line.
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::fs::write(root.join(newline_name), "stashed content").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(newline_name).exists(),
+            "fixture precondition: the newline-named file must be in the stash"
+        );
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry restores the exact newline-bearing \
+             denied name"
+        );
+        assert!(
+            !root.join(newline_name).exists(),
+            "a blocked pop must not restore the protected file"
+        );
+    }
+
+    // ── Rename-source regressions ────────────────────────────────────────────
+    //
+    // Default rename detection lists a rename as only its destination. Every
+    // operation below also writes the rename's SOURCE — checkout and pop
+    // delete it, push recreates it, a diff reads it — so each preflight lists
+    // with `--no-renames` and must refuse when the source is denied.
+
+    #[tokio::test]
+    async fn checkout_of_a_rename_source_is_refused_before_git_runs() {
+        // `master` tracks a deny_write `.env`; branch `renamer` renames it to
+        // `config.env`. Under rename detection the HEAD..renamer listing shows
+        // only `config.env`, yet `git checkout renamer` DELETES `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "renamer"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "config.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "rename away"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(root.join(".env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "renamer"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when the branch deletes a deny_write rename source"
+        );
+        assert!(
+            root.join(".env").exists(),
+            "a blocked checkout must leave the rename source in place"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("'.env'"),
+            "the denial must name the rename source, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_push_of_a_rename_source_is_refused_before_git_runs() {
+        // With a staged `git mv .env moved.env`, `git stash push` resets index
+        // and worktree to HEAD, RECREATING `.env`. The tracked listing sees
+        // only `moved.env` under rename detection; it must also list `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!root.join(".env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when it would recreate a deny_write rename source"
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked stash push must not restore the rename source"
+        );
+        let stashes = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stashes.stdout).trim().is_empty(),
+            "a blocked stash push must not have created a stash entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_of_a_rename_source_is_refused_before_git_runs() {
+        // The entry stashes a staged rename of `.env` to `moved.env`; popping
+        // it deletes `.env`. `stash show --name-only` lists only `moved.env`
+        // under rename detection, so the restore half must list the source.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(root.join(".env").exists());
+        assert!(!root.join("moved.env").exists());
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry deletes a deny_write rename source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            "initial",
+            "a blocked pop must leave the rename source untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_a_rename_source_under_deny_read() {
+        // A staged rename away from a deny_read file: the cached-diff listing
+        // collapses the rename to `moved.env` under rename detection, but the
+        // diff reads the source's HEAD content to compute it, so the source
+        // must clear the read policy too.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["mv", ".env", "moved.env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "diff", "files": ".", "cached": true}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a cached diff must be refused when the rename source is deny_read"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_rejected_when_it_would_stage_a_deny_read_file() {
+        // Staging hashes the file's bytes into the object store, so `add` is a
+        // read of every path it touches even though the working tree is
+        // untouched.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": ".env"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "staging a deny_read target must be refused"
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "a refused add must not have staged anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_fails_closed_when_a_broad_pathspec_covers_a_denied_file() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "SECRET=leaked").unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": "."}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a pathspec expanding onto a denied file must fail closed"
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&staged.stdout).trim().is_empty(),
+            "failing closed must stage neither the denied nor the permitted file"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_still_stages_a_permitted_file_under_the_same_policy() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "public change").unwrap();
+
+        let tool = deny_read_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "add", "paths": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "permitted add must work: {:?}",
+            result.error
+        );
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "notes.txt");
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_rejected_when_the_tree_holds_a_denied_file() {
+        // `worktree remove` deletes the whole tree. The root-only check cannot
+        // see a denied path nested inside it, and deletion is a write.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(wt.join("protected.txt"), "keep me").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join("protected.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "removing a worktree containing a deny_write path must be refused"
+        );
+        assert!(
+            wt.join("protected.txt").exists(),
+            "a blocked worktree remove must not delete the protected file"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_succeeds_when_the_tree_holds_no_denied_path() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join("untouched.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "removing a worktree with no denied paths must work: {:?}",
+            result.error
+        );
+        assert!(!wt.exists(), "the worktree should be gone");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_rejected_when_the_checked_out_tree_holds_a_denied_path() {
+        // The target root passes the existing check; the denial is on a file
+        // the branch would materialize underneath it.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join("notes.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "materializing a denied path through worktree add must be refused"
+        );
+        assert!(!wt.exists(), "a blocked worktree add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_a_basename_named_branch_tree() {
+        // `git worktree add -- <path>` with no branch checks out an EXISTING
+        // branch named after the path's basename instead of creating one from
+        // HEAD. Branch `topic` carries a denied `.env` that HEAD lacks, so the
+        // preflight must inspect `refs/heads/topic`, not `HEAD`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!root.join(".env").exists());
+        let wt = root.join("topic");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add must inspect the basename-named branch when the branch is omitted"
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the denied branch tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_checks_head_when_no_basename_branch_exists() {
+        // No branch named `fresh` exists, so `git worktree add -- <…>/fresh`
+        // creates branch `fresh` from HEAD; the preflight inspects HEAD's tree
+        // and the add succeeds under a policy that denies nothing in it.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("fresh");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "worktree add without a branch must still work when no basename branch exists: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("notes.txt").exists(),
+            "the new worktree must materialize HEAD's tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_a_guess_remote_branch_tree() {
+        // `git worktree add -- <path>` with no branch and
+        // `worktree.guessRemote=true` bases the new branch on a unique
+        // remote-tracking branch of the same name — NOT on HEAD. The
+        // preflight must inspect that remote tree: HEAD here is clean while
+        // `origin/topic` carries a denied `.env`.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "test setup must keep .env off HEAD's tree"
+        );
+        let wt = root.join("topic");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add must inspect the guess-remote tree when the branch is omitted: {:?}",
+            result.error
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the remote tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_ref_checks_the_branch_over_the_same_named_tag() {
+        // With a tag and a branch both named `topic`, `ls-tree topic`
+        // resolves the TAG (rev-parse precedence) while
+        // `git worktree add … topic` checks out the BRANCH. Passing the
+        // bare string to both commands checks one tree and writes another;
+        // the tool must resolve once, branch-first, and pin both commands
+        // to that tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![wt.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "worktree add of an ambiguous name must inspect the branch tree: {:?}",
+            result.error
+        );
+        assert!(
+            !wt.exists(),
+            "a blocked worktree add must not materialize the branch tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_guess_remote_creates_tracking_branch_when_allowed() {
+        // The refused guess-remote selection must remain a real dwim when
+        // the remote tree is allowed: the add succeeds, materializes the
+        // remote tree, and marks the remote branch upstream — the pinned
+        // `--track -b` form's documented equivalent.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("topic");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed guess-remote add must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("remote-note.txt").exists(),
+            "the worktree must materialize the remote tree, not HEAD's"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "topic",
+            "the dwim must create the basename-named branch"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim-created branch must track the remote branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_remote_only_ref_creates_tracking_branch_when_allowed() {
+        // A supplied name that is not a local branch but exists on exactly
+        // one remote dwims to `--track -b <name> <remote>/<name>` even with
+        // `worktree.guessRemote` unset. The preflight must inspect the
+        // remote tree, and an allowed one must still create the tracking
+        // branch the bare command would.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed remote-only dwim must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("remote-note.txt").exists(),
+            "the worktree must materialize the remote tree"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim must set up tracking for the supplied name"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_ref_prefers_the_tag_over_a_remote_match() {
+        // A name that is BOTH a tag and a unique remote-tracking branch (no
+        // local branch) detaches at the TAG — Git consults the remote dwim
+        // only when the name resolves to nothing else (verified with Git
+        // 2.49/2.50). The resolution must replicate that, not dwim past a
+        // resolvable tag and materialize the remote's tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "tag-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("tagged.txt"), "tagged").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tagged.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tagged",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "remote-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/remote-carrier",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "tag-carrier", "remote-carrier"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a tag/remote name collision must keep working, detached at the tag: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("tagged.txt").exists(),
+            "the worktree must materialize the tag's tree"
+        );
+        assert!(
+            !wt.join("remote-note.txt").exists(),
+            "the remote-tracking tree must NOT win over the resolvable tag"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            !branch.status.success(),
+            "the tag selection must detach HEAD, not dwim to a tracking branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_supplied_tag_ref_materializes_the_tag_tree() {
+        // A tag with no same-named branch is a plain commit-ish: the add
+        // checks out the tag's commit with a DETACHED HEAD, exactly as the
+        // bare command does. Pinning the resolution must keep that
+        // outcome — with the tag's tree, not a guessed one, listed first.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("tagged.txt"), "tagged").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tagged.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tagged",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("wt");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed tag commit-ish must keep working: {:?}",
+            result.error
+        );
+        assert!(
+            wt.join("tagged.txt").exists(),
+            "the worktree must materialize the tag's tree"
+        );
+        let branch = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            !branch.status.success(),
+            "the tag commit-ish must detach HEAD, as the bare command does"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_refuses_when_multiple_remotes_match() {
+        // `worktree.guessRemote=true` with the basename carried by more
+        // than one remote is a selection Git itself refuses; the tool
+        // refuses it in the preflight rather than guessing a tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        for remote in ["origin", "upstream"] {
+            std::process::Command::new("git")
+                .args([
+                    "update-ref",
+                    &format!("refs/remotes/{remote}/topic"),
+                    "refs/heads/master",
+                ])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["config", "worktree.guessRemote", "true"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let wt = root.join("topic");
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": wt.to_str().unwrap(),
+            }))
+            .await;
+
+        match result {
+            Ok(result) => assert!(
+                !result.success,
+                "a basename on multiple remotes must be refused, not guessed: {:?}",
+                result.error
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("ambiguous"),
+                "a basename on multiple remotes must be refused, not guessed: {error:#}"
+            ),
+        }
+        assert!(!wt.exists(), "a refused add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn checkout_supplied_ref_checks_the_branch_over_the_same_named_tag() {
+        // The checkout sibling of the worktree finding: with a tag and a
+        // branch both named `topic`, `diff HEAD topic` resolves the TAG
+        // (empty diff here, so nothing would be checked) while
+        // `git checkout topic` checks out the BRANCH and writes `.env`.
+        // The preflight must list the resolved branch tree.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["tag", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(".env"), "SECRET=env").unwrap();
+        std::process::Command::new("git")
+            .args(["add", ".env"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "env",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(".env").exists(),
+            "test setup must keep .env out of the working tree"
+        );
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join(".env")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout of an ambiguous name must inspect the branch tree: {:?}",
+            result.error
+        );
+        assert!(
+            !root.join(".env").exists(),
+            "a blocked checkout must not write the branch tree"
+        );
+        let head = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "master",
+            "a blocked checkout must not move HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_remote_only_ref_creates_tracking_branch_when_allowed() {
+        // A supplied name that exists only as a remote-tracking branch
+        // dwims to a new tracking branch, exactly as the bare command
+        // would; the pinned `--track -b` form must preserve that.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("remote-note.txt"), "from remote").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "remote-note.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "remote note",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/topic",
+                "refs/heads/carrier-topic",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["branch", "-D", "carrier-topic"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Tracking setup resolves `<remote>/<branch>` through the CONFIGURED
+        // remote, exactly as a real fetch would leave behind.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://.invalid/nowhere.git"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "checkout",
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an allowed remote-only checkout dwim must keep working: {:?}",
+            result.error
+        );
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "the remote dwim must create and attach the tracking branch"
+        );
+        assert!(
+            root.join("remote-note.txt").exists(),
+            "the checkout must materialize the remote tree"
+        );
+        let head = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "topic",
+            "the dwim must create and switch to the named branch"
+        );
+        let upstream = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            upstream.status.success(),
+            "the dwim-created branch must track the remote branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_prune_rejected_when_stale_admin_directory_is_denied() {
+        // Prune deletes stale `.git/worktrees/<name>` metadata, not tracked
+        // working-tree files, so the denial is on the admin directory Git
+        // itself would remove, not on anything under the workspace root.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Remove the worktree directory by hand (not via `worktree remove`)
+        // so Git considers its admin entry stale and prunable.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin_dir = root.join(".git").join("worktrees").join("wt");
+        assert!(
+            admin_dir.exists(),
+            "admin dir should still exist before pruning"
+        );
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![admin_dir.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        // Master's `validate_metadata_closure` checks every entry of the
+        // common Git directory for write before any write command, so the
+        // refusal arrives as an error from that check rather than a
+        // dedicated prune preflight. Either way the prune must not run.
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "prune",
+            }))
+            .await;
+
+        assert!(
+            result.as_ref().map_or(true, |r| !r.success),
+            "pruning a denied worktree admin directory must be refused: {result:?}"
+        );
+        assert!(
+            admin_dir.exists(),
+            "a blocked prune must not delete the protected admin directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_prune_succeeds_when_no_denied_administrative_path() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin_dir = root.join(".git").join("worktrees").join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join("untouched.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "prune",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "pruning with no denied administrative path must work: {:?}",
+            result.error
+        );
+        assert!(
+            !admin_dir.exists(),
+            "the stale worktree admin directory should be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_push_succeeds_when_no_denied_path_is_affected() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env", "notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push", "paths": "notes.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "stashing only permitted paths must still work: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "initial",
+            "the permitted file should have been reverted by the stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_succeeds_when_untracked_entries_are_permitted() {
+        // The untracked half of the entry is enumerated, so a pop must still
+        // succeed when nothing in it is denied.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[".env"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::fs::write(root.join("scratch.txt"), "untracked work").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, ".env");
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "popping an entry with only permitted untracked paths must work: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("scratch.txt")).unwrap(),
+            "untracked work",
+            "the permitted untracked file should have been restored"
         );
     }
 }
