@@ -345,25 +345,95 @@ impl CallerCommandBound {
     /// The bound a caller with this policy places on its delegates.
     #[must_use]
     pub fn from_caller(caller: &SecurityPolicy) -> Self {
+        // Exhaustive on purpose, like `overlay` below: a field added to
+        // `SecurityPolicy` stops this compiling until it is decided whether it
+        // gates a command (carry it here and in `overlay`) or not (name it
+        // with `_`). A `..` pattern would let it fall out of the bound unseen.
+        let SecurityPolicy {
+            autonomy,
+            allowed_commands,
+            block_high_risk_commands,
+            require_approval_for_medium_risk,
+            risk_profile_name: _,
+            delegation_policy: _,
+            workspace_dir: _,
+            config_path: _,
+            data_dir: _,
+            workspace_only: _,
+            forbidden_paths: _,
+            allowed_roots: _,
+            allowed_roots_read_only: _,
+            allowed_roots_write_only: _,
+            max_actions_per_hour: _,
+            max_cost_per_day_cents: _,
+            shell_env_passthrough: _,
+            shell_timeout_secs: _,
+            allowed_tools: _,
+            excluded_tools: _,
+            auto_approve: _,
+            always_ask: _,
+            sandbox_enabled: _,
+            sandbox_backend: _,
+            firejail_args: _,
+            sandbox_image: _,
+            // The caller's own chain is applied where it is stored, not copied
+            // into the bound it places on its delegates.
+            caller_command_bounds: _,
+            tracker: _,
+        } = caller;
         Self {
-            autonomy: caller.autonomy,
-            allowed_commands: caller.allowed_commands.clone(),
-            block_high_risk_commands: caller.block_high_risk_commands,
-            require_approval_for_medium_risk: caller.require_approval_for_medium_risk,
+            autonomy: *autonomy,
+            allowed_commands: allowed_commands.clone(),
+            block_high_risk_commands: *block_high_risk_commands,
+            require_approval_for_medium_risk: *require_approval_for_medium_risk,
         }
     }
 
     /// `policy` with this caller's command fields laid over it and its own
     /// chain cleared, so validating against the result checks exactly this
     /// caller's command policy on the policy's own paths.
+    ///
+    /// Every field of [`SecurityPolicy`] is named below, and there is no
+    /// `..policy.clone()`. That is deliberate: a field added to the struct
+    /// stops this function compiling until someone decides which side it
+    /// belongs to. With a struct-update tail it would silently come from the
+    /// target, and a new command-gating field would never bind the caller's
+    /// delegates.
     fn overlay(&self, policy: &SecurityPolicy) -> SecurityPolicy {
         SecurityPolicy {
+            // The caller's command policy: the four fields
+            // `validate_command_execution_for_shell` reads.
             autonomy: self.autonomy,
             allowed_commands: self.allowed_commands.clone(),
             block_high_risk_commands: self.block_high_risk_commands,
             require_approval_for_medium_risk: self.require_approval_for_medium_risk,
+            // This caller's own chain is applied by the caller, not nested.
             caller_command_bounds: Vec::new(),
-            ..policy.clone()
+            // Everything else stays the policy's own: paths, roots, sandbox,
+            // tool lists, limits and identity are judged against the target.
+            risk_profile_name: policy.risk_profile_name.clone(),
+            delegation_policy: policy.delegation_policy.clone(),
+            workspace_dir: policy.workspace_dir.clone(),
+            config_path: policy.config_path.clone(),
+            data_dir: policy.data_dir.clone(),
+            workspace_only: policy.workspace_only,
+            forbidden_paths: policy.forbidden_paths.clone(),
+            allowed_roots: policy.allowed_roots.clone(),
+            allowed_roots_read_only: policy.allowed_roots_read_only.clone(),
+            allowed_roots_write_only: policy.allowed_roots_write_only.clone(),
+            max_actions_per_hour: policy.max_actions_per_hour,
+            max_cost_per_day_cents: policy.max_cost_per_day_cents,
+            shell_env_passthrough: policy.shell_env_passthrough.clone(),
+            shell_timeout_secs: policy.shell_timeout_secs,
+            allowed_tools: policy.allowed_tools.clone(),
+            excluded_tools: policy.excluded_tools.clone(),
+            auto_approve: policy.auto_approve.clone(),
+            always_ask: policy.always_ask.clone(),
+            sandbox_enabled: policy.sandbox_enabled,
+            sandbox_backend: policy.sandbox_backend.clone(),
+            firejail_args: policy.firejail_args.clone(),
+            sandbox_image: policy.sandbox_image.clone(),
+            tracker: policy.tracker.clone(),
         }
     }
 }

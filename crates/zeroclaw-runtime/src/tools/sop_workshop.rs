@@ -69,6 +69,12 @@ pub struct SopWorkshopTool {
     /// engine from the same root, so it must match the root the engine was built
     /// from — otherwise apply would write to one tree and reload another.
     install_root: std::path::PathBuf,
+    /// The caller's tool ceiling, `Some` wherever this registry is bounded by
+    /// one (a bounded delegate target, a restricted run). Every action except
+    /// the two read-only ones persists state that a later run consumes outside
+    /// that ceiling - `apply` writes a SOP definition and reloads the shared
+    /// engine - so under a ceiling they are refused, sealed or not.
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl SopWorkshopTool {
@@ -76,6 +82,29 @@ impl SopWorkshopTool {
         Self {
             engine,
             install_root,
+            caller_ceiling: None,
+        }
+    }
+
+    pub(crate) fn with_caller_ceiling(
+        mut self,
+        ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
+    ) -> Self {
+        self.caller_ceiling = ceiling;
+        self
+    }
+
+    /// A fresh instance sharing this one's live engine and install root,
+    /// bound to `ceiling`. Used by the `Bounded` delegate rebuild in
+    /// `delegate.rs`, like `SopExecuteTool::rebound_with_ceiling`.
+    pub(crate) fn rebound_with_ceiling(
+        &self,
+        ceiling: crate::tools::caller_ceiling::CallerCeiling,
+    ) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            install_root: self.install_root.clone(),
+            caller_ceiling: Some(ceiling),
         }
     }
 }
@@ -96,6 +125,12 @@ impl ::zeroclaw_api::attribution::Attributable for SopWorkshopTool {
 
 #[async_trait]
 impl Tool for SopWorkshopTool {
+    // Lets the bounded delegate rebuild find this instance through a
+    // downcast and rebind it to the sealed ceiling.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn name(&self) -> &str {
         "sop_workshop"
     }
@@ -160,7 +195,22 @@ impl Tool for SopWorkshopTool {
             .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::Error::msg("Missing 'action' parameter"))?;
-        let result = match SopWorkshopAction::parse(action)? {
+        let action = SopWorkshopAction::parse(action)?;
+        // Read-only actions are the allow-list, so an action added later is
+        // refused under a ceiling until someone decides it belongs here.
+        if self.caller_ceiling.is_some()
+            && !matches!(action, SopWorkshopAction::List | SopWorkshopAction::Inspect)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "sop_workshop `{}` is not available under a caller tool ceiling: it                      persists a proposal or SOP definition that runs later, outside that                      ceiling. `list` and `inspect` remain available.",
+                    action.wire_name()
+                )),
+            });
+        }
+        let result = match action {
             SopWorkshopAction::Propose => self.propose(&args),
             SopWorkshopAction::CaptureRun => self.capture_run(&args),
             SopWorkshopAction::List => self.list(&args),

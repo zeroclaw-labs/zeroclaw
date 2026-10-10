@@ -218,9 +218,13 @@ A `cron_update` that names no `command`, and a `schedule` resume, leave a stored
 
 The chain travels by cloning the policy, so it does not reach a turn that is started for a different agent and rebuilds that agent's policy from config. Today that is a `send_message_to_peer` relay (`process_message_inner`) and a live nested SOP step that names another agent (`assemble_owned_execution`): both receive only the caller's tool-name ceiling, so the recipient's `shell` is judged by the recipient's own command policy. This is a known boundary of the mechanism, not a guarantee.
 
+A hop to an `independent` target below a bounded one is configured design, not a gap: an independent target resolves its own policy and builds its own registry, so it carries neither the tool ceiling nor the command chain of the callers above it. Only bounded hops extend the chain.
+
 The scheduler itself validates a stored command with the owning agent's policy, rebuilt from config when the job fires. The callers' bounds are therefore enforced when the command is written, re-armed or run through these tools, and not again at each later scheduled run.
 
 A deferred **agent** job has no command yet, so there is nothing to judge when it is written. A bounded registration therefore refuses any stored `allowed_tools` list that keeps `shell`, whether it names `shell` or inherits it from a ceiling that holds it; list the tools the job needs without `shell`. A `SubAgentOverrides::policy` override cannot shed a bound its parent carries (`EscalationViolation::CallerCommandBoundDroppedByChild`).
+
+`sop_workshop` leaves state that outlives the turn: `apply` writes a SOP definition and reloads the shared engine, and `propose`, `capture_run`, `reject` and `quarantine` save proposals. A bounded target, and any registry built under a caller tool ceiling, therefore keeps only its read-only `list` and `inspect` actions; the other actions are refused.
 
 ### `delegate`: output strings the model sees
 

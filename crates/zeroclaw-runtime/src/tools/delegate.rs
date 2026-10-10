@@ -5556,7 +5556,7 @@ impl DelegateTool {
                 // without it nothing above was rebuilt and `target_policy` IS the
                 // caller's policy, so that path keeps its current behaviour.
                 let deny_unclassified_reuse = self.root_config.is_some();
-                // D3: an MCP tool belongs to the target when the TARGET's own
+                // An MCP tool belongs to the target when the TARGET's own
                 // `mcp_bundles` grant the server it is prefixed with. Matched
                 // against the resolved server list rather than by splitting the
                 // name on `__`, because nothing stops a server name from
@@ -5728,12 +5728,11 @@ impl DelegateTool {
                                     None
                                 };
                             }
-                            // `sop_execute`/`sop_advance`: `SAFE_FOR_BOUNDED_REUSE`
-                            // because they share the caller's live `engine`/`audit`
-                            // handles rather than being rebuilt from config - there
-                            // is only one SOP engine to share. That reuse is only
-                            // safe for a run that stays inside this turn
-                            // (`bounded_delegate_sop_step_ceiling` covers it via
+                            // `sop_execute`/`sop_advance` share the caller's live
+                            // `engine`/`audit` handles rather than being rebuilt from
+                            // config - there is only one SOP engine to share. Sharing
+                            // the engine is only safe for a run that stays inside this
+                            // turn (`bounded_delegate_sop_step_ceiling` covers it via
                             // `SopStepReassembly`); a run that instead PARKS
                             // (WaitApproval/CheckpointWait/Pending) escapes to an
                             // external resume with `allowed_tools: None` - full
@@ -5741,6 +5740,11 @@ impl DelegateTool {
                             // the sealed ceiling here lets each tool cancel a run it
                             // parks, and marks the actions it queues so the live
                             // driver cancels any park it reaches later in the turn.
+                            //
+                            // They are therefore NOT in `SAFE_FOR_BOUNDED_REUSE`: the
+                            // two downcasts below are the only way they reach a
+                            // target, and the name check after them drops an
+                            // instance the downcast could not resolve.
                             if let Some(sop_execute) = tool
                                 .as_any()
                                 .and_then(|any| any.downcast_ref::<crate::tools::SopExecuteTool>())
@@ -5756,6 +5760,25 @@ impl DelegateTool {
                                 return Some(Box::new(
                                     sop_advance.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
                                 ) as Box<dyn Tool>);
+                            }
+                            if let Some(sop_workshop) = tool
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<crate::tools::SopWorkshopTool>())
+                            {
+                                // Its writes outlive the turn: under the sealed
+                                // ceiling it keeps only `list` and `inspect`.
+                                return Some(Box::new(
+                                    sop_workshop.rebound_with_ceiling(Arc::clone(&bounded_ceiling)),
+                                ) as Box<dyn Tool>);
+                            }
+                            // Fail closed. A name that is only ever handed over
+                            // rebound, whose downcast did not resolve (the instance
+                            // was wrapped, or `as_any` was not forwarded), is
+                            // omitted - never reused as the caller's instance. This
+                            // sits before `reuse_is_earned` on purpose: that switch
+                            // is `true` for everything when `root_config` is unset.
+                            if crate::tools::REBOUND_BY_DOWNCAST_TOOL_NAMES.contains(&tool.name()) {
+                                return None;
                             }
                             let reuse_is_earned = !deny_unclassified_reuse
                                 || crate::tools::SAFE_FOR_BOUNDED_REUSE.contains(&tool.name())
@@ -16948,7 +16971,7 @@ mod tests {
     /// containment check below passes. This fake just records the working
     /// directory it was asked to run in and returns a canned success - it never
     /// spawns anything, so this test stays safe both BEFORE and AFTER the
-    /// Bloqueante 2 fix lands (before: the containment check rejects the call and
+    /// working-directory containment fix lands (before: the containment check rejects the call and
     /// this executor is never even reached; after: it's reached, but is inert).
     #[derive(Default)]
     struct FakeCodingCliExecutor {
@@ -16985,7 +17008,7 @@ mod tests {
         std::os::unix::process::ExitStatusExt::from_raw(0)
     }
 
-    /// Real regression test for the coding-CLI class of the Bloqueante 2 gap,
+    /// Real regression test for the coding-CLI class of the working-directory containment gap,
     /// exercised through the real `DelegateTool::execute_agentic` Bounded branch -
     /// but with `parent_tools` built by hand (the ONE deliberate exception to
     /// "always build via the real factory" in this file) so a `FakeCodingCliExecutor`
@@ -23564,10 +23587,25 @@ command = "rm independent-delegate-marker"
         target_alias: &str,
         parent_tools: Vec<Arc<dyn Tool>>,
     ) -> Vec<String> {
+        bounded_offered_tool_names_with(config, target_alias, parent_tools, true).await
+    }
+
+    /// [`bounded_offered_tool_names`] with the choice of attaching the root
+    /// config. Without it `deny_unclassified_reuse` is off, so the bounded
+    /// rebuild reuses every caller instance that no category claimed.
+    async fn bounded_offered_tool_names_with(
+        config: &Arc<zeroclaw_config::schema::Config>,
+        target_alias: &str,
+        parent_tools: Vec<Arc<dyn Tool>>,
+        attach_root_config: bool,
+    ) -> Vec<String> {
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(config, "caller").expect("caller policy resolves"));
-        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
-            .with_root_config(Arc::clone(config))
+        let mut tool = DelegateTool::new(config.agents.clone(), None, caller_policy);
+        if attach_root_config {
+            tool = tool.with_root_config(Arc::clone(config));
+        }
+        let tool = tool
             .with_caller_alias("caller")
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone())
@@ -23641,6 +23679,73 @@ command = "rm independent-delegate-marker"
             "a SAFE_FOR_BOUNDED_REUSE tool must survive cross-profile bounded \
              delegation, got {names:?}"
         );
+    }
+
+    /// `sop_execute` and `sop_advance` reach a bounded target only rebound to
+    /// the sealed ceiling. An instance the downcast cannot resolve - here a
+    /// stand-in with no `as_any`, the same shape as a wrapped tool - is omitted
+    /// rather than reused as the caller's own instance.
+    #[tokio::test]
+    async fn bounded_target_omits_sop_tools_the_downcast_cannot_rebind() {
+        let tmp = TempDir::new().unwrap();
+        let config =
+            bounded_reuse_config(&["calculator", "sop_execute", "sop_advance"], false, &tmp);
+
+        let names = bounded_offered_tool_names(
+            &config,
+            "target",
+            vec![
+                Arc::new(crate::tools::CalculatorTool::new()),
+                Arc::new(NamedFixtureTool("sop_execute")),
+                Arc::new(NamedFixtureTool("sop_advance")),
+            ],
+        )
+        .await;
+
+        // Control: the same registry still hands over a proven-safe tool, so
+        // the omission below is the downcast rule and not an empty target.
+        assert!(
+            names.iter().any(|n| n == "calculator"),
+            "control: a SAFE_FOR_BOUNDED_REUSE tool must be offered, got {names:?}"
+        );
+        for sop in ["sop_execute", "sop_advance"] {
+            assert!(
+                !names.iter().any(|n| n == sop),
+                "`{sop}` whose downcast does not resolve must be omitted, never                  reused as the caller's instance, got {names:?}"
+            );
+        }
+    }
+
+    /// Same rule when no `root_config` is attached, the mode in which
+    /// `deny_unclassified_reuse` is off and every unclaimed name is reused.
+    #[tokio::test]
+    async fn bounded_target_omits_unrebindable_sop_tools_without_root_config() {
+        let tmp = TempDir::new().unwrap();
+        let config =
+            bounded_reuse_config(&["calculator", "sop_execute", "sop_advance"], false, &tmp);
+
+        let names = bounded_offered_tool_names_with(
+            &config,
+            "target",
+            vec![
+                Arc::new(crate::tools::CalculatorTool::new()),
+                Arc::new(NamedFixtureTool("sop_execute")),
+                Arc::new(NamedFixtureTool("sop_advance")),
+            ],
+            false,
+        )
+        .await;
+
+        assert!(
+            names.iter().any(|n| n == "calculator"),
+            "control: a SAFE_FOR_BOUNDED_REUSE tool must be offered, got {names:?}"
+        );
+        for sop in ["sop_execute", "sop_advance"] {
+            assert!(
+                !names.iter().any(|n| n == sop),
+                "`{sop}` whose downcast does not resolve must be omitted even                  without a root config, got {names:?}"
+            );
+        }
     }
 
     /// Sharing a risk profile is NOT a reason to hand over caller instances.

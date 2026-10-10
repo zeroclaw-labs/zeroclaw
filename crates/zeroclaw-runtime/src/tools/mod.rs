@@ -450,9 +450,9 @@ pub const FILESYSTEM_TOOL_NAMES: &[&str] = &[
 /// [`all_tools_with_runtime`] (config-gated, several disabled by default) —
 /// not by the smaller [`default_tools_with_runtime`]. A `Bounded` delegate to
 /// a cross-profile target must rebuild these against the target's own policy
-/// too; `delegate.rs`'s `Bounded` branch currently only checks
-/// `FILESYSTEM_TOOL_NAMES`, so a target allowed one of these still falls
-/// through to the caller's `ToolArcRef`-wrapped instance. See each
+/// too, and `delegate.rs`'s `Bounded` branch does (`target_workspace_bound_tools`).
+/// A name that was not rebuilt is never reused unless `SAFE_FOR_BOUNDED_REUSE`
+/// lists it. See each
 /// constructor function above for the exact captured field: `git_operations`,
 /// `backup`, `data_management` (these two work on the shared data directory,
 /// but capture the agent's `SecurityPolicy` that confines them;
@@ -488,9 +488,9 @@ pub const WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT: &[&str] = &[
 /// at construction time - a distinct capture mechanism from
 /// `FILESYSTEM_TOOL_NAMES`/`WORKSPACE_BOUND_TOOL_NAMES_BEYOND_DEFAULT`
 /// (`workspace_dir`/`SecurityPolicy`), but the exact same underlying bug: a
-/// `Bounded` delegate to a cross-profile target that falls through to the
-/// caller's `ToolArcRef`-wrapped instance acts using the CALLER's identity,
-/// not the target's. Severity varies by tool - `spawn_subagent` is the most
+/// `Bounded` delegate to a cross-profile target that was handed the
+/// caller's `ToolArcRef`-wrapped instance would act using the CALLER's
+/// identity, not the target's. Severity varies by tool - `spawn_subagent` is the most
 /// severe (a target can synchronously spawn a SubAgent inheriting the
 /// caller's full identity, `SecurityPolicy`, and permissions envelope);
 /// `cron_add`/`cron_update`/`schedule` let a target create or modify
@@ -550,12 +550,20 @@ pub const IDENTITY_BOUND_TOOL_NAMES: &[&str] = &[
 /// channel handle; their arguments come from `root_config`, from
 /// process-wide shared handles, or from nothing at all.
 ///
-/// Note that `sop_execute`, `sop_advance` and `web_search_tool` hold no
-/// `security` field, so they run no internal `can_act` gate. Reusing them is
-/// still correct under the capture test - an instance built with the target's
-/// context would be byte-identical - but the absence of that gate is a
-/// pre-existing property of those tools, identical outside bounded
-/// delegation, and is not what this boundary fix addresses.
+/// `sop_workshop` is NOT a member either: its `PathBuf` is
+/// `root_config.install_root_dir()`, the global install root, not the caller's
+/// workspace, but `apply` writes a SOP definition there and reloads the shared
+/// engine, so what it leaves behind outlives the turn. It is rebound to the
+/// sealed ceiling (see [`REBOUND_BY_DOWNCAST_TOOL_NAMES`]) and refuses every
+/// action except `list` and `inspect` while one is in force.
+///
+/// `sop_execute` and `sop_advance` are NOT members, although they hold no
+/// `SecurityPolicy` either: `sop_execute` carries its initiating agent
+/// (`.with_initiator(agent_alias)`), which lets a parked run resume as that
+/// agent with its full policy and no ceiling, and both tools queue runs that
+/// outlive the turn. They are listed in [`REBOUND_BY_DOWNCAST_TOOL_NAMES`]
+/// instead, so a bounded target only ever receives an instance rebound to the
+/// sealed ceiling.
 pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     // Unit structs: no fields at all.
     "calculator",
@@ -580,14 +588,12 @@ pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     // The SOP tools below hold the shared `sop_engine`/`sop_audit`/metrics
     // handles that `all_tools_with_runtime` receives as parameters: the same
     // objects for caller and target. `sop_approve` is deliberately absent -
-    // it is the one SOP tool built `.with_agent_alias(agent_alias)`.
+    // it is the one SOP tool built `.with_agent_alias(agent_alias)` - and so
+    // are `sop_execute`/`sop_advance`, which are rebound to the ceiling
+    // (`REBOUND_BY_DOWNCAST_TOOL_NAMES`) rather than reused. `sop_workshop`
+    // is absent for the same reason.
     "sop_list",
-    "sop_execute",
-    "sop_advance",
     "sop_status",
-    // Its `PathBuf` is `root_config.install_root_dir()`, the global install
-    // root that anchors SOP-definition writes - not the caller's workspace.
-    "sop_workshop",
     // Hold only the session backend, built from `config.data_dir` and the
     // global session-backend setting. `sessions_history`/`sessions_send` are
     // deliberately absent: those two do capture `security`.
@@ -599,6 +605,19 @@ pub const SAFE_FOR_BOUNDED_REUSE: &[&str] = &[
     "email_search",
     "email_read",
 ];
+
+/// Tools a `Bounded` delegate target receives ONLY as an instance rebound to
+/// the sealed caller ceiling (`rebound_with_ceiling`), found by downcasting the
+/// caller's instance through [`Tool::as_any`].
+///
+/// This is the fail-closed counterpart to `SAFE_FOR_BOUNDED_REUSE`: when the
+/// downcast does not resolve (the instance was wrapped, or `as_any` was not
+/// forwarded), the name is OMITTED from the target registry. It is never
+/// reused as-is, and that holds whether or not `root_config` is set - the
+/// reuse list's own `deny_unclassified_reuse` switch does not apply to these
+/// names. Reusing the caller's instance would hand the target a SOP tool whose
+/// parked runs resume outside the ceiling.
+pub const REBOUND_BY_DOWNCAST_TOOL_NAMES: &[&str] = &["sop_execute", "sop_advance", "sop_workshop"];
 
 /// Test-only counterpart to `SAFE_FOR_BOUNDED_REUSE`, consulted only through
 /// `is_test_only_safe_for_bounded_reuse` below so it never reaches a release
@@ -944,7 +963,23 @@ pub(crate) fn browser_tool(
 ///   boundary bug, on a surface the tool inventory never enumerated because
 ///   they are built by `build_mcp_capability_tools`, outside
 ///   `all_tools_with_runtime`.
-pub const BOUNDED_DENIED_TOOL_NAMES: &[&str] = &["model_switch", "mcp_resources", "mcp_prompts"];
+/// - The four `a2a_*` tools are built `A2aXTool::new(client, security.clone())`:
+///   each captures the CALLER's `SecurityPolicy`, and the shared client holds
+///   the caller's live config handle, so peer endpoints and their credentials
+///   resolve from the caller's configuration. That fails the admission test of
+///   `SAFE_FOR_BOUNDED_REUSE`, and no factory rebuilds them against a target's
+///   policy. They were left unclassified by the maximal-registry fixture, which
+///   never enabled `[a2a.client]`; this records the decision the fallback was
+///   already making for them.
+pub const BOUNDED_DENIED_TOOL_NAMES: &[&str] = &[
+    "model_switch",
+    "mcp_resources",
+    "mcp_prompts",
+    "a2a_discover",
+    "a2a_send",
+    "a2a_get_task",
+    "a2a_cancel",
+];
 
 /// Tools that capture BOTH the caller's `SecurityPolicy` and a live channel
 /// handle at construction time.
@@ -3493,10 +3528,10 @@ fn all_tools_with_runtime_on_thread(
                 .with_collector(crate::sop::SopMetricsCollector::shared()),
         ));
         if root_config.sop.procedural_memory_enabled {
-            tool_arcs.push(Arc::new(SopWorkshopTool::new(
-                Arc::clone(sop_engine),
-                root_config.install_root_dir(),
-            )));
+            tool_arcs.push(Arc::new(
+                SopWorkshopTool::new(Arc::clone(sop_engine), root_config.install_root_dir())
+                    .with_caller_ceiling(caller_ceiling.clone()),
+            ));
         }
     }
 
@@ -6320,7 +6355,7 @@ permissions = ["http_client"]
     }
 
     /// Every bounded-delegation category, paired with its name for diagnostics.
-    fn bounded_classification_lists() -> [(&'static str, &'static [&'static str]); 8] {
+    fn bounded_classification_lists() -> [(&'static str, &'static [&'static str]); 9] {
         [
             ("MEMORY_TOOL_NAMES", zeroclaw_tools::MEMORY_TOOL_NAMES),
             ("FILESYSTEM_TOOL_NAMES", FILESYSTEM_TOOL_NAMES),
@@ -6332,6 +6367,10 @@ permissions = ["http_client"]
             ("AUTONOMY_REBOUND_TOOL_NAMES", AUTONOMY_REBOUND_TOOL_NAMES),
             ("CHANNEL_REBOUND_TOOL_NAMES", CHANNEL_REBOUND_TOOL_NAMES),
             ("SAFE_FOR_BOUNDED_REUSE", SAFE_FOR_BOUNDED_REUSE),
+            (
+                "REBOUND_BY_DOWNCAST_TOOL_NAMES",
+                REBOUND_BY_DOWNCAST_TOOL_NAMES,
+            ),
             ("BOUNDED_DENIED_TOOL_NAMES", BOUNDED_DENIED_TOOL_NAMES),
         ]
     }
@@ -6391,6 +6430,7 @@ permissions = ["http_client"]
         cfg.project_intel.enabled = true;
         cfg.security_ops.enabled = true;
         cfg.cloud_ops.enabled = true;
+        cfg.a2a.client.enabled = true;
         cfg.knowledge.enabled = true;
         cfg.knowledge.db_path = tmp
             .path()
@@ -6600,6 +6640,74 @@ permissions = ["http_client"]
         );
     }
 
+    /// The categories must cover the compiled inventory
+    /// (`zeroclaw_tools::inventory::BUILTIN_TOOLS`), not only whatever
+    /// `maximal_tool_registry` happens to build: a tool whose gate that fixture
+    /// forgets to switch on would otherwise stay unclassified while the
+    /// completeness test above reports green, which is how the `a2a_*` tools
+    /// went unclassified. Every inventoried name must be in exactly one list,
+    /// except the few below that never reach the classifier.
+    #[test]
+    fn every_inventoried_tool_is_classified_for_bounded_delegation() {
+        let never_reaches_the_classifier = [
+            (
+                "delegate",
+                "the bounded filter strips the caller's own instance itself",
+            ),
+            (
+                "execute_pipeline",
+                "minted by the scoped assembly from the config it is given; the bounded                  assembly runs with `Config::default()`, so it is never in the registry",
+            ),
+            (
+                "tool_search",
+                "minted by the scoped assembly behind deferred MCP loading, which the                  bounded assembly leaves off (`connect_mcp: false`, no MCP registry)",
+            ),
+        ];
+        for (name, reason) in never_reaches_the_classifier {
+            assert!(
+                zeroclaw_tools::inventory::is_builtin_tool_name(name),
+                "`{name}` is exempted ({reason}) but is not in BUILTIN_TOOLS - stale exemption"
+            );
+        }
+
+        let inventory = zeroclaw_tools::inventory::BUILTIN_TOOLS;
+        assert!(
+            inventory.len() >= 60,
+            "the inventory should be far larger than this; only {} rows",
+            inventory.len()
+        );
+
+        let lists = bounded_classification_lists();
+        let mut unclassified: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<String> = Vec::new();
+        for spec in inventory {
+            if never_reaches_the_classifier
+                .iter()
+                .any(|(name, _)| *name == spec.name)
+            {
+                continue;
+            }
+            let hits: Vec<&str> = lists
+                .iter()
+                .filter(|(_, list)| list.contains(&spec.name))
+                .map(|(list_name, _)| *list_name)
+                .collect();
+            match hits.len() {
+                0 => unclassified.push(spec.name),
+                1 => {}
+                _ => duplicated.push(format!("{} in {hits:?}", spec.name)),
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "these inventoried tools belong to no bounded-delegation category; classify              each one (rebuilt / safe to reuse / rebound / denied): {unclassified:?}"
+        );
+        assert!(
+            duplicated.is_empty(),
+            "these inventoried tools are in more than one category: {duplicated:?}"
+        );
+    }
+
     /// A name cannot be both denied and reusable. Without this, moving one of
     /// the denied names into `SAFE_FOR_BOUNDED_REUSE` would silently win - the
     /// fallback checks the safe list and never consults the denial list.
@@ -6610,6 +6718,11 @@ permissions = ["http_client"]
                 !SAFE_FOR_BOUNDED_REUSE.contains(denied),
                 "'{denied}' is listed as denied for bounded targets and as safe to \
                  reuse; the safe list wins at runtime, so this is a real conflict"
+            );
+            assert!(
+                !REBOUND_BY_DOWNCAST_TOOL_NAMES.contains(denied),
+                "'{denied}' is listed as denied for bounded targets and as rebound \
+                 by downcast, which would hand the target a rebound instance"
             );
             for (list_name, list) in [
                 ("FILESYSTEM_TOOL_NAMES", FILESYSTEM_TOOL_NAMES),
