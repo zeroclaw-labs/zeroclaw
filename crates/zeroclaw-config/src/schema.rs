@@ -921,6 +921,16 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Override the wire field name for reasoning content on chat-completions
+    /// requests. Unset (default) sends the canonical `reasoning_content`;
+    /// set to `"reasoning"` for backends that only accept that alias (some
+    /// vLLM builds). Honored only by OpenAI-compatible families; branded
+    /// slots and `wire_api = "responses"` aliases ignore it silently. Affects
+    /// wire output only; stored assistant history stays under
+    /// `reasoning_content`.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_key: Option<String>,
     /// Model identifier to send with each request: the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]

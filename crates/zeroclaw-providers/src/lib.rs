@@ -753,6 +753,10 @@ pub struct ModelProviderRuntimeOptions {
     /// by `apply_compat_options`). Consumed by chat-template-aware backends
     /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Wire field name for reasoning content on OpenAI-compatible requests.
+    /// `None` sends the canonical `reasoning_content`. Normalized in
+    /// `OpenAiCompatibleModelProvider::reasoning_key`.
+    pub reasoning_key: Option<String>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
     /// The configured `[multimodal]` policy.
@@ -797,6 +801,7 @@ impl Default for ModelProviderRuntimeOptions {
             think: None,
             vision: None,
             chat_template_kwargs: None,
+            reasoning_key: None,
             tls_ca_cert_path: None,
             tool_result_image_policy: Default::default(),
             multimodal: Default::default(),
@@ -866,6 +871,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         think: entry.and_then(|e| e.think),
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
+        reasoning_key: entry.and_then(|e| e.reasoning_key.clone()),
         tls_ca_cert_path,
         multimodal: config.multimodal.clone(),
         tool_result_image_policy: entry
@@ -3548,6 +3554,26 @@ mod tests {
             .expect("server should capture request");
         assert_eq!(model, "new-model");
         server.abort();
+    }
+
+    /// `reasoning_key` lives on `ModelProviderConfig` and must reach every
+    /// OpenAI-compatible family — not just `custom`.
+    #[test]
+    fn provider_runtime_options_from_config_propagates_reasoning_key() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.custom.insert(
+            "vllm".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    reasoning_key: Some("reasoning".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let entry = config.providers.models.find("custom", "vllm");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        assert_eq!(options.reasoning_key.as_deref(), Some("reasoning"));
     }
 
     #[tokio::test]

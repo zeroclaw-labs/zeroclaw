@@ -117,6 +117,9 @@ pub struct OpenAiCompatibleModelProvider {
     /// providers so missing credentials still fall through to catalog sources.
     /// When `true`, the `/models` endpoint is treated as publicly accessible.
     public_model_listing: bool,
+    /// Wire field name for reasoning content on outgoing requests. `None` sends
+    /// the canonical `reasoning_content`.
+    reasoning_key: Option<String>,
     /// Raw PEM bytes of a custom CA certificate for TLS connections.
     /// Loaded from disk once at construction; not refreshed across config reloads.
     tls_ca_cert_pem: Option<Vec<u8>>,
@@ -563,6 +566,7 @@ pub struct OpenAiCompatibleBuilder {
     openrouter_vendor_prefix: Option<String>,
     local_model_tool_sanitize: bool,
     public_model_listing: bool,
+    reasoning_key: Option<String>,
     tls_ca_cert_path: Option<String>,
     extra_body: Option<serde_json::Value>,
     auth_model_provider: Option<String>,
@@ -777,6 +781,18 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Override the wire field name for reasoning content on outgoing
+    /// chat-completions requests. Blank and canonical (`"reasoning_content"`)
+    /// values normalize to `None`.
+    pub fn reasoning_key(mut self, key: Option<String>) -> Self {
+        self.reasoning_key = key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty() && *k != "reasoning_content")
+            .map(ToString::to_string);
+        self
+    }
+
     /// Path to a PEM-encoded custom CA certificate for TLS connections.
     /// The file is read once at [`Self::build`] time; failures are logged
     /// at WARN and TLS falls back to the system trust store.
@@ -886,6 +902,7 @@ impl OpenAiCompatibleBuilder {
             openrouter_vendor_prefix: self.openrouter_vendor_prefix,
             local_model_tool_sanitize: self.local_model_tool_sanitize,
             public_model_listing: self.public_model_listing,
+            reasoning_key: self.reasoning_key,
             tls_ca_cert_pem,
             extra_body: self.extra_body,
             schema_cache: std::sync::Arc::new(zeroclaw_api::schema::SchemaCleanCache::new()),
@@ -930,6 +947,7 @@ impl OpenAiCompatibleModelProvider {
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
             public_model_listing: false,
+            reasoning_key: None,
             tls_ca_cert_path: None,
             extra_body: None,
             auth_model_provider: None,
@@ -937,6 +955,35 @@ impl OpenAiCompatibleModelProvider {
             auth_profile_override: None,
         }
     }
+
+    /// Attach `body` as JSON, renaming `messages[*].reasoning_content` to
+    /// this provider's wire key first. No override → short-circuits to
+    /// `RequestBuilder::json` (default path builds no `Value` tree).
+    fn attach_chat_body<T: Serialize>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        body: &T,
+    ) -> serde_json::Result<reqwest::RequestBuilder> {
+        let Some(key) = self.reasoning_key.as_deref() else {
+            return Ok(builder.json(body));
+        };
+        let mut value = serde_json::to_value(body)?;
+        if let Some(messages) = value
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for msg in messages {
+                let Some(obj) = msg.as_object_mut() else {
+                    continue;
+                };
+                if let Some(reasoning) = obj.remove("reasoning_content") {
+                    obj.insert(key.to_string(), reasoning);
+                }
+            }
+        }
+        Ok(builder.json(&value))
+    }
+
     /// Add the configured custom CA certificate to a reqwest builder.
     /// The PEM bytes were loaded at construction, so this performs no disk I/O.
     fn add_tls_cert_to_builder(&self, builder: ClientBuilder) -> ClientBuilder {
@@ -1559,11 +1606,9 @@ impl OpenAiCompatibleModelProvider {
         // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
+        let builder = self.attach_chat_body(self.http_client().post(&url), &request)?;
         let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )?)
+            .apply_opencode_session_header(self.apply_auth_header(builder, credential.as_deref())?)
             .send()
             .await
         {
@@ -4244,11 +4289,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
 
+        let builder = self.attach_chat_body(self.http_client().post(&url), &request)?;
         let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )?)
+            .apply_opencode_session_header(self.apply_auth_header(builder, credential.as_deref())?)
             .send()
             .await
         {
@@ -4345,11 +4388,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = loop {
+            let builder = self.attach_chat_body(self.http_client().post(&url), &payload)?;
             let response = match self
-                .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
-                    credential.as_deref(),
-                )?)
+                .apply_opencode_session_header(
+                    self.apply_auth_header(builder, credential.as_deref())?,
+                )
                 .send()
                 .await
             {
@@ -4489,11 +4532,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = loop {
+            let builder = self.attach_chat_body(self.http_client().post(&url), &payload)?;
             let response = match self
-                .apply_opencode_session_header(self.apply_auth_header(
-                    self.http_client().post(&url).json(&payload),
-                    credential.as_deref(),
-                )?)
+                .apply_opencode_session_header(
+                    self.apply_auth_header(builder, credential.as_deref())?,
+                )
                 .send()
                 .await
             {
@@ -4758,7 +4801,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
             let response = loop {
-                let mut req_builder = client.post(&url).json(&payload);
+                let mut req_builder = match provider.attach_chat_body(client.post(&url), &payload) {
+                    Ok(builder) => builder,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(error.to_string())))
+                            .await;
+                        return;
+                    }
+                };
                 req_builder = match apply_auth_to_request(
                     req_builder,
                     &auth_header,
@@ -4964,7 +5015,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = match provider.attach_chat_body(client.post(&url), &request) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             // Apply auth header, or refuse locally if the credential cannot be
             // turned into one.
@@ -5117,7 +5176,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
-            let mut req_builder = client.post(&url).json(&request);
+            let mut req_builder = match provider.attach_chat_body(client.post(&url), &request) {
+                Ok(builder) => builder,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
             req_builder = match apply_auth_to_request(
                 req_builder,
                 &auth_header,
@@ -9633,6 +9700,33 @@ mod tests {
             !ensure_reasoning_effort_none(&mut canonical),
             "exact lowercase none is the fixed point"
         );
+    }
+
+    #[test]
+    fn reasoning_key_normalizes_blank_and_canonical_to_none() {
+        let canonical = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("http://127.0.0.1:9")
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_key(Some("reasoning_content".to_string()))
+            .build();
+        assert_eq!(canonical.reasoning_key, None);
+
+        let blank = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("http://127.0.0.1:9")
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_key(Some("   ".to_string()))
+            .build();
+        assert_eq!(blank.reasoning_key, None);
+
+        let custom = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("http://127.0.0.1:9")
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_key(Some("  reasoning  ".to_string()))
+            .build();
+        assert_eq!(custom.reasoning_key.as_deref(), Some("reasoning"));
     }
 
     #[tokio::test]
