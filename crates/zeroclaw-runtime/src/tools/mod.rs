@@ -192,6 +192,14 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn builtin_target_name(&self) -> Option<&str> {
+        self.0.builtin_target_name()
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        self.0.with_builtin_target(target)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.0.requires_unrestricted_principal()
     }
@@ -581,17 +589,18 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// The session memory route this factory's memory-starting tools share
+    /// (`spawn_subagent` here, and the pipeline `assemble` mints). The sealed
+    /// registry keeps it and pins it when its session is pinned to an owner.
+    /// `None` when the tool set was not built by this factory.
+    pub session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
-    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
-    /// delegate instance's nested-registry construction - it can only
-    /// re-derive the wiring by hand, which is exactly the thing that must not
-    /// be trusted. `None` when no agents are configured.
-    #[cfg(test)]
+    /// Retained so an owned session can bind its principal to the exact
+    /// registered delegate before any child memory tools are built.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -599,9 +608,9 @@ impl AllToolsResult {
     /// Wrap an already-built tool vector as `assemble` INPUT, with every
     /// side-channel handle empty. This mints an `AllToolsResult` (the input to
     /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
-    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
-    /// fields are all `pub`, so a caller could already hand-roll this literal;
-    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// `ScopedToolRegistry` - it does not touch the seal. Out-of-crate callers
+    /// must use it: the retained `delegate_tool` field is crate-private, so
+    /// they cannot hand-roll this literal. Used by the
     /// paths that already own a fixed / pre-filtered tool set (the skill-review
     /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
     /// route it through `assemble` only to seal it: they pass `skills: &[]`,
@@ -616,9 +625,9 @@ impl AllToolsResult {
             channel_room_handle: None,
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -1103,6 +1112,7 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
     let builder = move || {
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
@@ -1148,13 +1158,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
+        }?;
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
         }
+        Ok(result)
     })
 }
 
@@ -1331,6 +1348,18 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    // One route for the tools here that start memory work of their own; the
+    // sealed registry pins it when its session is pinned to an owner.
+    let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+    // A registry built over memory that is already an owner's plane (a
+    // delegated target, a SOP step, or a child run of an owned session)
+    // belongs to that owner from the start. Pin its route now: nothing pins
+    // it later, and an empty route reads as an unowned session, so its
+    // spawner and pipeline would fall back to the agent's shared memory.
+    if memory.principal_scope().is_some() {
+        let pinned = session_memory.pin(Arc::clone(&memory), Arc::clone(security));
+        debug_assert!(pinned.is_ok(), "a fresh route holds no other handle");
+    }
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool
@@ -1420,7 +1449,8 @@ fn all_tools_with_runtime_on_thread(
                 security.clone(),
             )
             .with_subagent_caller(is_subagent_caller)
-            .with_execution_capability(execution_capability.clone()),
+            .with_execution_capability(execution_capability.clone())
+            .with_session_memory(Arc::clone(&session_memory)),
         ),
         Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
@@ -2163,32 +2193,50 @@ fn all_tools_with_runtime_on_thread(
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopListTool::new(Arc::clone(sop_engine))
+                .with_session_memory(Arc::clone(&session_memory)),
+        ));
         if let Some(ref sop_audit) = sop_audit {
+            // The audit logger follows the session too: once it is pinned to an
+            // owner, run payloads and step outputs are audited on that owner's
+            // plane rather than through the shared logger captured here.
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
                     .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory))
                     .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine))
                     .with_agent_alias(agent_alias)
-                    .with_audit(Arc::clone(sop_audit)),
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_session_memory(Arc::clone(&session_memory)),
             ));
         } else {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
+                    .with_initiator(agent_alias),
             ));
-            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
+                    .with_agent_alias(agent_alias),
             ));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
+                .with_session_memory(Arc::clone(&session_memory))
                 .with_collector(crate::sop::SopMetricsCollector::shared()),
         ));
         if root_config.sop.procedural_memory_enabled {
@@ -2290,12 +2338,12 @@ fn all_tools_with_runtime_on_thread(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
-                    #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
                     reaction_handle,
                     poll_handle: Some(poll_handle),
+                    session_memory: Some(session_memory),
                     escalate_handle,
                 });
             }
@@ -2368,7 +2416,6 @@ fn all_tools_with_runtime_on_thread(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
-    #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
@@ -2415,10 +2462,7 @@ fn all_tools_with_runtime_on_thread(
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
-        #[cfg(test)]
-        {
-            built_delegate_tool = Some(Arc::clone(&delegate_tool));
-        }
+        built_delegate_tool = Some(Arc::clone(&delegate_tool));
         tool_arcs.push(delegate_tool as Arc<dyn Tool>);
         Some(parent_tools)
     };
@@ -2512,8 +2556,8 @@ fn all_tools_with_runtime_on_thread(
         channel_room_handle,
         reaction_handle,
         poll_handle: Some(poll_handle),
+        session_memory: Some(session_memory),
         escalate_handle,
-        #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }

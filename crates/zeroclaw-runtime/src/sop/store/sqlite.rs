@@ -92,6 +92,7 @@ fn guard_revision(
 /// with the default `"sqlite"` backend.
 pub struct SqliteRunStore {
     conn: Arc<Mutex<Connection>>,
+    nonblocking: bool,
 }
 
 impl SqliteRunStore {
@@ -111,17 +112,40 @@ impl SqliteRunStore {
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            nonblocking: false,
         })
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
-        self.conn
-            .lock()
-            .map_err(|_| StoreError::Backend("sqlite run store lock poisoned".into()))
+        let conn = if self.nonblocking {
+            self.conn.try_lock().map_err(|_| {
+                StoreError::Backend(crate::i18n::get_required_cli_string("sop-store-busy"))
+            })?
+        } else {
+            self.conn
+                .lock()
+                .map_err(|_| StoreError::Backend("sqlite run store lock poisoned".into()))?
+        };
+        // Every acquisition sets its own timeout while exclusively holding the
+        // connection. No ambient setting can leak from an RPC to a daemon call.
+        conn.busy_timeout(std::time::Duration::from_millis(if self.nonblocking {
+            0
+        } else {
+            5000
+        }))
+        .map_err(sql_err)?;
+        Ok(conn)
     }
 }
 
 impl SopRunStore for SqliteRunStore {
+    fn nonblocking(&self) -> Result<Arc<dyn SopRunStore>, StoreError> {
+        Ok(Arc::new(Self {
+            conn: Arc::clone(&self.conn),
+            nonblocking: true,
+        }))
+    }
+
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let g = self.lock()?;
         let id = run.run_id();
@@ -783,6 +807,7 @@ mod tests {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

@@ -19,6 +19,15 @@ pub use model::{
 pub use sqlite::SqliteRunStore;
 
 pub trait SopRunStore: Send + Sync {
+    /// A view sharing this store's data that refuses lock/writer contention.
+    /// Used only while an RPC holds current authority through a synchronous
+    /// effect. Unknown backends fail closed instead of silently waiting.
+    fn nonblocking(&self) -> Result<Arc<dyn SopRunStore>, StoreError> {
+        Err(StoreError::Backend(crate::i18n::get_required_cli_string(
+            "sop-store-nonblocking-unavailable",
+        )))
+    }
+
     // ── run state (persistence-resume, state-machine) ──
     /// Persist-before-mutate. Revision-guarded: a strictly-older revision is
     /// rejected as `StaleRevision`; an equal revision is accepted only as a
@@ -272,7 +281,8 @@ struct Inner {
 /// Process-local, non-durable store. Mirrors today's in-memory run maps; lost on
 /// restart. The compatibility default until `SqliteRunStore` lands.
 pub struct InMemoryRunStore {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+    nonblocking: bool,
 }
 
 impl Default for InMemoryRunStore {
@@ -284,14 +294,21 @@ impl Default for InMemoryRunStore {
 impl InMemoryRunStore {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Arc::new(Mutex::new(Inner::default())),
+            nonblocking: false,
         }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, StoreError> {
-        self.inner
-            .lock()
-            .map_err(|_| StoreError::Backend("in-memory store lock poisoned".into()))
+        if self.nonblocking {
+            self.inner.try_lock().map_err(|_| {
+                StoreError::Backend(crate::i18n::get_required_cli_string("sop-store-busy"))
+            })
+        } else {
+            self.inner
+                .lock()
+                .map_err(|_| StoreError::Backend("in-memory store lock poisoned".into()))
+        }
     }
 }
 
@@ -330,6 +347,13 @@ fn append_event_locked(g: &mut Inner, ev: &SopEventRecord) -> u64 {
 }
 
 impl SopRunStore for InMemoryRunStore {
+    fn nonblocking(&self) -> Result<Arc<dyn SopRunStore>, StoreError> {
+        Ok(Arc::new(Self {
+            inner: Arc::clone(&self.inner),
+            nonblocking: true,
+        }))
+    }
+
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         revision_guard(g.runs.get(run.run_id()), run)?;
@@ -650,6 +674,7 @@ mod tests {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
             initiating_agent: None,
+            memory_owner: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
