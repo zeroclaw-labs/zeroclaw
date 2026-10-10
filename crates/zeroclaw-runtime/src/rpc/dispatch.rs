@@ -10325,6 +10325,11 @@ impl RpcDispatcher {
                 )
                 .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
                 for path in &report.dirty_paths {
+                    self.recheck_config_write_authority(
+                        Method::ConfigMapKeyRename,
+                        Some(path),
+                        &config_write_guard,
+                    )?;
                     working.mark_dirty(path);
                 }
                 report.dirty_paths.len()
@@ -31785,6 +31790,334 @@ mod tests {
             "unexpected error message: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn agent_rename_cascades_profile_selectors_into_the_live_resolver() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = roster_config_in(&tmp, 4242);
+            config.agents.insert(
+                "alpha".into(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+            );
+            let reader = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster fixture defines the reader profile");
+            reader.allowed_agents = vec!["alpha".into()];
+            reader
+                .grants
+                .insert(Resource::Sessions, vec![Verb::Create, Verb::Read]);
+            // An existing config.toml makes the rename persist through the
+            // incremental dirty-path save rather than a first full write.
+            config.save().await.expect("seed config.toml");
+            let old_workspace = config.agent_workspace_dir("alpha");
+            let new_workspace = config.agent_workspace_dir("beta");
+            std::fs::create_dir_all(&old_workspace).unwrap();
+            std::fs::write(old_workspace.join("marker.txt"), "owned state").unwrap();
+
+            let ctx = enforcement_ctx(config);
+            let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+            alice
+                .selector_session_agent(Method::SessionNew, "alpha")
+                .expect("alice starts entitled to alpha");
+            let generation = ctx.auth.generation();
+
+            let (mut operator, mut rx) = local_operator(&ctx).await;
+            let response = rpc(
+                &mut operator,
+                &mut rx,
+                1,
+                "config/map-key-rename",
+                json!({"path": "agents", "from": "alpha", "to": "beta"}),
+            )
+            .await;
+            assert_eq!(response["result"]["renamed"], json!(true), "{response}");
+            assert_eq!(
+                ctx.auth.generation(),
+                generation + 1,
+                "the rename published exactly one authorization generation"
+            );
+
+            // alice's established connection re-resolves at that generation,
+            // where her selector names the renamed agent and no longer the old
+            // alias.
+            alice
+                .authorize(Method::SessionNew, Resource::Sessions, Verb::Create)
+                .expect("alice keeps her session grants");
+            assert_eq!(
+                alice.auth.as_ref().map(|auth| auth.generation),
+                Some(generation + 1)
+            );
+            alice
+                .selector_session_agent(Method::SessionNew, "beta")
+                .expect("the selector followed the rename");
+            let denied = alice
+                .selector_session_agent(Method::SessionNew, "alpha")
+                .expect_err("the old alias is no longer granted");
+            assert_eq!(denied.code, FORBIDDEN);
+
+            assert_eq!(
+                ctx.config.read().permission_profiles["reader"].allowed_agents,
+                vec!["beta".to_string()]
+            );
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(on_disk.contains("allowed_agents = [\"beta\"]"), "{on_disk}");
+            assert!(!on_disk.contains("\"alpha\""), "{on_disk}");
+            assert!(on_disk.contains("[agents.beta]"), "{on_disk}");
+            assert!(!on_disk.contains("[agents.alpha]"), "{on_disk}");
+            // The owned-state cascade still runs after the commit.
+            assert!(new_workspace.join("marker.txt").exists());
+            assert!(!old_workspace.exists());
+        });
+    }
+
+    fn scoped_agent_rename_config(
+        tmp: &tempfile::TempDir,
+        grant_profile: bool,
+        referenced: bool,
+    ) -> Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::PermissionProfileConfig;
+
+        let mut config = roster_config_in(tmp, 4243);
+        config.agents.insert("alpha".into(), Default::default());
+        config.agents.insert("gamma".into(), Default::default());
+        let reader = config.permission_profiles.get_mut("reader").unwrap();
+        reader.allowed_agents = vec![if referenced { "alpha" } else { "*" }.into()];
+        reader
+            .grants
+            .insert(Resource::Sessions, vec![Verb::Create, Verb::Read]);
+        config.permission_profiles.insert(
+            "unrelated".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["gamma".into()],
+                ..Default::default()
+            },
+        );
+        let mut paths = vec!["agents.alpha".into(), "agents.beta".into()];
+        if grant_profile {
+            paths.push("permission_profiles.reader".into());
+        }
+        config.permission_profiles.insert(
+            "config-writer".into(),
+            PermissionProfileConfig {
+                config_write_paths: paths,
+                grants: std::collections::HashMap::from([(
+                    Resource::Config,
+                    vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+                )]),
+                ..Default::default()
+            },
+        );
+        config.users.insert(
+            "writer".into(),
+            zeroclaw_config::schema::UserConfig {
+                uid: Some(4242),
+                permission_profiles: vec!["config-writer".into()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn agent_rename_rpc_authorizes_the_actual_cascade_write_set() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        run_on_a_large_stack(|| async move {
+            // Endpoint-only grants fail for a protected selector cascade, but
+            // suffice when wildcard/unrelated profiles have no rewritten refs.
+            for (grant_profile, referenced) in [(false, true), (true, true), (false, false)] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = scoped_agent_rename_config(&tmp, grant_profile, referenced);
+                config.save().await.unwrap();
+                let disk_before = std::fs::read(&config.config_path).unwrap();
+                let old_workspace = config.agent_workspace_dir("alpha");
+                let new_workspace = config.agent_workspace_dir("beta");
+                std::fs::create_dir_all(&old_workspace).unwrap();
+                std::fs::write(old_workspace.join("marker.txt"), "owned state").unwrap();
+                let ctx = enforcement_ctx(config);
+                let (mut writer, mut rx) = roster_peer(&ctx, 4242).await;
+                let (mut reader, _reader_rx) = roster_peer(&ctx, 4243).await;
+                reader
+                    .selector_session_agent(Method::SessionNew, "alpha")
+                    .unwrap();
+                let generation = ctx.auth.generation();
+                let revision = ctx.auth.accepted_revision();
+                assert!(ctx.sessions.count_by_agent().await.is_empty());
+
+                if !grant_profile {
+                    let direct = rpc(
+                        &mut writer, &mut rx, 1, "config/set",
+                        json!({"prop": "permission_profiles.reader.allowed_agents", "value": "[\"beta\"]"}),
+                    ).await;
+                    assert_eq!(direct["error"]["code"], FORBIDDEN, "{direct}");
+                }
+                let response = rpc(
+                    &mut writer,
+                    &mut rx,
+                    2,
+                    "config/map-key-rename",
+                    json!({"path": "agents", "from": "alpha", "to": "beta"}),
+                )
+                .await;
+                let denied = referenced && !grant_profile;
+                if denied {
+                    assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+                    assert!(
+                        response["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("permission_profiles.reader")
+                    );
+                    assert_eq!(
+                        std::fs::read(tmp.path().join("config.toml")).unwrap(),
+                        disk_before
+                    );
+                    assert_eq!(ctx.auth.generation(), generation);
+                    assert_eq!(ctx.auth.accepted_revision(), revision);
+                    assert!(ctx.config.read().agents.contains_key("alpha"));
+                    assert!(!ctx.config.read().agents.contains_key("beta"));
+                    assert_eq!(
+                        ctx.config.read().permission_profiles["reader"].allowed_agents,
+                        vec!["alpha"]
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(old_workspace.join("marker.txt")).unwrap(),
+                        "owned state"
+                    );
+                    assert!(!new_workspace.exists());
+                    reader
+                        .authorize(Method::SessionNew, Resource::Sessions, Verb::Create)
+                        .unwrap();
+                    reader
+                        .selector_session_agent(Method::SessionNew, "alpha")
+                        .unwrap();
+                    assert_eq!(
+                        reader
+                            .selector_session_agent(Method::SessionNew, "beta")
+                            .unwrap_err()
+                            .code,
+                        FORBIDDEN
+                    );
+                } else {
+                    assert_eq!(response["result"]["renamed"], true, "{response}");
+                    assert_eq!(ctx.auth.generation(), generation + u64::from(referenced));
+                    assert_eq!(ctx.auth.accepted_revision(), revision + 1);
+                    assert!(!ctx.config.read().agents.contains_key("alpha"));
+                    assert!(ctx.config.read().agents.contains_key("beta"));
+                    let selector = if referenced { "beta" } else { "*" };
+                    assert_eq!(
+                        ctx.config.read().permission_profiles["reader"].allowed_agents,
+                        vec![selector]
+                    );
+                    let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+                    assert!(disk.contains("[agents.beta]"), "{disk}");
+                    assert!(!disk.contains("[agents.alpha]"), "{disk}");
+                    assert!(
+                        disk.contains(&format!("allowed_agents = [\"{selector}\"]")),
+                        "{disk}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(new_workspace.join("marker.txt")).unwrap(),
+                        "owned state"
+                    );
+                    assert!(!old_workspace.exists());
+                    reader
+                        .authorize(Method::SessionNew, Resource::Sessions, Verb::Create)
+                        .unwrap();
+                    reader
+                        .selector_session_agent(Method::SessionNew, "beta")
+                        .unwrap();
+                    if referenced {
+                        assert_eq!(
+                            reader
+                                .selector_session_agent(Method::SessionNew, "alpha")
+                                .unwrap_err()
+                                .code,
+                            FORBIDDEN
+                        );
+                    }
+                }
+                assert_eq!(
+                    ctx.config.read().permission_profiles["unrelated"].allowed_agents,
+                    vec!["gamma"]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn agent_rename_rpc_rechecks_cascade_grants_after_waiting_for_writer_lock() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = scoped_agent_rename_config(&tmp, true, true);
+            config.save().await.unwrap();
+            let disk_before = std::fs::read(&config.config_path).unwrap();
+            let old_workspace = config.agent_workspace_dir("alpha");
+            let new_workspace = config.agent_workspace_dir("beta");
+            std::fs::create_dir_all(&old_workspace).unwrap();
+            std::fs::write(old_workspace.join("marker.txt"), "owned state").unwrap();
+            let ctx = enforcement_ctx(config);
+            let (mut writer, mut rx) = roster_peer(&ctx, 4242).await;
+            let generation = ctx.auth.generation();
+            let response = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move {
+                    Ok(rpc(
+                        &mut writer,
+                        &mut rx,
+                        1,
+                        "config/map-key-rename",
+                        json!({"path": "agents", "from": "alpha", "to": "beta"}),
+                    )
+                    .await)
+                },
+                |ctx| {
+                    let mut narrowed = ctx.config.read().clone();
+                    narrowed
+                        .permission_profiles
+                        .get_mut("config-writer")
+                        .unwrap()
+                        .config_write_paths
+                        .retain(|path| path != "permission_profiles.reader");
+                    ctx.auth.refresh_from_config(&narrowed).unwrap();
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("permission_profiles.reader")
+            );
+            assert_eq!(
+                std::fs::read(tmp.path().join("config.toml")).unwrap(),
+                disk_before
+            );
+            assert_eq!(
+                ctx.auth.generation(),
+                generation + 1,
+                "only the policy narrowing published"
+            );
+            assert!(ctx.config.read().agents.contains_key("alpha"));
+            assert!(!ctx.config.read().agents.contains_key("beta"));
+            assert_eq!(
+                ctx.config.read().permission_profiles["reader"].allowed_agents,
+                vec!["alpha"]
+            );
+            assert_eq!(
+                std::fs::read_to_string(old_workspace.join("marker.txt")).unwrap(),
+                "owned state"
+            );
+            assert!(!new_workspace.exists());
+        });
     }
 
     #[tokio::test]
