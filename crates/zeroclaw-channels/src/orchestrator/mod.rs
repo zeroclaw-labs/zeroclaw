@@ -2096,6 +2096,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "signal" => Some(
+            "When responding on Signal:\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in Signal media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
              - Be concise and direct\n\
@@ -12595,6 +12602,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-discord",
     feature = "channel-lark",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
@@ -12851,6 +12859,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("signal", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "signal", &alias);
             Ok(Arc::new(
                 SignalChannel::new(
                     sg.http_url.clone(),
@@ -12862,7 +12871,8 @@ fn build_channel_by_id(
                     sg.ignore_attachments,
                     sg.ignore_stories,
                 )
-                .with_approval_timeout_secs(sg.approval_timeout_secs),
+                .with_approval_timeout_secs(sg.approval_timeout_secs)
+                .with_workspace_dir(workspace_dir),
             ))
         }
         #[cfg(not(feature = "channel-signal"))]
@@ -14609,7 +14619,8 @@ fn collect_configured_channels_with_authority(
                         sig.ignore_stories,
                     )
                     .with_proxy_url(sig.proxy_url.clone())
-                    .with_approval_timeout_secs(sig.approval_timeout_secs),
+                    .with_approval_timeout_secs(sig.approval_timeout_secs)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("signal.{alias}"))),
                 ),
                 sig,
             ),
@@ -17452,7 +17463,8 @@ pub async fn deliver_announcement(
                 peer_resolver,
                 sg.ignore_attachments,
                 sg.ignore_stories,
-            );
+            )
+            .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-signal"))]
@@ -46005,6 +46017,36 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_delivery_instructions("whatsapp-web"),
             Some(block),
             "the compatibility alias should use the same WhatsApp Web guidance"
+        );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_signal_match_local_marker_contract() {
+        let block = channel_delivery_instructions("signal")
+            .expect("signal channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Signal:"),
+            "signal block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]") && block.contains("[DOCUMENT:<path>]"),
+            "signal block must describe marker syntax"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "signal block must match the outbound resolver's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "signal block must say URL schemes are refused"
+        );
+        assert!(
+            !block.contains("[LOCATION:"),
+            "signal has no location message, so the block must not offer location markers"
+        );
+        assert!(
+            build_channel_system_prompt("base prompt", "signal", None).contains(block),
+            "signal guidance must reach the channel system prompt"
         );
     }
 
