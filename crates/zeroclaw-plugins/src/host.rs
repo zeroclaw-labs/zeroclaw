@@ -2045,10 +2045,49 @@ fn copy_skills_into(src: &Path, dir: &Dir, dest: &Path) -> Result<(), PluginErro
         if entry.file_type()?.is_dir() {
             copy_skills_into(&entry.path(), dir, &dest.join(entry.file_name()))?;
         } else if entry.file_type()?.is_file() {
-            dir.write(dest.join(entry.file_name()), std::fs::read(entry.path())?)?;
+            let source = std::fs::File::open(entry.path())?;
+            #[cfg(unix)]
+            let executable =
+                std::os::unix::fs::PermissionsExt::mode(&source.metadata()?.permissions()) & 0o111;
+            let mut target = dir.create(dest.join(entry.file_name()))?;
+            #[cfg(test)]
+            let source = write_fault::skill_reader(source, &entry.file_name());
+            let mut source = source;
+            copy_skill_data(&mut source, &mut target)?;
+            #[cfg(unix)]
+            {
+                use cap_std::fs::PermissionsExt;
+
+                // Keep the staging file's creation policy for read/write and
+                // special bits; only transfer the source's executable intent.
+                let mut permissions = target.metadata()?.permissions();
+                let mode = (permissions.mode() & !0o111) | executable;
+                if mode != permissions.mode() {
+                    permissions.set_mode(mode);
+                    target.set_permissions(permissions)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Copy progressively with a fixed memory bound, including short writes and
+/// interrupted reads. A failure leaves only an owned staging file; the caller
+/// propagates it through the existing install cleanup before publication.
+fn copy_skill_data(
+    source: &mut impl std::io::Read,
+    target: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => target.write_all(&buffer[..read])?,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
@@ -2106,11 +2145,12 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
 /// its own install.
 #[cfg(test)]
 mod write_fault {
-    /// A write in [`super::write_package`] a test can make fail.
+    /// Package I/O a test can make fail.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Step {
         Manifest,
         Payload,
+        SkillRead,
     }
 
     thread_local! {
@@ -2149,6 +2189,43 @@ mod write_fault {
         Err(std::io::Error::other(format!(
             "injected {step:?} write fault"
         )))
+    }
+
+    /// Fail partway through the synthetic fail.bin asset, leaving other skill
+    /// files and parallel installs unaffected. The source file is still real.
+    pub(super) fn skill_reader(file: std::fs::File, name: &std::ffi::OsStr) -> SkillReader {
+        let armed = ARMED.with(|slot| {
+            if name == "fail.bin" && slot.get() == Some(Step::SkillRead) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        });
+        SkillReader {
+            file,
+            remaining: armed.then_some(4096),
+        }
+    }
+
+    pub(super) struct SkillReader {
+        file: std::fs::File,
+        remaining: Option<usize>,
+    }
+
+    impl std::io::Read for SkillReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(remaining) = self.remaining else {
+                return std::io::Read::read(&mut self.file, buffer);
+            };
+            if remaining == 0 {
+                return Err(std::io::Error::other("injected skill asset read fault"));
+            }
+            let take = buffer.len().min(remaining);
+            let read = std::io::Read::read(&mut self.file, &mut buffer[..take])?;
+            self.remaining = Some(remaining - read);
+            Ok(read)
+        }
     }
 }
 
@@ -2587,6 +2664,232 @@ capabilities = ["tool"]
                 &format!("Description for {skill}"),
             );
         }
+    }
+
+    /// Install a synthetic skill, preserving executable intent without
+    /// changing the staging policy for ordinary assets or copying special bits.
+    #[cfg(unix)]
+    #[test]
+    fn skill_install_preserves_execute_bits_and_non_executable_assets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), "copy-modes", &["fixture"]);
+        let package = source.path().join("copy-modes");
+        let skill = package.join("skills/fixture");
+        let script = b"#!/bin/sh\nprintf 'isolated copy fixture\\n'\n";
+        for (name, mode) in [
+            ("helper.sh", 0o755),
+            ("private.sh", 0o700),
+            ("special.sh", 0o4755),
+        ] {
+            std::fs::write(skill.join(name), script).unwrap();
+            std::fs::set_permissions(skill.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        std::fs::write(skill.join("notes.txt"), b"ordinary asset").unwrap();
+        std::fs::set_permissions(skill.join("notes.txt"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        host.install(package.to_str().unwrap()).unwrap();
+        let installed = plugins.path().join("copy-modes/skills/fixture");
+        let ordinary_mode = std::fs::metadata(installed.join("SKILL.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+
+        for (name, execute) in [
+            ("helper.sh", 0o111),
+            ("private.sh", 0o100),
+            ("special.sh", 0o111),
+        ] {
+            assert_eq!(std::fs::read(installed.join(name)).unwrap(), script);
+            let mode = std::fs::metadata(installed.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, execute, "{name}");
+            assert_eq!(mode & 0o7000, 0, "special bits must not transfer: {name}");
+            assert_eq!(mode & 0o666, ordinary_mode & 0o666, "{name}");
+        }
+        assert_eq!(
+            std::fs::read(installed.join("notes.txt")).unwrap(),
+            b"ordinary asset"
+        );
+        assert_eq!(
+            std::fs::metadata(installed.join("notes.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        // Only this literal test fixture is invoked; production never executes
+        // the copied package. Mode assertions run first for a causal failure.
+        let output = std::process::Command::new(installed.join("helper.sh"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"isolated copy fixture\n");
+    }
+
+    #[test]
+    fn skill_copy_streams_large_input_with_short_writes_and_interruptions() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // The producer permits only one unwritten chunk. Reading a whole
+        // asset first fails, while a progressive copy needs no asset-sized Vec.
+        struct Producer {
+            pending: Rc<Cell<usize>>,
+            offset: usize,
+            total: usize,
+            largest_request: usize,
+            interrupt: bool,
+        }
+        impl std::io::Read for Producer {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(buffer.len());
+                if self.interrupt {
+                    self.interrupt = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.pending.get() != 0 {
+                    return Err(std::io::Error::other("asset was read ahead of its output"));
+                }
+                let read = buffer.len().min(3073).min(self.total - self.offset);
+                for (i, byte) in buffer[..read].iter_mut().enumerate() {
+                    *byte = ((self.offset + i) % 251) as u8;
+                }
+                self.offset += read;
+                self.pending.set(read);
+                Ok(read)
+            }
+        }
+        struct Consumer {
+            pending: Rc<Cell<usize>>,
+            offset: usize,
+            interrupt: bool,
+        }
+        impl std::io::Write for Consumer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.interrupt {
+                    self.interrupt = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let written = bytes.len().min(127);
+                for (i, byte) in bytes[..written].iter().enumerate() {
+                    assert_eq!(*byte, ((self.offset + i) % 251) as u8);
+                }
+                self.offset += written;
+                self.pending.set(self.pending.get() - written);
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let pending = Rc::new(Cell::new(0));
+        let mut source = Producer {
+            pending: pending.clone(),
+            offset: 0,
+            total: 32 * 1024 * 1024,
+            largest_request: 0,
+            interrupt: true,
+        };
+        let mut target = Consumer {
+            pending,
+            offset: 0,
+            interrupt: true,
+        };
+        copy_skill_data(&mut source, &mut target).unwrap();
+        assert_eq!(source.offset, source.total);
+        assert_eq!(target.offset, source.total);
+        assert!(
+            source.largest_request <= 64 * 1024,
+            "read buffer grew with asset size"
+        );
+        assert_eq!(target.pending.get(), 0);
+    }
+
+    #[test]
+    fn skill_copy_preserves_written_prefix_and_propagates_read_failure() {
+        struct PartialRead(bool);
+        impl std::io::Read for PartialRead {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "asset became unreadable",
+                    ));
+                }
+                self.0 = true;
+                bytes[..6].copy_from_slice(b"prefix");
+                Ok(6)
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut target = std::fs::File::create(dir.path().join("partial")).unwrap();
+        let error = copy_skill_data(&mut PartialRead(false), &mut target).unwrap_err();
+        assert_eq!(std::fs::read(dir.path().join("partial")).unwrap(), b"prefix");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "asset became unreadable");
+    }
+
+    #[test]
+    fn skill_install_cleans_partial_asset_after_read_failure() {
+        let source = tempdir().unwrap();
+        write_skill_bundle_plugin(source.path(), "copy-error", &["fixture"]);
+        let package = source.path().join("copy-error");
+        std::fs::write(package.join("skills/fixture/fail.bin"), vec![0x5a; 32 * 1024]).unwrap();
+        let before = package_bytes(&package);
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        {
+            let _fault = write_fault::arm(write_fault::Step::SkillRead);
+            let error = host.install(package.to_str().unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("injected skill asset read fault"),
+                "{error:?}"
+            );
+        }
+        assert!(!plugins.path().join("copy-error").exists());
+        assert!(host.get_plugin("copy-error").is_none());
+        assert_eq!(dir_entries(plugins.path()), [".zeroclaw-package-lock-v1"]);
+        assert_eq!(package_bytes(&package), before);
+        // Clearing the fault permits the real package path to complete.
+        host.install(package.to_str().unwrap()).unwrap();
+        assert_eq!(package_bytes(&plugins.path().join("copy-error")), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_copy_skips_source_links_and_refuses_destination_escape() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(source.path().join("asset"), b"copied asset").unwrap();
+        std::fs::write(outside.path().join("keep"), b"outside bytes").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("keep"), source.path().join("linked-file"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), source.path().join("linked-dir")).unwrap();
+        let dir = Dir::open_ambient_dir(target.path(), cap_std::ambient_authority()).unwrap();
+        copy_skills_into(source.path(), &dir, Path::new("skills")).unwrap();
+        assert_eq!(
+            std::fs::read(target.path().join("skills/asset")).unwrap(),
+            b"copied asset"
+        );
+        assert!(!target.path().join("skills/linked-file").exists());
+        assert!(!target.path().join("skills/linked-dir").exists());
+
+        std::os::unix::fs::symlink(outside.path(), target.path().join("redirect")).unwrap();
+        assert!(copy_skills_into(source.path(), &dir, Path::new("redirect")).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("keep")).unwrap(),
+            b"outside bytes"
+        );
+        assert!(!outside.path().join("asset").exists());
     }
 
     #[test]
