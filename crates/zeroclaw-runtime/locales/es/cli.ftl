@@ -1170,3 +1170,6 @@ channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
 tool-git-operations-error-docker-runtime-write-unsupported = Los comandos de escritura de Git no están disponibles con el entorno de ejecución Docker porque no pueden confinarse a su contenedor.
+tool-spawn-subagent-error-model-hint-invalid = spawn_subagent: model_hint debe ser una cadena no vacía que nombre una ruta configurada; omítelo para ejecutar con el modelo propio de este agente.
+tool-spawn-subagent-error-model-hint-unknown = spawn_subagent: model_hint desconocido "{ $hint }"; sugerencias configuradas: { $hints }
+tool-spawn-subagent-error-model-hint-no-routes = spawn_subagent: model_hint desconocido "{ $hint }"; no hay [[model_routes]] configuradas, así que los subagentes se ejecutan con el modelo propio de este agente.

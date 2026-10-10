@@ -105,6 +105,64 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
     }
 }
 
+/// Resolve an optional `model_hint` argument to the `(model_provider, model)`
+/// pair of an operator-declared `[[model_routes]]` entry.
+///
+/// The hint is the only way a subagent leaves its parent's model, and it can
+/// only name a route the operator declared. A free-form provider argument
+/// would let the model send the workspace it can read to any provider the
+/// config happens to hold, including one meant for a different agent with a
+/// different trust posture. A route is the operator saying "this purpose may
+/// use this provider".
+///
+/// `Ok(None)` means no hint: the subagent runs on the parent's model, exactly
+/// as before. Anything else that is not a declared hint is an error rather
+/// than a silent fallback, so neither a typo nor a malformed value can quietly
+/// put the subtask back on the expensive model the caller was avoiding.
+///
+/// "No hint" is the key being absent or `null`; `null` is how many
+/// tool-calling models express an optional parameter they chose not to set.
+/// Arguments reach `execute` without schema validation, so every other shape
+/// (a blank string, a number, an object) is a present-but-invalid hint and is
+/// refused, never read as omitted.
+fn resolve_model_hint(
+    config: &Config,
+    args: &serde_json::Value,
+) -> std::result::Result<Option<(String, String)>, String> {
+    let hint = match args.get("model_hint") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => match value.as_str().map(str::trim) {
+            Some(hint) if !hint.is_empty() => hint,
+            _ => {
+                return Err(crate::i18n::get_required_cli_string(
+                    "tool-spawn-subagent-error-model-hint-invalid",
+                ));
+            }
+        },
+    };
+    match config.model_routes.iter().find(|route| route.hint == hint) {
+        Some(route) => Ok(Some((route.model_provider.clone(), route.model.clone()))),
+        None => {
+            let known: Vec<&str> = config
+                .model_routes
+                .iter()
+                .map(|route| route.hint.as_str())
+                .collect();
+            Err(if known.is_empty() {
+                crate::i18n::get_required_cli_string_with_args(
+                    "tool-spawn-subagent-error-model-hint-no-routes",
+                    &[("hint", hint)],
+                )
+            } else {
+                crate::i18n::get_required_cli_string_with_args(
+                    "tool-spawn-subagent-error-model-hint-unknown",
+                    &[("hint", hint), ("hints", known.join(", ").as_str())],
+                )
+            })
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn requires_unrestricted_principal(&self) -> bool {
@@ -126,7 +184,7 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "prompt": {
@@ -135,7 +193,26 @@ impl Tool for SpawnSubagentTool {
                 }
             },
             "required": ["prompt"]
-        })
+        });
+        // Offered only when the operator declared routes, and enumerated so
+        // the model can only pick one of them: an unused optional parameter is
+        // noise in every request, and a free-text one invites invented hints.
+        let hints: Vec<&str> = self
+            .config
+            .model_routes
+            .iter()
+            .map(|route| route.hint.as_str())
+            .collect();
+        if !hints.is_empty() {
+            schema["properties"]["model_hint"] = json!({
+                "type": "string",
+                "enum": hints,
+                "description": "Optional. Run the SubAgent on the model of an operator-declared \
+                    route instead of this agent's own model, e.g. a lighter or lower-reasoning \
+                    one for broad, mechanical passes. Omit to use this agent's model."
+            });
+        }
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
@@ -211,6 +288,18 @@ impl Tool for SpawnSubagentTool {
             }
         };
 
+        let route = match resolve_model_hint(&config, &args) {
+            Ok(route) => route,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                });
+            }
+        };
+        let (provider_override, model_override) = route.unzip();
+
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, Self::NAME)
@@ -241,9 +330,17 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = config
-            .model_provider_for_agent(&self.parent_alias)
-            .and_then(|e| e.temperature);
+        // Sampling belongs to the provider that serves the run: a routed
+        // subagent takes its route's temperature, not its parent's.
+        let temperature: Option<f64> = match provider_override.as_deref() {
+            Some(provider_ref) => provider_ref
+                .split_once('.')
+                .and_then(|(ty, alias)| config.providers.models.find(ty, alias))
+                .and_then(|e| e.temperature),
+            None => config
+                .model_provider_for_agent(&self.parent_alias)
+                .and_then(|e| e.temperature),
+        };
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
         let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
@@ -283,8 +380,8 @@ impl Tool for SpawnSubagentTool {
                 (*config).clone(),
                 &self.parent_alias,
                 Some(prompt),
-                None,
-                None,
+                provider_override,
+                model_override,
                 temperature,
                 vec![],
                 false,
@@ -810,6 +907,153 @@ mod tests {
         assert!(
             !Attributable::alias(tool.as_ref()).is_empty(),
             "Attributable::alias on a Tool must be non-empty so composite keys never produce `.<bare>`"
+        );
+    }
+
+    fn config_with_route(alias: &str, hint: &str) -> Config {
+        let mut config = config_with_agent(alias);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: hint.into(),
+                model_provider: "custom.light".into(),
+                model: "light-model".into(),
+                ..Default::default()
+            });
+        config
+    }
+
+    /// Only an absent key or `null` means "no hint". `null` is how many
+    /// tool-calling models express an optional parameter left unset.
+    #[test]
+    fn no_model_hint_keeps_the_parent_model() {
+        let config = config_with_route("alpha", "light");
+        for args in [
+            json!({"prompt": "p"}),
+            json!({"prompt": "p", "model_hint": null}),
+        ] {
+            assert_eq!(resolve_model_hint(&config, &args), Ok(None), "{args}");
+        }
+    }
+
+    /// A hint that is present but malformed must be refused, never read as
+    /// omitted: arguments reach `execute` without schema validation, and
+    /// treating these as "no hint" would silently run on the parent's model,
+    /// the cost the caller was trying to avoid.
+    #[test]
+    fn a_present_but_malformed_hint_is_refused_not_ignored() {
+        let config = config_with_route("alpha", "light");
+        let invalid =
+            crate::i18n::get_required_cli_string("tool-spawn-subagent-error-model-hint-invalid");
+        for hint in [
+            json!(""),
+            json!("   "),
+            json!(42),
+            json!(true),
+            json!(["light"]),
+            json!({"hint": "light"}),
+        ] {
+            assert_eq!(
+                resolve_model_hint(&config, &json!({"prompt": "p", "model_hint": hint})),
+                Err(invalid.clone()),
+                "{hint} must be refused as malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_hint_resolves_to_its_route() {
+        let config = config_with_route("alpha", "light");
+        assert_eq!(
+            resolve_model_hint(&config, &json!({"prompt": "p", "model_hint": "light"})),
+            Ok(Some(("custom.light".into(), "light-model".into())))
+        );
+    }
+
+    /// An undeclared hint must fail loudly, not fall back to the parent's
+    /// model: the operator's route list is the whole permission.
+    #[test]
+    fn an_undeclared_hint_is_refused_and_names_the_valid_ones() {
+        let config = config_with_route("alpha", "light");
+        assert_eq!(
+            resolve_model_hint(&config, &json!({"model_hint": "cloud"})),
+            Err(crate::i18n::get_required_cli_string_with_args(
+                "tool-spawn-subagent-error-model-hint-unknown",
+                &[("hint", "cloud"), ("hints", "light")],
+            )),
+            "an undeclared hint must be refused, naming the valid ones"
+        );
+
+        assert_eq!(
+            resolve_model_hint(&config_with_agent("alpha"), &json!({"model_hint": "x"})),
+            Err(crate::i18n::get_required_cli_string_with_args(
+                "tool-spawn-subagent-error-model-hint-no-routes",
+                &[("hint", "x")],
+            )),
+            "with no routes, every hint is undeclared"
+        );
+    }
+
+    #[test]
+    fn the_schema_offers_model_hint_only_when_routes_exist() {
+        let without = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(
+            without.parameters_schema()["properties"]
+                .get("model_hint")
+                .is_none(),
+            "no routes, no parameter"
+        );
+
+        let with = SpawnSubagentTool::new(
+            Arc::new(config_with_route("alpha", "light")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert_eq!(
+            with.parameters_schema()["properties"]["model_hint"]["enum"],
+            json!(["light"]),
+            "the model may only choose among declared hints"
+        );
+    }
+
+    /// Refusal happens before any spawn work, so a bad hint costs nothing and
+    /// cannot start a run on the parent's model by accident.
+    #[tokio::test]
+    async fn an_undeclared_hint_is_refused_before_spawning() {
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({"prompt": "hello", "model_hint": "light"}))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string_with_args(
+                "tool-spawn-subagent-error-model-hint-no-routes",
+                &[("hint", "light")],
+            ))
+        );
+
+        // The reported case, through the real entry point: a malformed hint
+        // must be refused before spawning, not run on the parent's model.
+        let result = tool
+            .execute(json!({"prompt": "hello", "model_hint": "   "}))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string(
+                "tool-spawn-subagent-error-model-hint-invalid"
+            ))
         );
     }
 }

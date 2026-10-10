@@ -1169,6 +1169,9 @@ channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
 tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在 Docker 运行时中不可用，因为无法将其限制在其容器内。
+tool-spawn-subagent-error-model-hint-invalid = spawn_subagent：model_hint 必须是指向已配置路由的非空字符串；省略它即可使用此代理自身的模型运行。
+tool-spawn-subagent-error-model-hint-unknown = spawn_subagent：未知的 model_hint“{ $hint }”；已配置的提示：{ $hints }
+tool-spawn-subagent-error-model-hint-no-routes = spawn_subagent：未知的 model_hint“{ $hint }”；未配置任何 [[model_routes]]，因此子代理使用此代理自身的模型运行。
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。

@@ -1168,3 +1168,6 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+tool-spawn-subagent-error-model-hint-invalid = spawn_subagent: model_hint は、設定済みのルートを指す空でない文字列である必要があります。このエージェント自身のモデルで実行するには省略してください。
+tool-spawn-subagent-error-model-hint-unknown = spawn_subagent: 不明な model_hint「{ $hint }」です。設定済みのヒント: { $hints }
+tool-spawn-subagent-error-model-hint-no-routes = spawn_subagent: 不明な model_hint「{ $hint }」です。[[model_routes]] が設定されていないため、サブエージェントはこのエージェント自身のモデルで実行されます。
