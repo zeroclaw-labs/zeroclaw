@@ -41107,8 +41107,6 @@ mod tests {
             Ok("fallback".to_string())
         }
 
-        // Keep the pre-1.99 method name while the workspace MSRV remains 1.96.
-        #[allow(deprecated)]
         async fn chat(
             &self,
             _request: zeroclaw_providers::ChatRequest<'_>,
@@ -41119,7 +41117,7 @@ mod tests {
             // fallback; both must fail before the loop can trim and retry.
             if self
                 .overflows_left
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |left| left.checked_sub(1),

@@ -85,11 +85,9 @@ impl UploadBudget {
             .clone()
     }
 
-    // Keep the pre-1.99 method name while the workspace MSRV remains 1.96.
-    #[allow(deprecated)]
     fn try_charge(&self, bytes: u64) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= self.limit)
             })
             .is_ok()
