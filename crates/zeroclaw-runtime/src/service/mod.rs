@@ -2642,14 +2642,16 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn install_linux_systemd(config: &Config) -> Result<()> {
-    let file = linux_service_file(config)?;
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)?;
-    }
+/// Seconds the systemd and OpenRC services wait after asking the daemon to stop
+/// before they kill it. The daemon drains admitted agent turns on shutdown with
+/// no deadline of its own, so this budget is what bounds that drain; systemd's
+/// default (90s) ends a long turn before it can persist. Unrelated to
+/// `SERVICE_STOP_TIMEOUT`, which is how long the launchd wrapper waits for its
+/// child.
+const SHUTDOWN_DRAIN_BUDGET_SECS: u64 = 600;
 
-    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = format!(
+fn linux_systemd_unit_contents(exe: &Path) -> String {
+    format!(
         "[Unit]\n\
          Description=ZeroClaw daemon\n\
          After=network.target\n\
@@ -2659,6 +2661,13 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          ExecStart={exe} daemon\n\
          Restart=always\n\
          RestartSec=3\n\
+         # On stop the daemon waits for in-flight agent turns to finish and\n\
+         # persist; give it time before systemd escalates to SIGKILL.\n\
+         TimeoutStopSec={stop_timeout}\n\
+         # Signal only the daemon: its tool subprocesses (MCP servers, shell\n\
+         # commands) must stay up for the turns it is still draining. Whatever\n\
+         # remains is killed with the unit when the daemon exits or times out.\n\
+         KillMode=mixed\n\
          # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
          Environment=HOME=%h\n\
          # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
@@ -2667,8 +2676,19 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = exe.display()
-    );
+        exe = exe.display(),
+        stop_timeout = SHUTDOWN_DRAIN_BUDGET_SECS,
+    )
+}
+
+fn install_linux_systemd(config: &Config) -> Result<()> {
+    let file = linux_service_file(config)?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let unit = linux_systemd_unit_contents(&exe);
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
@@ -3084,6 +3104,8 @@ command_args="--config-dir {config_dir} daemon"
 command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
+# On stop the daemon waits for in-flight agent turns to finish and persist.
+retry="TERM/{stop_timeout}/KILL/5"
 umask 027
 output_logger="{output_logger}"
 error_logger="{error_logger}"
@@ -3105,6 +3127,7 @@ start_pre() {{
         config_dir = config_dir.display().to_string(),
         output_logger = output_logger,
         error_logger = error_logger,
+        stop_timeout = SHUTDOWN_DRAIN_BUDGET_SECS,
     )
 }
 
@@ -4290,6 +4313,27 @@ mod linux_service_tests {
     }
 
     #[test]
+    fn linux_systemd_unit_gives_the_shutdown_drain_time_before_sigkill() {
+        let unit = linux_systemd_unit_contents(Path::new("/usr/local/bin/zeroclaw"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/zeroclaw daemon\n"));
+        assert!(unit.contains("Restart=always\n"));
+
+        let service_section = unit
+            .split("[Service]")
+            .nth(1)
+            .and_then(|rest| rest.split("[Install]").next())
+            .expect("unit has a [Service] section followed by [Install]");
+        assert!(
+            service_section.contains(&format!("\nTimeoutStopSec={SHUTDOWN_DRAIN_BUDGET_SECS}\n")),
+            "the stop timeout must sit in [Service]: {unit}"
+        );
+        assert!(
+            service_section.contains("\nKillMode=mixed\n"),
+            "tool subprocesses must outlive the stop signal while turns drain: {unit}"
+        );
+    }
+
+    #[test]
     fn systemd_linger_hint_names_enable_command() {
         let hint = systemd_linger_hint("1000");
         assert!(hint.contains("may stop after logout"));
@@ -4500,6 +4544,12 @@ mod service_helper_tests {
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
+        assert!(
+            script.contains(&format!(
+                "retry=\"TERM/{SHUTDOWN_DRAIN_BUDGET_SECS}/KILL/5\""
+            )),
+            "OpenRC must wait for the shutdown drain before escalating to KILL"
+        );
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
