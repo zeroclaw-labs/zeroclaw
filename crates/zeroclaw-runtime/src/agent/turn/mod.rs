@@ -19,6 +19,7 @@ pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
+pub(crate) mod repetition;
 pub(crate) mod results_collect;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
@@ -1356,7 +1357,25 @@ async fn emit_rejected_attempt_usage(
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    run_tool_call_loop_with_guard(p, None).await
+}
+
+/// Agent owns the guard for its API turn, including steering/model-switch
+/// reentry. Low-level and nested SOP callers retain the public legacy wrapper.
+pub(crate) fn run_tool_call_loop_with_guard<'a>(
+    p: ToolLoop<'a>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    // Nested SOP turns call back into this engine. An explicit boxed return
+    // breaks the mutual opaque-future Send proof at that recursive boundary.
+    Box::pin(run_tool_call_loop_inner(p, repetition_guard))
+}
+
+async fn run_tool_call_loop_inner(
+    mut p: ToolLoop<'_>,
+    repetition_guard: Option<&std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1533,10 +1552,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .collect();
     let mut consecutive_identical_outputs: usize = 0;
     let mut last_tool_output_hash: Option<u64> = None;
-
+    let mut warned_call = repetition_guard
+        .filter(|_| pacing.loop_detection_enabled)
+        .and_then(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recovery_call_hash()
+        });
     let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
         crate::agent::loop_detector::LoopDetectorConfig {
-            enabled: pacing.loop_detection_enabled,
+            enabled: pacing.loop_detection_enabled && repetition_guard.is_none(),
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
@@ -2849,9 +2875,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let PreparedToolCalls {
             mut ordered_results,
-            executable_indices,
-            executable_calls,
-            stream_calls,
+            mut executable_indices,
+            mut executable_calls,
+            mut stream_calls,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -2863,6 +2889,78 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+
+        // Hooks and approvals have resolved the effective call. Admit one
+        // recovery dispatch for the warned identity; record the remaining
+        // identical requests as synthetic pairs rather than executing them.
+        if let Some(warned_call) = warned_call {
+            let mut recovery_admitted = false;
+            let dispatch = ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: model_switch_callback.as_ref(),
+            };
+            let mut retained_indices = Vec::new();
+            let mut retained_calls = Vec::new();
+            let mut retained_stream_calls = Vec::new();
+            for ((call_idx, call), stream_call) in executable_indices
+                .drain(..)
+                .zip(executable_calls.drain(..))
+                .zip(stream_calls.drain(..))
+            {
+                let recovery =
+                    crate::agent::tool_execution::dispatch_tool_name(&call.name, dispatch)
+                        .is_some_and(|name| {
+                            repetition::call_signature(&name, &call.arguments) == warned_call
+                        });
+                if recovery && recovery_admitted {
+                    call_prep::abandon_unexecuted_prepared_contexts(
+                        &ctx,
+                        iteration,
+                        &[call_idx],
+                        std::slice::from_ref(&call),
+                        &[],
+                    )
+                    .await;
+                    let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
+                        output: crate::i18n::get_required_cli_string(
+                            "turn-repeated-failure-retry-skipped",
+                        ),
+                        output_data: None,
+                        success: false,
+                        error_reason: None,
+                        duration: std::time::Duration::ZERO,
+                        receipt: None,
+                        attachments: Vec::new(),
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        events::emit_tool_call_pair(tx, &call, &outcome).await;
+                    }
+                    if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
+                        let _ = tx
+                            .send(StreamDelta::ToolComplete {
+                                tool: call.name.clone(),
+                                arguments: stream_call.arguments,
+                                tool_provenance: stream_call.tool_provenance,
+                                secs: 0,
+                                success: false,
+                                error: Some(outcome.output.clone()),
+                            })
+                            .await;
+                    }
+                    ordered_results[call_idx] = Some((call.name, call.tool_call_id, outcome));
+                } else {
+                    recovery_admitted |= recovery;
+                    retained_indices.push(call_idx);
+                    retained_calls.push(call);
+                    retained_stream_calls.push(stream_call);
+                }
+            }
+            executable_indices = retained_indices;
+            executable_calls = retained_calls;
+            stream_calls = retained_stream_calls;
+        }
 
         // Hooks and preparation may rewrite tool names or arguments. Decide
         // parallel eligibility from the final executable calls so policy is
@@ -2957,12 +3055,33 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
+        let repetition_disposition = if let Some(guard) =
+            repetition_guard.filter(|_| pacing.loop_detection_enabled && !cancelled_mid_batch)
+        {
+            let mut guard = guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let disposition = guard.observe_round(
+                &executed_completed_calls,
+                &executed_completed_outcomes,
+                &loop_ignore_tools,
+                pacing.loop_detection_max_repeats,
+            );
+            warned_call = guard.recovery_call_hash();
+            disposition
+        } else {
+            repetition::RepetitionDisposition::default()
+        };
+
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
             &executed_completed_stream_calls,
-            executed_completed_outcomes,
+            executed_completed_outcomes
+                .into_iter()
+                .map(|completed| completed.outcome)
+                .collect(),
             &mut ordered_results,
             iteration,
         )
@@ -3043,7 +3162,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_id,
         )?;
 
-        if !cancelled_mid_batch {
+        if !cancelled_mid_batch && repetition_guard.is_none() {
             check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -3066,6 +3185,33 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if let Some(key) = repetition_disposition.message_key {
+            if cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(ToolLoopCancelled.into());
+            }
+            let reason = crate::i18n::get_required_cli_string(key);
+            let visible_reason = format!("{reason}\n\n");
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &visible_reason).await;
+            if let Some(ref tx) = on_delta {
+                events::stream_text_posthoc_chunks(
+                    tx,
+                    &visible_reason,
+                    cancellation_token.as_ref(),
+                )
+                .await?;
+            }
+            accumulated_display_text.push_str(&visible_reason);
+            if repetition_disposition.close {
+                turn_state.push_dual(ChatMessage::assistant(reason));
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                return Ok(accumulated_display_text);
+            }
+            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);

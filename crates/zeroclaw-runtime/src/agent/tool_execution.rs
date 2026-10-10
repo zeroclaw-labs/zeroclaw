@@ -10,7 +10,6 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
-use zeroclaw_api::attribution::Attributable;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -39,6 +38,47 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+enum ResolvedTool<'a> {
+    Static(&'a dyn Tool),
+    Activated(Arc<dyn Tool>),
+}
+
+impl ResolvedTool<'_> {
+    fn tool(&self) -> &dyn Tool {
+        match self {
+            Self::Static(tool) => *tool,
+            Self::Activated(tool) => tool.as_ref(),
+        }
+    }
+}
+
+fn resolve_tool<'a>(
+    tools_registry: &'a [Box<dyn Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    name: &str,
+    tool_call_id: Option<&str>,
+) -> Option<ResolvedTool<'a>> {
+    if let Some(tool) = find_tool(tools_registry, name) {
+        return Some(ResolvedTool::Static(tool));
+    }
+    let activated = activated_tools?;
+    let activated = match activated.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"tool": name, "tool_call_id": tool_call_id})),
+                "activated-tool lock poisoned while resolving tool; recovering guard for read"
+            );
+            poisoned.into_inner()
+        }
+    };
+    activated.get_resolved(name).map(ResolvedTool::Activated)
+}
+
 /// Resolve presentation provenance with the same static-then-activated lookup
 /// order used by execution. Unknown names remain `None` so callers fail closed.
 pub(crate) fn resolved_tool_provenance(
@@ -46,20 +86,8 @@ pub(crate) fn resolved_tool_provenance(
     activated_tools: Option<&Arc<std::sync::Mutex<ActivatedToolSet>>>,
     name: &str,
 ) -> Option<zeroclaw_api::attribution::ToolProvenance> {
-    if let Some(tool) = find_tool(tools_registry, name) {
-        return Some(tool.tool_provenance());
-    }
-
-    activated_tools
-        .map(|activated| match activated.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        })
-        .and_then(|activated| {
-            activated
-                .get_resolved(name)
-                .map(|tool| tool.tool_provenance())
-        })
+    resolve_tool(tools_registry, activated_tools, name, None)
+        .map(|resolved| resolved.tool().tool_provenance())
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +103,43 @@ fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     excluded_tools
         .iter()
         .any(|excluded| excluded.trim().eq_ignore_ascii_case(name))
+}
+
+enum DispatchResolution<'a> {
+    Available(ResolvedTool<'a>),
+    Unavailable,
+    Unknown,
+}
+
+fn resolve_dispatch_tool<'a>(
+    name: &str,
+    dispatch: ToolDispatchContext<'a>,
+    tool_call_id: Option<&str>,
+) -> DispatchResolution<'a> {
+    if is_excluded_tool(name, dispatch.excluded_tools) {
+        return DispatchResolution::Unavailable;
+    }
+    match resolve_tool(
+        dispatch.tools_registry,
+        dispatch.activated_tools,
+        name,
+        tool_call_id,
+    ) {
+        Some(resolved) if is_excluded_tool(resolved.tool().name(), dispatch.excluded_tools) => {
+            DispatchResolution::Unavailable
+        }
+        Some(resolved) => DispatchResolution::Available(resolved),
+        None => DispatchResolution::Unknown,
+    }
+}
+
+/// Admission snapshot from the executor's canonical resolver. Completed
+/// dispatch provenance remains authoritative if availability changes later.
+pub(crate) fn dispatch_tool_name(name: &str, dispatch: ToolDispatchContext<'_>) -> Option<String> {
+    match resolve_dispatch_tool(name, dispatch, None) {
+        DispatchResolution::Available(resolved) => Some(resolved.tool().name().to_owned()),
+        DispatchResolution::Unavailable | DispatchResolution::Unknown => None,
+    }
 }
 
 fn unavailable_tool_outcome(
@@ -140,6 +205,14 @@ pub struct ToolExecutionOutcome {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
+pub(crate) struct CompletedToolExecution {
+    pub(crate) outcome: ToolExecutionOutcome,
+    /// Created by the executor only after `Tool::execute` completes. An
+    /// unavailable name returns an outcome without dispatch evidence.
+    pub(crate) executed_tool_name: Option<String>,
+}
+
+#[cfg(test)]
 pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -151,6 +224,32 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
+    execute_one_tool_with_provenance(
+        call_name,
+        call_arguments,
+        tool_call_id,
+        dispatch,
+        meta,
+        observer,
+        cancellation_token,
+        receipt_generator,
+        event_tx,
+    )
+    .await
+    .map(|completed| completed.outcome)
+}
+
+async fn execute_one_tool_with_provenance(
+    call_name: &str,
+    call_arguments: serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    event_tx: Option<&Sender<TurnEvent>>,
+) -> Result<CompletedToolExecution> {
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -164,84 +263,51 @@ pub(crate) async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    if is_excluded_tool(call_name, dispatch.excluded_tools) {
-        return Ok(unavailable_tool_outcome(
-            call_name,
-            tool_call_id_owned,
-            &full_args,
-            meta,
-            observer,
-            start.elapsed(),
-        ));
-    }
-
-    let static_tool = find_tool(dispatch.tools_registry, call_name);
-    let activated_arc = if static_tool.is_none() {
-        match dispatch.activated_tools {
-            Some(at) => {
-                let activated_tools = match at.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "tool": call_name,
-                                "tool_call_id": tool_call_id,
-                            })),
-                            "activated-tool lock poisoned while resolving tool; recovering guard for read"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                activated_tools.get_resolved(call_name)
-            }
-            None => None,
+    let resolved = match resolve_dispatch_tool(call_name, dispatch, tool_call_id) {
+        DispatchResolution::Available(resolved) => resolved,
+        DispatchResolution::Unavailable => {
+            return Ok(CompletedToolExecution {
+                executed_tool_name: None,
+                outcome: unavailable_tool_outcome(
+                    call_name,
+                    tool_call_id_owned,
+                    &full_args,
+                    meta,
+                    observer,
+                    start.elapsed(),
+                ),
+            });
         }
-    } else {
-        None
+        DispatchResolution::Unknown => {
+            let reason = format!("Unknown tool: {call_name}");
+            let duration = start.elapsed();
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                tool_call_id: tool_call_id_owned.clone(),
+                duration,
+                success: false,
+                arguments: Some(full_args.clone()),
+                result: Some(scrub_credentials(&reason)),
+                channel: Some(meta.channel_name.to_string()),
+                agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+                turn_id: Some(meta.turn_id.to_string()),
+            });
+            return Ok(CompletedToolExecution {
+                executed_tool_name: None,
+                outcome: ToolExecutionOutcome {
+                    output: reason.clone(),
+                    success: false,
+                    error_reason: Some(reason),
+                    duration,
+                    receipt: None,
+                    output_data: None,
+                    attachments: Vec::new(),
+                },
+            });
+        }
     };
-    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
-        let reason = format!("Unknown tool: {call_name}");
-        let duration = start.elapsed();
-        observer.record_event(&ObserverEvent::ToolCall {
-            tool: call_name.to_string(),
-            tool_call_id: tool_call_id_owned.clone(),
-            duration,
-            success: false,
-            arguments: Some(full_args.clone()),
-            result: Some(scrub_credentials(&reason)),
-            channel: Some(meta.channel_name.to_string()),
-            agent_alias: meta.agent_alias.map(|s| s.to_string()),
-            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
-            turn_id: Some(meta.turn_id.to_string()),
-        });
-        return Ok(ToolExecutionOutcome {
-            output: reason.clone(),
-            success: false,
-            error_reason: Some(reason),
-            duration,
-            receipt: None,
-            output_data: None,
-            attachments: Vec::new(),
-        });
-    };
-
-    if is_excluded_tool(tool.name(), dispatch.excluded_tools) {
-        return Ok(unavailable_tool_outcome(
-            call_name,
-            tool_call_id_owned,
-            &full_args,
-            meta,
-            observer,
-            start.elapsed(),
-        ));
-    }
+    let tool = resolved.tool();
 
     use ::zeroclaw_log::Instrument;
     let tool_span = ::zeroclaw_log::info_span!(
@@ -443,7 +509,7 @@ pub(crate) async fn execute_one_tool(
                         })),
                     format!("tool error: {call_name}")
                 );
-                let reason = format!("Error executing {call_name}: {e}");
+                let reason = format!("Error executing {}: {e}", tool.name());
                 // Same model-visible egress boundary as the
                 // `Ok(success = false)` arm above: a tool error can embed a
                 // redirect URL with a signed query string. Scrub the
@@ -501,7 +567,10 @@ pub(crate) async fn execute_one_tool(
         let _ = tx.send(plan_event).await;
     }
 
-    outcome
+    outcome.map(|outcome| CompletedToolExecution {
+        outcome,
+        executed_tool_name: Some(tool.name().to_owned()),
+    })
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -562,11 +631,11 @@ pub(crate) async fn execute_tools_parallel(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+) -> Result<Vec<Option<CompletedToolExecution>>> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
-            execute_one_tool(
+            execute_one_tool_with_provenance(
                 &call.name,
                 call.arguments.clone(),
                 call.tool_call_id.as_deref(),
@@ -602,8 +671,8 @@ pub(crate) async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
-    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
+) -> Result<Vec<Option<CompletedToolExecution>>> {
+    let mut slots: Vec<Option<CompletedToolExecution>> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -635,7 +704,7 @@ pub(crate) async fn execute_tools_sequential(
                 .unwrap_or(dispatch.excluded_tools),
             model_switch_callback: dispatch.model_switch_callback,
         };
-        let outcome = match execute_one_tool(
+        let outcome = match execute_one_tool_with_provenance(
             &call.name,
             call.arguments.clone(),
             call.tool_call_id.as_deref(),
@@ -924,6 +993,7 @@ mod tests {
         );
         let second = outcomes[1]
             .as_ref()
+            .map(|completed| &completed.outcome)
             .expect("the second call produced an outcome");
         assert!(
             !second.success,
