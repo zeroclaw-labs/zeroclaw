@@ -892,6 +892,7 @@ cli-config-all-configured = All sections already configured.
 cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
+cli-config-patch-notice-flush-failed = Config patch was saved, but its notice could not be flushed
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
 cli-plugin-catalog-heading = Plugins:
