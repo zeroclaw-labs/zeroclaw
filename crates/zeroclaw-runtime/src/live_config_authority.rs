@@ -43,6 +43,7 @@ impl LiveConfigAuthority {
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
+        ownership.recover_abandoned_turns_or_log();
         Ok(Self::new_with_ownership(config, ownership))
     }
 
@@ -456,6 +457,8 @@ impl AgentExecutionAdmission {
 #[derive(Debug)]
 pub struct ConfigOwnershipGuard {
     _file: File,
+    /// The data directory this guard locked.
+    data_dir: PathBuf,
 }
 
 #[cfg(unix)]
@@ -565,13 +568,42 @@ impl ConfigOwnershipGuard {
                         )));
                     }
                 }
-                Ok(Self { _file: file })
+                Ok(Self {
+                    _file: file,
+                    data_dir: data_dir.to_path_buf(),
+                })
             }
             Err(TryLockError::WouldBlock) => Err(ConfigOwnershipError::AlreadyOwned { path }),
             Err(TryLockError::Error(error)) => Err(ConfigOwnershipError::Unavailable(
                 anyhow::Error::new(error)
                     .context(format!("locking config lifecycle at {}", path.display())),
             )),
+        }
+    }
+}
+
+impl ConfigOwnershipGuard {
+    /// Settle the session turns a previous process left marked "running" in
+    /// the data directory this guard locked. Holding the guard is what makes
+    /// that safe; see [`zeroclaw_infra::recover_abandoned_session_turns`],
+    /// which does the work and acts once per process. Call it before the
+    /// process admits a turn of its own.
+    pub fn recover_abandoned_turns(&self) -> std::io::Result<usize> {
+        zeroclaw_infra::recover_abandoned_session_turns(&self.data_dir)
+    }
+
+    /// [`Self::recover_abandoned_turns`] for a startup path: a store that
+    /// cannot be settled is no reason to refuse to start, so the failure is
+    /// logged and startup goes on.
+    pub fn recover_abandoned_turns_or_log(&self) {
+        if let Err(error) = self.recover_abandoned_turns() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                "could not settle session turns left running by a previous process"
+            );
         }
     }
 }
@@ -1880,5 +1912,136 @@ mod tests {
         assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
         drop(next);
         assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
+    }
+
+    fn store_with_running_turn(
+        data_dir: &Path,
+    ) -> Arc<dyn zeroclaw_infra::session_backend::SessionBackend> {
+        use zeroclaw_api::model_provider::ChatMessage;
+        let backend = zeroclaw_infra::make_session_backend(data_dir, "sqlite").unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+        backend
+    }
+
+    fn owned_config(data_dir: &Path) -> Config {
+        Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn fresh_owner_settles_turns_a_killed_process_left_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // The previous process: it marked a turn running and never came back.
+        drop(store_with_running_turn(temp.path()));
+
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        let state = store.get_session_state("s1").unwrap().unwrap();
+        assert_eq!(state.state, "error");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(store.load("s1").len(), 1, "the session's history is kept");
+        drop(authority);
+    }
+
+    #[test]
+    fn process_refused_ownership_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // The owner is running this turn right now.
+        let store = store_with_running_turn(temp.path());
+
+        assert!(LiveConfigAuthority::new_owned(owned_config(temp.path())).is_err());
+
+        assert_eq!(store.list_running_sessions().len(), 1);
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn reload_leaves_live_turns_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn this process started after it took ownership, still
+        // draining while the daemon reloads.
+        let store = store_with_running_turn(temp.path());
+
+        authority.close_agent_lifecycle();
+        authority.drain_agent_lifecycle_retaining_ownership().await;
+        let guard = authority
+            .take_process_ownership()
+            .expect("reload drain retains ownership for transfer");
+        // The next generation starts up exactly as the first one did.
+        assert_eq!(guard.recover_abandoned_turns().unwrap(), 0);
+        let next = LiveConfigAuthority::new_with_ownership(owned_config(temp.path()), guard);
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(next);
+    }
+
+    #[test]
+    fn taking_ownership_again_in_the_same_process_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn started under the first acquisition and detached from it:
+        // it is still running when the surface that admitted it is torn
+        // down and started again.
+        let store = store_with_running_turn(temp.path());
+        drop(first);
+
+        let second = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(second);
+    }
+
+    /// Run state lives in the SQLite store whichever backend is configured:
+    /// a process started on JSONL can reload onto SQLite later, and must not
+    /// find turns from before it started still marked running.
+    #[test]
+    fn fresh_owner_settles_the_sqlite_store_when_jsonl_is_configured() {
+        let temp = tempfile::TempDir::new().unwrap();
+        drop(store_with_running_turn(temp.path()));
+        let mut config = owned_config(temp.path());
+        config.channels.session_backend = "jsonl".to_string();
+
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        drop(authority);
+    }
+
+    #[test]
+    fn unreadable_store_does_not_stop_startup_and_the_error_is_returned() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(temp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+
+        let guard = ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+        assert!(guard.recover_abandoned_turns().is_err());
+        drop(guard);
+
+        let other = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(other.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+        assert!(LiveConfigAuthority::new_owned(owned_config(other.path())).is_ok());
     }
 }

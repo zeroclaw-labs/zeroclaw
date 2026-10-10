@@ -381,6 +381,21 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
+    /// Settle every turn still marked "running" as "error", in one atomic
+    /// step, and return how many there were. The turn id stays on the
+    /// session so a client can tell which turn ended, and the session's
+    /// messages are untouched. Nothing is restarted.
+    ///
+    /// A "running" row only says a turn started; it cannot say the process
+    /// that ran it is still alive. Only a process that has just become the
+    /// sole owner of the data directory knows that none is, so only that
+    /// process may call this, once, before it admits any turn of its own.
+    /// Opening a backend never does it implicitly. Backends that do not
+    /// track run state have nothing to settle.
+    fn recover_abandoned_turns(&self) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
     /// Get the current session state. Returns `None` if the backend doesn't track state.
     fn get_session_state(&self, _session_key: &str) -> std::io::Result<Option<SessionState>> {
         Ok(None)

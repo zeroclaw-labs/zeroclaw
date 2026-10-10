@@ -7025,33 +7025,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             config.data_dir.display()
         );
     }
-    #[cfg(feature = "agent-runtime")]
-    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
-        anyhow::ensure!(
-            config.data_dir == *expected_data_dir,
-            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
-            expected_data_dir.display(),
-            config.data_dir.display()
-        );
-        let ownership = standalone_ownership.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": expected_data_dir.display().to_string(),
-                    })),
-                "standalone config ownership invariant failed"
-            );
-            anyhow::Error::msg("standalone ownership was not acquired")
-        })?;
-        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
-            config.clone(),
-            ownership,
-        ))
-    } else {
-        None
-    };
     let running_executable =
         running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
@@ -7114,6 +7087,43 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // This process has just become the data directory's only owner and has
+    // admitted nothing yet: any session turn still marked running belongs to
+    // a process that is gone. It happens once per process, so a reload does
+    // not repeat it. It follows the trace sink init above so that what it
+    // settles, or fails to, is on record.
+    #[cfg(feature = "agent-runtime")]
+    if let Some((_, ownership)) = daemon_ownership.as_ref() {
+        ownership.recover_abandoned_turns_or_log();
+    }
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
+        ownership.recover_abandoned_turns_or_log();
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
     // Enrollment's contract is that stdout carries exactly the token and
     // nothing else, so the `oidc` commands are dispatched before any
     // startup prelude that may print: the OTP prelude below discloses a

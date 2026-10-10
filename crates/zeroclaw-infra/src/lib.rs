@@ -56,6 +56,52 @@ pub fn make_session_backend(
     }
 }
 
+/// Data directories whose startup recovery this process has already claimed,
+/// by resolved location, so two spellings of one directory are one claim.
+static STARTUP_RECOVERY_CLAIMED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Settle the session turns a previous process left marked "running" under
+/// `data_dir`, and return how many there were.
+///
+/// The caller must hold process ownership of `data_dir` and must not have
+/// admitted a turn yet. The first time a process owns a data directory is
+/// the one moment it knows no turn is running there: whoever marked them is
+/// gone. Each such turn is recorded as "error" with its history kept, and
+/// nothing is restarted.
+///
+/// It acts once per process for a directory. Every later call returns
+/// `Ok(0)` without looking, because by then a running turn may be this
+/// process's own. That holds after a failed attempt too: the error is
+/// returned once, and the turns stay as they are until the next process
+/// start.
+///
+/// Run state lives only in the SQLite store, so that store is settled
+/// whenever it exists, whichever backend is configured now: a later reload
+/// may switch to it. It is neither created nor migrated for this.
+pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize> {
+    let identity = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if !STARTUP_RECOVERY_CLAIMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(identity)
+    {
+        return Ok(0);
+    }
+    let recovered = session_sqlite::SqliteSessionBackend::recover_abandoned_turns_at(data_dir)?;
+    if recovered > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "sessions": recovered })),
+            "marked session turns left running by a previous process as failed"
+        );
+    }
+    Ok(recovered)
+}
+
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
@@ -125,6 +171,83 @@ mod tests {
             .append("reload_user", &user_msg("hello after reload"))
             .unwrap();
         assert_eq!(jsonl.load("reload_user").len(), 1);
+    }
+
+    fn store_with_running_turn(data_dir: &Path) -> Arc<dyn SessionBackend> {
+        let backend = make_session_backend(data_dir, "sqlite").unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+        backend
+    }
+
+    #[test]
+    fn recovery_settles_what_a_killed_process_left_and_acts_once() {
+        let tmp = TempDir::new().unwrap();
+        drop(store_with_running_turn(tmp.path()));
+
+        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 1);
+
+        let restarted = make_session_backend(tmp.path(), "sqlite").unwrap();
+        assert!(restarted.list_running_sessions().is_empty());
+        let state = restarted.get_session_state("s1").unwrap().unwrap();
+        assert_eq!(state.state, "error");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(restarted.load("s1").len(), 1);
+
+        // From here on a running turn is this process's own.
+        restarted
+            .set_session_state("s1", "running", Some("turn-2"))
+            .unwrap();
+        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
+        assert_eq!(restarted.list_running_sessions().len(), 1);
+    }
+
+    #[test]
+    fn recovery_creates_no_store() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
+        assert!(!tmp.path().join("sessions").exists());
+    }
+
+    /// One directory reached through two spellings is one claim: the second
+    /// spelling must not settle turns started since the first.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_claim_follows_the_directory_not_its_spelling() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("data");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        assert_eq!(recover_abandoned_session_turns(&real).unwrap(), 0);
+        let store = store_with_running_turn(&real);
+
+        assert_eq!(recover_abandoned_session_turns(&alias).unwrap(), 0);
+        assert_eq!(
+            recover_abandoned_session_turns(&real.join("..").join("data")).unwrap(),
+            0
+        );
+        assert_eq!(store.list_running_sessions().len(), 1);
+    }
+
+    /// A failed attempt is reported once and never repeated: by the time the
+    /// store works again, the process may be running turns in it.
+    #[test]
+    fn failed_recovery_is_reported_and_not_retried() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = session_sqlite::SqliteSessionBackend::db_path(tmp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+
+        assert!(recover_abandoned_session_turns(tmp.path()).is_err());
+
+        std::fs::remove_file(&db_path).unwrap();
+        let store = store_with_running_turn(tmp.path());
+        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
+        assert_eq!(store.list_running_sessions().len(), 1);
     }
 
     #[test]
