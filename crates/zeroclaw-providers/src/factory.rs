@@ -286,7 +286,7 @@ fn merge_extra_body(
 }
 
 /// Apply cross-cutting compat overrides (timeout, headers, api_path,
-/// max_tokens, reasoning effort, TLS CA, `provider_extra`,
+/// max_tokens, reasoning effort, native-tool, TLS CA, `provider_extra`,
 /// `chat_template_kwargs`) to a compat builder before calling `.build()` and
 /// boxing the trait object. Single source of the override chain — every compat
 /// impl funnels through here.
@@ -294,6 +294,9 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    if let Some(native_tools) = opts.native_tools {
+        b = b.with_native_tools(native_tools);
+    }
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
@@ -3295,6 +3298,38 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_factory_honors_native_tools_override_true() {
+        let cfg = VeniceModelProviderConfig::default();
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("default", None, None, &options)
+            .unwrap();
+        assert!(
+            provider.capabilities().native_tool_calling,
+            "native_tools = true must override a compat family's prompt-guided default"
+        );
+    }
+
+    #[test]
+    fn compat_factory_honors_native_tools_override_false() {
+        let cfg = OpencodeModelProviderConfig::default();
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(false),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("default", None, None, &options)
+            .unwrap();
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "native_tools = false must force prompt-guided tools for a compat family"
+        );
     }
 
     #[test]

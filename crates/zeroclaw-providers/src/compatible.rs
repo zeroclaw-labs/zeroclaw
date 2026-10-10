@@ -533,7 +533,7 @@ pub struct OpenAiCompatibleBuilder {
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
     /// to enable the merge behaviour without disabling native tool calling.
     merge_system_into_user_preserve_native: bool,
-    /// Set to `Some(false)` by [`OpenAiCompatibleBuilder::without_native_tools`].
+    /// Set to `Some(bool)` by [`OpenAiCompatibleBuilder::with_native_tools`].
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
@@ -664,10 +664,17 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Disable native tool calling, forcing prompt-guided tool use instead.
-    pub fn without_native_tools(mut self) -> Self {
-        self.native_tool_calling_override = Some(false);
+    /// Override native tool calling for this provider instance.
+    ///
+    /// When disabled, tools are injected into the system prompt as text.
+    pub fn with_native_tools(mut self, native_tool_calling: bool) -> Self {
+        self.native_tool_calling_override = Some(native_tool_calling);
         self
+    }
+
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    pub fn without_native_tools(self) -> Self {
+        self.with_native_tools(false)
     }
 
     /// Override the HTTP request timeout for LLM API calls. Values of 0

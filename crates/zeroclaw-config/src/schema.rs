@@ -1087,10 +1087,11 @@ pub struct ModelProviderConfig {
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
-    /// Currently consulted only by the Groq factory, which defaults to
-    /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
-    /// tool calling for Groq models that support it.
+    /// For OpenAI-compatible chat-completions families, native calls avoid
+    /// injecting the prompt-guided tool-use protocol into the system prompt.
+    /// Set this only after confirming the configured endpoint and model
+    /// accept the native tool schema. Providers routed through
+    /// `wire_api = "responses"` are inherently native and ignore this setting.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
