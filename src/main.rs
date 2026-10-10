@@ -7773,7 +7773,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 zeroclaw_channels::orchestrator::live_channel_map()
             }));
 
-            let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
+            let canvas_store = zeroclaw_runtime::tools::CanvasStore::for_data_dir(&config.data_dir);
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
