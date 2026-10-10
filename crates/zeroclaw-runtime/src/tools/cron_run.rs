@@ -202,10 +202,24 @@ impl Tool for CronRunTool {
                 approved,
             )
         {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "error_key": "cron.shell.command_blocked",
+                        "diagnostic": zeroclaw_providers::sanitize_api_error(&reason.to_string()),
+                    })),
+                "Cron shell command blocked by security policy"
+            );
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(reason.to_string()),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "cron-shell-command-blocked",
+                )),
             });
         }
 
@@ -688,12 +702,13 @@ mod tests {
         // Without approval, the tool-level policy check blocks medium-risk commands.
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .unwrap_or_default()
-                .contains("explicit approval")
+        let error = denied.error.unwrap_or_default();
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string("cron-shell-command-blocked")
         );
+        assert!(!error.contains("touch cron-run-approval"));
+        assert!(!error.contains("explicit approval"));
     }
 
     #[tokio::test]
