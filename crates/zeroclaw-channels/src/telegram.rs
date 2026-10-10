@@ -61,6 +61,9 @@ struct MultiDraftKey {
 #[derive(Debug)]
 struct SendChunksError {
     delivered: usize,
+    /// The chunk failed because Telegram is still flood-limiting this chat.
+    /// Callers must not resume or resend inside the penalty window.
+    rate_limited: bool,
     source: anyhow::Error,
 }
 
@@ -6024,6 +6027,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
                 })? {
                 SendMessageAttempt::Sent => {
@@ -6035,6 +6039,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 SendMessageAttempt::RateLimited { status, body } => {
                     return Err(SendChunksError {
                         delivered: index,
+                        rate_limited: true,
                         source: anyhow::Error::msg(format!(
                             "Telegram sendMessage rate limited ({status}): {body}"
                         )),
@@ -6064,19 +6069,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
+                    rate_limited: false,
                     source: e.into(),
                 })? {
                 SendMessageAttempt::Sent => {}
                 SendMessageAttempt::RateLimited {
                     status: plain_status,
                     body: plain_err,
+                } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendMessage rate limited (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                        )),
+                    });
                 }
-                | SendMessageAttempt::Failed {
+                SendMessageAttempt::Failed {
                     status: plain_status,
                     body: plain_err,
                 } => {
                     return Err(SendChunksError {
                         delivered: index,
+                        rate_limited: false,
                         source: anyhow::Error::msg(format!(
                             "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
                         )),
@@ -6156,6 +6171,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram already delivered. A failure before any chunk is accepted
     /// (`delivered == 0`) is returned as the plain source error: nothing is on
     /// the wire, so a full-message fallback is safe.
+    ///
+    /// A flood-limit failure is different: Telegram has asked for no requests
+    /// until `retry_after` has passed, so neither the resume nor the
+    /// orchestrator's full-message fallback may send. It is reported as
+    /// [`FinalizePartialDelivery`] even when no chunk was accepted.
     async fn finalize_send_chunks(
         &self,
         text: &str,
@@ -6165,8 +6185,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         match self.send_text_chunks(text, chat_id, thread_id, 0).await {
             Ok(_) => Ok(()),
             Err(SendChunksError {
+                delivered,
+                rate_limited: true,
+                ..
+            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into()),
+            Err(SendChunksError {
                 delivered: 0,
                 source,
+                ..
             }) => Err(source),
             Err(SendChunksError { delivered, .. }) => {
                 // Some chunks are already posted. Resume from the first unsent
@@ -24366,7 +24392,7 @@ mod tests {
         );
     }
 
-    /// Issue #11615: a 429 must wait out `retry_after` and resend the same
+    /// A 429 must wait out `retry_after` and resend the same
     /// HTML request, not fire an immediate plain-text retry into the limit.
     #[tokio::test]
     async fn send_text_chunks_waits_retry_after_then_resends_same_format() {
@@ -24406,7 +24432,7 @@ mod tests {
         }
     }
 
-    /// Issue #11615: a penalty too long to wait inline fails the chunk without
+    /// A penalty too long to wait inline fails the chunk without
     /// sending any more requests inside the penalty window.
     #[tokio::test]
     async fn send_text_chunks_does_not_retry_inside_long_flood_penalty() {
@@ -24434,5 +24460,120 @@ mod tests {
             1,
             "no markdown or plain retry into the limit"
         );
+    }
+
+    /// Repeated short 429s stop after the retry cap: the original request plus
+    /// `TELEGRAM_RATE_LIMIT_RETRIES` resends, all with the same body.
+    #[tokio::test]
+    async fn send_text_chunks_stops_after_rate_limit_retry_cap() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0);
+        assert!(err.rate_limited);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1 + TELEGRAM_RATE_LIMIT_RETRIES as usize,
+            "one request plus the capped resends"
+        );
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["parse_mode"], "HTML", "no plain-text retry on 429");
+        }
+    }
+
+    /// A 429 on the plain-text fallback also waits `retry_after` and resends
+    /// the same plain-text body.
+    #[tokio::test]
+    async fn plain_text_fallback_waits_retry_after_and_keeps_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(1))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the plain-text resend must wait for retry_after"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["parse_mode"], "HTML");
+        assert!(bodies[1].get("parse_mode").is_none());
+        assert_eq!(bodies[1], bodies[2], "the plain-text resend keeps its body");
+    }
+
+    /// A flood-limited finalize must not resume or let the orchestrator fall
+    /// back to a full resend: it reports `FinalizePartialDelivery`.
+    #[tokio::test]
+    async fn finalize_send_chunks_does_not_resend_inside_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let err = ch
+            .finalize_send_chunks("hello", "123", None)
+            .await
+            .unwrap_err();
+        let partial = err
+            .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+            .expect("rate-limited finalize must report FinalizePartialDelivery");
+        assert_eq!(partial.delivered, 0);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "no resume inside the penalty window");
     }
 }
