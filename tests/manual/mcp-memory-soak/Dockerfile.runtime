@@ -1,0 +1,22 @@
+# Diagnostic image for the historical #8642 comparison, not a product image.
+FROM rust:1.96-slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+ENV CARGO_BUILD_JOBS=1
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=cc
+ARG SOAK_REVISION
+RUN --mount=type=cache,id=github-zeroclaw-8642-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=github-zeroclaw-8642-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=github-zeroclaw-8642-${SOAK_REVISION}-ci,target=/src/target,sharing=locked \
+    cargo build --profile ci --locked -p zeroclawlabs --bin zeroclaw --no-default-features --features agent-runtime,gateway && cp target/ci/zeroclaw /src/zeroclaw
+
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/zeroclaw /usr/local/bin/zeroclaw
+ARG SOAK_REVISION
+LABEL org.opencontainers.image.revision=$SOAK_REVISION
+LABEL org.opencontainers.image.description="#8642 diagnostic build; profile=ci; features=agent-runtime,gateway"
+ENV MALLOC_ARENA_MAX=2
+WORKDIR /soak
+ENTRYPOINT ["/usr/local/bin/zeroclaw"]
