@@ -1164,6 +1164,7 @@ channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
 channel-telegram-voice-drop-too-long = ⚠️ Message audio ignoré : il dépasse la limite de { $limit_secs } s. Envoyez un enregistrement plus court ou découpez-le en plusieurs parties.
 channel-telegram-voice-drop-file-unavailable = ⚠️ Message audio ignoré : le fichier n'a pas pu être récupéré depuis Telegram — il est peut-être trop volumineux ou n'est plus disponible. Essayez un fichier plus petit ou plus court.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Message audio ignoré : rien n'a pu être reconnu dans l'enregistrement. Réessayez avec un enregistrement plus clair.
+channel-telegram-voice-drop-transcription-rejected = ⚠️ Message audio ignoré : le service de transcription n'a pas pu traiter cet enregistrement — il est peut-être trop long ou dans un format non pris en charge. Essayez un enregistrement plus court ou un autre format.
 channel-discord-approval-btn-allow-once = Autoriser une fois
 channel-discord-approval-btn-allow-session = Autoriser pour cette session
 channel-discord-approval-btn-allow-always = Toujours autoriser
