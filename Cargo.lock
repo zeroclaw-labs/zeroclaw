@@ -14642,8 +14642,6 @@ dependencies = [
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
- "tower",
- "tower-http",
  "urlencoding",
  "uuid",
  "webpki-roots 1.0.9",
