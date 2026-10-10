@@ -28241,6 +28241,79 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn plan_persistence_failure_routes_through_client_and_renders() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut active = state();
+        active.turn_in_flight = true;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "plan_persistence",
+                "session_id": "sess-1",
+                "operation": "write",
+                "status": "unavailable",
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-1",
+                "text": "final answer still arrives",
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "completed",
+                "content": "",
+            }),
+        );
+        chat.drain_notifications();
+
+        let state = active_state(&mut chat);
+        assert!(!state.turn_in_flight, "completion must settle the turn");
+        assert_eq!(state.turn_status, TurnStatus::Idle);
+        assert_eq!(state.last_error, None);
+
+        let area = Rect::new(0, 0, 120, 18);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, state, area, PaneKind::Acp))
+            .expect("render Code pane");
+        let buffer = terminal.backend().buffer();
+        let rendered = buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("TodoWrite plan storage is unavailable"),
+            "plan persistence failure notice must reach the rendered Code pane: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("final answer still arrives"),
+            "a storage notice must not hide the completed turn output: {rendered:?}"
+        );
+    }
+
     #[test]
     fn legacy_history_trimmed_update_reports_message_count() {
         let mut s = state();
