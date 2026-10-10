@@ -1,9 +1,11 @@
 pub mod anthropic_token;
+pub mod chatgpt_plan;
 pub mod email_oauth2;
 pub mod gemini_oauth;
 pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
+mod protected_file;
 pub mod xai_oauth;
 
 use crate::auth::oauth_common::{RefreshAttemptError, RefreshRetryPolicy, refresh_with_retries};
@@ -126,6 +128,10 @@ impl AuthService {
         requested_profile: &str,
     ) -> Result<String> {
         let model_provider = normalize_model_provider(model_provider)?;
+        anyhow::ensure!(
+            model_provider != chatgpt_plan::PROVIDER,
+            "ChatGPT plan providers require an explicit registration binding; global activation is unsupported"
+        );
         let data = self.store.load().await?;
         let profile_id = resolve_requested_profile_id(&model_provider, requested_profile);
 
@@ -163,6 +169,10 @@ impl AuthService {
         requested_profile: &str,
     ) -> Result<bool> {
         let model_provider = normalize_model_provider(model_provider)?;
+        anyhow::ensure!(
+            model_provider != chatgpt_plan::PROVIDER,
+            "ChatGPT plan CLI sign-out is unsupported in this slice; disconnect the app in ChatGPT settings"
+        );
         let profile_id = resolve_requested_profile_id(&model_provider, requested_profile);
         self.store.remove_profile(&profile_id).await
     }
@@ -1145,6 +1155,14 @@ impl AuthProvider {
 
 // ── OpenAI Codex impl ──────────────────────────────────────────────────
 
+/// Keep plan-usage opt-in separate from legacy Quickstart/AuthProvider choices.
+pub fn flow_for_model_provider(raw: &str) -> Result<Box<dyn AuthProviderFlow>> {
+    if raw.trim() == chatgpt_plan::PROVIDER {
+        return Ok(Box::new(chatgpt_plan::ChatGptPlanFlow::default()));
+    }
+    Ok(raw.parse::<AuthProvider>()?.flow())
+}
+
 pub struct OpenaiCodexFlow;
 
 #[async_trait::async_trait]
@@ -1911,6 +1929,7 @@ mod tests {
                 kind: AuthProfileKind::Token,
                 account_id: None,
                 workspace_id: None,
+                plan_registration: None,
                 token_set: None,
                 token: Some("x".into()),
                 metadata: std::collections::BTreeMap::default(),
@@ -1927,6 +1946,7 @@ mod tests {
                 kind: AuthProfileKind::Token,
                 account_id: None,
                 workspace_id: None,
+                plan_registration: None,
                 token_set: None,
                 token: Some("y".into()),
                 metadata: std::collections::BTreeMap::default(),

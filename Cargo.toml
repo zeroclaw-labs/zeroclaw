@@ -444,6 +444,8 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# Synthetic OAuth/JWKS/SSE fixture injection is absent from shipped builds.
+zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
 # Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
 # so this package's integration-test helpers can mint the now-sealed engine tool
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped

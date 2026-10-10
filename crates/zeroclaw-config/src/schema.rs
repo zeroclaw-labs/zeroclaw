@@ -969,6 +969,12 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     #[credential_class = "external_auth_store"]
     pub requires_openai_auth: bool,
+    /// Explicit reference to a ChatGPT plan-usage registration in this
+    /// instance's auth profile store. Separate from legacy Codex selection.
+    #[tab(Connection)]
+    #[nested]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_plan_auth: Option<ChatGptPlanAuthConfig>,
     /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already; leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1146,6 +1152,17 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
+}
+
+/// The credential store creates registration identity and owns credentials.
+/// Config owns only the reference; readiness is resolved at request time.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.chatgpt_plan_auth"]
+pub struct ChatGptPlanAuthConfig {
+    /// Exact canonical profile ID, e.g. `chatgpt-plan:subscriber`.
+    #[credential_class = "external_auth_store"]
+    pub registration: String,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────

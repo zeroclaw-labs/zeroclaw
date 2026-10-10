@@ -89,6 +89,7 @@
   - [Routing](./providers/routing.md)
   - [Custom providers](./providers/custom.md)
   - [OpenAI Codex (subscription)](./providers/openai-codex-subscription.md)
+  - [ChatGPT plan usage](./providers/openai-chatgpt-plan.md)
 
 - [Channels & Integrations](./channels/overview.md)
   - [Peer Groups](./channels/peer-groups.md)

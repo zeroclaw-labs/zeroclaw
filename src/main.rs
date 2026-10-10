@@ -5746,9 +5746,18 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex, Gemini, or xAI)
+    /// Complete one text-only request using an explicitly bound ChatGPT plan provider
+    PlanCheck {
+        /// Exact provider alias, e.g. openai.subscriber
+        #[arg(long)]
+        model_provider: String,
+        /// Text prompt; consumes the selected account's plan usage
+        #[arg(long)]
+        message: String,
+    },
+    /// Login with OAuth (ChatGPT plan usage, OpenAI Codex, Gemini, or xAI)
     Login {
-        /// ModelProvider (`openai-codex`, `gemini`, or `xai`)
+        /// ModelProvider (`chatgpt-plan`, `openai-codex`, `gemini`, or `xai`)
         #[arg(long)]
         model_provider: String,
         /// Profile name (default: default)
@@ -12415,13 +12424,25 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
         |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
+        AuthCommands::PlanCheck {
+            model_provider,
+            message,
+        } => {
+            let text =
+                auth::chatgpt_plan::check_bound_provider(config, &model_provider, &message).await?;
+            println!(
+                "{}",
+                ta("cli-auth-chatgpt-response", &[("text", &text)], "{$text}")
+            );
+            Ok(())
+        }
         AuthCommands::Login {
             model_provider,
             profile,
             device_code,
             import,
         } => {
-            let provider: auth::AuthProvider = model_provider.parse()?;
+            let flow = auth::flow_for_model_provider(&model_provider)?;
             let client = reqwest::Client::new();
             let ctx = auth::AuthFlowContext {
                 config,
@@ -12429,9 +12450,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 client: &client,
                 format_cli: &auth_cli_formatter,
             };
-            provider
-                .flow()
-                .login(&ctx, &profile, device_code, import.as_deref())
+            flow.login(&ctx, &profile, device_code, import.as_deref())
                 .await
         }
 
@@ -12537,7 +12556,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             model_provider,
             profile,
         } => {
-            let provider: auth::AuthProvider = model_provider.parse()?;
+            let flow = auth::flow_for_model_provider(&model_provider)?;
             let client = reqwest::Client::new();
             let ctx = auth::AuthFlowContext {
                 config,
@@ -12545,10 +12564,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 client: &client,
                 format_cli: &auth_cli_formatter,
             };
-            let status = provider
-                .flow()
-                .refresh_status(&ctx, profile.as_deref())
-                .await?;
+            let status = flow.refresh_status(&ctx, profile.as_deref()).await?;
             match status {
                 auth::RefreshStatus::Refreshed { profile } => {
                     println!(
@@ -13739,11 +13755,179 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
     }
 }
 
+#[cfg(all(test, feature = "agent-runtime", unix))]
+mod chatgpt_plan_tool_loop_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[tokio::test]
+    #[cfg(all(feature = "agent-runtime", unix))]
+    async fn chatgpt_plan_cli_login_to_bound_text_completion() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_providers::plan_test_transport::{SyntheticIdentity, scope_with_observer};
+        let server = MockServer::start().await;
+        let identity = Arc::new(SyntheticIdentity::new());
+        let nonce = Arc::new(Mutex::new(String::new()));
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(identity.jwks()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/token")).respond_with({ let identity = identity.clone(); let nonce = nonce.clone(); move |request: &wiremock::Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            assert!(body.contains("client_id=oaiapp_fixture")); assert!(body.contains("code_verifier="));
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"synthetic-cli-access","refresh_token":"synthetic-cli-refresh",
+                "id_token":identity.id_token("oaiapp_fixture","subject-fixture",&nonce.lock().unwrap()),"expires_in":3600,"token_type":"Bearer","scope":"chatgpt.tokens.use.direct"}))
+        }}).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/responses")).respond_with(|request: &wiremock::Request| {
+            assert_eq!(request.headers.get("authorization").unwrap(),"Bearer synthetic-cli-access");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["store"],false); assert_eq!(body["stream"],true); assert!(body.get("tools").is_none());
+            ResponseTemplate::new(200).set_body_raw("data: {\"type\":\"response.output_text.delta\",\"delta\":\"READY\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".as_bytes(),"text/event-stream")
+        }).expect(2).mount(&server).await;
+        let observer = Arc::new({
+            let nonce = nonce.clone();
+            move |authorization: &str| {
+                let url = reqwest::Url::parse(authorization).unwrap();
+                let query: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                assert_eq!(query["client_id"], "dynamic_agent_client");
+                *nonce.lock().unwrap() = query["nonce"].clone();
+                let callback = format!(
+                    "{}?state={}&code=synthetic-code&client_id=oaiapp_fixture",
+                    query["redirect_uri"], query["state"]
+                );
+                ::zeroclaw_spawn::spawn!(async move {
+                    let response = reqwest::Client::new().get(callback).send().await.unwrap();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                });
+            }
+        });
+        let root = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: root.path().join("config.toml"),
+            ..Default::default()
+        };
+        Box::pin(scope_with_observer(&server.uri(), observer, async {
+            let cli = Cli::try_parse_from([
+                "zeroclaw",
+                "auth",
+                "login",
+                "--model-provider",
+                "chatgpt-plan",
+                "--profile",
+                "subscriber",
+            ])
+            .unwrap();
+            let Commands::Auth { auth_command } = cli.command else {
+                panic!("auth command");
+            };
+            handle_auth_command(auth_command, &config).await.unwrap();
+            let saved = auth::AuthService::from_config(&config)
+                .load_profiles()
+                .await
+                .unwrap();
+            assert!(saved.profiles.contains_key("chatgpt-plan:subscriber"));
+            let raw = std::fs::read_to_string(root.path().join("auth-profiles.json")).unwrap();
+            for secret in ["synthetic-cli-access", "synthetic-cli-refresh"] {
+                assert!(!raw.contains(secret));
+            }
+            config.providers.models.openai.insert(
+                "subscriber".into(),
+                zeroclaw_config::schema::OpenAIModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("model-fixture".into()),
+                        kind: Some("chatgpt-plan".into()),
+                        chatgpt_plan_auth: Some(zeroclaw_config::schema::ChatGptPlanAuthConfig {
+                            registration: "chatgpt-plan:subscriber".into(),
+                        }),
+                        ..Default::default()
+                    },
+                },
+            );
+            // Re-materialize config and auth service to exercise the restart seam.
+            let mut restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            restored.config_path = config.config_path.clone();
+            assert_eq!(
+                auth::chatgpt_plan::check_bound_provider(
+                    &restored,
+                    "openai.subscriber",
+                    "Reply READY"
+                )
+                .await
+                .unwrap(),
+                "READY"
+            );
+            let cli = Cli::try_parse_from([
+                "zeroclaw",
+                "auth",
+                "plan-check",
+                "--model-provider",
+                "openai.subscriber",
+                "--message",
+                "Reply READY",
+            ])
+            .unwrap();
+            let Commands::Auth { auth_command } = cli.command else {
+                panic!("auth command");
+            };
+            handle_auth_command(auth_command, &restored).await.unwrap();
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "agent-runtime", unix))]
+    async fn chatgpt_plan_cli_rejects_import_device_code_and_unbound_check() {
+        let root = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: root.path().join("config.toml"),
+            ..Default::default()
+        };
+        for args in [
+            vec![
+                "zeroclaw",
+                "auth",
+                "login",
+                "--model-provider",
+                "chatgpt-plan",
+                "--device-code",
+            ],
+            vec![
+                "zeroclaw",
+                "auth",
+                "login",
+                "--model-provider",
+                "chatgpt-plan",
+                "--import",
+                "synthetic-do-not-read.json",
+            ],
+            vec![
+                "zeroclaw",
+                "auth",
+                "plan-check",
+                "--model-provider",
+                "openai.missing",
+                "--message",
+                "fixture",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Auth { auth_command } = cli.command else {
+                panic!("auth command");
+            };
+            assert!(handle_auth_command(auth_command, &config).await.is_err());
+        }
+        assert!(!root.path().join("auth-profiles.json").exists());
+    }
 
     /// `oidc login` prints the access token on stdout and shells capture it, so
     /// the browser opener must not inherit the CLI's standard streams. The probe

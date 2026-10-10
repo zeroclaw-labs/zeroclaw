@@ -2,10 +2,14 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(any(test, not(unix)))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::fs::{self, OpenOptions};
+use tokio::fs;
+#[cfg(not(unix))]
+use tokio::fs::OpenOptions;
+#[cfg(not(unix))]
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use zeroclaw_config::secrets::SecretStore;
@@ -13,8 +17,13 @@ use zeroclaw_config::secrets::SecretStore;
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
+#[cfg(unix)]
+const LOCK_GATE_FILENAME: &str = "auth-profiles.guard";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
+
+#[cfg(all(test, unix))]
+tokio::task_local! { static REPLACE_GATE_BEFORE_PUBLICATION: std::cell::Cell<bool>; }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -23,7 +32,7 @@ pub enum AuthProfileKind {
     Token,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     #[serde(default)]
@@ -36,6 +45,29 @@ pub struct TokenSet {
     pub token_type: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("expires_at", &self.expires_at)
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Validated registration identity, distinct from any email/workspace label.
+/// Credentials remain solely in TokenSet's encrypted persistence fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGptPlanRegistration {
+    pub client_id: String,
+    pub subject: String,
+    #[serde(default)]
+    pub earliest_refresh_at: Option<DateTime<Utc>>,
+    /// Durable refresh egress marker; unresolved outcomes require re-login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_started_at: Option<DateTime<Utc>>,
 }
 
 impl TokenSet {
@@ -61,6 +93,8 @@ pub struct AuthProfile {
     pub account_id: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_registration: Option<ChatGptPlanRegistration>,
     #[serde(default)]
     pub token_set: Option<TokenSet>,
     #[serde(default)]
@@ -97,6 +131,7 @@ impl AuthProfile {
             kind: AuthProfileKind::OAuth,
             account_id: None,
             workspace_id: None,
+            plan_registration: None,
             token_set: Some(token_set),
             token: None,
             metadata: BTreeMap::new(),
@@ -115,6 +150,7 @@ impl AuthProfile {
             kind: AuthProfileKind::Token,
             account_id: None,
             workspace_id: None,
+            plan_registration: None,
             token_set: None,
             token: Some(token),
             metadata: BTreeMap::new(),
@@ -130,6 +166,8 @@ pub struct AuthProfilesData {
     pub updated_at: DateTime<Utc>,
     pub active_profiles: BTreeMap<String, String>,
     pub profiles: BTreeMap<String, AuthProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_host_id: Option<String>,
 }
 
 impl Default for AuthProfilesData {
@@ -139,6 +177,7 @@ impl Default for AuthProfilesData {
             updated_at: Utc::now(),
             active_profiles: BTreeMap::new(),
             profiles: BTreeMap::new(),
+            plan_host_id: None,
         }
     }
 }
@@ -180,6 +219,16 @@ impl AuthProfilesStore {
 
         profile.updated_at = Utc::now();
         if let Some(existing) = data.profiles.get(&profile.id) {
+            if let Some(registration) = &existing.plan_registration {
+                anyhow::ensure!(
+                    profile
+                        .plan_registration
+                        .as_ref()
+                        .is_some_and(|new| new.client_id == registration.client_id
+                            && new.subject == registration.subject),
+                    "ChatGPT plan registration identity changed; use a separate profile"
+                );
+            }
             profile.created_at = existing.created_at;
         }
 
@@ -192,6 +241,54 @@ impl AuthProfilesStore {
         data.updated_at = Utc::now();
 
         self.save_locked(&data).await
+    }
+
+    /// Persist once per instance before starting authorization. UUIDs contain
+    /// no account identity; legacy stores migrate lazily when opting in.
+    pub async fn ensure_plan_host_id(&self) -> Result<String> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+        if let Some(id) = data.plan_host_id {
+            return Ok(id);
+        }
+        let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+        data.plan_host_id = Some(id.clone());
+        self.save_locked(&data).await?;
+        Ok(id)
+    }
+
+    /// Kernel-held lock, released on process exit. The file lives in the
+    /// canonical instance directory, so root aliases coordinate naturally.
+    pub(super) async fn acquire_plan_refresh_lock(
+        &self,
+        registration: &str,
+    ) -> Result<std::fs::File> {
+        use sha2::{Digest, Sha256};
+        let parent = self.path.parent().context("Auth store has no directory")?;
+        fs::create_dir_all(parent).await?;
+        let root = std::fs::canonicalize(parent)?;
+        let path = root.join(format!(
+            "auth-plan-refresh-{}.lock",
+            hex::encode(Sha256::digest(registration.as_bytes()))
+        ));
+        let file = super::protected_file::lock_file(&path)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(LOCK_WAIT_MS)).await
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("Timed out waiting for ChatGPT plan refresh lock")
+                }
+                Err(error) => {
+                    return Err(error).context("Unable to lock ChatGPT plan registration");
+                }
+            }
+        }
     }
 
     pub async fn remove_profile(&self, profile_id: &str) -> Result<bool> {
@@ -328,6 +425,7 @@ impl AuthProfilesStore {
                     kind,
                     account_id: p.account_id.clone(),
                     workspace_id: p.workspace_id.clone(),
+                    plan_registration: p.plan_registration.clone(),
                     token_set,
                     token,
                     metadata: p.metadata.clone(),
@@ -346,6 +444,7 @@ impl AuthProfilesStore {
             updated_at: parse_datetime_with_fallback(&persisted.updated_at),
             active_profiles: persisted.active_profiles,
             profiles,
+            plan_host_id: persisted.plan_host_id,
         })
     }
 
@@ -355,15 +454,32 @@ impl AuthProfilesStore {
             updated_at: data.updated_at.to_rfc3339(),
             active_profiles: data.active_profiles.clone(),
             profiles: BTreeMap::new(),
+            plan_host_id: data.plan_host_id.clone(),
         };
 
         for (id, profile) in &data.profiles {
+            // Plan credentials always use encryption, even when the legacy
+            // operator preference permits plaintext API/Codex credentials.
+            let plan_secrets = SecretStore::new(
+                self.path.parent().context("Auth store has no directory")?,
+                true,
+            );
+            let encrypt = |value: Option<&str>| -> Result<Option<String>> {
+                if profile.plan_registration.is_some() {
+                    value
+                        .filter(|s| !s.is_empty())
+                        .map(|s| plan_secrets.encrypt(s))
+                        .transpose()
+                } else {
+                    self.encrypt_optional(value)
+                }
+            };
             let (access_token, refresh_token, id_token, expires_at, token_type, scope) =
                 match (&profile.kind, &profile.token_set) {
                     (AuthProfileKind::OAuth, Some(token_set)) => (
-                        self.encrypt_optional(Some(&token_set.access_token))?,
-                        self.encrypt_optional(token_set.refresh_token.as_deref())?,
-                        self.encrypt_optional(token_set.id_token.as_deref())?,
+                        encrypt(Some(&token_set.access_token))?,
+                        encrypt(token_set.refresh_token.as_deref())?,
+                        encrypt(token_set.id_token.as_deref())?,
                         token_set.expires_at.as_ref().map(DateTime::to_rfc3339),
                         token_set.token_type.clone(),
                         token_set.scope.clone(),
@@ -381,6 +497,7 @@ impl AuthProfilesStore {
                     kind: profile_kind_to_string(profile.kind).to_string(),
                     account_id: profile.account_id.clone(),
                     workspace_id: profile.workspace_id.clone(),
+                    plan_registration: profile.plan_registration.clone(),
                     access_token,
                     refresh_token,
                     id_token,
@@ -399,16 +516,9 @@ impl AuthProfilesStore {
     }
 
     async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
-        if !self.path.exists() {
+        let Some(bytes) = super::protected_file::read(&self.path)? else {
             return Ok(PersistedAuthProfiles::default());
-        }
-
-        let bytes = fs::read(&self.path).await.with_context(|| {
-            format!(
-                "Failed to read auth profile store at {}",
-                self.path.display()
-            )
-        })?;
+        };
 
         if bytes.is_empty() {
             return Ok(PersistedAuthProfiles::default());
@@ -449,29 +559,7 @@ impl AuthProfilesStore {
 
         let json =
             serde_json::to_vec_pretty(persisted).context("Failed to serialize auth profiles")?;
-        let tmp_name = format!(
-            "{}.tmp.{}.{}",
-            PROFILES_FILENAME,
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let tmp_path = self.path.with_file_name(tmp_name);
-
-        fs::write(&tmp_path, &json).await.with_context(|| {
-            format!(
-                "Failed to write temporary auth profile file at {}",
-                tmp_path.display()
-            )
-        })?;
-
-        fs::rename(&tmp_path, &self.path).await.with_context(|| {
-            format!(
-                "Failed to replace auth profile store at {}",
-                self.path.display()
-            )
-        })?;
-
-        Ok(())
+        super::protected_file::atomic_write(&self.path, &json)
     }
 
     fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>> {
@@ -491,6 +579,77 @@ impl AuthProfilesStore {
         }
     }
 
+    #[cfg(unix)]
+    async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
+        let parent = self
+            .lock_path
+            .parent()
+            .context("Auth store has no directory")?;
+        fs::create_dir_all(parent).await?;
+        let root = std::fs::canonicalize(parent)?;
+        let gate_path = root.join(LOCK_GATE_FILENAME);
+        let lock_path = root.join(LOCK_FILENAME);
+        let lease = super::protected_file::lock_file(&gate_path)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(LOCK_TIMEOUT_MS);
+        loop {
+            match lease.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("Timed out waiting for auth profile kernel lock")
+                }
+                Err(error) => return Err(error).context("Unable to lock auth profile store"),
+            }
+        }
+
+        // Atomic link publication makes recovery ownership knowable even if
+        // killed immediately: there is no create-then-write-marker window.
+        // Never delete the gate: every current peer must lock the same inode.
+        loop {
+            #[cfg(test)]
+            if REPLACE_GATE_BEFORE_PUBLICATION
+                .try_with(|replace| replace.replace(false))
+                .unwrap_or(false)
+            {
+                std::fs::remove_file(&gate_path)?;
+                std::fs::File::create(&gate_path)?;
+            }
+            super::protected_file::reject_symlink(&lock_path)?;
+            match std::fs::hard_link(&gate_path, &lock_path) {
+                Ok(()) => {
+                    anyhow::ensure!(
+                        super::protected_file::same_inode(&lease, &lock_path)?,
+                        "Auth profile kernel lock identity changed"
+                    );
+                    return Ok(AuthProfileLockGuard { lock_path, lease });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if super::protected_file::same_inode(&lease, &lock_path)? {
+                        // Current peers cannot replace this link while we hold
+                        // the gate; legacy create_new peers cannot replace it
+                        // while it exists. A matching link is a crashed owner.
+                        std::fs::remove_file(&lock_path)
+                            .context("Unable to recover auth profile sentinel")?;
+                        continue;
+                    }
+                    // A foreign inode may belong to an older live writer that
+                    // ignores the gate. Even a dead PID is not safe evidence:
+                    // checking it then unlinking races legacy replacement.
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!("Timed out waiting for legacy auth profile lock");
+                    }
+                    sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
+                }
+                Err(error) => return Err(error).context("Unable to publish auth profile sentinel"),
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
     async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
@@ -501,14 +660,16 @@ impl AuthProfilesStore {
             })?;
         }
 
+        super::protected_file::reject_symlink(&self.lock_path)?;
         let mut waited = 0_u64;
         loop {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&self.lock_path)
-                .await
-            {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            match options.open(&self.lock_path).await {
                 Ok(mut file) => {
                     let mut buffer = Vec::new();
                     writeln!(&mut buffer, "pid={}", std::process::id())?;
@@ -564,10 +725,16 @@ impl AuthProfilesStore {
 
 struct AuthProfileLockGuard {
     lock_path: PathBuf,
+    #[cfg(unix)]
+    lease: std::fs::File,
 }
 
 impl Drop for AuthProfileLockGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if !super::protected_file::same_inode(&self.lease, &self.lock_path).unwrap_or(false) {
+            return;
+        }
         let _ = std::fs::remove_file(&self.lock_path);
     }
 }
@@ -582,6 +749,8 @@ struct PersistedAuthProfiles {
     active_profiles: BTreeMap<String, String>,
     #[serde(default)]
     profiles: BTreeMap<String, PersistedAuthProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_host_id: Option<String>,
 }
 
 impl Default for PersistedAuthProfiles {
@@ -591,6 +760,7 @@ impl Default for PersistedAuthProfiles {
             updated_at: default_now_rfc3339(),
             active_profiles: BTreeMap::new(),
             profiles: BTreeMap::new(),
+            plan_host_id: None,
         }
     }
 }
@@ -605,6 +775,8 @@ struct PersistedAuthProfile {
     account_id: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_registration: Option<ChatGptPlanRegistration>,
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
@@ -672,6 +844,436 @@ pub fn profile_id(model_provider: &str, profile_name: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_process_child() {
+        let Ok(root) = std::env::var("ZEROCLAW_STORE_KILL_ROOT") else {
+            return;
+        };
+        let store = AuthProfilesStore::new(Path::new(&root), false);
+        match std::env::var("ZEROCLAW_STORE_KILL_ACTION")
+            .unwrap()
+            .as_str()
+        {
+            "hold" => {
+                let _guard = store.acquire_lock().await.unwrap();
+                std::fs::write(std::env::var("ZEROCLAW_STORE_KILL_READY").unwrap(), b"held")
+                    .unwrap();
+                std::future::pending::<()>().await;
+            }
+            "legacy-hold" => {
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&store.lock_path)
+                    .unwrap();
+                writeln!(file, "pid={}", std::process::id()).unwrap();
+                std::fs::write(std::env::var("ZEROCLAW_STORE_KILL_READY").unwrap(), b"held")
+                    .unwrap();
+                if let Ok(release) = std::env::var("ZEROCLAW_STORE_KILL_RELEASE") {
+                    while !Path::new(&release).exists() {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    std::fs::remove_file(&store.lock_path).unwrap();
+                    return;
+                }
+                std::future::pending::<()>().await;
+            }
+            "recover" => {
+                let data = tokio::time::timeout(Duration::from_secs(1), store.load())
+                    .await
+                    .expect("fresh process must regain canonical store access")
+                    .unwrap();
+                assert_eq!(
+                    data.profiles["anthropic:original"].token.as_deref(),
+                    Some("synthetic")
+                );
+                store
+                    .upsert_profile(
+                        AuthProfile::new_token("anthropic", "recovered", "synthetic-new".into()),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+            action => panic!("unexpected synthetic child action: {action}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn store_child(root: &Path, action: &str, ready: &Path) -> tokio::process::Child {
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "auth::profiles::tests::canonical_store_process_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_STORE_KILL_ROOT", root)
+            .env("ZEROCLAW_STORE_KILL_ACTION", action)
+            .env("ZEROCLAW_STORE_KILL_READY", ready)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn wait_store_child_ready(ready: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_owner_kill_recovers_and_alias_excludes_live_writers() {
+        let tmp = TempDir::new().unwrap();
+        let aliases = TempDir::new().unwrap();
+        let alias = aliases.path().join("instance");
+        std::os::unix::fs::symlink(tmp.path(), &alias).unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "original", "synthetic".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let ready = tmp.path().join("ready");
+        let mut child = store_child(&alias, "hold", &ready);
+        wait_store_child_ready(&ready).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), store.load())
+                .await
+                .is_err(),
+            "live alias writer must exclude this process"
+        );
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&store.lock_path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "legacy writer must also remain excluded"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            store_child(tmp.path(), "recover", &ready).wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            status.success(),
+            "fresh process failed to recover the canonical store"
+        );
+        assert!(
+            store
+                .load()
+                .await
+                .unwrap()
+                .profiles
+                .contains_key("anthropic:recovered")
+        );
+        // A clean downgrade can still acquire the old create_new sentinel.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&store.lock_path)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_never_reclaims_legacy_live_or_dead_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let ready = tmp.path().join("ready");
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let mut child = store_child(tmp.path(), "legacy-hold", &ready);
+        wait_store_child_ready(&ready).await;
+        let original = std::fs::read(&store.lock_path).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), store.load())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&store.lock_path).unwrap(), original);
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), store.load())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&store.lock_path).unwrap(),
+            original,
+            "a PID-only lock is not proof of safe ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_legacy_writer_clean_release_allows_current_writer() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "original", "synthetic".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let ready = tmp.path().join("ready");
+        let release = tmp.path().join("release");
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "auth::profiles::tests::canonical_store_process_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_STORE_KILL_ROOT", tmp.path())
+            .env("ZEROCLAW_STORE_KILL_ACTION", "legacy-hold")
+            .env("ZEROCLAW_STORE_KILL_READY", &ready)
+            .env("ZEROCLAW_STORE_KILL_RELEASE", &release)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        wait_store_child_ready(&ready).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), store.load())
+                .await
+                .is_err()
+        );
+        std::fs::write(release, b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                store_child(tmp.path(), "recover", &ready).wait()
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_recovery_and_cleanup_require_gate_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let guard = store.acquire_lock().await.unwrap();
+        let gate_path = tmp.path().join(LOCK_GATE_FILENAME);
+        let gate = std::fs::metadata(&gate_path).unwrap();
+        let sentinel = std::fs::metadata(&store.lock_path).unwrap();
+        assert_eq!((gate.dev(), gate.ino()), (sentinel.dev(), sentinel.ino()));
+        assert_eq!(gate.permissions().mode() & 0o777, 0o600);
+        drop(guard);
+        assert!(gate_path.exists());
+        assert!(!store.lock_path.exists());
+
+        // Matching contents/PID do not prove ownership: only the inode does.
+        let contents = std::fs::read(&gate_path).unwrap();
+        std::fs::write(&store.lock_path, &contents).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), store.load())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&store.lock_path).unwrap(), contents);
+        std::fs::remove_file(&store.lock_path).unwrap();
+
+        // Simulate an operator replacing the sentinel while our guard lives.
+        // Cleanup must leave that foreign inode intact.
+        let guard = store.acquire_lock().await.unwrap();
+        std::fs::remove_file(&store.lock_path).unwrap();
+        std::fs::write(&store.lock_path, b"pid=foreign\n").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read(&store.lock_path).unwrap(), b"pid=foreign\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_rejects_gate_and_sentinel_leaf_symlinks() {
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("outside");
+        std::fs::write(&target, b"unchanged").unwrap();
+        for filename in [LOCK_GATE_FILENAME, LOCK_FILENAME] {
+            let tmp = TempDir::new().unwrap();
+            let link = tmp.path().join(filename);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let store = AuthProfilesStore::new(tmp.path(), false);
+            assert!(
+                store.load().await.is_err(),
+                "must reject {filename} symlink"
+            );
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_identity_rejects_nonregular_and_unlinked_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let gate =
+            super::super::protected_file::lock_file(&tmp.path().join(LOCK_GATE_FILENAME)).unwrap();
+        let sentinel = tmp.path().join(LOCK_FILENAME);
+        assert!(!super::super::protected_file::same_inode(&gate, &sentinel).unwrap());
+        std::fs::create_dir(&sentinel).unwrap();
+        assert!(super::super::protected_file::same_inode(&gate, &sentinel).is_err());
+        std::fs::remove_dir(&sentinel).unwrap();
+        let fifo = std::ffi::CString::new(sentinel.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is terminated and lives through this syscall.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(super::super::protected_file::same_inode(&gate, &sentinel).is_err());
+        std::fs::remove_file(&sentinel).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join(LOCK_GATE_FILENAME), &sentinel).unwrap();
+        assert!(super::super::protected_file::same_inode(&gate, &sentinel).is_err());
+        // Cleanup must inspect a substituted symlink rather than following it.
+        std::fs::remove_file(&sentinel).unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let guard = store.acquire_lock().await.unwrap();
+        std::fs::remove_file(&sentinel).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join(LOCK_GATE_FILENAME), &sentinel).unwrap();
+        drop(guard);
+        assert!(
+            std::fs::symlink_metadata(&sentinel)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_store_detects_gate_replacement_before_publication() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let error = REPLACE_GATE_BEFORE_PUBLICATION
+            .scope(std::cell::Cell::new(true), async {
+                store.load().await.unwrap_err()
+            })
+            .await;
+        assert!(error.to_string().contains("kernel lock identity changed"));
+        // The rejected publication belongs to the substituted gate, not the
+        // file we locked. Do not unlink it under the old inode's lease.
+        assert!(store.lock_path.exists());
+        assert!(store.load().await.unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn token_debug_does_not_expose_credentials() {
+        let tokens = TokenSet {
+            access_token: "synthetic-access-secret".into(),
+            refresh_token: Some("synthetic-refresh-secret".into()),
+            id_token: Some("synthetic-id-secret".into()),
+            expires_at: None,
+            token_type: None,
+            scope: None,
+        };
+        let debug = format!("{tokens:?}");
+        for secret in [
+            "synthetic-access-secret",
+            "synthetic-refresh-secret",
+            "synthetic-id-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protected_store_rejects_symlink_read_and_write() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target");
+        let original = b"{}";
+        std::fs::write(&target, original).unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+        symlink(&target, store.path()).unwrap();
+        assert!(store.load().await.is_err());
+        assert!(
+            store
+                .upsert_profile(
+                    AuthProfile::new_token("anthropic", "default", "synthetic".into()),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(store.path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protected_store_final_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+        store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "default", "synthetic".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_store_failed_replace_leaves_no_temporary_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        std::fs::create_dir(store.path()).unwrap();
+        let persisted = PersistedAuthProfiles::default();
+        assert!(store.write_persisted_locked(&persisted).await.is_err());
+        assert!(store.path().is_dir());
+        assert!(!std::fs::read_dir(tmp.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")
+        }));
+    }
 
     #[test]
     fn profile_id_format() {

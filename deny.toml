@@ -176,6 +176,15 @@ version = "=1.0.69"
 name = "thiserror-impl"
 version = "=1.0.69"
 
+# jsonwebtoken's maintained AWS-LC backend uses untrusted 0.7, while the
+# existing Ring TLS/HMAC backend uses 0.9. Keep the patched JWT verifier
+# instead of reverting to its vulnerable pre-10.3 generation or disabling
+# advisory checks. This exact duplicate exception does not permit other
+# untrusted versions; remove it when AWS-LC aligns its parser dependency.
+[[bans.skip]]
+name = "untrusted"
+version = "=0.7.1"
+
 [[bans.skip]]
 name = "webpki-roots"
 version = "=0.26.11"

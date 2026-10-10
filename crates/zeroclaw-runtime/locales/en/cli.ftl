@@ -167,7 +167,7 @@ cli-cron-update-about = Update one or more fields of an existing scheduled task
 cli-cron-pause-about = Pause a scheduled task
 cli-cron-resume-about = Resume a paused task
 
-cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-login-about = Login with OAuth (ChatGPT plan usage, OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
@@ -949,6 +949,10 @@ cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
 cli-estop-status = Estop status:
 cli-auth-none = No auth profiles configured.
+cli-auth-chatgpt-continue = Continue with ChatGPT: open {$url} in your browser. This request asks permission to use your ChatGPT plan.
+cli-auth-chatgpt-saved = Saved ChatGPT registration chatgpt-plan:{$profile}. Bind an OpenAI provider alias explicitly before inference.
+cli-auth-chatgpt-response = {$text}
+cli-auth-plan-check-about = Complete one text-only request with an explicitly bound ChatGPT plan provider
 cli-auth-active = Active profiles:
 
 # ── misc main (errors, config, plugin info, estop fields, auth) ──

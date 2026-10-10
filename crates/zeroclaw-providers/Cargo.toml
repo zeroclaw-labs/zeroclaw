@@ -35,6 +35,9 @@ rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "rustls-tls-native-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
+# Reuse the workspace's maintained JWT verifier/backend; avoid the unmaintained
+# rsa dependency selected by jsonwebtoken's alternative rust_crypto backend.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
