@@ -1086,3 +1086,297 @@ async fn a_trapping_health_check_reads_unhealthy_without_disabling_the_channel()
     .await;
     listener.abort();
 }
+
+/// A trap leaves Wasmtime refusing every later call into that store. A
+/// `poll-message` that traps must cost only the message it had dequeued: the
+/// host discards the instance and polls a rebuilt one, so later messages still
+/// arrive, without waiting for the next health ask.
+#[tokio::test]
+async fn a_poll_trap_costs_only_its_message_and_later_ones_still_arrive() {
+    let channel = Arc::new(
+        channel("poll-trap")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    let inbound = channel.inbound();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    // The first health ask has run, so the next one is 30 seconds away and
+    // cannot be what replaces the trapped instance.
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(5)).await;
+
+    inbound.enqueue(queued("trap", "poll:trap"));
+    inbound.enqueue(queued("after-trap", "delivered after the trap"));
+    inbound.enqueue(queued("count", "configure:count"));
+    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a message queued behind the trap arrives")
+        .expect("listener remains connected");
+    assert_eq!(
+        delivered.id, "after-trap",
+        "the trapping poll consumed its own message"
+    );
+    let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the configure count arrives")
+        .expect("listener remains connected");
+    assert_eq!(
+        report.content, "configures:2",
+        "one rebuild replaced the trapped instance"
+    );
+    listener.abort();
+}
+
+/// Exports with an error result of their own fail in two ways: the plugin
+/// returns an error string and its instance is fine, or the call traps and
+/// Wasmtime refuses every later call into the store. The host keeps the
+/// instance after the first and replaces it after the second.
+#[tokio::test]
+async fn a_send_trap_replaces_the_instance_but_a_returned_error_keeps_it() {
+    let channel = channel("send-trap")
+        .await
+        .with_sender_authorizer(Arc::new(|_| true));
+
+    let returned = channel
+        .send(&outbound("v0:stale-token", "room"))
+        .await
+        .expect_err("the fixture rejects a message built from stale config");
+    assert_eq!(
+        returned.to_string(),
+        "message did not use one current config revision",
+        "the plugin's own error string reaches the caller unchanged"
+    );
+
+    let trapped = channel
+        .send(&outbound("send:trap", "room"))
+        .await
+        .expect_err("a trapping send fails");
+    assert!(
+        trapped.to_string().starts_with("channel.send trapped"),
+        "unexpected error: {trapped:#}"
+    );
+    channel
+        .send(&outbound("v1:token-send-trap", "room"))
+        .await
+        .expect("a rebuilt instance serves the next send");
+
+    let inbound = channel.inbound();
+    inbound.enqueue(queued("count", "configure:count"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the configure count arrives")
+        .expect("listener remains connected");
+    assert_eq!(
+        report.content, "configures:2",
+        "the returned error kept the instance and only the trap replaced it"
+    );
+    listener.abort();
+}
+
+/// Each rebuild runs `configure` again, which reconnects a gateway-style
+/// plugin. A plugin whose polls keep trapping must not be rebuilt on every
+/// poll: once traps outrun the rebuild budget, rebuilds come five minutes
+/// apart, and the channel delivers again once polls stop trapping.
+#[tokio::test]
+async fn rebuilds_after_repeated_poll_traps_are_spaced_out() {
+    const TRAPS: usize = 40;
+    let channel = Arc::new(
+        channel("trap-loop")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    // Virtual time; see `listener_health_follows_the_guest_health_check_at_a_bounded_cadence`.
+    tokio::time::pause();
+    let inbound = channel.inbound();
+    for index in 0..TRAPS {
+        inbound.enqueue(queued(&format!("trap-{index}"), "poll:trap"));
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    // Each instance traps on its first poll and consumes one message. The
+    // first three traps are rebuilt at once and the next instance waits five
+    // minutes, so five instances have polled after seven and a half minutes.
+    // Rebuilding on every poll would drain the queue in about twenty seconds.
+    tokio::time::sleep(Duration::from_secs(450)).await;
+    let polled = TRAPS - inbound.pending() as usize;
+    assert_eq!(
+        polled, 5,
+        "instances that polled in seven and a half minutes"
+    );
+    assert_eq!(channel.listener_health(), Some(ListenerHealth::Unhealthy));
+
+    // The wait holds back every rebuild, not only the poll loop's: a send in
+    // the meantime is refused without running the plugin.
+    let refused = channel
+        .send(&outbound("v1:token-trap-loop", "room"))
+        .await
+        .expect_err("a send cannot rebuild the instance early");
+    assert!(
+        refused.to_string().contains("keeps failing"),
+        "unexpected error: {refused:#}"
+    );
+
+    // Polls stop trapping. The next rebuild, at most five minutes away,
+    // delivers again.
+    while inbound.poll().is_some() {}
+    inbound.enqueue(queued("recovered", "delivered once polls stop trapping"));
+    let delivered = tokio::time::timeout(Duration::from_secs(300), rx.recv())
+        .await
+        .expect("the channel delivers again within one rebuild interval")
+        .expect("listener remains connected");
+    assert_eq!(delivered.id, "recovered");
+    // The first poll trapped, so the guest's health check has never run, and
+    // the listener puts the first ask off until the budget could absorb a
+    // trap, one interval later.
+    assert_eq!(channel.listener_health(), Some(ListenerHealth::Pending));
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(310)).await;
+    channel
+        .send(&outbound("v1:token-trap-loop", "room"))
+        .await
+        .expect("the rebuilt instance serves sends");
+    listener.abort();
+}
+
+/// A trapping health ask discards the instance and counts against the rebuild
+/// budget like any trap. The listener waits longer after each failed ask, so
+/// a plugin whose health check always traps stays within the budget and keeps
+/// delivering, each ask's instance replaced at once.
+#[tokio::test]
+async fn a_health_check_that_always_traps_does_not_delay_delivery() {
+    let channel = Arc::new(
+        channel("health-always-traps")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    // Virtual time; see `listener_health_follows_the_guest_health_check_at_a_bounded_cadence`.
+    tokio::time::pause();
+    let inbound = channel.inbound();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(1)).await;
+    inbound.enqueue(queued("trap", "health:trap-always"));
+
+    // The next five asks, 30, 60, 120, 240 and 480 seconds apart, each trap
+    // and cost a rebuild. Had the budget made one of those rebuilds wait, a
+    // message arriving meanwhile would have waited with it.
+    let mut configures = String::new();
+    for probe in 1..=600 {
+        inbound.enqueue(queued(&format!("probe-{probe}"), "configure:count"));
+        configures = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("probe {probe} waited more than a second"))
+            .expect("listener remains connected")
+            .content;
+        if configures == "configures:6" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert_eq!(
+        configures, "configures:6",
+        "each of the five failed asks cost one rebuild"
+    );
+    assert_eq!(channel.listener_health(), Some(ListenerHealth::Unhealthy));
+    listener.abort();
+}
+
+/// A missed deadline discards the instance and counts against the rebuild
+/// budget like a trap, so a hung export cannot reconnect the plugin at every
+/// deadline. An export that waits for a person to answer is the exception: a
+/// choice or approval prompt that outlasts the deadline is not a broken
+/// plugin.
+#[tokio::test]
+async fn missed_deadlines_spend_the_rebuild_budget_unless_a_person_is_answering() {
+    let channel = channel_with_timeout("deadline-budget", Duration::from_millis(250)).await;
+    let choices = ["yes".to_string(), "no".to_string()];
+    for attempt in 0..5 {
+        let error = channel
+            .request_choice("spin until the deadline", &choices, Duration::from_secs(60))
+            .await
+            .expect_err("an unanswered choice prompt misses the deadline");
+        assert!(
+            error.to_string().contains("wall-clock deadline"),
+            "attempt {attempt}: {error:#}"
+        );
+    }
+    channel
+        .send(&outbound("v1:token-deadline-budget", "room"))
+        .await
+        .expect("slow answers left the budget untouched");
+
+    // Three hung sends are rebuilt at once; the fourth makes the next
+    // rebuild wait.
+    for attempt in 0..4 {
+        let error = channel
+            .send(&outbound("spin until the deadline", "room"))
+            .await
+            .expect_err("a hung send misses the deadline");
+        assert!(
+            error.to_string().contains("wall-clock deadline"),
+            "attempt {attempt}: {error:#}"
+        );
+    }
+    let refused = channel
+        .send(&outbound("v1:token-deadline-budget", "room"))
+        .await
+        .expect_err("the budget holds the rebuild back");
+    assert!(
+        refused.to_string().contains("keeps failing"),
+        "unexpected error: {refused:#}"
+    );
+}
+
+/// A health check that traps now and then must not take the channel down.
+/// The listener's ask back-off returns to the regular interval after any
+/// answer, so such traps could outrun the rebuild budget; the listener skips
+/// an ask the budget could not absorb, and polls and sends never wait on it.
+#[tokio::test]
+async fn a_health_check_that_traps_now_and_then_does_not_take_the_channel_down() {
+    let channel = Arc::new(
+        channel("health-traps-now-and-then")
+            .await
+            .with_sender_authorizer(Arc::new(|_| true)),
+    );
+    // Virtual time; see `listener_health_follows_the_guest_health_check_at_a_bounded_cadence`.
+    tokio::time::pause();
+    let inbound = channel.inbound();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let listener_channel = Arc::clone(&channel);
+    let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    wait_for_listener_health(&channel, ListenerHealth::Healthy, Duration::from_secs(1)).await;
+    inbound.enqueue(queued("trap", "health:trap-alternate"));
+
+    // Every other ask traps, and asks come 30 to 60 seconds apart. For twenty
+    // minutes, every message is still delivered within a second.
+    let until = tokio::time::Instant::now() + Duration::from_secs(20 * 60);
+    let mut configures = String::new();
+    let mut probe = 0;
+    while tokio::time::Instant::now() < until {
+        probe += 1;
+        inbound.enqueue(queued(&format!("probe-{probe}"), "configure:count"));
+        configures = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("probe {probe} waited more than a second"))
+            .expect("listener remains connected")
+            .content;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let rebuilds = configures
+        .strip_prefix("configures:")
+        .and_then(|count| count.parse::<u32>().ok())
+        .expect("the probe reports a configure count")
+        - 1;
+    // The budget lets about one trapped ask through every five minutes once
+    // the first few have spent it: six in twenty minutes.
+    assert!(
+        (5..=7).contains(&rebuilds),
+        "{rebuilds} trapped asks were rebuilt in twenty minutes"
+    );
+    listener.abort();
+}

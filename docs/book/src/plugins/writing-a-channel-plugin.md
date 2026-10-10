@@ -71,10 +71,19 @@ The poll bridge deserves a note: the host runs a poll-to-push loop
 backoff from 50ms to 500ms while the queue is empty, resetting on traffic. If
 your `poll-message` traps, the host logs it, backs off, and reports the channel
 unhealthy in the gateway's `/health` snapshot, even if you export no
-`health-check` of your own. A trap also leaves the instance unable to run any
-export, so nothing more arrives through `poll-message` until the host replaces
-it: at the next [health check](#health-checks) if you advertise
-`health-check`, otherwise only when the daemon restarts or reloads. Keep it
+`health-check` of your own. A trap leaves the instance unable to run any
+export, so the host discards it and the next call builds a new one, running
+`configure` again. The message the trapping poll had taken off the queue is
+lost; later messages still arrive. Any export that traps or misses the call
+deadline is replaced the same way, while an error string your export returns
+leaves the instance in place. A rebuild reconnects a gateway-style
+plugin, so the host budgets them: it rebuilds at once while failures average
+no more than one every five minutes, allowing a burst of three, and beyond
+that waits for the budget to refill, failing calls in the meantime without
+running your plugin. A missed deadline in `request-approval` or
+`request-choice`, which wait for a person to answer, does not count against
+the budget. An export that routinely needs longer than the deadline, such as
+a large upload, calls for a higher `plugins.limits.call_timeout_ms`. Keep it
 simple: drain the queue, translate, return.
 
 ## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
@@ -132,7 +141,9 @@ poll; if you verify credentials over the network, keep the last result and
 refresh it on your own schedule. A check that traps or misses the call
 deadline discards the instance, and the host rebuilds it with `configure`, so a
 gateway-style plugin loses its connection; after each such failure the host
-waits twice as long before the next check, up to ten minutes.
+waits twice as long before the next check, up to ten minutes. The host also
+puts off a check while one more failure would make a rebuild wait, so a failed
+check never by itself makes one wait.
 
 ### The approval surface
 

@@ -260,11 +260,17 @@ jobs:
           $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
           binary="target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
           bytes="$(wc -c < "$binary" | tr -d ' ')"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sha256="$(shasum -a 256 "$binary" | cut -d ' ' -f 1)"
+          else
+            sha256="$(sha256sum "$binary" | cut -d ' ' -f 1)"
+          fi
           {
             echo "### ${{ inputs.distribution }} / ${{ matrix.target }}"
             echo
             echo "- Binary bytes: $bytes"
             echo "- Resolved features: \`$FEATURES\`"
+            echo "- SHA-256: $sha256"
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

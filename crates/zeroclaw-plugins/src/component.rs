@@ -865,17 +865,24 @@ macro_rules! call_tool_execute {
 }
 pub(crate) use call_tool_execute;
 
-/// Warm channel calls reinstantiate from host-owned inputs when the previous
-/// call was interrupted and discarded, then run under the same
-/// discard-on-interruption rule as other warm instances, inside the
-/// channel-service frame.
+/// Run one warm channel export inside the channel-service frame, bounded by
+/// the wall-clock deadline, first rebuilding the instance from host-owned
+/// inputs when an earlier call discarded it.
 ///
-/// The `discard_on_error` form also discards the instance when the call
-/// returns an error. Use it for an export with no error result of its own:
-/// every error there is a trap or a failed host call, after which Wasmtime
-/// refuses every later call into the store.
+/// `$body` returns the export's own Wasmtime result. `Err` means the call
+/// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
+/// or a result that could not be lifted. Wasmtime refuses every later call
+/// into such a store, so the instance is discarded, as it is after a missed
+/// deadline, and the error is reported with `$context`. An error the export
+/// itself returns arrives inside `Ok`, and the instance goes back to its slot.
+///
+/// Both kinds of discard count against the channel's rebuild budget, so a
+/// hung export cannot reconnect the plugin at every deadline. The
+/// `waits_on_person` form leaves missed deadlines out, for an export that
+/// waits for a person to answer, such as an approval prompt: a slow answer
+/// is not a broken plugin.
 macro_rules! call_channel {
-    (@frame $self:expr, $keep:path, $body:expr) => {{
+    (@call $self:expr, $count_missed_deadline:expr, $context:expr, $body:expr) => {{
         'plugin_call: {
             let mut guard = $self.state.lock().await;
             if guard.is_none() {
@@ -890,36 +897,35 @@ macro_rules! call_channel {
             let deadline = store.data().call_timeout();
             let mut active_call = crate::component::ActivePluginCall::channel_service(&mut store);
             let f = $body;
-            match ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await
-            {
-                Ok(result) => {
-                    drop(active_call);
-                    if $keep(&result) {
-                        *guard = Some((store, bindings));
-                    }
-                    break 'plugin_call result;
+            let outcome =
+                ::tokio::time::timeout(deadline, f(active_call.store_mut(), &mut bindings)).await;
+            drop(active_call);
+            match outcome {
+                Ok(Ok(value)) => {
+                    *guard = Some((store, bindings));
+                    Ok(value)
+                }
+                Ok(Err(error)) => {
+                    $self.instance_failed();
+                    crate::component::wt(Err(error), $context)
                 }
                 Err(_) => {
-                    drop(active_call);
-                    break 'plugin_call Err(crate::component::call_timeout_error(deadline));
+                    if $count_missed_deadline {
+                        $self.instance_failed();
+                    }
+                    Err(crate::component::call_timeout_error(deadline))
                 }
             }
         }
     }};
-    ($self:expr, discard_on_error, $body:expr) => {{
-        crate::component::call_channel!(@frame $self, ::std::result::Result::is_ok, $body)
+    ($self:expr, waits_on_person, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, false, $context, $body)
     }};
-    ($self:expr, $body:expr) => {{
-        crate::component::call_channel!(@frame $self, crate::component::keep_warm_instance, $body)
+    ($self:expr, $context:expr, $body:expr) => {{
+        crate::component::call_channel!(@call $self, true, $context, $body)
     }};
 }
 pub(crate) use call_channel;
-
-/// `call_channel!` keeps the instance after any call that finished inside its
-/// deadline.
-pub(crate) fn keep_warm_instance<T>(_result: &T) -> bool {
-    true
-}
 
 /// Run one direct owned-store call inside its host-service frame, bounded by
 /// the wall-clock deadline. Used during instantiation and metadata probing,

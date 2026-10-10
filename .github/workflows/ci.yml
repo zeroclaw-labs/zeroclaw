@@ -205,6 +205,12 @@ jobs:
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
 
+      - name: Test binary size report
+        run: bash scripts/ci/binary_size_report.test.sh
+
+      - name: Test dependency footprint report
+        run: bash scripts/ci/dependency_footprint.test.sh
+
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
 

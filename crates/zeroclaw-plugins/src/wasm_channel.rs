@@ -59,6 +59,9 @@ pub struct WasmChannel {
     /// read by `listener_health`. Only kept for a component that advertises
     /// `HEALTH_CHECK`.
     guest_health: std::sync::Mutex<GuestHealth>,
+    /// The rebuild budget of the warm instance. Only calls holding the
+    /// `state` lock change it.
+    rebuild_budget: std::sync::Mutex<RebuildBudget>,
     /// Applied at the final host boundary for polling and webhook delivery.
     sender_authorizer: SenderAuthorizer,
     /// Drain end of the bounded gateway-to-plugin queue. Set once by runtime
@@ -204,6 +207,86 @@ fn listener_verdict(
     guest.map(|guest| guest.observe(now, stale_after))
 }
 
+/// The average spacing the rebuild budget allows between failures. Each
+/// rebuild runs `configure` again, which reconnects a gateway-style plugin,
+/// and platforms limit how many sessions an account may open in a day. One
+/// rebuild per five minutes, at most 291 a day, is a conservative target
+/// well under limits such as Discord's 1,000 gateway logins a day.
+const REBUILD_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Failures in quick succession that are each rebuilt at once before the
+/// budget makes a rebuild wait.
+const REBUILD_BURST: u32 = 3;
+
+/// The rebuild budget of a channel's warm instance. A call that fails inside
+/// Wasmtime or misses its deadline discards the instance, and the next call
+/// rebuilds it unless failures have outrun the budget, in which case the call
+/// is refused.
+///
+/// Each failure adds `REBUILD_INTERVAL` of debt, which drains in real time,
+/// and a rebuild may start while the debt is at most `REBUILD_BURST`
+/// intervals. Failures at most one per interval are therefore always rebuilt
+/// at once, a burst of `REBUILD_BURST` is too, and beyond that rebuilds come
+/// one interval apart. No pattern of counted failures gets more than
+/// `REBUILD_BURST` rebuilds plus one per elapsed interval.
+#[derive(Clone, Copy, Debug)]
+struct RebuildBudget {
+    /// When the debt from counted failures is paid off.
+    paid_off_at: Instant,
+}
+
+impl RebuildBudget {
+    fn new(now: Instant) -> Self {
+        Self { paid_off_at: now }
+    }
+
+    /// Count a failure at `now`.
+    fn failed(&mut self, now: Instant) {
+        self.paid_off_at = self.paid_off_at.max(now) + REBUILD_INTERVAL;
+    }
+
+    /// How long a rebuild must still wait at `now`.
+    fn wait(&self, now: Instant) -> Duration {
+        self.paid_off_at
+            .saturating_duration_since(now)
+            .saturating_sub(REBUILD_INTERVAL.saturating_mul(REBUILD_BURST))
+    }
+
+    /// Whether a failure at `now` would still be rebuilt at once.
+    fn absorbs_failure(&self, now: Instant) -> bool {
+        let mut after = *self;
+        after.failed(now);
+        after.wait(now).is_zero()
+    }
+}
+
+/// Whether the listener asks the guest's `health-check` after a poll: when
+/// an ask is due, after a poll that completed, and while the rebuild budget
+/// would absorb a trap.
+///
+/// A failed poll has discarded the instance, and asking then would rebuild
+/// it ahead of the next poll or, while a rebuild waits, record a failure the
+/// guest's check never had. The ask is the host's own check, so it waits
+/// rather than spend the budget down to where a trap makes a rebuild wait:
+/// a check that traps now and then must not hold back the channel's other
+/// calls. A due ask stays due, and runs once the budget recovers.
+fn health_ask_due(
+    poll_completed: bool,
+    budget_absorbs_trap: bool,
+    next_ask: Option<Instant>,
+    now: Instant,
+) -> bool {
+    poll_completed && budget_absorbs_trap && next_ask.is_some_and(|due| now >= due)
+}
+
+/// Error for a call refused while the rebuild budget holds the rebuild back.
+fn rebuild_delayed_error(wait: Duration) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "plugin instance is unavailable: it keeps failing, and the host rebuilds it in {} ms",
+        wait.as_millis()
+    ))
+}
+
 fn deny_all_senders() -> SenderAuthorizer {
     Arc::new(|_| false)
 }
@@ -315,20 +398,37 @@ impl WasmChannel {
             cached_multi_message_delay_ms: instance.multi_message_delay_ms,
             poll_healthy: AtomicBool::new(true),
             guest_health: std::sync::Mutex::new(GuestHealth::Unasked),
+            rebuild_budget: std::sync::Mutex::new(RebuildBudget::new(Instant::now())),
             sender_authorizer: deny_all_senders(),
             webhook_rx: std::sync::Mutex::new(None),
         })
     }
 
-    /// Rebuild an interrupted warm instance from the host-owned component,
-    /// scope, generation-scoped config snapshot, and limits, reattaching the
-    /// queued inbound backlog. A message the interrupted call had already
-    /// dequeued through `inbound-poll` is not requeued: inbound delivery to
-    /// the guest is at-most-once across an interruption, and only the
-    /// still-queued backlog survives reconstruction.
+    /// Rebuild the warm instance after a call discarded it, from the
+    /// host-owned component, scope, generation-scoped config snapshot, and
+    /// limits, reattaching the queued inbound backlog. A message the discarded
+    /// call had already dequeued through `inbound-poll` is not requeued:
+    /// inbound delivery to the guest is at-most-once across a discard, and
+    /// only the still-queued backlog survives reconstruction.
+    ///
+    /// While the rebuild budget holds the rebuild back, this fails at once
+    /// without running guest code. A rebuild that fails counts against the
+    /// budget like a failed call.
     /// This does not lock `state`, so the shared call boundary may invoke it
     /// while holding the slot lock.
     async fn reinstantiate(&self) -> Result<(Store<PluginState>, ChannelPlugin)> {
+        let wait = self.rebuild_wait();
+        if !wait.is_zero() {
+            return Err(rebuild_delayed_error(wait));
+        }
+        let rebuilt = self.rebuild_instance().await;
+        if rebuilt.is_err() {
+            self.instance_failed();
+        }
+        rebuilt
+    }
+
+    async fn rebuild_instance(&self) -> Result<(Store<PluginState>, ChannelPlugin)> {
         let instance = self
             .factory
             .instantiate(&self.endpoint, self.inbound.clone())
@@ -338,11 +438,48 @@ impl WasmChannel {
             || instance.self_addressed_mention != self.cached_self_addressed_mention
             || instance.multi_message_delay_ms != self.cached_multi_message_delay_ms
         {
-            anyhow::bail!(
-                "channel plugin metadata changed while recreating an interrupted instance"
-            );
+            anyhow::bail!("channel plugin metadata changed while recreating a discarded instance");
         }
         Ok(instance.state)
+    }
+
+    fn rebuild_budget(&self) -> std::sync::MutexGuard<'_, RebuildBudget> {
+        self.rebuild_budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How long until the warm instance may be rebuilt; zero when it may be
+    /// rebuilt now.
+    fn rebuild_wait(&self) -> Duration {
+        self.rebuild_budget().wait(Instant::now())
+    }
+
+    /// Count a failure against the rebuild budget: a call that failed inside
+    /// Wasmtime or missed its deadline, and so discarded the instance, or a
+    /// rebuild that failed.
+    fn instance_failed(&self) {
+        let now = Instant::now();
+        let delay = {
+            let mut budget = self.rebuild_budget();
+            budget.failed(now);
+            budget.wait(now)
+        };
+        if delay.is_zero() {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "channel": self.endpoint.channel_type(),
+                    "channel_alias": self.endpoint.alias(),
+                    "retry_in_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "error_key": "plugin_channel_rebuild_delayed",
+                })),
+            "Channel plugin instance keeps failing; waiting before rebuilding it"
+        );
     }
 
     /// Whether the listener asks the guest's `health-check` export at all.
@@ -358,21 +495,16 @@ impl WasmChannel {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Call the guest's `health-check` export on the warm instance. The export
-    /// returns a bare `bool`, so any error is a trap or a failed host call, and
-    /// the instance is discarded rather than handed back unusable.
+    /// Call the guest's `health-check` export on the warm instance.
     async fn call_guest_health_check(&self) -> Result<bool> {
         call_channel!(
             self,
-            discard_on_error,
+            "channel.health-check failed",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_health_check(store)
-                        .await,
-                    "channel.health-check failed",
-                )
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_health_check(store)
+                    .await
             }
         )
     }
@@ -384,8 +516,6 @@ impl WasmChannel {
         let answer = self.call_guest_health_check().await;
         let now = Instant::now();
         if let Err(error) = &answer {
-            // The error may come from an earlier poll or send trap: a store
-            // that trapped refuses every call, including this one.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -440,14 +570,12 @@ impl WasmChannel {
         }
         call_channel!(
             self,
+            "channel.webhook-path failed",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_webhook_path(store)
-                        .await,
-                    "channel.webhook-path failed",
-                )
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_webhook_path(store)
+                    .await
             }
         )
     }
@@ -922,17 +1050,15 @@ impl Channel for WasmChannel {
         let wit_msg = to_wit_send(message);
         call_channel!(
             self,
+            "channel.send trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_send(store, &wit_msg)
-                        .await,
-                    "channel.send trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_send(store, &wit_msg)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -949,34 +1075,33 @@ impl Channel for WasmChannel {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
             const MAX_BACKOFF: Duration = Duration::from_millis(500);
             let mut backoff = INITIAL_BACKOFF;
-            // The first ask follows the first poll, so a plugin that connects
-            // lazily has had one poll to start; later asks wait a full
-            // interval, longer while asks keep failing. Asking on this task
-            // keeps it between polls, so it never overlaps `poll-message` and a
-            // busy poll loop cannot skip it.
+            // The first ask follows the first poll that completes, so a plugin
+            // that connects lazily has had one poll to start; later asks wait
+            // a full interval, longer while asks keep failing. Asking on this
+            // task keeps it between polls, so it never overlaps `poll-message`
+            // and a busy poll loop cannot skip it.
             let mut next_health_ask = self.asks_guest_health().then(Instant::now);
             let mut health_ask_interval = GUEST_HEALTH_INTERVAL;
             loop {
                 let polled: Result<Option<WitInboundMessage>> = call_channel!(
                     self,
+                    "channel.poll-message trapped",
                     async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                        wt(
-                            bindings
-                                .zeroclaw_plugin_channel()
-                                .call_poll_message(store)
-                                .await,
-                            "channel.poll-message trapped",
-                        )
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_poll_message(store)
+                            .await
                     }
                 );
-                if let Some(due) = next_health_ask
-                    && Instant::now() >= due
-                {
+                let now = Instant::now();
+                let budget_absorbs_trap = self.rebuild_budget().absorbs_failure(now);
+                if health_ask_due(polled.is_ok(), budget_absorbs_trap, next_health_ask, now) {
                     let completed = self.ask_guest_health().await;
                     health_ask_interval =
                         next_guest_health_interval(health_ask_interval, completed);
                     next_health_ask = Some(Instant::now() + health_ask_interval);
                 }
+                let mut pause = backoff;
                 match polled {
                     Ok(Some(wit_msg)) => {
                         mark_poll_healthy(&self.poll_healthy, true);
@@ -998,6 +1123,9 @@ impl Channel for WasmChannel {
                     Ok(None) => mark_poll_healthy(&self.poll_healthy, true),
                     Err(error) => {
                         mark_poll_healthy(&self.poll_healthy, false);
+                        // The failed poll left no instance, and polling again
+                        // before it may be rebuilt would only fail again.
+                        pause = pause.max(self.rebuild_wait());
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1009,15 +1137,16 @@ impl Channel for WasmChannel {
                                 "channel": self.endpoint.channel_type(),
                                 "channel_alias": self.endpoint.alias(),
                                 "error": bounded_webhook_detail(format!("{error:#}")),
+                                "retry_in_ms": u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
                             })),
-                            "Channel plugin poll-message trapped; backing off"
+                            "Channel plugin poll-message failed; backing off"
                         );
                     }
                 }
 
                 tokio::select! {
                     () = tx.closed() => return Ok(()),
-                    () = tokio::time::sleep(backoff) => {}
+                    () = tokio::time::sleep(pause) => {}
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -1153,17 +1282,15 @@ impl Channel for WasmChannel {
         let recipient = recipient.to_string();
         call_channel!(
             self,
+            "channel.start-typing trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_start_typing(store, &recipient)
-                        .await,
-                    "channel.start-typing trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_start_typing(store, &recipient)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
@@ -1173,17 +1300,15 @@ impl Channel for WasmChannel {
         let recipient = recipient.to_string();
         call_channel!(
             self,
+            "channel.stop-typing trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_stop_typing(store, &recipient)
-                        .await,
-                    "channel.stop-typing trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_stop_typing(store, &recipient)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -1198,17 +1323,15 @@ impl Channel for WasmChannel {
         let wit_msg = to_wit_send(message);
         call_channel!(
             self,
+            "channel.send-draft trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_send_draft(store, &wit_msg)
-                        .await,
-                    "channel.send-draft trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_send_draft(store, &wit_msg)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
@@ -1225,17 +1348,15 @@ impl Channel for WasmChannel {
         );
         call_channel!(
             self,
+            "channel.update-draft trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_update_draft(store, &recipient, &message_id, &text)
-                        .await,
-                    "channel.update-draft trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_update_draft(store, &recipient, &message_id, &text)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn update_draft_progress(
@@ -1257,17 +1378,15 @@ impl Channel for WasmChannel {
         );
         call_channel!(
             self,
+            "channel.update-draft-progress trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_update_draft_progress(store, &recipient, &message_id, &text)
-                        .await,
-                    "channel.update-draft-progress trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_update_draft_progress(store, &recipient, &message_id, &text)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn finalize_draft(
@@ -1290,17 +1409,15 @@ impl Channel for WasmChannel {
         );
         call_channel!(
             self,
+            "channel.finalize-draft trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_finalize_draft(store, &recipient, &message_id, &text)
-                        .await,
-                    "channel.finalize-draft trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_finalize_draft(store, &recipient, &message_id, &text)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
@@ -1313,17 +1430,15 @@ impl Channel for WasmChannel {
         let (recipient, message_id) = (recipient.to_string(), message_id.to_string());
         call_channel!(
             self,
+            "channel.cancel-draft trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_cancel_draft(store, &recipient, &message_id)
-                        .await,
-                    "channel.cancel-draft trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_cancel_draft(store, &recipient, &message_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -1353,17 +1468,15 @@ impl Channel for WasmChannel {
         );
         call_channel!(
             self,
+            "channel.add-reaction trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_add_reaction(store, &channel_id, &message_id, &emoji)
-                        .await,
-                    "channel.add-reaction trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_add_reaction(store, &channel_id, &message_id, &emoji)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
@@ -1380,17 +1493,15 @@ impl Channel for WasmChannel {
         );
         call_channel!(
             self,
+            "channel.remove-reaction trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_remove_reaction(store, &channel_id, &message_id, &emoji)
-                        .await,
-                    "channel.remove-reaction trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_remove_reaction(store, &channel_id, &message_id, &emoji)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
@@ -1400,17 +1511,15 @@ impl Channel for WasmChannel {
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
         call_channel!(
             self,
+            "channel.pin-message trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_pin_message(store, &channel_id, &message_id)
-                        .await,
-                    "channel.pin-message trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_pin_message(store, &channel_id, &message_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn unpin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
@@ -1423,17 +1532,15 @@ impl Channel for WasmChannel {
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
         call_channel!(
             self,
+            "channel.unpin-message trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_unpin_message(store, &channel_id, &message_id)
-                        .await,
-                    "channel.unpin-message trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_unpin_message(store, &channel_id, &message_id)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn redact_message(
@@ -1451,17 +1558,15 @@ impl Channel for WasmChannel {
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
         call_channel!(
             self,
+            "channel.redact-message trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_redact_message(store, &channel_id, &message_id, reason.as_deref())
-                        .await,
-                    "channel.redact-message trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_redact_message(store, &channel_id, &message_id, reason.as_deref())
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     async fn request_approval(
@@ -1477,20 +1582,19 @@ impl Channel for WasmChannel {
         }
         let recipient = recipient.to_string();
         let wit_req = to_wit_approval_request(request);
-        call_channel!(
+        let response = call_channel!(
             self,
+            waits_on_person,
+            "channel.request-approval trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                let out = wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_request_approval(store, &recipient, &wit_req)
-                        .await,
-                    "channel.request-approval trapped",
-                )?
-                .map_err(anyhow::Error::msg)?;
-                Ok(out.map(from_wit_approval_response))
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_request_approval(store, &recipient, &wit_req)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)?;
+        Ok(response.map(from_wit_approval_response))
     }
 
     async fn request_choice(
@@ -1510,17 +1614,16 @@ impl Channel for WasmChannel {
         let timeout_secs = timeout.as_secs();
         call_channel!(
             self,
+            waits_on_person,
+            "channel.request-choice trapped",
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
-                wt(
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_request_choice(store, &question, &choices, timeout_secs)
-                        .await,
-                    "channel.request-choice trapped",
-                )?
-                .map_err(anyhow::Error::msg)
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_request_choice(store, &question, &choices, timeout_secs)
+                    .await
             }
-        )
+        )?
+        .map_err(anyhow::Error::msg)
     }
 
     fn supports_free_form_ask(&self) -> bool {
@@ -1735,6 +1838,136 @@ mod tests {
                 .answered(true, asked)
                 .observe(slowest_next_answer, stale_after),
             ListenerHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn failures_at_most_one_per_interval_are_always_rebuilt_at_once() {
+        let start = Instant::now();
+        let mut budget = RebuildBudget::new(start);
+        assert_eq!(budget.wait(start), Duration::ZERO, "a new channel");
+        for failure in 0..100 {
+            let now = start + REBUILD_INTERVAL * failure;
+            budget.failed(now);
+            assert_eq!(budget.wait(now), Duration::ZERO, "failure {failure}");
+        }
+    }
+
+    #[test]
+    fn a_burst_is_rebuilt_at_once_and_then_rebuilds_come_one_interval_apart() {
+        let start = Instant::now();
+        let mut budget = RebuildBudget::new(start);
+        // Each rebuilt instance fails as soon as it is built.
+        let mut now = start + Duration::from_secs(5);
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            budget.failed(now);
+            let wait = budget.wait(now);
+            waits.push(wait.as_secs());
+            now += wait;
+        }
+        assert_eq!(waits, [0, 0, 0, 300, 300, 300]);
+    }
+
+    #[test]
+    fn the_rebuild_budget_refills_as_time_passes() {
+        let start = Instant::now();
+        let mut budget = RebuildBudget::new(start);
+        for _ in 0..=REBUILD_BURST {
+            budget.failed(start);
+        }
+        assert_eq!(budget.wait(start), REBUILD_INTERVAL);
+        assert_eq!(
+            budget.wait(start + REBUILD_INTERVAL / 2),
+            REBUILD_INTERVAL / 2
+        );
+
+        // One quiet interval per failure restores the whole burst.
+        let rested = start + REBUILD_INTERVAL * (REBUILD_BURST + 1);
+        for _ in 0..REBUILD_BURST {
+            budget.failed(rested);
+            assert_eq!(budget.wait(rested), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn no_pattern_of_failures_outruns_the_rebuild_budget() {
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+        let per_day = REBUILD_BURST
+            + u32::try_from(DAY.as_secs() / REBUILD_INTERVAL.as_secs())
+                .expect("a day holds a small number of intervals");
+        // How long each rebuilt instance runs before it fails, repeated: any
+        // steady run time up to twenty minutes, and bursts of instant failures
+        // between long runs.
+        let mut patterns: Vec<Vec<Duration>> = (0..=1_200)
+            .map(|secs| vec![Duration::from_secs(secs)])
+            .collect();
+        for burst in 1..=10 {
+            for run in [300, 600, 601, 720, 1_200] {
+                let mut pattern = vec![Duration::ZERO; burst];
+                pattern.push(Duration::from_secs(run));
+                patterns.push(pattern);
+            }
+        }
+        for pattern in patterns {
+            let start = Instant::now();
+            let mut budget = RebuildBudget::new(start);
+            let mut built = start;
+            let mut rebuilds = 0;
+            for runs_for in pattern.iter().cycle() {
+                let failed = built + *runs_for;
+                budget.failed(failed);
+                let rebuilt = failed + budget.wait(failed);
+                if rebuilt > start + DAY || rebuilds > per_day {
+                    break;
+                }
+                built = rebuilt;
+                rebuilds += 1;
+            }
+            assert!(
+                rebuilds <= per_day,
+                "instances running {pattern:?}: {rebuilds} rebuilds in a day"
+            );
+        }
+    }
+
+    #[test]
+    fn the_listener_asks_only_after_a_completed_poll_and_within_the_budget() {
+        let now = Instant::now();
+        assert!(health_ask_due(true, true, Some(now), now));
+        assert!(
+            !health_ask_due(false, true, Some(now), now),
+            "a failed poll discarded the instance"
+        );
+        assert!(
+            !health_ask_due(true, false, Some(now), now),
+            "a trap now would make a rebuild wait"
+        );
+        assert!(
+            !health_ask_due(true, true, Some(now + GUEST_HEALTH_INTERVAL), now),
+            "not due yet"
+        );
+        assert!(
+            !health_ask_due(true, true, None, now),
+            "a component without a health check"
+        );
+    }
+
+    #[test]
+    fn the_budget_absorbs_a_failure_only_while_it_would_be_rebuilt_at_once() {
+        let start = Instant::now();
+        let mut budget = RebuildBudget::new(start);
+        for failure in 0..REBUILD_BURST {
+            assert!(
+                budget.absorbs_failure(start),
+                "failure {failure} of the burst"
+            );
+            budget.failed(start);
+        }
+        assert!(!budget.absorbs_failure(start));
+        assert!(
+            budget.absorbs_failure(start + REBUILD_INTERVAL),
+            "one quiet interval makes room for one more"
         );
     }
 
