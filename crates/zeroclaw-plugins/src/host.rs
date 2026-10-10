@@ -2845,6 +2845,24 @@ capabilities = ["tool"]
 
     #[test]
     fn skill_install_cleans_partial_asset_after_read_failure() {
+        fn snapshot(root: &Path, dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if entry.file_type().unwrap().is_dir() {
+                    entries.push((relative, None));
+                    entries.extend(snapshot(root, &path));
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    entries.push((relative, Some(std::fs::read(&path).unwrap())));
+                }
+            }
+            entries.sort();
+            entries
+        }
+
         let source = tempdir().unwrap();
         write_skill_bundle_plugin(source.path(), "copy-error", &["fixture"]);
         let package = source.path().join("copy-error");
@@ -2853,7 +2871,7 @@ capabilities = ["tool"]
             vec![0x5a; 32 * 1024],
         )
         .unwrap();
-        let before = package_bytes(&package);
+        let before = snapshot(&package, &package);
         let plugins = tempdir().unwrap();
         let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         {
@@ -2869,10 +2887,11 @@ capabilities = ["tool"]
         assert!(!plugins.path().join("copy-error").exists());
         assert!(host.get_plugin("copy-error").is_none());
         assert_eq!(dir_entries(plugins.path()), [".zeroclaw-package-lock-v1"]);
-        assert_eq!(package_bytes(&package), before);
+        assert_eq!(snapshot(&package, &package), before);
         // Clearing the fault permits the real package path to complete.
         host.install(package.to_str().unwrap()).unwrap();
-        assert_eq!(package_bytes(&plugins.path().join("copy-error")), before);
+        let installed = plugins.path().join("copy-error");
+        assert_eq!(snapshot(&installed, &installed), before);
     }
 
     #[cfg(unix)]
