@@ -21166,6 +21166,187 @@ temperature = 0.3
         );
     }
 
+    fn daemon_factory_agent(
+        bindings: &[&str],
+        enabled: bool,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            channels: bindings
+                .iter()
+                .map(|b| zeroclaw_config::providers::ChannelRef(b.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn daemon_factory_config(bindings: &[&str]) -> Config {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("sales".into(), daemon_factory_agent(bindings, true));
+        config
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_resolves_the_running_instances_for_the_agent() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let sibling = mock_channel("whatsapp");
+        let other = mock_channel("telegram");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&running),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("soporte".to_string()),
+                channel: Arc::clone(&sibling),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&other),
+            },
+        ]);
+
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+        let map = live_channel_map_for_agent(&config, "sales");
+
+        assert!(
+            Arc::ptr_eq(map.get("whatsapp.ventas").unwrap(), &running),
+            "a daemon turn must get the instance the channel task is running"
+        );
+        assert!(
+            !map.contains_key("whatsapp.soporte"),
+            "an exact binding must not admit another alias of the same type"
+        );
+        // The bare key follows the agent's own bindings, so it stays
+        // unambiguous even though two WhatsApp aliases are running.
+        assert!(Arc::ptr_eq(map.get("whatsapp").unwrap(), &running));
+        assert!(
+            !map.contains_key("telegram.ops") && !map.contains_key("telegram"),
+            "channels the agent is not bound to stay out of its map"
+        );
+        assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_is_empty_until_a_channel_task_publishes() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+
+        prepare_live_channel_registry(true);
+        assert!(live_channel_map_for_agent(&config, "sales").is_empty());
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+        assert!(Arc::ptr_eq(
+            live_channel_map_for_agent(&config, "sales")
+                .get("whatsapp.ventas")
+                .unwrap(),
+            &running
+        ));
+
+        drop(lease);
+        assert!(
+            live_channel_map_for_agent(&config, "sales").is_empty(),
+            "a retired channel task must not stay reachable from daemon turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_applies_type_bindings_singleton_keys_and_fallbacks() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let ops = mock_channel("telegram");
+        let alerts = mock_channel("telegram");
+        let ventas = mock_channel("whatsapp");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&ops),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("alerts".to_string()),
+                channel: Arc::clone(&alerts),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&ventas),
+            },
+        ]);
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("typed".into(), daemon_factory_agent(&["telegram"], true));
+        config.agents.insert(
+            "disabled".into(),
+            daemon_factory_agent(&["whatsapp.ventas"], false),
+        );
+
+        // A type-only binding takes every alias of that type, and two aliases
+        // leave no unambiguous bare key.
+        let map = live_channel_map_for_agent(&config, "typed");
+        assert!(Arc::ptr_eq(map.get("telegram.ops").unwrap(), &ops));
+        assert!(Arc::ptr_eq(map.get("telegram.alerts").unwrap(), &alerts));
+        assert!(
+            !map.contains_key("telegram"),
+            "a bare key would be ambiguous between two aliases"
+        );
+        assert!(!map.contains_key("whatsapp.ventas") && !map.contains_key("whatsapp"));
+
+        assert!(
+            live_channel_map_for_agent(&config, "disabled").is_empty(),
+            "a disabled agent gets no channels"
+        );
+
+        // When no agent binds any channel, an enabled agent sees all of them.
+        let mut unbound = Config::default();
+        unbound
+            .agents
+            .insert("any".into(), daemon_factory_agent(&[], true));
+        let mut keys: Vec<String> = live_channel_map_for_agent(&unbound, "any")
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "telegram.alerts",
+                "telegram.ops",
+                "whatsapp",
+                "whatsapp.ventas"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn startup_rejects_retired_publication_and_starts_no_listeners_on_setup_failure() {
         use zeroclaw_config::schema::{
