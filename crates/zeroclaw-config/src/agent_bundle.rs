@@ -380,16 +380,16 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             // the import-side `Config::validate()` reports it.
             continue;
         };
-        // An absolute `directory` names this host. Worse, it would fail the
-        // target's own validation, which requires bundle directories to sit
-        // inside *its* `<install>/shared/`. Dropping it lets the target
-        // resolve its default location for the alias, which is where the
-        // carried content is mapped back to.
+        // A `directory` that starts at a root or a drive names this host.
+        // Worse, it would fail the target's own validation, which requires
+        // bundle directories to sit inside *its* `<install>/shared/`. Dropping
+        // it lets the target resolve its default location for the alias, which
+        // is where the carried content is mapped back to.
         if configured
             .directory
             .as_deref()
             .map(str::trim)
-            .is_some_and(|dir| !dir.is_empty() && std::path::Path::new(dir).is_absolute())
+            .is_some_and(|dir| !dir.is_empty() && anchored_to_host(std::path::Path::new(dir)))
             && let Some(table) = table_at_mut(&mut out, &["skill_bundles", &bundle])
         {
             table.remove("directory");
@@ -917,6 +917,19 @@ fn is_windows_device_name(component: &str) -> bool {
 #[must_use]
 pub fn is_safe_path_component(alias: &str) -> bool {
     unportable_component(alias).is_none()
+}
+
+/// Whether a configured path starts at a root or a drive or share prefix, and
+/// so names a place on this host rather than one relative to the install.
+///
+/// `Path::is_absolute` is not enough on Windows: `\srv\skills` has a root but
+/// no drive, so it is not absolute there, yet joining it to the install keeps
+/// only the install's drive and lands at a fixed place on this host.
+fn anchored_to_host(path: &std::path::Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
+    )
 }
 
 /// The workspace-relative form of an `aieos_path` the bundle can carry, or why
@@ -3285,6 +3298,45 @@ mod tests {
         imported
             .validate()
             .expect("a bundle directory the target owns validates");
+    }
+
+    /// A Windows root without a drive is not absolute, but it still names this
+    /// host: it resolves against the install's drive, so carried as configured
+    /// it fails validation on a target installed anywhere else. It is dropped
+    /// like an absolute directory, while the content it holds inside the
+    /// shared tree still travels.
+    #[cfg(windows)]
+    #[test]
+    fn a_skill_bundle_directory_rooted_without_a_drive_is_dropped() {
+        let mut config = fixture();
+        config.config_path = std::path::PathBuf::from(r"C:\zc\config.toml");
+        config.skill_bundles.insert(
+            "research_tools".to_string(),
+            SkillBundleConfig {
+                directory: Some(r"\zc\shared\skills\pool".to_string()),
+                ..Default::default()
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.skill_bundles = vec!["research_tools".to_string()];
+        }
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.path == "skill_bundles.research_tools.directory"
+                    && d.reason == DropReason::HostSpecific),
+            "{:?}",
+            plan.dropped
+        );
+        assert_eq!(plan.skill_sources.len(), 1, "{:?}", plan.skill_sources);
+
+        let mut imported: Config = toml::from_str(&render_config_toml(&plan).unwrap()).unwrap();
+        imported.config_path = std::path::PathBuf::from(r"D:\elsewhere\config.toml");
+        imported
+            .validate()
+            .expect("a target installed elsewhere validates the bundle");
     }
 
     /// A relative directory that lexically escapes `<install>/shared/` is the
