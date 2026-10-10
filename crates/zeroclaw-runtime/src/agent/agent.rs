@@ -8015,11 +8015,20 @@ mod tests {
 
     #[tokio::test]
     async fn single_tool_rounds_rpc_transcript_matches_final_renderer_fixture() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        let fixture_text = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/single-tool-rounds.json"
-        )))
-        .unwrap();
+            "/tests/fixtures/single-tool-rounds.json"
+        ));
+        // Each published crate is self-contained; workspace tests also pin their copies.
+        let zerocode = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/zerocode");
+        if zerocode.join("Cargo.toml").is_file() {
+            assert_eq!(
+                std::fs::read_to_string(zerocode.join("tests/fixtures/single-tool-rounds.json"))
+                    .unwrap(),
+                fixture_text
+            );
+        }
+        let fixture: serde_json::Value = serde_json::from_str(fixture_text).unwrap();
         let notice = crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
         assert_eq!(fixture["unsupported_notice"], notice);
         for streaming in [false, true] {

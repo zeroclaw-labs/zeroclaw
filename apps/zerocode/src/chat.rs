@@ -30071,7 +30071,7 @@ mod tests {
 
         let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/single-tool-rounds.json"
+            "/tests/fixtures/single-tool-rounds.json"
         )))
         .unwrap();
         let notice = fixture["unsupported_notice"].as_str().unwrap();
