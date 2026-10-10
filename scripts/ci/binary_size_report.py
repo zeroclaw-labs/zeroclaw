@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import unquote, urlsplit
 
 if sys.version_info < (3, 11):
     raise SystemExit("error: binary_size_report.py requires Python 3.11 or newer (tomllib)")
@@ -375,13 +376,40 @@ def reported_executable(stdout: bytes, profile_id: str) -> Path:
     return Path(executables.pop())
 
 
-def effective_feature_evidence(stdout: bytes, repo_root: Path) -> dict[str, Any] | None:
+def artifact_package_name(package_id: str) -> str | None:
+    """Read a package name from supported nonopaque Cargo artifact IDs."""
+    source, separator, fragment = package_id.rpartition("#")
+    if not separator or re.fullmatch(r"(?:(?:registry|git|path)\+)?(?:https?|ssh|git|file)://[^\s#]+", source) is None:
+        return None
+    try:
+        location = urlsplit(source)
+    except ValueError:
+        return None
+    if not location.netloc and not location.scheme.endswith("file"):
+        return None
+    match = re.fullmatch(
+        r"(?:([A-Za-z0-9][A-Za-z0-9_-]*)[@:])?"
+        r"[0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        fragment,
+    )
+    if match is None:
+        return None
+    name = match.group(1)
+    if name is None:
+        name = unquote(location.path.rstrip("/").rsplit("/", 1)[-1])
+        if name.endswith(".git"):
+            name = name[:-4]
+    return name if PACKAGE_RE.fullmatch(name) is not None else None
+
+
+def effective_feature_evidence(stdout: bytes) -> dict[str, Any] | None:
     """Fingerprint the feature sets Cargo emitted for every compiled unit, including fresh ones."""
     units: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
     unit_features: dict[tuple[str, str, tuple[str, ...]], tuple[str, ...]] = {}
+    package_ids: dict[str, str] = {}
     binary_features: set[tuple[str, ...]] = set()
     finished = False
-    root_uri = repo_root.as_uri()
     for line in stdout.splitlines():
         try:
             message = json.loads(line)
@@ -405,16 +433,17 @@ def effective_feature_evidence(stdout: bytes, repo_root: Path) -> dict[str, Any]
             return None
         if not all(isinstance(value, str) and value for value in kinds):
             return None
-        # Local package IDs differ between source checkouts. Keep their relative
-        # identity; hash all IDs so registry credentials/absolute paths are not
-        # copied into the report. No metadata or feature-resolution probe runs.
-        for prefix in ("path+" + root_uri, root_uri):
-            if package == prefix or package.startswith(prefix + "/") or package.startswith(prefix + "#"):
-                package = "workspace:" + package[len(prefix):]
-                break
-        identity = hashlib.sha256(package.encode("utf-8")).hexdigest()
+        package_name = artifact_package_name(package)
+        if package_name is None:
+            return None
+        # Version/source changes belong to the existing lock/source context.
+        # Within one build, refuse same-name packages from different IDs rather
+        # than collapse simultaneous versions or sources into one feature set.
+        if package_name in package_ids and package_ids[package_name] != package:
+            return None
+        package_ids[package_name] = package
         enabled = tuple(sorted(set(features)))
-        unit = (identity, name, tuple(sorted(set(kinds))))
+        unit = (package_name, name, tuple(sorted(set(kinds))))
         if unit in unit_features and unit_features[unit] != enabled:
             # Cargo can build host/target variants of one unit. Without a unit
             # graph, do not infer which variant consumed each feature set.
@@ -534,7 +563,11 @@ def validate_context(context: Any, label: str) -> dict[str, list[str]]:
     config = context.get("cargo_config")
     if config is not None:
         require_fields(config, frozenset({"status", "files", "reason"}), f"{label}.cargo_config")
-        if config["status"] not in {"known", "unknown"} or not isinstance(config["files"], list):
+        if (
+            not isinstance(config["status"], str)
+            or config["status"] not in {"known", "unknown"}
+            or not isinstance(config["files"], list)
+        ):
             raise fail(f"{label}.cargo_config: malformed inspection record")
         sources = []
         for index, row in enumerate(config["files"]):
@@ -849,7 +882,7 @@ def command_measure(args: argparse.Namespace) -> None:
                 "path": relative,
                 "bytes": size,
                 "sha256": digest,
-                "effective_features": effective_feature_evidence(stdout, repo_root),
+                "effective_features": effective_feature_evidence(stdout),
             }
         )
     if git_source_identity(repo_root, identity_exclusions) != source_identity:

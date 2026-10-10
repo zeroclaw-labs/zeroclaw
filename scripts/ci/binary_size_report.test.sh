@@ -239,7 +239,13 @@ executable, requested, no_default, profile = sys.argv[1:]
 enabled = requested.split(",") if requested else []
 if no_default == "false":
     enabled = os.environ.get("FAKE_CARGO_DEFAULT_FEATURES", "default,fixture-default").split(",")
-package = "path+" + pathlib.Path.cwd().as_uri() + "#zeroclaw@0.8.5"
+package = "path+" + pathlib.Path.cwd().as_uri() + "#zeroclaw@" + os.environ.get("FAKE_CARGO_WORKSPACE_VERSION", "0.8.5")
+dependency_source = os.environ.get("FAKE_CARGO_DEPENDENCY_SOURCE", "registry+https://example.invalid/index")
+dependency_version = os.environ.get("FAKE_CARGO_DEPENDENCY_VERSION", "1.0.0")
+dependency = dependency_source + "#fixture-dependency@" + dependency_version
+if os.environ.get("FAKE_CARGO_OPAQUE_PACKAGE_ID"):
+    dependency = "fixture-dependency 1.0.0 (opaque source)"
+dependency_features = os.environ.get("FAKE_CARGO_DEPENDENCY_FEATURES", "dep-base").split(",")
 
 def emit(package, name, kind, features, executable):
     message = {"reason": "compiler-artifact", "package_id": package,
@@ -248,8 +254,16 @@ def emit(package, name, kind, features, executable):
         message["features"] = sorted(features)
     print(json.dumps(message))
 
-emit("registry+https://example.invalid/index#fixture-dependency@1.0.0", "fixture_dependency", "lib",
-     os.environ.get("FAKE_CARGO_DEPENDENCY_FEATURES", "dep-base").split(","), None)
+emit(dependency, "fixture_dependency", "lib", dependency_features, None)
+if os.environ.get("FAKE_CARGO_EXTRA_DEPENDENCY_VERSION"):
+    other = dependency_source + "#fixture-dependency@" + os.environ["FAKE_CARGO_EXTRA_DEPENDENCY_VERSION"]
+    # Distinct targets must not hide simultaneous versions of one package.
+    emit(other, "build-script-build", "custom-build", dependency_features, None)
+if os.environ.get("FAKE_CARGO_EXTRA_DEPENDENCY_SOURCE"):
+    other = os.environ["FAKE_CARGO_EXTRA_DEPENDENCY_SOURCE"] + "#fixture-dependency@" + dependency_version
+    emit(other, "fixture_dependency", "lib", dependency_features, None)
+if os.environ.get("FAKE_CARGO_HOST_TARGET_VARIANT"):
+    emit(dependency, "fixture_dependency", "lib", ["host-variant"], None)
 emit(package, "zeroclaw", "lib", enabled, None)
 print("a line that is not JSON")
 if profile != os.environ.get("FAKE_CARGO_UNREPORTED_PROFILE"):
@@ -335,10 +349,29 @@ def compare(name, before, after, expected):
     passed = row["comparable"] is expected and (expected or
               (row["delta_bytes"] is None and row["delta_percent"] is None))
     passed = passed and row["before_bytes"] >= 0 and row["after_bytes"] >= 0
+    if expected:
+        passed = passed and row["delta_bytes"] == row["after_bytes"] - row["before_bytes"]
     receipt = {"case": name, "expected_comparable": expected,
                "observed_comparable": row["comparable"], "passed": passed,
                "before_bytes": row["before_bytes"], "after_bytes": row["after_bytes"],
                "delta_bytes": row["delta_bytes"], "changed_inputs": row["changed_inputs"]}
+    receipts.append(receipt)
+    print(("PASS" if passed else "FAIL") + ": " + name + " " + json.dumps(receipt), flush=True)
+
+def invalid_status(name, status):
+    report = json.loads((evidence / "explicit-before.json").read_text())
+    report["context"]["cargo_config"]["status"] = status
+    path = evidence / (name + ".json")
+    path.write_text(json.dumps(report))
+    output = evidence / (name + "-comparison.json")
+    result = subprocess.run(["bash", str(tool), "compare", str(path), str(path),
+                             "--output", str(output)], capture_output=True, text=True)
+    (evidence / (name + ".stdout")).write_text(result.stdout)
+    (evidence / (name + ".stderr")).write_text(result.stderr)
+    passed = result.returncode == 1 and "error: before report.context.cargo_config: malformed inspection record" in result.stderr
+    passed = passed and "Traceback" not in result.stderr and not output.exists()
+    receipt = {"case": name, "passed": passed, "exit": result.returncode,
+               "traceback": "Traceback" in result.stderr, "stderr": result.stderr}
     receipts.append(receipt)
     print(("PASS" if passed else "FAIL") + ": " + name + " " + json.dumps(receipt), flush=True)
 
@@ -384,6 +417,51 @@ known["schema_version"] = 1
 legacy = evidence / "legacy-input-record.json"
 legacy.write_text(json.dumps(known))
 compare("legacy-unknown-input-record", legacy, legacy, False)
+
+# Version/source context is already recorded separately. Same named packages,
+# targets and enabled features must still provide a size delta after updates.
+repo = repository("dependency-version-control")
+a = measure(repo, "dependency-version-before")
+with (repo / "Cargo.lock").open("a") as stream:
+    stream.write("\n# fixture dependency version update\n")
+b = measure(repo, "dependency-version-after", FAKE_CARGO_DEPENDENCY_VERSION="2.0.0",
+            FAKE_CARGO_SIZES="foundation=1100")
+compare("ordinary-dependency-version-update", a, b, True)
+
+repo = repository("dependency-source-control")
+a = measure(repo, "dependency-source-before")
+with (repo / "Cargo.lock").open("a") as stream:
+    stream.write("\n# fixture dependency source update\n")
+b = measure(repo, "dependency-source-after", FAKE_CARGO_DEPENDENCY_SOURCE="git+https://example.invalid/repository?rev=new",
+            FAKE_CARGO_SIZES="foundation=1100")
+compare("ordinary-dependency-source-update", a, b, True)
+
+repo = repository("workspace-version-control")
+a = measure(repo, "workspace-version-before")
+with (repo / "Cargo.toml").open("a") as stream:
+    stream.write("\n# fixture workspace version update\n")
+b = measure(repo, "workspace-version-after", FAKE_CARGO_WORKSPACE_VERSION="0.8.6",
+            FAKE_CARGO_SIZES="foundation=1100")
+compare("ordinary-workspace-version-update", a, b, True)
+
+repo = repository("simultaneous-version-control")
+a = measure(repo, "simultaneous-versions", FAKE_CARGO_EXTRA_DEPENDENCY_VERSION="2.0.0")
+compare("ambiguous-simultaneous-package-versions", a, a, False)
+
+repo = repository("simultaneous-source-control")
+a = measure(repo, "simultaneous-sources", FAKE_CARGO_EXTRA_DEPENDENCY_SOURCE="git+https://example.invalid/other")
+compare("ambiguous-simultaneous-package-sources", a, a, False)
+
+repo = repository("host-target-control")
+a = measure(repo, "host-target-variants", FAKE_CARGO_HOST_TARGET_VARIANT="1")
+compare("ambiguous-host-target-feature-variants", a, a, False)
+
+repo = repository("opaque-package-control")
+a = measure(repo, "opaque-package-id", FAKE_CARGO_OPAQUE_PACKAGE_ID="1")
+compare("opaque-package-id-is-unknown", a, a, False)
+
+invalid_status("cargo-config-status-list", [])
+invalid_status("cargo-config-status-object", {})
 
 (evidence / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
 raise SystemExit(0 if all(receipt["passed"] for receipt in receipts) else 1)
