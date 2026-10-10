@@ -12696,6 +12696,10 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_rate_limit_tuning(
+                    tg.rate_limit_max_wait_secs,
+                    tg.typing_refresh_interval_secs,
+                )
                 .with_passive_group_context(tg.passive_group_context)
                 .with_transcription_manager(
                     config.transcription.clone(),
@@ -14274,6 +14278,10 @@ fn collect_configured_channels_with_authority(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_rate_limit_tuning(
+                        tg.rate_limit_max_wait_secs,
+                        tg.typing_refresh_interval_secs,
+                    )
                     .with_passive_group_context(tg.passive_group_context)
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -51006,6 +51014,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -51038,6 +51048,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,

@@ -16,6 +16,8 @@ use zeroclaw_config::schema::{
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
+use crate::telegram_rate_limit::{BotApiClass, TelegramRateLimiter};
+
 /// How long a successful `getUpdates` exchange stays evidence that the listener
 /// is working.
 ///
@@ -924,6 +926,14 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
+/// Default ceiling on how long a deliver-class Bot API call waits out a
+/// Telegram flood-control window (`retry_after`) before giving up.
+const TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
+
+/// Default typing-indicator refresh cadence. Telegram expires the indicator
+/// after ~5s, so the loop refreshes just under that.
+const TELEGRAM_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -938,6 +948,16 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
+    /// Shared per-token flood-control window (HTTP 429 / `retry_after`).
+    /// Runtime-only mirror of Telegram's server-side limiter; not config.
+    rate_limiter: TelegramRateLimiter,
+    /// Ceiling on how long a deliver-class Bot API call waits out a
+    /// flood-control window. Canonical source:
+    /// `[channels.telegram.<alias>].rate_limit_max_wait_secs`.
+    rate_limit_max_wait_secs: u64,
+    /// Typing-indicator refresh cadence for `start_typing`'s loop. Canonical
+    /// source: `[channels.telegram.<alias>].typing_refresh_interval_secs`.
+    typing_refresh_interval_secs: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -2562,6 +2582,9 @@ impl TelegramChannel {
             pairing,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
+            rate_limiter: TelegramRateLimiter::new(),
+            rate_limit_max_wait_secs: TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
+            typing_refresh_interval_secs: TELEGRAM_TYPING_REFRESH_INTERVAL_SECS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -2736,6 +2759,27 @@ impl TelegramChannel {
             TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
         } else {
             draft_update_interval_ms
+        };
+        self
+    }
+
+    /// Configure flood-control handling: the ceiling on deliver-class waits
+    /// and the typing-indicator refresh cadence. Zeros fall back to the
+    /// channel defaults, matching `with_streaming`.
+    pub fn with_rate_limit_tuning(
+        mut self,
+        rate_limit_max_wait_secs: u64,
+        typing_refresh_interval_secs: u64,
+    ) -> Self {
+        self.rate_limit_max_wait_secs = if rate_limit_max_wait_secs == 0 {
+            TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS
+        } else {
+            rate_limit_max_wait_secs
+        };
+        self.typing_refresh_interval_secs = if typing_refresh_interval_secs == 0 {
+            TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
+        } else {
+            typing_refresh_interval_secs
         };
         self
     }
@@ -3669,6 +3713,28 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    /// POST to a Bot API method through the shared per-token flood-control
+    /// gate (see [`crate::telegram_rate_limit::post_bot_api_json`]). Deliver-
+    /// class calls wait out an active 429 window (bounded by
+    /// `rate_limit_max_wait_secs`) and retry once on a fresh 429; Droppable
+    /// calls fail with a skip error instead of touching the network.
+    async fn bot_api_post(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+        class: BotApiClass,
+    ) -> anyhow::Result<reqwest::Response> {
+        crate::telegram_rate_limit::post_bot_api_json(
+            &self.http_client(),
+            &self.api_url(method),
+            body,
+            class,
+            &self.rate_limiter,
+            Duration::from_secs(self.rate_limit_max_wait_secs),
+        )
+        .await
     }
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
@@ -5981,14 +6047,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
 
             let markdown_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
+                .bot_api_post("sendMessage", &markdown_body, BotApiClass::Deliver)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
-                    source: e.into(),
+                    source: e,
                 })?;
 
             if markdown_resp.status().is_success() {
@@ -6018,14 +6081,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
             let plain_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
+                .bot_api_post("sendMessage", &plain_body, BotApiClass::Deliver)
                 .await
                 .map_err(|e| SendChunksError {
                     delivered: index,
-                    source: e.into(),
+                    source: e,
                 })?;
 
             if !plain_resp.status().is_success() {
@@ -7635,12 +7695,29 @@ impl Channel for TelegramChannel {
                     "text": display_text,
                 });
 
-                let resp = self
-                    .http_client()
-                    .post(self.api_url("editMessageText"))
-                    .json(&body)
-                    .send()
-                    .await?;
+                let resp = match self
+                    .bot_api_post("editMessageText", &body, BotApiClass::Droppable)
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) if err.is::<crate::telegram_rate_limit::TelegramGateError>() => {
+                        // Inside the shared flood-control window (or just
+                        // answered 429): this draft frame is stale by the next
+                        // scheduled edit anyway, so drop it like the per-chat
+                        // interval short-circuit does.
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                            "editMessageText draft update dropped"
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
 
                 if resp.status().is_success() {
                     self.last_draft_edit
@@ -7871,10 +7948,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .http_client()
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
+            .bot_api_post("editMessageText", &body, BotApiClass::Deliver)
             .await?;
 
         match Self::classify_edit_message_response(resp).await {
@@ -7897,10 +7971,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .http_client()
-            .post(self.api_url("editMessageText"))
-            .json(&plain_body)
-            .send()
+            .bot_api_post("editMessageText", &plain_body, BotApiClass::Deliver)
             .await?;
 
         match Self::classify_edit_message_response(resp).await {
@@ -8386,6 +8457,9 @@ Ensure only one `zeroclaw` process is using this bot token."
         let client = self.http_client();
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
+        let rate_limiter = self.rate_limiter.clone();
+        let max_wait = Duration::from_secs(self.rate_limit_max_wait_secs);
+        let refresh = Duration::from_secs(self.typing_refresh_interval_secs);
 
         let handle = zeroclaw_spawn::spawn!(async move {
             loop {
@@ -8393,9 +8467,19 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "chat_id": &chat_id,
                     "action": "typing"
                 });
-                let _ = client.post(&url).json(&body).send().await;
-                // Telegram typing indicator expires after 5s; refresh at 4s
-                tokio::time::sleep(Duration::from_secs(4)).await;
+                // Droppable: inside a flood-control window the indicator is
+                // skipped entirely and refreshed on the next tick.
+                let _ = crate::telegram_rate_limit::post_bot_api_json(
+                    &client,
+                    &url,
+                    &body,
+                    BotApiClass::Droppable,
+                    &rate_limiter,
+                    max_wait,
+                )
+                .await;
+                // Telegram typing indicator expires after ~5s; refresh sooner.
+                tokio::time::sleep(refresh).await;
             }
         });
 
@@ -8549,10 +8633,7 @@ impl TelegramChannel {
 
         let send_prompt = async {
             let resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&body)
-                .send()
+                .bot_api_post("sendMessage", &body, BotApiClass::Deliver)
                 .await;
 
             match resp {
@@ -8590,10 +8671,7 @@ impl TelegramChannel {
                     }
 
                     let plain_resp = self
-                        .http_client()
-                        .post(self.api_url("sendMessage"))
-                        .json(&plain_body)
-                        .send()
+                        .bot_api_post("sendMessage", &plain_body, BotApiClass::Deliver)
                         .await;
 
                     match plain_resp {
@@ -8605,10 +8683,10 @@ impl TelegramChannel {
                                 "Telegram sendMessage (approval) failed ({status}): {err}"
                             );
                         }
-                        Err(e) => Err(e.into()),
+                        Err(e) => Err(e),
                     }
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Err(e),
             }
         };
 
@@ -24232,5 +24310,231 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_message_429_waits_out_retry_after_and_retries_once() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("sendMessage flood-limited once")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .named("sendMessage succeeds after the wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        let sent = ch
+            .send_text_chunks("final answer", "100", None, 0)
+            .await
+            .expect("the chunk must be delivered by the gated retry");
+
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the deliver path must wait out retry_after before retrying, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "exactly the flood-limited attempt and one gated retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn droppable_calls_make_no_network_request_inside_flood_window() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/(editMessageText|sendChatAction)$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(0)
+            .named("droppable traffic suppressed while blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_mock_api_base(mock_server.uri());
+        ch.rate_limiter.note_rate_limited(30);
+
+        ch.update_draft("123", "42", "delta text")
+            .await
+            .expect("a skipped draft edit is not an error");
+
+        ch.start_typing("123").await.expect("start_typing");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ch.stop_typing("123").await.expect("stop_typing");
+
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "inside the shared flood window, droppable traffic must not reach the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_under_flood_window_waits_instead_of_double_firing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("editMessageText flood-limited once")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .named("editMessageText succeeds after the wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        ch.finalize_draft("123", "42", "short final text", true)
+            .await
+            .expect("the gated retry must land the edit");
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "finalize must wait out the flood window instead of instantly firing the plain fallback, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "HTML attempt plus one gated retry; no immediate plain double-fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn flood_window_is_shared_across_chats_on_the_same_token() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 30",
+                "parameters": { "retry_after": 30 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("sendMessage flood-limited once")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .named("sendMessage succeeds after the capped wait")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(0)
+            .named("no draft edit may fire while the token is blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        // Cap the deliver wait so the test does not sit out the 30s window.
+        .with_rate_limit_tuning(1, 4)
+        .with_mock_api_base(mock_server.uri());
+
+        // Chat "100" eats the 429: the deliver path waits the capped 1s, lands
+        // its retry, and notes a ~30s window for the whole token.
+        ch.send_text_chunks("final answer", "100", None, 0)
+            .await
+            .expect("retry after the capped wait");
+
+        // A draft edit for a *different* chat on the same channel instance is
+        // inside that window and must be skipped without a network call.
+        ch.update_draft("200", "42", "delta text")
+            .await
+            .expect("a skipped draft edit is not an error");
+
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "only chat 100's sendMessage attempt and its gated retry reached the mock"
+        );
     }
 }
