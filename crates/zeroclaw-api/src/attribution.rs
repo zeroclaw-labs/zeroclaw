@@ -112,6 +112,7 @@ pub enum ChannelKind {
     Notion,
     Qq,
     Reddit,
+    Sendblue,
     Signal,
     Slack,
     Telegram,

@@ -1596,6 +1596,10 @@ mod tests {
             linq: std::collections::HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: std::collections::HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: std::collections::HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]

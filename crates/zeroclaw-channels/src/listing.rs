@@ -69,6 +69,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-linq"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Sendblue"),
+        type_keys: &["sendblue"],
+        compiled: cfg!(feature = "channel-sendblue"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("NextCloud Talk"),
         type_keys: &["nextcloud", "nextcloud-talk", "nextcloud_talk"],
         compiled: cfg!(feature = "channel-nextcloud"),

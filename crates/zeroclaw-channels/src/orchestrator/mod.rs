@@ -51,6 +51,9 @@ pub use crate::notion::NotionChannel;
 pub use crate::qq::QQChannel;
 #[cfg(feature = "channel-reddit")]
 pub use crate::reddit::RedditChannel;
+#[cfg(feature = "channel-sendblue")]
+pub use crate::sendblue::SendblueChannel;
+
 #[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
@@ -533,6 +536,7 @@ const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 #[allow(clippy::struct_excessive_bools)]
 struct InterruptOnNewMessageConfig {
     telegram: bool,
+    sendblue: bool,
     slack: bool,
     discord: bool,
     mattermost: bool,
@@ -544,6 +548,7 @@ impl InterruptOnNewMessageConfig {
     fn enabled_for_channel(self, channel: &str) -> bool {
         match channel {
             "telegram" => self.telegram,
+            "sendblue" => self.sendblue,
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
@@ -565,6 +570,10 @@ fn interrupt_on_new_message_config(
             .telegram
             .values()
             .any(|tg| tg.interrupt_on_new_message),
+        sendblue: channels
+            .sendblue
+            .values()
+            .any(|sb| sb.interrupt_on_new_message),
         slack: channels
             .slack
             .values()
@@ -607,6 +616,12 @@ fn interrupt_on_new_message_enabled(
             .prompt_config
             .channels
             .telegram
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "sendblue" => ctx
+            .prompt_config
+            .channels
+            .sendblue
             .get(alias)
             .is_some_and(|config| config.interrupt_on_new_message),
         "slack" => ctx
@@ -12637,7 +12652,8 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, sendblue, email, gmail_push, git, irc, twitter, mochat, imessage, line, \
+            voice-call"
         )
     }
 }
@@ -13245,6 +13261,62 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-linq"))]
         x if x.starts_with("linq") => {
             anyhow::bail!("Linq channel requires the `channel-linq` feature");
+        }
+        #[cfg(feature = "channel-sendblue")]
+        "sendblue" => {
+            let sb = config
+                .channels
+                .sendblue
+                .get("default")
+                .context("Sendblue channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+            };
+            Ok(Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias,
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ))
+        }
+        #[cfg(feature = "channel-sendblue")]
+        x if x.starts_with("sendblue.") => {
+            let alias = x
+                .strip_prefix("sendblue.")
+                .context("invalid sendblue channel id")?;
+            let sb = config
+                .channels
+                .sendblue
+                .get(alias)
+                .with_context(|| format!("Sendblue alias '{alias}' not configured"))?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.to_string();
+                Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+            };
+            Ok(Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias.to_string(),
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ))
+        }
+        #[cfg(not(feature = "channel-sendblue"))]
+        x if x.starts_with("sendblue") => {
+            anyhow::bail!("Sendblue channel requires the `channel-sendblue` feature");
         }
         #[cfg(feature = "channel-email")]
         "email" => {
@@ -14817,6 +14889,47 @@ fn collect_configured_channels_with_authority(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Linq channel is configured but this build was compiled without \
              `channel-linq`; skipping Linq."
+        );
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    for (alias, sb) in &config.channels.sendblue {
+        if !active_channel_aliases.contains(&format!("sendblue.{alias}")) {
+            continue;
+        }
+        if !sb.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Sendblue",
+            alias: Some(alias.clone()),
+            channel: Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias.clone(),
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ),
+        });
+    }
+
+    #[cfg(not(feature = "channel-sendblue"))]
+    if !config.channels.sendblue.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Sendblue channel is configured but this build was compiled without \
+             `channel-sendblue`; skipping Sendblue."
         );
     }
 
@@ -17748,6 +17861,7 @@ fn concurrent_persist_lock_serialization() {
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -17931,6 +18045,7 @@ fn test_channel_ctx_with_backend(
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -18055,6 +18170,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
         reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
         interrupt_on_new_message: InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -21483,6 +21599,7 @@ temperature = 0.3
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22460,6 +22577,7 @@ temperature = 0.3
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -22947,6 +23065,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -23056,6 +23175,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -23183,6 +23303,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -23314,6 +23435,7 @@ api_key = "anthropic-key"
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28435,6 +28557,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28534,6 +28657,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28714,6 +28838,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -28920,6 +29045,7 @@ BTC is currently around $65,000 based on latest tool output."#
             live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -29112,6 +29238,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -29313,6 +29440,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -29888,6 +30016,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30040,6 +30169,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30168,6 +30298,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30475,6 +30606,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30612,6 +30744,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30771,6 +30904,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -30913,6 +31047,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -31040,6 +31175,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -31182,6 +31318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -31351,6 +31488,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -31556,6 +31694,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -32079,6 +32218,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -32201,6 +32341,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -32333,6 +32474,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -33823,6 +33965,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -34033,6 +34176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: true,
                 slack: false,
                 discord: false,
@@ -34204,6 +34348,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -34374,6 +34519,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -34539,6 +34685,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: true,
                 discord: false,
@@ -34991,6 +35138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: true,
                 slack: false,
                 discord: false,
@@ -35137,6 +35285,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -35820,6 +35969,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -35959,6 +36109,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -36102,6 +36253,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -36237,6 +36389,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -36372,6 +36525,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -36794,6 +36948,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -38323,6 +38478,7 @@ BTC is currently around $65,000 based on latest tool output."#
             live_config: zeroclaw_config::live::LiveConfig::new(prompt_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: true,
                 slack: false,
                 discord: false,
@@ -40180,6 +40336,7 @@ BTC is currently around $65,000 based on latest tool output."#
         Arc::get_mut(&mut ctx)
             .expect("the freshly built context has no other handles yet")
             .interrupt_on_new_message = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: true,
             slack: false,
             discord: false,
@@ -42793,6 +42950,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.hooks = Some(Arc::new(hook_runner));
         }
         ctx.interrupt_on_new_message = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: interrupt_telegram,
             slack: false,
             discord: false,
@@ -44348,6 +44506,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -44536,6 +44695,7 @@ BTC is currently around $65,000 based on latest tool output."#
             live_config: zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -45066,6 +45226,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -45564,6 +45725,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -45742,6 +45904,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -49759,6 +49922,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -49896,6 +50060,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -50073,6 +50238,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -50392,6 +50558,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -50557,6 +50724,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -50714,6 +50882,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -50891,6 +51060,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: false,
                 discord: false,
@@ -51506,6 +51676,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_mattermost_when_true() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -51519,6 +51690,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_disabled_for_mattermost_by_default() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -51532,6 +51704,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_discord() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: true,
@@ -51545,6 +51718,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_whatsapp() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -51577,6 +51751,38 @@ This is an example JSON object for profile settings."#;
     /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
     /// This previously resolved to `false` because the lookup hardcoded the
     /// literal key `"default"`.
+    /// Enabling interrupts on one Sendblue alias must not enable them on
+    /// another alias that left the option off.
+    #[test]
+    fn interrupt_on_new_message_resolves_per_sendblue_alias() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        for (alias, interrupt) in [("on", true), ("off", false)] {
+            config.channels.sendblue.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::SendblueConfig {
+                    interrupt_on_new_message: interrupt,
+                    ..Default::default()
+                },
+            );
+        }
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = |alias: &str| zeroclaw_api::channel::ChannelMessage {
+            channel: "sendblue".to_string(),
+            channel_alias: Some(alias.to_string()),
+            ..Default::default()
+        };
+
+        assert!(interrupt_on_new_message_enabled(&ctx, &msg("on")));
+        assert!(!interrupt_on_new_message_enabled(&ctx, &msg("off")));
+    }
+
     #[test]
     fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
         let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
@@ -51615,6 +51821,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {
+            sendblue: false,
             telegram: false,
             slack: false,
             discord: false,
@@ -52069,6 +52276,7 @@ This is an example JSON object for profile settings."#;
             .handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
+                sendblue: false,
                 telegram: false,
                 slack: true,
                 discord: false,
