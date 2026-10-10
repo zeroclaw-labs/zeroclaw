@@ -8,13 +8,30 @@ repo_root="$(cd "${script_dir}/../.." && pwd -P)"
 policy="${repo_root}/dev/ci/dependency-footprint.toml"
 test_root="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$test_root"' EXIT
+test_mode="${1:-suite}"
+[[ "$test_mode" == suite || "$test_mode" == --comparison-input-regressions ]] \
+    || { echo "unknown fixture mode: $test_mode" >&2; exit 2; }
 
 # Variables that measure refuses or records would make fixture runs depend on the caller's environment.
 scrubbed_variables='CARGO_PROFILE_.*|CARGO_TARGET_.*_(RUSTFLAGS|LINKER)|RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS'
 scrubbed_variables+='|CARGO_BUILD_RUSTFLAGS|CARGO_BUILD_TARGET|RUSTC|CARGO_BUILD_RUSTC|ZEROCLAW_BUILD_ID'
+scrubbed_variables+='|CARGO_.*|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER'
 while IFS= read -r name; do
     unset "$name"
 done < <(compgen -e | grep -E "^(${scrubbed_variables})$" || true)
+export CARGO_HOME="$test_root/cargo-home"
+mkdir -p "$CARGO_HOME"
+
+# Build input fixtures have no Cargo configuration. The real checkout does,
+# and unresolved configuration must not be a positive comparability control.
+fixture_repo="$test_root/fixture-repo"
+mkdir -p "$fixture_repo"
+cp "$repo_root/Cargo.toml" "$repo_root/Cargo.lock" "$fixture_repo/"
+git init -q "$fixture_repo"
+git -C "$fixture_repo" add Cargo.toml Cargo.lock
+git -C "$fixture_repo" -c user.name='Binary Size Fixture' \
+    -c user.email='fixture@example.invalid' -c commit.gpgsign=false \
+    -c core.hooksPath=/dev/null commit -qm 'fixture source'
 
 # A fake rustc fixes the host triple, and with it the distribution features
 # resolved for an implicit target, whatever machine runs the suite.
@@ -212,12 +229,32 @@ if [[ "$profile" != "${FAKE_CARGO_SKIP_PROFILE:-}" ]]; then
         head -c "$size" /dev/zero >"$out_dir/$name"
     fi
 fi
-printf '%s\n' '{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"zeroclaw"},"executable":null,"fresh":true}'
-printf '%s\n' 'a line that is not JSON'
-if [[ "$profile" != "${FAKE_CARGO_UNREPORTED_PROFILE:-}" ]]; then
-    printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"zeroclaw"},"executable":"%s","fresh":false}\n' \
-        "$out_dir/$name"
-fi
+python3 - "$out_dir/$name" "$features" "$no_default" "$profile" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+executable, requested, no_default, profile = sys.argv[1:]
+enabled = requested.split(",") if requested else []
+if no_default == "false":
+    enabled = os.environ.get("FAKE_CARGO_DEFAULT_FEATURES", "default,fixture-default").split(",")
+package = "path+" + pathlib.Path.cwd().as_uri() + "#zeroclaw@0.8.5"
+
+def emit(package, name, kind, features, executable):
+    message = {"reason": "compiler-artifact", "package_id": package,
+               "target": {"kind": [kind], "name": name}, "executable": executable, "fresh": True}
+    if not os.environ.get("FAKE_CARGO_MISSING_FEATURES"):
+        message["features"] = sorted(features)
+    print(json.dumps(message))
+
+emit("registry+https://example.invalid/index#fixture-dependency@1.0.0", "fixture_dependency", "lib",
+     os.environ.get("FAKE_CARGO_DEPENDENCY_FEATURES", "dep-base").split(","), None)
+emit(package, "zeroclaw", "lib", enabled, None)
+print("a line that is not JSON")
+if profile != os.environ.get("FAKE_CARGO_UNREPORTED_PROFILE"):
+    emit(package, "zeroclaw", "bin", enabled, executable)
+PY
 if [[ "$profile" == "${FAKE_CARGO_EXTRA_BINARY_PROFILE:-}" ]]; then
     printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"zeroclaw"},"executable":"%s","fresh":false}\n' \
         "$out_dir/other-$name"
@@ -242,7 +279,7 @@ run_measure() {
         FAKE_CARGO_PROFILES="$fake_profiles" \
         bash "$tool" measure \
         --cargo "$fake_cargo" \
-        --repo-root "$repo_root" \
+        --repo-root "$fixture_repo" \
         --target-dir "$target_dir" \
         --output "$output" \
         "$@" 2>"$test_root/measure.err" || status=$?
@@ -255,6 +292,104 @@ run_measure() {
 run_compare() {
     bash "$tool" compare "$@"
 }
+
+if [[ "$test_mode" == --comparison-input-regressions ]]; then
+    FAKE_CARGO_PROFILES="$fake_profiles" python3 - \
+        "$tool" "$fake_cargo" "$fixture_repo" "$test_root" <<'PY'
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+tool, cargo, source, scratch = map(pathlib.Path, sys.argv[1:])
+evidence = pathlib.Path(os.environ.get("BINARY_SIZE_REPORT_TEST_EVIDENCE_DIR", scratch / "receipts"))
+evidence.mkdir(parents=True, exist_ok=True)
+receipts = []
+
+def repository(name):
+    target = scratch / name
+    shutil.copytree(source, target)
+    return target
+
+def measure(repo, name, profile="foundation", **overrides):
+    path = evidence / (name + ".json")
+    env = dict(os.environ, FAKE_CARGO_LOG=str(scratch / "regression-cargo.log"), **overrides)
+    command = ["bash", str(tool), "measure", "--cargo", str(cargo), "--repo-root", str(repo),
+               "--target-dir", str(scratch / "builds"), "--profile", profile, "--output", str(path)]
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    return path
+
+def compare(name, before, after, expected):
+    output = evidence / (name + "-comparison.json")
+    result = subprocess.run(["bash", str(tool), "compare", str(before), str(after),
+                             "--output", str(output)], capture_output=True, text=True)
+    (evidence / (name + ".stdout")).write_text(result.stdout)
+    (evidence / (name + ".stderr")).write_text(result.stderr)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    [row] = json.loads(output.read_text())["measurements"]
+    passed = row["comparable"] is expected and (expected or
+              (row["delta_bytes"] is None and row["delta_percent"] is None))
+    passed = passed and row["before_bytes"] >= 0 and row["after_bytes"] >= 0
+    receipt = {"case": name, "expected_comparable": expected,
+               "observed_comparable": row["comparable"], "passed": passed,
+               "before_bytes": row["before_bytes"], "after_bytes": row["after_bytes"],
+               "delta_bytes": row["delta_bytes"], "changed_inputs": row["changed_inputs"]}
+    receipts.append(receipt)
+    print(("PASS" if passed else "FAIL") + ": " + name + " " + json.dumps(receipt), flush=True)
+
+repo = repository("explicit-control")
+a = measure(repo, "explicit-before")
+b = measure(repo, "explicit-after")
+compare("explicit-profile-positive-control", a, b, True)
+
+repo = repository("defaults-control")
+a = measure(repo, "defaults-before", "root-default", FAKE_CARGO_DEFAULT_FEATURES="default,old-default")
+b = measure(repo, "defaults-after", "root-default", FAKE_CARGO_DEFAULT_FEATURES="default,new-default")
+compare("changed-effective-defaults", a, b, False)
+
+repo = repository("dependency-control")
+a = measure(repo, "dependency-before", "agent-runtime", FAKE_CARGO_DEPENDENCY_FEATURES="old-dependency")
+b = measure(repo, "dependency-after", "agent-runtime", FAKE_CARGO_DEPENDENCY_FEATURES="new-dependency")
+compare("changed-dependency-feature-expansion", a, b, False)
+
+repo = repository("config-control")
+a = measure(repo, "config-before")
+(repo / ".cargo").mkdir()
+config = repo / ".cargo/config.toml"
+config.write_text('[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "target-feature=+crt-static"]\nlinker = "old-linker"\n')
+b = measure(repo, "config-flags-after")
+compare("changed-repository-rustflags", a, b, False)
+config.write_text('[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "target-feature=+crt-static"]\nlinker = "new-linker"\n')
+c = measure(repo, "config-linker-after")
+compare("changed-repository-linker", b, c, False)
+compare("unresolved-configuration-self-comparison", c, c, False)
+
+repo = repository("unknown-features-control")
+a = measure(repo, "unknown-feature-message", FAKE_CARGO_MISSING_FEATURES="1")
+compare("missing-cargo-feature-evidence", a, a, False)
+
+known = json.loads((evidence / "explicit-before.json").read_text())
+known["context"].pop("cargo_config", None)
+for item in known["measurements"]:
+    item.pop("effective_features", None)
+missing = evidence / "missing-input-record.json"
+missing.write_text(json.dumps(known))
+compare("missing-comparison-input-record", missing, missing, False)
+known["schema_version"] = 1
+legacy = evidence / "legacy-input-record.json"
+legacy.write_text(json.dumps(known))
+compare("legacy-unknown-input-record", legacy, legacy, False)
+
+(evidence / "receipts.json").write_text(json.dumps(receipts, indent=2) + "\n")
+raise SystemExit(0 if all(receipt["passed"] for receipt in receipts) else 1)
+PY
+    exit "$?"
+fi
 
 expect_invalid() {
     local name="$1"
@@ -290,7 +425,7 @@ def zeros_digest(size):
     return hashlib.sha256(b"\0" * size).hexdigest()
 
 
-assert report["schema_version"] == 1
+assert report["schema_version"] == 2
 assert report["kind"] == "binary_size"
 assert report["evidence_units"] == {
     "binary_bytes": "measured",
@@ -350,7 +485,7 @@ assert_line "$test_root/fake-cargo.log" \
 # Re-running is deterministic, and a bare wrapper invocation dispatches to measure.
 FAKE_CARGO_LOG="$test_root/rerun.log" FAKE_CARGO_PROFILES="$fake_profiles" bash "$tool" \
     --cargo "$fake_cargo" \
-    --repo-root "$repo_root" \
+    --repo-root "$fixture_repo" \
     --target-dir "$target_a" \
     --output "$test_root/report-a-rerun.json" >/dev/null 2>"$test_root/rerun.err"
 cmp -s "$test_root/report-a.json" "$test_root/report-a-rerun.json" || fail "measure was not deterministic"
@@ -375,7 +510,7 @@ def zeros_digest(size):
     return hashlib.sha256(b"\0" * size).hexdigest()
 
 
-assert delta["schema_version"] == 1
+assert delta["schema_version"] == 2
 assert delta["kind"] == "binary_size_comparison"
 assert delta["context"]["changed_fields"] == []
 assert delta["context"]["before"] == delta["context"]["after"]
@@ -523,7 +658,7 @@ expect_invalid unknown-cargo-profile-field 'report["cargo_profile"]["extra"] = 1
     'before report.cargo_profile: unknown field(s): extra'
 expect_invalid missing-context-field 'del report["context"]["build_env"]' \
     'before report.context: missing field(s): build_env'
-expect_invalid schema-version-two 'report["schema_version"] = 2' 'before report: incompatible schema version'
+expect_invalid schema-version-three 'report["schema_version"] = 3' 'before report: incompatible schema version'
 expect_invalid schema-version-bool 'report["schema_version"] = True' 'before report: incompatible schema version'
 expect_invalid wrong-kind 'report["kind"] = "dependency_footprint"' "before report.kind: expected 'binary_size'"
 expect_invalid evidence-units 'report["evidence_units"]["binary_bytes"] = "not measured"' \
@@ -816,5 +951,9 @@ with contextlib.redirect_stderr(stderr):
 assert status == 1
 assert "runs on Linux or macOS only" in stderr.getvalue(), stderr.getvalue()
 PY
+
+# CI invokes the default suite. The explicit subgroup exits above, so this
+# single invocation cannot recurse back into the full suite.
+bash "${script_dir}/binary_size_report.test.sh" --comparison-input-regressions
 
 echo "binary size report fixture tests: pass"

@@ -49,7 +49,7 @@ from dependency_footprint import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPORT_KIND = "binary_size"
 COMPARISON_KIND = "binary_size_comparison"
 PACKAGE = "zeroclaw"
@@ -100,10 +100,12 @@ CARGO_PROFILE_FIELDS = frozenset({"name", "settings"})
 REFUSED_COMPILER_OVERRIDES = ("RUSTC", "CARGO_BUILD_RUSTC")
 
 
-def require_fields(value: Any, fields: frozenset[str], label: str) -> dict[str, Any]:
+def require_fields(
+    value: Any, fields: frozenset[str], label: str, optional: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise fail(f"{label}: expected an object")
-    reject_unknown(value, set(fields), label)
+    reject_unknown(value, set(fields | optional), label)
     missing = sorted(fields - set(value))
     if missing:
         raise fail(f"{label}: missing field(s): {', '.join(missing)}")
@@ -373,6 +375,114 @@ def reported_executable(stdout: bytes, profile_id: str) -> Path:
     return Path(executables.pop())
 
 
+def effective_feature_evidence(stdout: bytes, repo_root: Path) -> dict[str, Any] | None:
+    """Fingerprint the feature sets Cargo emitted for every compiled unit, including fresh ones."""
+    units: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+    unit_features: dict[tuple[str, str, tuple[str, ...]], tuple[str, ...]] = {}
+    binary_features: set[tuple[str, ...]] = set()
+    finished = False
+    root_uri = repo_root.as_uri()
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(message, dict):
+            continue
+        if message.get("reason") == "build-finished":
+            finished = message.get("success") is True
+        if message.get("reason") != "compiler-artifact":
+            continue
+        package = message.get("package_id")
+        target = message.get("target")
+        features = message.get("features")
+        if not isinstance(package, str) or not package or not isinstance(target, dict):
+            return None
+        name, kinds = target.get("name"), target.get("kind")
+        if not isinstance(name, str) or not name or not isinstance(kinds, list) or not kinds:
+            return None
+        if not isinstance(features, list) or not all(isinstance(value, str) and value for value in features):
+            return None
+        if not all(isinstance(value, str) and value for value in kinds):
+            return None
+        # Local package IDs differ between source checkouts. Keep their relative
+        # identity; hash all IDs so registry credentials/absolute paths are not
+        # copied into the report. No metadata or feature-resolution probe runs.
+        for prefix in ("path+" + root_uri, root_uri):
+            if package == prefix or package.startswith(prefix + "/") or package.startswith(prefix + "#"):
+                package = "workspace:" + package[len(prefix):]
+                break
+        identity = hashlib.sha256(package.encode("utf-8")).hexdigest()
+        enabled = tuple(sorted(set(features)))
+        unit = (identity, name, tuple(sorted(set(kinds))))
+        if unit in unit_features and unit_features[unit] != enabled:
+            # Cargo can build host/target variants of one unit. Without a unit
+            # graph, do not infer which variant consumed each feature set.
+            return None
+        unit_features[unit] = enabled
+        units.add((*unit, enabled))
+        if name == BIN and "bin" in kinds:
+            binary_features.add(enabled)
+    if not finished or not units or len(binary_features) != 1:
+        return None
+    payload = json.dumps(sorted(units), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "binary": list(next(iter(binary_features))),
+        "artifact_feature_sets_sha256": hashlib.sha256(payload).hexdigest(),
+        "artifact_count": len(units),
+    }
+
+
+def cargo_config_evidence(repo_root: Path, triple: str, other_profiles: list[str]) -> dict[str, Any]:
+    """Inspect Cargo's documented config locations, without interpreting or merging settings."""
+    locations: list[tuple[str, Path]] = []
+    for index, directory in enumerate((repo_root, *repo_root.parents)):
+        origin = "repository" if index == 0 else f"parent/{index}"
+        for name in ("config", "config.toml"):
+            locations.append((f"{origin}/{name}", directory / ".cargo" / name))
+    try:
+        home = Path(os.environ["CARGO_HOME"]) if "CARGO_HOME" in os.environ else Path.home() / ".cargo"
+        if not home.is_absolute():
+            home = repo_root / home
+        locations.extend((f"cargo-home/{name}", home / name) for name in ("config", "config.toml"))
+    except (OSError, RuntimeError, ValueError):
+        return {"status": "unknown", "files": [], "reason": "Cargo home could not be inspected"}
+    files = []
+    unreadable = False
+    for origin, path in locations:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            unreadable = True
+            continue
+        digest = None
+        try:
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise fail("Cargo configuration is not a regular file")
+            digest = measure_binary(path, "Cargo configuration")[1]
+        except (ToolError, OSError, ValueError):
+            unreadable = True
+        files.append({"source": origin, "sha256": digest})
+    known_environment = set(build_env_names(triple)) | {"CARGO_HOME", "CARGO_BUILD_TARGET"}
+    other_prefixes = tuple(cargo_profile_env_prefix(name) for name in other_profiles)
+    unknown_environment = sorted(
+        name for name in os.environ
+        if (name.startswith("CARGO_") and name not in known_environment and not name.startswith(other_prefixes))
+        or name in {"RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"}
+    )
+    reason = None
+    if unreadable:
+        reason = "Cargo configuration could not be inspected"
+    elif files:
+        reason = "Cargo configuration files are not resolved"
+    elif unknown_environment:
+        reason = "Cargo configuration environment is not resolved: " + ", ".join(unknown_environment)
+    return {"status": "unknown" if reason else "known", "files": sorted(files, key=lambda row: row["source"]),
+            "reason": reason}
+
+
 def measure_binary(path: Path, profile_id: str) -> tuple[int, str]:
     try:
         handle = path.open("rb")
@@ -409,7 +519,7 @@ def validate_build_env(value: Any, label: str, triple: str) -> None:
 
 
 def validate_context(context: Any, label: str) -> dict[str, list[str]]:
-    require_fields(context, CONTEXT_FIELDS, label)
+    require_fields(context, CONTEXT_FIELDS, label, frozenset({"cargo_config"}))
     for key in ("git_revision", "cargo_version", "rustc_version", "rustc_host", "target"):
         require_stable_context_string(context[key], f"{label}.{key}")
     if REVISION_RE.fullmatch(context["git_revision"]) is None:
@@ -421,6 +531,25 @@ def validate_context(context: Any, label: str) -> dict[str, list[str]]:
     for key in ("rustc_host", "target"):
         require_string(context[key], f"{label}.{key}", TARGET_RE)
     validate_build_env(context["build_env"], f"{label}.build_env", context["target"])
+    config = context.get("cargo_config")
+    if config is not None:
+        require_fields(config, frozenset({"status", "files", "reason"}), f"{label}.cargo_config")
+        if config["status"] not in {"known", "unknown"} or not isinstance(config["files"], list):
+            raise fail(f"{label}.cargo_config: malformed inspection record")
+        sources = []
+        for index, row in enumerate(config["files"]):
+            item_label = f"{label}.cargo_config.files[{index}]"
+            require_fields(row, frozenset({"source", "sha256"}), item_label)
+            sources.append(require_string(row["source"], f"{item_label}.source"))
+            if row["sha256"] is not None:
+                require_digest(row["sha256"], f"{item_label}.sha256")
+        if sources != sorted(set(sources)):
+            raise fail(f"{label}.cargo_config.files: expected unique sorted sources")
+        if config["status"] == "known":
+            if config["files"] or config["reason"] is not None:
+                raise fail(f"{label}.cargo_config: unresolved configuration cannot be known")
+        else:
+            require_string(config["reason"], f"{label}.cargo_config.reason")
     selections = normalize_resolved_selections(
         context["resolved_selections"],
         f"{label}.resolved_selections",
@@ -444,7 +573,19 @@ def validate_measurement(
     selections: dict[str, list[str]],
     context: dict[str, Any],
 ) -> str:
-    require_fields(measurement, MEASUREMENT_FIELDS, label)
+    require_fields(measurement, MEASUREMENT_FIELDS, label, frozenset({"effective_features"}))
+    evidence = measurement.get("effective_features")
+    if evidence is not None:
+        require_fields(evidence, frozenset({"binary", "artifact_feature_sets_sha256", "artifact_count"}),
+                       f"{label}.effective_features")
+        features = evidence["binary"]
+        if not isinstance(features, list) or not all(isinstance(value, str) and value for value in features):
+            raise fail(f"{label}.effective_features.binary: expected feature names")
+        if features != sorted(set(features)):
+            raise fail(f"{label}.effective_features.binary: expected unique sorted features")
+        require_digest(evidence["artifact_feature_sets_sha256"], f"{label}.effective_features.artifact_feature_sets_sha256")
+        if type(evidence["artifact_count"]) is not int or evidence["artifact_count"] <= 0:
+            raise fail(f"{label}.effective_features.artifact_count: expected a positive integer")
     profile_id = require_string(measurement["id"], f"{label}.id", PROFILE_ID_RE)
     expected = policy_profiles.get(profile_id)
     if expected is None:
@@ -492,7 +633,7 @@ def validate_report(
     policy_digest: str,
 ) -> dict[str, Any]:
     require_fields(report, REPORT_FIELDS, label)
-    if type(report["schema_version"]) is not int or report["schema_version"] != SCHEMA_VERSION:
+    if type(report["schema_version"]) is not int or report["schema_version"] not in {1, SCHEMA_VERSION}:
         raise fail(f"{label}: incompatible schema version")
     if report["kind"] != REPORT_KIND:
         raise fail(f"{label}.kind: expected {REPORT_KIND!r}")
@@ -563,12 +704,35 @@ def describe_changes(changes: dict[str, Any]) -> str:
             names = [f"+{name}" for name in change["added"]] + [f"-{name}" for name in change["removed"]]
             parts.append(f"features {' '.join(names)}")
         else:
-            parts.append(f"{key} {change['before']} -> {change['after']}")
+            if key == "effective_features":
+                parts.append("Cargo enabled feature sets differ")
+            elif key == "cargo_config":
+                parts.append("Cargo configuration inspection differs")
+            else:
+                parts.append(f"{key} {change['before']} -> {change['after']}")
     return "; ".join(parts)
 
 
-def compare_measurement(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+def compare_measurement(
+    old: dict[str, Any], new: dict[str, Any], old_config: Any = None, new_config: Any = None
+) -> dict[str, Any]:
     changes = changed_inputs(old, new)
+    old_features, new_features = old.get("effective_features"), new.get("effective_features")
+    if old_features != new_features:
+        changes["effective_features"] = {"before": old_features, "after": new_features}
+    if old_config != new_config:
+        changes["cargo_config"] = {"before": old_config, "after": new_config}
+    def unknown(features: Any, config: Any) -> str:
+        if features is None:
+            return "missing Cargo enabled-feature evidence"
+        if config is None:
+            return "missing Cargo configuration inspection"
+        if config["status"] != "known":
+            return config["reason"]
+        return "known"
+    before_state, after_state = unknown(old_features, old_config), unknown(new_features, new_config)
+    if before_state != "known" or after_state != "known":
+        changes["comparison_inputs"] = {"before": before_state, "after": after_state}
     comparable = not changes
     delta = new["bytes"] - old["bytes"]
     return {
@@ -656,6 +820,7 @@ def command_measure(args: argparse.Namespace) -> None:
     context["resolved_selections"] = normalize_resolved_selections(resolved, "resolved selections")
     triple = require_string(context["target"], "target triple", TARGET_RE)
     context["build_env"] = {name: os.environ[name] for name in build_env_names(triple) if name in os.environ}
+    context["cargo_config"] = cargo_config_evidence(repo_root, triple, other_profiles)
     measurements: list[dict[str, Any]] = []
     for profile in profiles:
         inputs = profile_inputs(profile, resolved)
@@ -684,10 +849,13 @@ def command_measure(args: argparse.Namespace) -> None:
                 "path": relative,
                 "bytes": size,
                 "sha256": digest,
+                "effective_features": effective_feature_evidence(stdout, repo_root),
             }
         )
     if git_source_identity(repo_root, identity_exclusions) != source_identity:
         raise fail("git source identity: worktree changed during measurement")
+    if cargo_config_evidence(repo_root, triple, other_profiles) != context["cargo_config"]:
+        raise fail("Cargo configuration inspection changed during measurement")
     report = {
         "schema_version": SCHEMA_VERSION,
         "kind": REPORT_KIND,
@@ -732,7 +900,8 @@ def command_compare(args: argparse.Namespace) -> None:
             details.append(f"only after: {', '.join(only_after)}")
         raise fail(f"reports: incompatible policy profile sets ({'; '.join(details)})")
     rows = [
-        compare_measurement(before_items[profile_id], after_items[profile_id])
+        compare_measurement(before_items[profile_id], after_items[profile_id],
+                            before["context"].get("cargo_config"), after["context"].get("cargo_config"))
         for profile_id in sorted(before_items)
     ]
     result = {
@@ -742,7 +911,8 @@ def command_compare(args: argparse.Namespace) -> None:
             "before": before["context"],
             "after": after["context"],
             "changed_fields": sorted(
-                key for key in before["context"] if before["context"][key] != after["context"][key]
+                key for key in set(before["context"]) | set(after["context"])
+                if before["context"].get(key) != after["context"].get(key)
             ),
         },
         "policy": before["policy"],
@@ -760,7 +930,7 @@ def command_compare(args: argparse.Namespace) -> None:
     if not_comparable:
         print(
             f"note: no delta for policy profile(s) {', '.join(not_comparable)}: "
-            "their resolved inputs or binary paths differ between the reports",
+            "their comparison inputs are unknown or differ between the reports",
             file=sys.stderr,
         )
 
@@ -806,7 +976,9 @@ def parser() -> argparse.ArgumentParser:
     compare = commands.add_parser(
         "compare",
         help="compare two measure reports",
-        description="Compare two measure reports built with the same toolchain, target, and build environment.",
+        description=("Compare two measure reports built with the same toolchain, target, and build environment. "
+                     "Raw sizes remain available when enabled-feature evidence is missing or Cargo configuration "
+                     "is unresolved; those rows have no comparable delta."),
     )
     compare.add_argument("before", help="report measured first")
     compare.add_argument("after", help="report measured second")
