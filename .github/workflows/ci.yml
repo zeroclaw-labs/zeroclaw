@@ -822,6 +822,9 @@ jobs:
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
+      - name: Run manifest signing command tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
+        run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --example sign_manifest
       - name: Run runtime live-config plugin regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         # Module filter, not a single test name: agent::plugin_live_config holds
