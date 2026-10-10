@@ -371,11 +371,16 @@ mod tests {
             !tool_result.output.contains("[IMAGE:"),
             "the text references the saved path, never marker syntax"
         );
+        // The text is the serialized result, so the path in it carries JSON
+        // escaping (Windows backslashes double). Compare the escaped form.
+        let escaped_target =
+            serde_json::to_string(&tool_result.output.attachments()[0].target).unwrap();
         assert!(
             tool_result
                 .output
-                .contains(tool_result.output.attachments()[0].target.as_str()),
-            "the text keeps the path visible to the model"
+                .contains(escaped_target.trim_matches('"')),
+            "the text keeps the path visible to the model: {}",
+            tool_result.output.as_str()
         );
     }
 }

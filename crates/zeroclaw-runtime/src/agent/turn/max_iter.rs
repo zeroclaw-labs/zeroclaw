@@ -1492,7 +1492,7 @@ mod graceful_summary_metering_tests {
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::tool(tool_content.clone()),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1541,10 +1541,11 @@ mod graceful_summary_metering_tests {
         );
         // A legacy carrier is delivered as its bytes: the body reaches the
         // provider verbatim, quoted marker syntax and raw path included, as
-        // text. Nothing infers, sweeps, or strips it.
-        let body = format!("saw {marker} in output");
+        // text. Nothing infers, sweeps, or strips it. Compare the whole
+        // carrier: its JSON escaping doubles a Windows path's backslashes, so
+        // the unescaped body never appears in it there.
         assert!(
-            captured.contains(&body),
+            captured.contains(&tool_content),
             "the legacy body is delivered verbatim: {captured}"
         );
         assert!(
