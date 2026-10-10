@@ -412,8 +412,7 @@ fn assert_config_patch_notice_flush_failure(
         "the real CLI must render the saved-config Fluent context\n{evidence}"
     );
     assert!(
-        stderr.contains("opening log file")
-            && stderr.contains(&blocked_log.display().to_string()),
+        stderr.contains("opening log file") && stderr.contains(&blocked_log.display().to_string()),
         "the error must identify this log destination rather than an unrelated failure\n{evidence}"
     );
     assert!(
