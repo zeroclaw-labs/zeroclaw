@@ -43816,6 +43816,50 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(mcp_servers.value_type, "McpServerConfig");
     }
 
+    fn assert_map_key_sections_reuse_paths(
+        first: &[crate::traits::MapKeySection],
+        second: &[crate::traits::MapKeySection],
+    ) {
+        assert_eq!(first.len(), second.len());
+        for (first, second) in first.iter().zip(second) {
+            assert_eq!(
+                (
+                    first.path,
+                    first.kind,
+                    first.value_type,
+                    first.description,
+                    first.natural_key,
+                    first.resource_key,
+                ),
+                (
+                    second.path,
+                    second.kind,
+                    second.value_type,
+                    second.description,
+                    second.natural_key,
+                    second.resource_key,
+                ),
+            );
+            assert_eq!(
+                first.path.as_ptr(),
+                second.path.as_ptr(),
+                "schema path {} must reuse its static backing storage",
+                first.path,
+            );
+        }
+    }
+
+    #[test]
+    async fn map_key_sections_reuses_static_paths() {
+        let sections = Config::map_key_sections();
+        for path in ["agents", "model_routes", "mcp.servers", "cost.rates.tools"] {
+            assert!(sections.iter().any(|section| section.path == path));
+        }
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &Config::map_key_sections());
+        }
+    }
+
     #[test]
     async fn create_map_key_inserts_default_mcp_server() {
         // Round-trip: `POST /api/config/map-key?path=mcp.servers&key=github`.
@@ -44065,6 +44109,22 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         #[nested]
         pub types: HashMap<String, HashMap<String, DoubleMapLeaf>>,
+    }
+
+    #[test]
+    async fn map_key_sections_double_map_reuses_static_paths() {
+        let sections = DoubleMapOuter::map_key_sections();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.path, "dm.types");
+        assert_eq!(section.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(section.value_type, "DoubleMapLeaf");
+        assert_eq!(section.description, "");
+        assert_eq!(section.natural_key, None);
+        assert!(!section.resource_key);
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &DoubleMapOuter::map_key_sections());
+        }
     }
 
     fn double_map_fixture() -> DoubleMapOuter {
