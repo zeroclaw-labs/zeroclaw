@@ -9890,8 +9890,57 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn run_tool_call_loop_aborts_repeated_prompt_required_shell_before_reprompting() {
+    /// A channel that answers every approval request with an operator `Deny`
+    /// and counts the requests.
+    struct DenyingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DenyingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "denying-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for DenyingChannel {
+        fn name(&self) -> &str {
+            "denying-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Deny))
+        }
+    }
+
+    /// Run a turn whose model asks for the same prompt-required `shell` call
+    /// in two consecutive iterations, then answers "done". Returns the turn's
+    /// result, the number of approval requests and the number of executions.
+    async fn run_repeated_prompt_required_shell_turn(
+        approve: bool,
+    ) -> (anyhow::Result<String>, usize, usize) {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let repeated_shell_call = r#"<tool_call>
 {"name":"shell","arguments":{"command":"pwd"}}
@@ -9899,7 +9948,7 @@ mod tests {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             repeated_shell_call,
             repeated_shell_call,
-            "should not reach final response",
+            "done",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -9909,7 +9958,15 @@ mod tests {
             )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let approving_channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        let denying_channel = DenyingChannel {
+            approval_requests: Arc::clone(&approval_requests),
+        };
+        let channel: &dyn Channel = if approve {
+            &approving_channel
+        } else {
+            &denying_channel
+        };
         let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -9923,7 +9980,7 @@ mod tests {
             ..LoopKnobs::default()
         };
 
-        let err = run_tool_call_loop(ToolLoop {
+        let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9966,7 +10023,7 @@ mod tests {
             cancellation_token: None,
             on_delta: None,
             shared_budget: None,
-            channel: Some(&channel),
+            channel: Some(channel),
             collected_receipts: None,
             event_tx: None,
             steering: None,
@@ -9977,24 +10034,46 @@ mod tests {
             agent_alias: None,
             turn_id: &turn_id,
         })
-        .await
-        .expect_err("identical prompt-required shell call should abort before another prompt");
+        .await;
 
-        let err = err.to_string();
+        (
+            result,
+            approval_requests.load(Ordering::SeqCst),
+            invocations.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_reprompts_identical_shell_rerun_after_approval() {
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(true).await;
+
+        let reply = result.expect("an approved shell call may be rerun later in the same turn");
+        assert_eq!(reply, "done");
+        assert_eq!(
+            approval_requests, 2,
+            "the rerun must ask for a fresh approval instead of reusing the first one"
+        );
+        assert_eq!(invocations, 2, "each approved run executes once");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aborts_repeated_shell_call_after_denial() {
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(false).await;
+
+        let err = result
+            .expect_err("repeating a denied shell call should abort before another prompt")
+            .to_string();
         assert!(
             err.contains("repeated prompt-required tool call 'shell'"),
             "unexpected error: {err}"
         );
         assert_eq!(
-            approval_requests.load(Ordering::SeqCst),
-            1,
-            "the repeated shell call should not issue a second approval request"
+            approval_requests, 1,
+            "the repeated denied shell call should not issue a second approval request"
         );
-        assert_eq!(
-            invocations.load(Ordering::SeqCst),
-            1,
-            "the repeated shell call should not execute a second time"
-        );
+        assert_eq!(invocations, 0, "a denied shell call never executes");
     }
 
     #[tokio::test]
@@ -10127,7 +10206,11 @@ mod tests {
             )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
-        let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
+        // The guard holds the signature of a denied call, so a dedup-exempt
+        // tool repeating it must still abort instead of asking again.
+        let channel = DenyingChannel {
+            approval_requests: Arc::clone(&approval_requests),
+        };
         let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
@@ -10207,8 +10290,8 @@ mod tests {
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
-            1,
-            "dedup-exempt repeated shell should not execute a second time"
+            0,
+            "a denied dedup-exempt shell call should never execute"
         );
     }
 
