@@ -21433,8 +21433,10 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
 ///
 /// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
-/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
-/// is reported only when it differs from the configured plugins dir and contains
+/// before the data-dir rename, `<install_root>/workspace/plugins`). A resumed
+/// V2 split may have already relocated that directory; its destination comes
+/// from the same migration resolver rather than the agent's live workspace.
+/// A directory is reported only when it differs from the configured plugins dir and contains
 /// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
 /// migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
@@ -21443,6 +21445,7 @@ pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     [
         config.data_dir.join("plugins"),
         config.install_root_dir().join("workspace").join("plugins"),
+        v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins"),
     ]
     .into_iter()
     .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
@@ -30256,6 +30259,37 @@ zeroclaw-operators = "operator"
         assert_eq!(dirs.len(), 2, "both legacy locations should be reported");
         assert!(dirs.contains(&config.data_dir.join("plugins")));
         assert!(dirs.contains(&config.install_root_dir().join("workspace").join("plugins")));
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_detects_resumed_destination_after_workspace_override() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        write_plugin(&migrated, "resumed");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        assert_ne!(
+            config.agent_workspace_dir("default").join("plugins"),
+            migrated
+        );
+
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![migrated]);
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_resumed_destination_when_it_is_the_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        config.plugins.plugins_dir = migrated.to_string_lossy().into_owned();
+        write_plugin(&migrated, "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
     }
 
     #[test]

@@ -73,6 +73,19 @@ one.
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
 
+## Recovering legacy installations
+
+Run `zeroclaw plugin migrate` to relocate legacy package directories into
+`[plugins] plugins_dir`. Recovery looks in the older data and workspace
+locations and in the workspace-split destination used by V2 migration. This
+also finds packages after an interrupted split has resumed, or after the
+default agent's workspace has been changed. Packages already in the configured
+plugins directory are excluded, and an existing same-name target is preserved.
+
+Directory recovery relocates package files. It does not enable plugins, grant
+permissions, trust a publisher, or certify that a package can load or execute.
+The normal manifest, signature, component and configuration checks still apply.
+
 ## Signature policy
 
 Every plugin manifest may carry an Ed25519 signature and the hex-encoded public
