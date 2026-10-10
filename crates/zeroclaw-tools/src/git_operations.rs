@@ -171,15 +171,22 @@ enum ResolvedGitReference {
     Commit(String),
 }
 
-impl ResolvedGitReference {
-    /// The rev the preflight must list: a full refname or SHA that resolves
-    /// identically in every Git command.
-    fn listing_ref(&self) -> &str {
-        match self {
-            Self::Branch(refname) | Self::Commit(refname) => refname,
-            Self::RemoteTrack { refname, .. } => refname,
-        }
-    }
+/// A resolver selection pinned to the exact commit it designated when it
+/// was made. `reference` carries the form the mutating command and its
+/// messages need (attachment-correct spelling per variant), while
+/// `commit` is the immutable id the preflight lists and the post-exec
+/// verification demands, so a reference that moves or vanishes between
+/// resolution and execution cannot silently substitute a tree the
+/// preflight never checked.
+struct ResolvedReference {
+    reference: ResolvedGitReference,
+    commit: String,
+}
+
+/// The bare branch name Git attaches a checkout or new worktree to; only
+/// the short spelling keeps HEAD attached (`refs/heads/x` detaches).
+fn short_branch_name(refname: &str) -> &str {
+    refname.strip_prefix("refs/heads/").unwrap_or(refname)
 }
 
 impl GitOperationsTool {
@@ -1496,11 +1503,12 @@ impl GitOperationsTool {
     /// select, following the branch-first order `checkout` and
     /// `worktree add` themselves use: an existing local branch, then the
     /// unique-remote dwim, then tags and other commit-ishes. The returned
-    /// form is handed to both the preflight listing and the mutating
-    /// command, so neither command re-derives — and mis-derives — the
-    /// selection: a bare short name can resolve differently per command
-    /// (rev-parse precedence puts tags first, while checkout and worktree
-    /// add interpret the same string branch-first).
+    /// selection carries the attachment-correct execution form per variant
+    /// plus the commit id designated at resolution time: the preflight
+    /// lists that pinned id and the post-exec verification demands it, so
+    /// neither command re-derives (and mis-derives) the selection, and a
+    /// reference that moves or vanishes before execution fails the
+    /// operation instead of substituting an unchecked tree.
     ///
     /// The order replicates the mutating commands' own selection, verified
     /// against Git 2.49/2.50: an existing local branch is checked out; a
@@ -1522,7 +1530,7 @@ impl GitOperationsTool {
         supplied: &str,
         working_dir: &Path,
         allow_remote_dwim: bool,
-    ) -> anyhow::Result<ResolvedGitReference> {
+    ) -> anyhow::Result<ResolvedReference> {
         if supplied.is_empty() {
             anyhow::bail!("Cannot resolve an empty Git reference");
         }
@@ -1531,7 +1539,11 @@ impl GitOperationsTool {
             .await?;
         let local = format!("refs/heads/{supplied}");
         if refs.contains(&local) {
-            return Ok(ResolvedGitReference::Branch(local));
+            let commit = self.rev_parse_commit(&local, working_dir).await?;
+            return Ok(ResolvedReference {
+                reference: ResolvedGitReference::Branch(local),
+                commit,
+            });
         }
         // A name that resolves to any ref other than a branch detaches at
         // that commit; the remote dwim below is only consulted when the
@@ -1540,7 +1552,11 @@ impl GitOperationsTool {
         // detaches at the TAG).
         for resolvable in [format!("refs/{supplied}"), format!("refs/tags/{supplied}")] {
             if refs.contains(&resolvable) {
-                return Ok(ResolvedGitReference::Commit(resolvable));
+                let commit = self.rev_parse_commit(&resolvable, working_dir).await?;
+                return Ok(ResolvedReference {
+                    reference: ResolvedGitReference::Commit(resolvable),
+                    commit,
+                });
             }
         }
         let remotes = Self::remote_tracking_matches(&refs, supplied);
@@ -1555,9 +1571,13 @@ impl GitOperationsTool {
                     );
                 }
                 Self::ensure_unshadowed_remote_start_point(&refs, only)?;
-                return Ok(ResolvedGitReference::RemoteTrack {
-                    refname: (*only).to_string(),
-                    new_branch: supplied.to_string(),
+                let commit = self.rev_parse_commit(only, working_dir).await?;
+                return Ok(ResolvedReference {
+                    reference: ResolvedGitReference::RemoteTrack {
+                        refname: (*only).to_string(),
+                        new_branch: supplied.to_string(),
+                    },
+                    commit,
                 });
             }
             _ => anyhow::bail!(
@@ -1591,7 +1611,28 @@ impl GitOperationsTool {
                  refusing a tree that cannot be named exactly"
             );
         }
-        Ok(ResolvedGitReference::Commit(commit))
+        Ok(ResolvedReference {
+            reference: ResolvedGitReference::Commit(commit.clone()),
+            commit,
+        })
+    }
+
+    /// Resolve a reference to the single commit id it designates right
+    /// now, on the hardened read path the preflight and verification use.
+    async fn rev_parse_commit(
+        &self,
+        reference: &str,
+        working_dir: &Path,
+    ) -> anyhow::Result<String> {
+        let designated = format!("{reference}^{{commit}}");
+        let args = [
+            "--no-optional-locks",
+            "rev-parse",
+            "--verify",
+            designated.as_str(),
+        ];
+        let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
     /// Resolve which tree `git worktree add -- <path>` materializes when the
@@ -1608,7 +1649,7 @@ impl GitOperationsTool {
         &self,
         target: &Path,
         working_dir: &Path,
-    ) -> anyhow::Result<Option<ResolvedGitReference>> {
+    ) -> anyhow::Result<Option<ResolvedReference>> {
         let Some(basename) = target
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
@@ -1625,7 +1666,11 @@ impl GitOperationsTool {
             .await?;
         let expected = format!("refs/heads/{basename}");
         if refs.contains(&expected) {
-            return Ok(Some(ResolvedGitReference::Branch(expected)));
+            let commit = self.rev_parse_commit(&expected, working_dir).await?;
+            return Ok(Some(ResolvedReference {
+                reference: ResolvedGitReference::Branch(expected),
+                commit,
+            }));
         }
         if self
             .read_config_bool("worktree.guessRemote", working_dir)
@@ -1636,9 +1681,13 @@ impl GitOperationsTool {
             match remotes.as_slice() {
                 [only] => {
                     Self::ensure_unshadowed_remote_start_point(&refs, only)?;
-                    return Ok(Some(ResolvedGitReference::RemoteTrack {
-                        refname: (*only).to_string(),
-                        new_branch: basename,
+                    let commit = self.rev_parse_commit(only, working_dir).await?;
+                    return Ok(Some(ResolvedReference {
+                        reference: ResolvedGitReference::RemoteTrack {
+                            refname: (*only).to_string(),
+                            new_branch: basename,
+                        },
+                        commit,
                     }));
                 }
                 [] => {}
@@ -1652,6 +1701,71 @@ impl GitOperationsTool {
             }
         }
         Ok(None)
+    }
+
+    /// `symbolic-ref HEAD` (full refname form) for the repository Git would
+    /// act on from `working_dir`. `Ok(None)` means HEAD is detached; a query
+    /// that cannot run at all is also reported as detached, so the
+    /// verification caller fails closed instead of assuming attachment. The
+    /// full form is deliberate: with an ambiguous name (a tag and a branch
+    /// sharing it) Git's `--short` output is namespace-prefixed (`heads/x`),
+    /// while the full refname is stable.
+    async fn head_symbolic_ref(&self, working_dir: &Path) -> anyhow::Result<Option<String>> {
+        let args = ["--no-optional-locks", "symbolic-ref", "HEAD"];
+        match self.run_git_read_output(&args, working_dir).await {
+            Ok((_, stdout)) => Ok(Some(String::from_utf8_lossy(&stdout).trim().to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// After `checkout` or `worktree add` succeeds, assert the repository is
+    /// in the state the resolver selected: attached to the expected branch,
+    /// and at exactly the commit the resolution pinned (the same id the
+    /// preflight listed). Branch and dwim selections attach (Git only
+    /// attaches to a bare branch name, so those execute short while the
+    /// preflight listed the pinned id); tag and commit selections detach
+    /// (a fully-spelled positional detaches `checkout` and leaves a new
+    /// worktree detached too, creating no branch). A mismatch means a reference
+    /// moved or vanished between resolution and execution — which only an
+    /// actor with repository write access can do — and the tool reports a
+    /// hard failure instead of letting the agent commit on a silently
+    /// different checkout: a moved branch executes at its new tip, which
+    /// cannot equal the pinned id, and a vanished one either errors or
+    /// dwim-falls-through to a detached checkout the attachment check
+    /// rejects. Comparing against the pinned id (rather than re-resolving
+    /// the reference at verification time) is what detects the move.
+    async fn verify_checkout_result(
+        &self,
+        resolved: &Option<ResolvedReference>,
+        expected_branch: Option<&str>,
+        working_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(resolved) = resolved.as_ref() else {
+            // A plain `HEAD` re-checkout moves nothing; nothing to pin.
+            return Ok(());
+        };
+        let head = {
+            let args = ["--no-optional-locks", "rev-parse", "HEAD"];
+            let (_, stdout) = self.run_git_read_output(&args, working_dir).await?;
+            String::from_utf8_lossy(&stdout).trim().to_string()
+        };
+        if let Some(expected) = expected_branch {
+            let attached = self.head_symbolic_ref(working_dir).await?;
+            if attached.as_deref() != Some(format!("refs/heads/{expected}").as_str()) {
+                anyhow::bail!(
+                    "HEAD is {} rather than attached to branch '{expected}'",
+                    attached.as_deref().unwrap_or("detached")
+                );
+            }
+        }
+        if head != resolved.commit {
+            anyhow::bail!(
+                "HEAD {head} is not commit '{}' the reference was pinned to at \
+                 resolution time",
+                resolved.commit
+            );
+        }
+        Ok(())
     }
 
     /// Check every file `git worktree add` would materialize under `target`.
@@ -2487,9 +2601,12 @@ impl GitOperationsTool {
                 }
             }
         };
+        // The preflight lists the pinned commit id, not the live refname,
+        // so the tree that gets checked is the tree the resolution
+        // selected even if the reference moves afterward.
         let listing_ref = resolved
             .as_ref()
-            .map(ResolvedGitReference::listing_ref)
+            .map(|resolved| resolved.commit.as_str())
             .unwrap_or("HEAD");
 
         if let Some(refused) = preflight_outcome(
@@ -2500,14 +2617,30 @@ impl GitOperationsTool {
             return Ok(refused);
         }
 
-        // Same fully-spelled form the preflight listed; options precede the
-        // positional so no user string is re-interpreted by Git's dwim
-        // rules at run time.
+        // Execution uses the attachment-correct spelling of the SAME
+        // resolution the preflight listed: a branch checkout stays attached
+        // only when Git receives the bare branch name (`checkout
+        // refs/heads/x` detaches), so the resolved branch runs short with
+        // remote guessing disabled, while tag/commit references keep the
+        // exact fully-spelled detached form. The residual race — the branch
+        // vanishing between resolution and execution so the bare name
+        // falls through to a same-named tag — cannot be closed by
+        // spelling; the post-exec verification below asserts the
+        // attachment and tree and fails loudly instead.
         let mut checkout_args: Vec<String> = vec!["checkout".to_string()];
-        match &resolved {
+        let mut expected_branch: Option<String> = None;
+        let mut detached_at: Option<String> = None;
+        match resolved.as_ref().map(|resolved| &resolved.reference) {
             None => checkout_args.push("HEAD".to_string()),
-            Some(ResolvedGitReference::Branch(refname))
-            | Some(ResolvedGitReference::Commit(refname)) => checkout_args.push(refname.clone()),
+            Some(ResolvedGitReference::Branch(refname)) => {
+                checkout_args.push("--no-guess".to_string());
+                checkout_args.push(short_branch_name(refname).to_string());
+                expected_branch = Some(short_branch_name(refname).to_string());
+            }
+            Some(ResolvedGitReference::Commit(refname)) => {
+                checkout_args.push(refname.clone());
+                detached_at = Some(refname.clone());
+            }
             Some(ResolvedGitReference::RemoteTrack {
                 refname,
                 new_branch,
@@ -2521,17 +2654,47 @@ impl GitOperationsTool {
                     .strip_prefix("refs/remotes/")
                     .unwrap_or(refname.as_str());
                 checkout_args.push(start_point.to_string());
+                expected_branch = Some(new_branch.clone());
             }
         }
         let checkout_args: Vec<&str> = checkout_args.iter().map(String::as_str).collect();
         let output = self.run_git_command(&checkout_args, working_dir).await;
 
         match output {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                output: format!("Switched to branch: {branch_name}").into(),
-                error: None,
-            }),
+            Ok(_) => {
+                let expected = expected_branch.as_deref();
+                if let Err(e) = self
+                    .verify_checkout_result(&resolved, expected, working_dir)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "branch": branch_name,
+                            })),
+                        "git_operations: checkout result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Checkout verification failed: {e}")),
+                    });
+                }
+                let message = if let Some(branch) = &expected_branch {
+                    format!("Switched to branch: {branch}")
+                } else if let Some(reference) = &detached_at {
+                    format!("Detached HEAD at: {reference}")
+                } else {
+                    format!("Switched to branch: {branch_name}")
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output: message.into(),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -2781,11 +2944,11 @@ impl GitOperationsTool {
                 // `worktree.guessRemote` remote match, or HEAD) or the
                 // supplied reference (branch-first, then other resolvable
                 // refs which detach, then the unique-remote dwim) — and pin
-                // execution to the resolution. The preflight lists the
-                // resolved ref and the command below receives the same
-                // fully-spelled form, so Git never re-derives the selection
-                // at run time: the checked tree is the tree that gets
-                // written.
+                // execution to the resolution: the preflight lists the
+                // pinned commit id, the command below receives the
+                // attachment-correct spelling, and the post-exec
+                // verification demands the pinned id, so the checked tree
+                // is the tree that gets written.
                 let resolved = if branch.is_empty() {
                     self.resolve_worktree_omitted_reference(&worktree_path, working_dir)
                         .await?
@@ -2796,9 +2959,12 @@ impl GitOperationsTool {
                             .await?,
                     )
                 };
+                // The preflight lists the pinned commit id, not the live
+                // refname, so the tree that gets checked is the tree the
+                // resolution selected even if the reference moves afterward.
                 let listing_ref = resolved
                     .as_ref()
-                    .map(ResolvedGitReference::listing_ref)
+                    .map(|resolved| resolved.commit.as_str())
                     .unwrap_or("HEAD");
                 if let Some(refused) = preflight_outcome(
                     self.preflight_worktree_add(&worktree_path, listing_ref, working_dir)
@@ -2807,14 +2973,33 @@ impl GitOperationsTool {
                 )? {
                     return Ok(refused);
                 }
-                // Options precede `--`; only tool-built full refnames or
-                // commit ids follow it, so no user string is re-interpreted
-                // by Git's dwim rules at run time.
+                // Options precede `--`; what follows is tool-built. Like
+                // checkout, execution uses the attachment-correct spelling
+                // of the SAME resolution the preflight pinned: an existing
+                // branch is handed to Git by its bare name so the new
+                // worktree attaches to it (`worktree add refs/heads/x`
+                // detaches), with remote guessing disabled; tag and commit
+                // references keep the exact fully-spelled form, which
+                // creates a DETACHED worktree (the basename-branch
+                // convenience applies only to bare short names, which the
+                // resolver never passes for these). The post-exec
+                // verification below asserts attachment and pinned commit
+                // in the new worktree, closing the residual race where a
+                // vanishing branch would let the bare name fall through to
+                // a different commit-ish.
                 let mut git_args: Vec<String> = vec!["worktree".to_string(), "add".to_string()];
                 let mut positional: Option<String> = None;
-                match &resolved {
-                    Some(ResolvedGitReference::Branch(refname))
-                    | Some(ResolvedGitReference::Commit(refname)) => {
+                let mut expected_branch: Option<String> = None;
+                match resolved.as_ref().map(|resolved| &resolved.reference) {
+                    Some(ResolvedGitReference::Branch(refname)) => {
+                        // Pinning --no-guess-remote keeps execution on this
+                        // resolution even if the branch vanishes and a
+                        // remote-tracking branch of the same name exists.
+                        git_args.push("--no-guess-remote".to_string());
+                        positional = Some(short_branch_name(refname).to_string());
+                        expected_branch = Some(short_branch_name(refname).to_string());
+                    }
+                    Some(ResolvedGitReference::Commit(refname)) => {
                         positional = Some(refname.clone());
                     }
                     Some(ResolvedGitReference::RemoteTrack {
@@ -2830,6 +3015,7 @@ impl GitOperationsTool {
                             .strip_prefix("refs/remotes/")
                             .unwrap_or(refname.as_str());
                         positional = Some(start_point.to_string());
+                        expected_branch = Some(new_branch.clone());
                     }
                     None => {
                         // Create the basename branch from HEAD. Pinning
@@ -2846,9 +3032,38 @@ impl GitOperationsTool {
                 }
                 let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
                 self.run_git_command(&git_args, working_dir).await?;
+                if let Err(e) = self
+                    .verify_checkout_result(
+                        &resolved,
+                        expected_branch.as_deref(),
+                        Path::new(git_worktree_path),
+                    )
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(serde_json::json!({
+                                "worktree_path": git_worktree_path,
+                            })),
+                        "git_operations: worktree add result did not match the resolved reference"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Worktree add verification failed: {e}")),
+                    });
+                }
+                let message = match &expected_branch {
+                    Some(branch) => {
+                        format!("Worktree added at: {git_worktree_path} (branch: {branch})")
+                    }
+                    None => format!("Worktree added at: {git_worktree_path}"),
+                };
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree added at: {git_worktree_path}").into(),
+                    output: message.into(),
                     error: None,
                 })
             }
@@ -6706,6 +6921,513 @@ mod tests {
         assert_eq!(content, "updated docs");
     }
 
+    // ── Branch attachment: branch operations stay on the branch ──
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed during test setup or verification: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn checkout_of_an_existing_branch_stays_attached_and_advances_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("docs.txt"), "on topic").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "topic work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "an existing-branch checkout must keep HEAD attached to the branch"
+        );
+
+        // A follow-up commit must land on the branch the agent believes it
+        // is on, not on a detached HEAD.
+        std::fs::write(root.join("docs.txt"), "more topic").unwrap();
+        let added = tool
+            .execute(json!({"operation": "add", "paths": "docs.txt"}))
+            .await
+            .unwrap();
+        assert!(added.success, "add failed: {added:?}");
+        let committed = tool
+            .execute(json!({"operation": "commit", "message": "more topic"}))
+            .await
+            .unwrap();
+        assert!(committed.success, "commit failed: {:?}", committed.error);
+        let branch_tip = run_git(&root, &["rev-parse", "refs/heads/topic"]);
+        let head = run_git(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            branch_tip, head,
+            "the commit must advance refs/heads/topic itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_of_an_existing_branch_stays_attached_and_advances_it() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("docs.txt"), "on topic").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "topic work",
+            ],
+        );
+        // Leave HEAD on master so the topic branch is free to attach the
+        // new worktree.
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "worktree add of an existing branch must attach to it, not detach"
+        );
+
+        std::fs::write(worktree.join("docs.txt"), "from worktree").unwrap();
+        let added = tool
+            .execute(json!({
+                "operation": "add",
+                "path": worktree.to_str().unwrap(),
+                "paths": "docs.txt",
+            }))
+            .await
+            .unwrap();
+        assert!(added.success, "add in worktree failed: {added:?}");
+        let committed = tool
+            .execute(json!({
+                "operation": "commit",
+                "path": worktree.to_str().unwrap(),
+                "message": "from worktree",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            committed.success,
+            "commit in worktree failed: {:?}",
+            committed.error
+        );
+        let branch_tip = run_git(&root, &["rev-parse", "refs/heads/topic"]);
+        let worktree_head = run_git(&worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            branch_tip, worktree_head,
+            "the worktree commit must advance refs/heads/topic itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_without_branch_checks_out_an_existing_basename_branch_attached() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["docs.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("docs.txt"), "on feature").unwrap();
+        run_git(&root, &["add", "docs.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "feature work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("feature");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/feature",
+            "the omitted-branch dwim must attach the existing basename branch"
+        );
+        let content = std::fs::read_to_string(worktree.join("docs.txt")).unwrap();
+        assert_eq!(content, "on feature");
+    }
+
+    #[tokio::test]
+    async fn checkout_of_a_tag_branch_collision_attaches_to_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "topic"]);
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch work").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "branch work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(result.success, "checkout failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "a tag/branch collision must stay attached to the branch, matching the resolver's branch-first order"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_of_a_tag_branch_collision_attaches_to_the_branch() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "topic"]);
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch work").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "branch work",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "worktree add failed: {:?}", result.error);
+        assert_eq!(
+            run_git(&worktree, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "a tag/branch collision must attach the branch, matching the resolver's branch-first order"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_of_a_tag_reference_detaches_head() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["tag", "v1"]);
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "v1"}))
+            .await
+            .unwrap();
+        assert!(result.success, "tag checkout failed: {:?}", result.error);
+        let symbolic = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !symbolic.status.success(),
+            "a tag reference must detach HEAD, not attach a branch"
+        );
+    }
+
+    // ── Resolution-to-execution drift fails loudly ──
+
+    /// Simulates an actor with repository write access racing the tool: on
+    /// the FIRST mutating command the boundary wraps (the resolver and
+    /// preflight use the read path, so that command is the checkout or
+    /// worktree add under test), it runs `action` against the repository
+    /// before letting the wrapped command proceed.
+    struct RacingActorBoundary {
+        root: std::path::PathBuf,
+        action: Vec<String>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl GitCommandBoundary for RacingActorBoundary {
+        fn wrap_command(&self, _command: &mut std::process::Command) -> anyhow::Result<()> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let args: Vec<&str> = self.action.iter().map(String::as_str).collect();
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&self.root)
+                    .args(&args)
+                    .output()
+                    .expect("racing actor git invocation must run");
+                assert!(
+                    output.status.success(),
+                    "racing actor action failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+    }
+
+    fn racing_tool(root: &std::path::Path, action: &[&str]) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new_with_command_boundary(
+            security,
+            Arc::new(RacingActorBoundary {
+                root: root.to_path_buf(),
+                action: action.iter().map(|s| s.to_string()).collect(),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn checkout_fails_loudly_when_the_branch_moves_between_resolution_and_execution() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "moved tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        // The actor repoints refs/heads/topic at master after the tool
+        // resolved and preflighted the original tip, so the checkout
+        // materializes a tree the preflight never listed.
+        let tool = racing_tool(&root, &["branch", "-f", "topic", "master"]);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a moved branch must fail the checkout, not pass silently"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pinned"),
+            "the failure must come from the pin verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_fails_loudly_when_the_branch_vanishes_and_a_tag_shares_its_name() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "branch tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        // A same-named tag at a different commit: once the racing actor
+        // deletes the branch, the bare name falls through to the tag and
+        // would detach there silently.
+        run_git(&root, &["checkout", "master"]);
+        run_git(&root, &["tag", "topic", "master"]);
+
+        let tool = racing_tool(&root, &["branch", "-D", "topic"]);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "topic"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a vanished branch with a same-named tag must fail, not detach at the tag"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("attached"),
+            "the failure must come from the attachment verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_add_fails_loudly_when_the_branch_moves_between_resolution_and_execution() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("notes.txt"), "moved tip").unwrap();
+        run_git(&root, &["add", "notes.txt"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "tip",
+            ],
+        );
+        run_git(&root, &["checkout", "master"]);
+
+        let worktree = root.join("wt-topic");
+        let tool = racing_tool(&root, &["branch", "-f", "topic", "master"]);
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": "topic",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "a moved branch must fail the worktree add, not pass silently"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pinned"),
+            "the failure must come from the pin verification: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_checkout_result_rejects_a_pin_head_does_not_match() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let tool = test_tool(&root);
+        let resolved = Some(ResolvedReference {
+            reference: ResolvedGitReference::Branch("refs/heads/master".to_string()),
+            commit: "0".repeat(40),
+        });
+        let error = tool
+            .verify_checkout_result(&resolved, Some("master"), &root)
+            .await
+            .expect_err("a pin that does not match HEAD must fail");
+        assert!(
+            error.to_string().contains("pinned"),
+            "the error must name the pin: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_symbolic_ref_reports_detached_head_as_none() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        run_git(&root, &["checkout", "--detach"]);
+        let tool = test_tool(&root);
+        let symbolic = tool.head_symbolic_ref(&root).await.unwrap();
+        assert_eq!(symbolic, None, "a detached HEAD must read as None");
+    }
+
     // ── Git tool policy boundary: deny_read on reads, deny_write on mutations ──
 
     /// Build a tool whose policy denies reads of `denied` (a repo-relative
@@ -8483,6 +9205,11 @@ mod tests {
             result.success,
             "an allowed remote-only checkout dwim must keep working: {:?}",
             result.error
+        );
+        assert_eq!(
+            run_git(&root, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic",
+            "the remote dwim must create and attach the tracking branch"
         );
         assert!(
             root.join("remote-note.txt").exists(),
