@@ -846,6 +846,36 @@ struct PreDispatchTrimResult {
     kept_turns: usize,
 }
 
+/// Model-facing feedback for a withheld reply. The rejected text never enters
+/// history, so this is the only place the model learns what happened. When the
+/// payload named known tools it says which ones and that none of them ran, so a
+/// refusal cannot be mistaken for a completed action; otherwise it keeps the
+/// generic parse wording.
+fn tool_call_rejection_feedback(tools: &[String]) -> String {
+    if tools.is_empty() {
+        return "[Tool call parse error]\n\
+                Your previous response looked like an internal tool-call protocol payload, \
+                but ZeroClaw could not parse it into a valid tool call, so nothing was \
+                executed. Use the supported tool-call schema, or answer in natural language \
+                if no tool is needed."
+            .to_string();
+    }
+    let names = tools
+        .iter()
+        .map(|tool| format!("`{tool}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[Tool call not executed]\n\
+         Your previous response was withheld: it contained a call to {names} written as \
+         text inside the reply instead of issued as a tool call. ZeroClaw never runs calls \
+         written as text, so {names} did not run and nothing it would have produced exists. \
+         If you need the tool, issue the call through the tool-call interface with no \
+         surrounding prose; otherwise answer in natural language. Do not tell the user the \
+         action was done."
+    )
+}
+
 fn record_dispatch_trim(
     (provider_name, model): (&str, &str),
     trim: &PreDispatchTrimResult,
@@ -2339,6 +2369,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &provider_request_messages,
             image_recovery_messages.as_deref(),
             request_tools,
+            &iteration_tool_specs.known_tool_names,
             should_consume_provider_stream,
             iteration,
         )
@@ -2438,6 +2469,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
+            parse_issue_tools,
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
@@ -2463,6 +2495,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     interpreted.assistant_history_content,
                     interpreted.native_tool_calls,
                     interpreted.parse_issue_detected,
+                    interpreted.parse_issue_tools,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
@@ -2611,13 +2644,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
                 // output has no valid tool_call_id to attach a role=tool message to.
-                let msg = ChatMessage::user(
-                    "[Tool call parse error]\n\
-                     Your previous response looked like an internal tool-call protocol payload, \
-                     but ZeroClaw could not parse it into a valid tool call. Use the supported \
-                     tool-call schema, or answer in natural language if no tool is needed."
-                        .to_string(),
-                );
+                let msg = ChatMessage::user(tool_call_rejection_feedback(&parse_issue_tools));
                 turn_state.push_dual(msg);
                 continue;
             }
