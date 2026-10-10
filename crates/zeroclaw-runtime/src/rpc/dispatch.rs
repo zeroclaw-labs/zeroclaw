@@ -9621,6 +9621,42 @@ impl RpcDispatcher {
                 continue;
             };
 
+            // Pre-filter on scope BEFORE taking the per-session lock. A
+            // running turn holds `model_provider_update` for its whole
+            // duration (see `handle_session_prompt`), so locking first would
+            // park this transaction — and the sequential dispatcher loop of
+            // the connection that issued the `config/set` — behind every
+            // busy session on the daemon, including ones this edit cannot
+            // touch (editing agent B's provider while agent A is mid-turn).
+            // The pre-read is authoritative for selection: overrides only
+            // change through `session/configure`, which takes
+            // `config_write_lock` first, and the caller holds that lock for
+            // the whole transaction. Agent alias is fixed for a generation.
+            // The state is re-read under the lock below anyway so the
+            // rebuild uses exactly what the ordering boundary guarantees.
+            {
+                let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                    continue;
+                };
+                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                    continue;
+                };
+                let in_scope = scope
+                    .resolve_provider_ref(config, &agent_alias, &overrides)
+                    .map_err(|error| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!(
+                                "Config update cannot refresh live session `{session_id}`: {error}"
+                            ),
+                        )
+                    })?
+                    .is_some();
+                if !in_scope {
+                    continue;
+                }
+            }
+
             // Acquire the per-session ordering boundary. This serialises
             // with session/configure so the state we read afterwards
             // reflects any configure that committed before this point.
@@ -37524,6 +37560,65 @@ mod tests {
         .expect("session/configure must succeed for the unrelated session");
 
         drop(blocked_guard);
+    }
+
+    /// Editing agent B's `model_provider` must not queue behind agent A's
+    /// running turn. `handle_session_prompt` holds the session's
+    /// `model_provider_update` guard for the whole turn; if the refresh
+    /// transaction locked every session before checking scope, a config
+    /// edit for an idle agent would stall until an unrelated busy agent
+    /// finished — and the issuing TUI's `config/list` would time out and
+    /// exit (observed 2026-10-07 on the experiment daemon).
+    #[tokio::test]
+    async fn config_set_for_other_agent_does_not_wait_on_busy_session() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        config.agents.insert(
+            "other-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+        // Only `test-agent` has a live session; it is "mid-turn".
+        let busy_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&busy_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_config_set(&json!({
+                "prop": "agents.other-agent.model_provider",
+                "value": "openai.other-provider"
+            })),
+        )
+        .await
+        .expect("editing another agent's provider must not wait on this session's turn")
+        .expect("config/set must succeed");
+
+        // The busy session was out of scope: its provider is untouched.
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "old-model"
+        );
+        drop(busy_guard);
     }
 
     #[tokio::test]
