@@ -2606,6 +2606,25 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
+/// Returns true if `s` contains any glob metacharacter (`*`, `?`, `[`, `]`).
+fn contains_glob_metacharacters(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '*' | '?' | '[' | ']'))
+}
+
+/// Normalize a path for glob matching. Canonical Windows paths use `\`, so on
+/// Windows it is rewritten to the `/` the patterns use. On Unix a backslash is
+/// an ordinary filename character: rewriting it into a separator would let a
+/// pattern such as `/workspace/scripts/*.sh` match an out-of-directory file
+/// spelled `/workspace/scripts\evil.sh`.
+fn glob_match_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 fn is_allowlist_entry_match(
     allowed: &str,
     executable: &str,
@@ -2623,11 +2642,36 @@ fn is_allowlist_entry_match(
     }
 
     // Path-like allowlist entries must match the executable token exactly
-    // after "~" expansion.
+    // after "~" expansion, or via a glob pattern.
     if looks_like_path(allowed) {
         let allowed_path = expand_user_path(allowed);
         let executable_path = expand_user_path(executable);
-        return executable_path == allowed_path;
+
+        // Exact match first.
+        if executable_path == allowed_path {
+            return true;
+        }
+
+        // Glob match (e.g. `/workspace/scripts/**/*.sh`). `*`/`?` never cross
+        // `/`; `**` crosses directories. Separators are normalized only on
+        // Windows so `/`-oriented patterns match canonical Windows paths.
+        let allowed_str = glob_match_path(&allowed_path);
+        let executable_str = glob_match_path(&executable_path);
+        if contains_glob_metacharacters(&allowed_str)
+            && let Ok(pattern) = glob::Pattern::new(&allowed_str)
+            && pattern.matches_with(
+                &executable_str,
+                glob::MatchOptions {
+                    case_sensitive: true,
+                    require_literal_separator: true,
+                    require_literal_leading_dot: false,
+                },
+            )
+        {
+            return true;
+        }
+
+        return false;
     }
 
     // Command-name entries continue to match by basename, case-insensitively.
@@ -5527,6 +5571,67 @@ mod tests {
         };
         assert!(p.is_command_allowed("/usr/bin/Antigravity"));
         assert!(!p.is_command_allowed("/usr/bin/antigravity"));
+    }
+
+    #[test]
+    fn glob_allowlist_entry_matches_path_pattern() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/workspace/scripts/**/*.sh".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/workspace/scripts/deploy.sh"));
+        assert!(p.is_command_allowed("/workspace/scripts/nested/backup.sh"));
+        assert!(!p.is_command_allowed("/workspace/scripts/run.py"));
+    }
+
+    #[test]
+    fn glob_allowlist_star_does_not_cross_separator() {
+        // `*.sh` matches one segment; deeper nesting needs `**/*.sh`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/workspace/scripts/*.sh".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/workspace/scripts/deploy.sh"));
+        assert!(!p.is_command_allowed("/workspace/scripts/nested/backup.sh"));
+    }
+
+    #[test]
+    fn glob_allowlist_exact_path_match_still_works() {
+        // A literal path entry (no metacharacters) keeps its exact-match
+        // behaviour and is not broadened by the glob path.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/git".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("/usr/bin/git"));
+        assert!(!p.is_command_allowed("/usr/bin/gitk"));
+    }
+
+    #[test]
+    fn glob_allowlist_does_not_apply_to_bare_command_names() {
+        // Glob metacharacters only widen path-like entries; a bare name such
+        // as `git*` is matched literally, not as a glob, so it does not
+        // authorize `git`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("git status"));
+    }
+
+    #[test]
+    fn glob_allowlist_does_not_rewrite_unix_backslash_into_separator() {
+        // On Unix a backslash is an ordinary filename character, not a
+        // separator. `scripts\evil.sh` is a single filename directly under
+        // `/workspace`, so the pattern `/workspace/scripts/*.sh` must not
+        // match it. (The separator normalization is Windows-only.)
+        if cfg!(not(windows)) {
+            let p = SecurityPolicy {
+                allowed_commands: vec!["/workspace/scripts/*.sh".into()],
+                ..SecurityPolicy::default()
+            };
+            assert!(!p.is_command_allowed("/workspace/scripts\\evil.sh"));
+        }
     }
 
     #[test]

@@ -14552,7 +14552,12 @@ pub struct RiskProfileConfig {
     pub level: AutonomyLevel,
     /// Restrict filesystem access to workspace-relative paths. Default: `false`.
     pub workspace_only: bool,
-    /// Allowlist of executable names for shell execution.
+    /// Allowlist of executable names for shell execution. Path-like entries
+    /// (those containing `/` or `~`) may use glob patterns — `*` and `?` match
+    /// within one path segment, `**` crosses directories — e.g.
+    /// `/workspace/scripts/**/*.sh`. Glob matching applies only to path-like
+    /// entries; bare command names are matched literally. Escape a literal
+    /// glob character with `[[]`, `[?]`, etc. where an exact path is intended.
     pub allowed_commands: Vec<String>,
     /// Explicit path denylist.
     pub forbidden_paths: Vec<String>,
