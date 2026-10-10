@@ -38,6 +38,8 @@ if tool == "cargo" and args[0] == "metadata":
 elif tool == "cargo" and args[0] == "publish":
     with (root / "publishes.jsonl").open("a") as log:
         log.write(json.dumps(args) + "\n")
+    with (root / "publish-cwd.log").open("a") as log:
+        log.write(os.getcwd() + "\n")
     if "--dry-run" not in args:
         name = args[args.index("-p") + 1]
         (root / "registry" / name).touch()
@@ -82,7 +84,7 @@ class PublishCratesTest(unittest.TestCase):
         self.env.pop("CARGO_REGISTRY_TOKEN", None)
 
     def run_publisher(self, packages=None, *, raw=None, execute=False, token=True,
-                      web_digest=None):
+                      web_digest=None, source_root=None):
         # Match the real workspace's private and independent members. Bash 3.2
         # cannot expand empty arrays under nounset in the existing summary.
         metadata = raw if raw is not None else json.dumps({"packages": [
@@ -95,6 +97,8 @@ class PublishCratesTest(unittest.TestCase):
             env["CARGO_REGISTRY_TOKEN"] = "fixture-not-a-credential"
         if web_digest is not None:
             env["WEB_DIST_DIGEST"] = web_digest
+        if source_root is not None:
+            env["PUBLISH_SOURCE_ROOT"] = str(source_root)
         args = ["bash", str(self.root / "scripts/release/publish-crates.sh")]
         if execute:
             args.append("--execute")
@@ -346,6 +350,45 @@ class PublishCratesTest(unittest.TestCase):
             text=True, capture_output=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("contains no files", result.stderr)
+
+
+    def tagged_tree_with_broken_publisher(self):
+        """A release tree whose own copy of the publisher is broken."""
+        source = self.root / "tagged-release"
+        (source / "scripts/release").mkdir(parents=True)
+        (source / "web/dist").mkdir(parents=True)
+        (source / "Cargo.toml").write_text('[workspace.package]\nversion = "1.2.3"\n')
+        (source / "web/dist/index.html").write_text("tagged bundle")
+        broken = source / "scripts/release/publish-crates.sh"
+        broken.write_text("#!/usr/bin/env bash\necho 'tagged publisher ran' >&2\nexit 97\n")
+        broken.chmod(0o755)
+        return source
+
+    def test_recovery_runs_current_tooling_against_the_tagged_tree(self):
+        source = self.tagged_tree_with_broken_publisher()
+        # Before: the workflow ran the tag's own publisher, so the only way
+        # through a publisher bug was a manual publish outside the workflow.
+        before = subprocess.run(["bash", str(source / "scripts/release/publish-crates.sh"),
+                                 "--execute"], env=self.env, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(before.returncode, 97)
+        # After: the fixed tooling packages the tagged tree, including its
+        # dashboard bundle, and never runs the tag's broken copy.
+        digest = self.web_digest(source / "web/dist")
+        result = self.run_publisher([package("a-runtime", [dependency("z-relay", "dev")]),
+                                     package("z-relay")], execute=True,
+                                    web_digest=digest, source_root=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("tagged publisher ran", result.stderr)
+        self.assertEqual(self.uploads(), ["z-relay", "a-runtime"])
+        cwds = (self.root / "publish-cwd.log").read_text().splitlines()
+        self.assertEqual({Path(cwd).resolve() for cwd in cwds}, {source.resolve()})
+
+    def test_recovery_source_root_must_be_a_release_tree(self):
+        empty = self.root / "not-a-release"
+        empty.mkdir()
+        result = self.run_publisher([package("a")], execute=True, source_root=empty)
+        self.assert_preflight_failure(result, "has no Cargo.toml; set PUBLISH_SOURCE_ROOT")
 
 
 if __name__ == "__main__":

@@ -861,9 +861,11 @@ pub(crate) async fn run_responses_sse(
         Ok(r) => r,
         Err(err) => {
             let _ = tx
-                .send(Err(StreamError::ModelProvider(
-                    super::stream_idle_error_message(&err, idle_timeout),
-                )))
+                .send(Err(if err.is_connect() {
+                    StreamError::ConnectFailed(super::stream_idle_error_message(&err, idle_timeout))
+                } else {
+                    StreamError::ModelProvider(super::stream_idle_error_message(&err, idle_timeout))
+                }))
                 .await;
             return;
         }

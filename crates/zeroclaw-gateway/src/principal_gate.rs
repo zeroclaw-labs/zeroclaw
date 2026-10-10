@@ -24,7 +24,10 @@
 //! `Delete` for one it removes, `Update` otherwise) and matched against
 //! the principal's config path selectors, with the persist boundary
 //! refusing anything the handler did not authorize
-//! ([`ConfigWriteAuthorization`]).
+//! ([`ConfigWriteAuthorization`]). That handler check runs under the config
+//! write lock against the grants the principal holds then, not the ones
+//! stamped at admission, so a revocation, expiry or unpairing that lands
+//! while the request body arrives or the lock is awaited binds the write.
 //!
 //! Policy itself moves only at that persist boundary: the handler that
 //! writes a configuration publishes the policy compiled from it as the
@@ -44,13 +47,15 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
+use zeroclaw_api::grants::{ResolvedGrants, Resource, Verb, WILDCARD};
 use zeroclaw_api::jsonrpc::error_codes::FORBIDDEN;
 use zeroclaw_config::pairing::PairingGuard;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::rpc::auth::{AuthDenied, ConnectionAuth, RpcInboundAuth};
 use zeroclaw_runtime::rpc::transport::TransportKind;
 use zeroclaw_runtime::security::auth_provider::Credential;
+
+use crate::ConfigWriteGuard;
 
 /// Header naming the auth provider to verify the bearer with, mirroring
 /// the RPC handshake's `auth_provider` field (e.g. `oidc.corp`). Absent
@@ -168,14 +173,43 @@ fn forbidden(message: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// A refused config write: the 403 the handler returns in place of the
-/// mutation, carrying which path or grant fell short.
+/// A refused config write: the response the handler returns in place of
+/// the mutation. A 403 carries which path or grant fell short; a 401 means
+/// the credential that admitted the request is no longer live.
 #[derive(Debug)]
-pub struct WriteDenied(String);
+pub struct WriteDenied {
+    status: StatusCode,
+    message: String,
+}
+
+impl WriteDenied {
+    fn forbidden(message: String) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message,
+        }
+    }
+
+    fn authority_lost(denied: AuthDenied) -> Self {
+        let status = if denied.code == FORBIDDEN {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        Self {
+            status,
+            message: denied.message,
+        }
+    }
+}
 
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
-        forbidden(self.0)
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 
@@ -322,7 +356,7 @@ impl ConfigWriteAuthorization {
         };
         for path in dirty {
             if !writes.covers(path) {
-                return Err(WriteDenied(format!(
+                return Err(WriteDenied::forbidden(format!(
                     "Config path `{path}` is outside the write set authorized for this mutation"
                 )));
             }
@@ -357,14 +391,38 @@ fn unenforced(authority: Option<Arc<GatewayInboundAuth>>) -> ConfigWriteAuthoriz
     }
 }
 
+/// The grants the request's principal holds now, under the config write
+/// lock, not the ones stamped on it when the route layer admitted it.
+///
+/// Between admission and the write the handler extracts the body, which the
+/// caller paces, and waits for the config write lock. A revocation, an
+/// expiry, or an unpairing that lands in that window must bind the write.
+/// Every accepted policy is published under the same process-wide lock
+/// (the gateway's persist boundary and the RPC context's save both hold
+/// it), so no publication can land between this resolution and the save
+/// that follows it. `_guard` is the witness that the caller holds it.
+fn current_grants(
+    request: &RequestAuth,
+    conn: &ConnectionAuth,
+    _guard: &ConfigWriteGuard,
+) -> Result<ResolvedGrants, WriteDenied> {
+    request
+        .authority
+        .inner
+        .current_grants(conn)
+        .map_err(WriteDenied::authority_lost)
+}
+
 /// Authorize one mutation's complete write set for the request's
-/// principal, before the mutation's first side effect. Every path needs
-/// both the Config verb its effect requires and a matching config path
-/// selector. The open posture and an admin principal are unrestricted,
-/// as everywhere else.
+/// principal, before the mutation's first side effect and under the config
+/// write lock. Every path needs both the Config verb its effect requires
+/// and a matching config path selector, checked against the principal's
+/// current grants. The open posture and an admin principal are
+/// unrestricted, as everywhere else.
 pub fn authorize_config_write(
     request: &RequestPrincipal,
     writes: ConfigWriteSet,
+    guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
         return Ok(unenforced(None));
@@ -373,18 +431,19 @@ pub fn authorize_config_write(
     let Some(conn) = &request.principal else {
         return Ok(unenforced(authority));
     };
-    if conn.grants.admin {
+    let grants = current_grants(request, conn, guard)?;
+    if grants.admin {
         return Ok(unenforced(authority));
     }
     for (path, verb) in &writes.writes {
-        if !conn.grants.permits(Resource::Config, *verb) {
-            return Err(WriteDenied(format!(
+        if !grants.permits(Resource::Config, *verb) {
+            return Err(WriteDenied::forbidden(format!(
                 "Principal lacks the config `{}` grant this mutation needs for `{path}`",
                 verb_name(*verb)
             )));
         }
-        if !conn.grants.may_write_config(path) {
-            return Err(WriteDenied(format!(
+        if !grants.may_write_config(path) {
+            return Err(WriteDenied::forbidden(format!(
                 "Principal's config path selectors do not cover `{path}`"
             )));
         }
@@ -402,6 +461,7 @@ pub fn authorize_config_write(
 pub fn authorize_whole_config_write(
     request: &RequestPrincipal,
     verbs: &[Verb],
+    guard: &ConfigWriteGuard,
 ) -> Result<ConfigWriteAuthorization, WriteDenied> {
     let Some(axum::Extension(request)) = request else {
         return Ok(unenforced(None));
@@ -410,19 +470,20 @@ pub fn authorize_whole_config_write(
     let Some(conn) = &request.principal else {
         return Ok(unenforced(authority));
     };
-    if conn.grants.admin {
+    let grants = current_grants(request, conn, guard)?;
+    if grants.admin {
         return Ok(unenforced(authority));
     }
     for verb in verbs {
-        if !conn.grants.permits(Resource::Config, *verb) {
-            return Err(WriteDenied(format!(
+        if !grants.permits(Resource::Config, *verb) {
+            return Err(WriteDenied::forbidden(format!(
                 "Principal lacks the config `{}` grant this operation needs",
                 verb_name(*verb)
             )));
         }
     }
-    if !conn.grants.may_write_config(WILDCARD) {
-        return Err(WriteDenied(
+    if !grants.may_write_config(WILDCARD) {
+        return Err(WriteDenied::forbidden(
             "This operation rewrites the configuration as a whole; the principal's config path selectors would need `*`"
                 .to_owned(),
         ));
@@ -564,7 +625,7 @@ mod tests {
     ) -> (
         Router,
         Arc<RpcInboundAuth>,
-        Arc<parking_lot::RwLock<Config>>,
+        zeroclaw_runtime::LiveConfigAuthority,
     ) {
         let pairing = Arc::new(PairingGuard::new(
             config.gateway.require_pairing,
@@ -575,17 +636,16 @@ mod tests {
             RpcInboundAuth::from_config(&config, Arc::clone(&pairing))
                 .expect("inbound auth builds from a valid config"),
         );
-        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
         let state = AppState {
             pairing,
-            config: Arc::clone(&live_config),
             ..crate::api::tests::test_state(config)
         };
+        let authority = state.config_authority.clone();
         let auth = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc_auth)));
         (
             crate::config_admin_router(&auth).with_state(state),
             rpc_auth,
-            live_config,
+            authority,
         )
     }
 
@@ -1283,11 +1343,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // The RPC context's save, in the order `save_and_swap_config` runs
-        // it: swap the live configuration, then publish the policy compiled
+        // The RPC context's save, in the order `save_and_publish_config` runs
+        // it: publish the live configuration, then publish the policy compiled
         // from it as the next accepted revision. The mapped profile keeps a
         // grant but loses Config.
-        let mut revoked = live_config.read().clone();
+        let commit = live_config.begin_config_commit().await.unwrap();
+        let mut revoked = commit.current_config();
         revoked.permission_profiles.insert(
             "config-reader".into(),
             PermissionProfileConfig {
@@ -1295,11 +1356,13 @@ mod tests {
                 ..PermissionProfileConfig::default()
             },
         );
-        *live_config.write() = revoked.clone();
+        let config_revision = commit.next_revision().unwrap();
+        commit.publish(config_revision, revoked.clone()).unwrap();
         let revision = rpc_auth.accepted_revision().saturating_add(1);
         rpc_auth
             .publish_accepted(&revoked, revision)
             .expect("the revoked policy compiles");
+        drop(commit);
 
         let (status, _) = send(
             &router,
@@ -1342,6 +1405,154 @@ mod tests {
             rpc_auth.generation(),
             generation + 1,
             "the gateway persist published into the RPC context's authority"
+        );
+    }
+
+    // ── Authority is rechecked at the write, not only at admission ──
+
+    /// A config write whose body the caller withholds after the route layer
+    /// admitted it. The route layer reads only headers, so the handler's
+    /// first poll of the body is strictly after admission: `admitted` fires
+    /// there, and the body is delivered only once `release` is sent.
+    /// Returns the in-flight request with its two ends.
+    fn parked_write(
+        router: &Router,
+        bearer: &str,
+        provider: Option<&str>,
+        body: serde_json::Value,
+    ) -> (
+        tokio::task::JoinHandle<StatusCode>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stream = futures_util::stream::once(async move {
+            let _ = admitted_tx.send(());
+            let _ = release_rx.await;
+            Ok::<_, std::convert::Infallible>(body.to_string())
+        });
+        let mut builder = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/config/prop")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json");
+        if let Some(provider) = provider {
+            builder = builder.header(AUTH_PROVIDER_HEADER, provider);
+        }
+        let request = builder.body(Body::from_stream(stream)).unwrap();
+        let router = router.clone();
+        let write =
+            ::zeroclaw_spawn::spawn!(
+                async move { router.oneshot(request).await.unwrap().status() }
+            );
+        (write, admitted_rx, release_tx)
+    }
+
+    /// The control for the two tests below: parking the body on its own
+    /// changes nothing, so a refusal there is the recheck's doing.
+    #[tokio::test]
+    async fn a_parked_write_with_its_authority_intact_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let router = router_for(editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Update],
+            &["agents.*"],
+        ));
+        create_agent(&router, "alpha").await;
+
+        let (write, admitted, release) = parked_write(
+            &router,
+            "opaque-token",
+            Some("oidc.test"),
+            put_model("alpha", "parked"),
+        );
+        admitted
+            .await
+            .expect("the handler polled the body after admission");
+        release.send(()).unwrap();
+
+        assert_eq!(write.await.unwrap(), StatusCode::OK);
+        assert_eq!(agent_model(&router, "alpha").await.1, "parked");
+    }
+
+    /// An operator revocation that lands while an admitted scoped write is
+    /// still receiving its body binds that write: the grants stamped at
+    /// admission are not the authority it persists under.
+    #[tokio::test]
+    async fn a_revocation_after_admission_binds_the_in_flight_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let router = router_for(editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Update],
+            &["agents.*"],
+        ));
+        create_agent(&router, "alpha").await;
+        let (_, before) = agent_model(&router, "alpha").await;
+
+        let (write, admitted, release) = parked_write(
+            &router,
+            "opaque-token",
+            Some("oidc.test"),
+            put_model("alpha", "after-revocation"),
+        );
+        admitted
+            .await
+            .expect("the handler polled the body after admission");
+
+        // The operator revokes through the gateway and gets success: the
+        // claim the profile map reads no longer exists in the token.
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(serde_json::json!({ "path": "oidc.test.claim_path", "value": "roles" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        release.send(()).unwrap();
+        assert_eq!(write.await.unwrap(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            agent_model(&router, "alpha").await.1,
+            before,
+            "the revoked write must not reach the configuration"
+        );
+    }
+
+    /// The same window for a native token unpaired after admission: pairing
+    /// liveness is checked at the write, not only when the request arrived.
+    #[tokio::test]
+    async fn a_native_token_unpaired_after_admission_cannot_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = paired_config();
+        config.gateway.paired_tokens.push("zc_second".into());
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        let (router, authority) = router_and_authority_for(config);
+        create_agent(&router, "alpha").await;
+        let (_, before) = agent_model(&router, "alpha").await;
+
+        let (write, admitted, release) =
+            parked_write(&router, "zc_second", None, put_model("alpha", "unpaired"));
+        admitted
+            .await
+            .expect("the handler polled the body after admission");
+
+        assert!(authority.pairing().revoke_token("zc_second"));
+        release.send(()).unwrap();
+
+        assert_eq!(write.await.unwrap(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            agent_model(&router, "alpha").await.1,
+            before,
+            "the unpaired write must not reach the configuration"
         );
     }
 }

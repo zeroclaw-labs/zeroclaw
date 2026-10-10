@@ -481,6 +481,21 @@ pub async fn handle_api_cron_add(
         shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -602,13 +617,20 @@ pub async fn handle_api_cron_runs(
     let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
     let config = state.config.read().clone();
 
-    // Verify the job exists before listing runs.
+    // A missing job is not necessarily a missing history: a successful
+    // auto-delete one-shot removes its job row while its run record is
+    // retained durably. 404 only when neither the job nor any run exists.
     if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
-        )
-            .into_response();
+        let retained = zeroclaw_runtime::cron::list_runs(&config, &id, 1)
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false);
+        if !retained {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
@@ -624,6 +646,11 @@ pub async fn handle_api_cron_runs(
                         "status": r.status,
                         "output": r.output,
                         "duration_ms": r.duration_ms,
+                        "execution": r.execution,
+                        "delivery": r.delivery,
+                        "persistence": r.persistence,
+                        "principal": r.principal,
+                        "executing_agent": r.executing_agent,
                     })
                 })
                 .collect();
@@ -647,6 +674,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -661,11 +693,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 
@@ -865,12 +898,23 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
-    // Held through the swap below so a concurrent config writer can't land
-    // between this read and the save.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut config = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish below so a concurrent config writer can't land
+    // between them. The save runs retained on the commit, so a dropped
+    // request cannot abandon a dispatched save without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "config commit refused without any change: the daemon generation is closing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut config = commit.current_config();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
         config.scheduler.enabled = v;
@@ -885,15 +929,43 @@ pub async fn handle_api_cron_settings_patch(
         config.mark_dirty("scheduler.max-run-history");
     }
 
-    if let Err(e) = config.save_dirty().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
-    }
-
-    *state.config.write() = config.clone();
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config revision unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            if let Err(e) = config.save_dirty().await {
+                return Err(format!("Failed to save config: {e}"));
+            }
+            commit
+                .publish(revision, config.clone())
+                .map_err(|e| format!("Failed to publish config: {e}"))?;
+            Ok(config)
+        }));
+    let config = match task.await {
+        Ok(Ok(config)) => config,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config commit task failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -2213,7 +2285,6 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2386,9 +2457,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -3181,14 +3254,14 @@ pub(crate) mod tests {
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job_id.to_string());
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent configured by with_test_agent")
+                .cron_jobs
+                .push(job_id.to_string());
+        });
     }
 
     fn config_with_webhook(
@@ -4227,6 +4300,44 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn cron_api_shell_roundtrip_includes_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -5110,8 +5221,9 @@ pub(crate) mod tests {
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
             "imperative jobs default to wrapped"
         );
-        // Imperative jobs get UUID ids; the scheduler resolves owning agent
-        // by reverse-lookup against `agent.cron_jobs`, same as
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one, same as
         // `cron_api_run_executes_shell_job_and_records_run`.
         link_job_to_test_agent(&state, &job.id);
 
@@ -5424,8 +5536,9 @@ pub(crate) mod tests {
         )
         .expect("job added");
 
-        // Imperative jobs get UUID ids; the scheduler resolves owning
-        // agent by reverse-lookup against `agent.cron_jobs`.
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one.
         link_job_to_test_agent(&state, &job.id);
 
         let response =
@@ -5449,6 +5562,70 @@ pub(crate) mod tests {
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_endpoint_serves_retained_history_after_job_deletion() {
+        // A successful auto-delete one-shot removes its job row but keeps
+        // its run record; the runs endpoint must serve that durable record
+        // rather than 404 on the missing job — and still 404 when neither
+        // job nor history exists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let config = state.config.read().clone();
+
+        let now = chrono::Utc::now();
+        zeroclaw_runtime::cron::record_run(
+            &config,
+            "retained-one-shot",
+            now,
+            now + chrono::Duration::milliseconds(5),
+            "ok",
+            zeroclaw_runtime::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            zeroclaw_runtime::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("retained-one-shot".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let runs = json["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "ok");
+        assert_eq!(runs[0]["executing_agent"], "test-agent");
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("never-existed".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

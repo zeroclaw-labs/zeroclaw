@@ -199,6 +199,11 @@ Examples:
         /// Host of the running gateway to query; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Print one JSON object (`pairing_code`, `message`) instead of text,
+        /// for programs such as the desktop app
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -220,6 +225,9 @@ pub enum ServiceCommands {
         #[arg(long, hide = true)]
         port: u16,
     },
+    /// Internal Windows task runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunWindowsDaemon,
     /// Internal OpenRC logger that drains one daemon stream into bounded storage
     #[command(hide = true)]
     RunOpenrcLogWriter {
@@ -539,9 +547,13 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
-        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory),
+        /// or from an HTTPS well-known index when used with --well-known.
         #[arg(long)]
         skill: Option<String>,
+        /// Discover and install one selected skill from an HTTPS well-known index.
+        #[arg(long)]
+        well_known: bool,
     },
     /// Remove an installed skill
     Remove {

@@ -37,6 +37,8 @@ The mechanism, end to end:
 
 This is the whole point of the design: per-thing logging code is zero. You impl the trait once and wrap the entry point once; every emission underneath is attributed for free.
 
+When inheriting attribution, a composite group belongs to the nearest span whose stored attribution contains any of its keys: `<prefix>`, `<prefix>_type`, or `<prefix>_alias`. Missing members of that group do not inherit from an outer span unless the inner group contains only `<prefix>_type` and the outer group has the same type. For example, an inner `scope!(channel: "telegram", ...)` retains an outer `channel = "telegram.outer"` and `channel_alias = "outer"`, while an inner `scope!(channel: "webhook", ...)` stays type-only under that outer Telegram span. An explicit inner composite such as `telegram.inner` keeps its own instance even when the outer type matches. Plain attribution fields and unrelated composite groups still inherit normally. Late field recording within one span continues to fill that span's missing fields.
+
 ### The `Attributable` trait
 
 Lives in `crates/zeroclaw-api/src/attribution.rs` so every crate can implement it without depending on `zeroclaw-log`:
@@ -237,6 +239,39 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 | Persisted JSONL | `writer.rs` | Enqueues the serialized event without blocking the runtime. The bounded queue can drop an event when full, worker write failures are warnings, and periodic `sync_all` covers only the current active file. Daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. Persistence mode then decides whether the active file is trimmed, retained indefinitely, or rotated. This is best-effort operational history, not a transactional audit log. |
 
 Do not use Observer, OTLP, or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached OTLP or live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
+
+## Observer events share the same bus
+
+Typed observer events (`agent_start`, `agent_end`, `llm_request`, `tool_call`, `tool_call_start`, `history_trimmed`, `error`) reach the same broadcast channel through a separate path: `zeroclaw_runtime::observability::broadcast`. Every observer built by `create_observer` tees into one process-wide broadcast hook, and an `EventBus` (the live sender plus a 500-frame history buffer) supplies that hook.
+
+- **Under the daemon**, `daemon::run` creates the bus and installs its hook once, whether or not the gateway runs. RPC `logs/subscribe` therefore carries these frames with the gateway off. A supervised gateway reuses the daemon's bus and installs nothing, so each frame is delivered once and buffered once.
+- **A standalone gateway** (`zeroclaw gateway start`) builds and installs its own bus.
+- **History:** `GET /api/events/history` and RPC `events/history` (grant `Logs:Read`) replay the buffered observer frames, oldest first. Like live delivery, they never carry pairing credentials: frames with the ephemeral marker are withheld from history, and `logs/subscribe` withholds them from live delivery.
+
+Log-layer frames sent directly on the channel are live-only; the history buffer holds observer frames only.
+
+## RPC subscriptions are replayable and never end silently
+
+RPC streams do not read the broadcast channel directly. A `SubscriptionHub` (`zeroclaw_runtime::rpc::subscription`) copies the bus into bounded rings, one per source, and every subscriber is just a cursor into a ring. Two sources exist today:
+
+| Method | Ring | Notification |
+|---|---|---|
+| `logs/subscribe` | every bus frame | `logs/event` |
+| `events/subscribe` | observer frames only | `events/event` |
+
+- **Bounds:** each ring is capped at 2,048 frames and 4 MiB, and all rings share a 16 MiB process-wide budget. Over budget, the oldest frame across all rings is evicted.
+- **Producers never wait for a subscriber;** a slow subscriber only falls behind.
+- **Sequence numbers:** start at 1 per source. Every notification carries `subscription_id` and its `seq`. The subscribe result returns the newest `seq` and the hub's `epoch`.
+- **Epochs:** every hub (every daemon start or reload) gets a new random `epoch`, and numbering restarts at 1, so a sequence number means nothing outside its epoch.
+- **Resume:** `X/subscribe{since_seq, epoch}` replays the frames after `since_seq` that are still buffered, then continues live, but only when `epoch` matches.
+  - With a different epoch, or none, the client gets `subscription/lagged` with `epoch_changed: true`, then every frame the new hub still buffers.
+  - A `since_seq` ahead of the newest frame in the same epoch is refused with `INVALID_PARAMS`.
+- **Gaps:** a gap is reported, never skipped. A cursor that points at frames that are gone (evicted by the caps or the budget, or overrun on the bus) receives `subscription/lagged{subscription_id, from_seq, resume_seq}` and continues at `resume_seq`. `from_seq` is never greater than `resume_seq`. A replay batch stops at a gap, so the cursor never jumps over a recorded loss.
+- **Cancel:** `subscription/cancel{subscription_id}` (grant `Logs:Read`, the same as subscribing) ends one subscription on the calling connection. Closing the connection ends them all.
+- **Authority:** these streams and `events/history` are unscoped-only. Their frames come from every principal's work (session messages, cron results, log lines), and many name no owner, so they cannot be filtered per principal. The caller needs `Logs:Read`, and it must be an administrator or the unauthenticated shared operator, the same principals that bypass session ownership. An authenticated non-admin principal is refused, even with the `*` agent selector: addressing every agent is not owning every user's sessions.
+- **Recheck:** every delivery, whether a frame or a `lagged` notice, is rechecked against the caller's live credential. When the policy changes, the principal is resolved again, and demoting it or removing `Logs:Read` ends the stream.
+- **Replay reach:** an administrator or the shared operator can replay frames from before it connected, up to the ring caps.
+- **Pairing credentials** are dropped before they reach a ring, so neither stream can deliver or replay them.
 
 ## Reader cursors span the active file and retained archives
 

@@ -7,8 +7,7 @@ use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
 use crate::egress::{AuthorizedEgress, EgressError, EgressHostService, build_tls_client_config};
@@ -580,7 +579,7 @@ impl WasiView for PluginState {
 
 impl WasiHttpView for PluginState {
     /// Hand `wasi:http` ZeroClaw's policy hooks instead of
-    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// `wasmtime_wasi_http::default_hooks()`. The default hooks send every
     /// request the guest asks for; these submit it to the host-owned egress
     /// boundary first and own the connect (see [`crate::wasi_http`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {

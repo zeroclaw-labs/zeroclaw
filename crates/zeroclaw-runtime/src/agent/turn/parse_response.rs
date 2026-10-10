@@ -239,17 +239,17 @@ pub(crate) async fn interpret_chat_response(
                     .known_tool_names
                     .contains(&call.name.to_ascii_lowercase())
             })
-            .map(|mut call| {
-                if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
-                    recover_structured_arguments(&mut call.arguments, &spec.parameters, 0);
-                }
-                call
-            })
             .collect();
         if !fallback_text.is_empty() && !filtered_calls.is_empty() {
             parsed_text = fallback_text;
         }
         calls = filtered_calls;
+    }
+
+    for call in &mut calls {
+        if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
+            recover_structured_arguments(&mut call.arguments, &spec.parameters, 0);
+        }
     }
 
     let parse_issue = if ctx.strict_tool_parsing {
@@ -653,7 +653,7 @@ mod argument_preservation_tests {
     }
 
     #[tokio::test]
-    async fn fallback_recovers_structured_fields_but_native_calls_are_unchanged() {
+    async fn schema_recovers_structured_fields_for_fallback_and_native_calls() {
         let schema = json!({"type":"object", "properties":{
             "params":{"type":"object"},
             "items":{"type":"array", "items":{"type":"string"}},
@@ -692,7 +692,45 @@ mod argument_preservation_tests {
             true,
         )
         .await;
-        assert_eq!(native.tool_calls[0].arguments, args);
+        let recovered = &native.tool_calls[0].arguments;
+        assert_eq!(recovered["params"], json!({"maxResults":3}));
+        assert_eq!(recovered["items"], json!(["{\"id\":1}"]));
+        assert_eq!(recovered["content"], "[1,2]");
+    }
+
+    #[tokio::test]
+    async fn native_call_recovers_schema_declared_structured_fields() {
+        let schema = json!({"type":"object", "properties":{
+            "action":{"type":"string"},
+            "options":{"type":"object"},
+            "filters":{"type":"array", "items":{"type":"object"}},
+            "label":{"type":"string"}
+        }});
+        let arguments = json!({
+            "action":"upsert",
+            "options":"{\"allowMultiple\":false,\"color\":\"default\"}",
+            "filters":"[{\"field\":\"status\",\"value\":\"active\"}]",
+            "label":"Site web"
+        });
+
+        let native = interpret(
+            ToolSpec::new("customermates__manage_custom_columns", "test", schema),
+            arguments,
+            true,
+            true,
+        )
+        .await;
+        let recovered = &native.tool_calls[0].arguments;
+        assert_eq!(
+            recovered["options"],
+            json!({"allowMultiple":false, "color":"default"})
+        );
+        assert_eq!(
+            recovered["filters"],
+            json!([{"field":"status", "value":"active"}])
+        );
+        assert_eq!(recovered["action"], "upsert");
+        assert_eq!(recovered["label"], "Site web");
     }
 
     #[test]

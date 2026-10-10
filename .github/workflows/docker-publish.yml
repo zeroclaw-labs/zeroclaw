@@ -72,6 +72,13 @@ jobs:
         with:
           ref: ${{ inputs.release_ref || github.ref }}
 
+      # The image must report the commit it was built from, not the caller's
+      # ambient sha: on the workflow_call release path the two differ.
+      - name: Resolve the commit being built
+        id: srcsha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
@@ -98,6 +105,7 @@ jobs:
           platforms: ${{ matrix.platforms }}
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
+            ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
@@ -138,6 +146,11 @@ jobs:
           # rather than the caller/default ref.
           ref: ${{ inputs.release_ref || github.ref }}
 
+      - name: Resolve the commit being built
+        id: srcsha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
@@ -174,6 +187,8 @@ jobs:
           context: .
           file: apps/zerorelay/Dockerfile
           push: true
+          build-args: |
+            ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
           tags: |
             ${{ steps.tags.outputs.pinned }}
             ${{ steps.tags.outputs.floating }}

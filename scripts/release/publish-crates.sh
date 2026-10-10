@@ -31,7 +31,16 @@ set -euo pipefail
 # hardcoded here, so they cannot drift from the manifests.
 # tests/architecture/publish_contract.rs asserts the same invariants in CI.
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# The release helpers live beside this script. The tree being packaged is
+# normally the checkout this script came from, but release recovery runs the
+# current tooling against an older tagged tree: a publisher bug found after the
+# tag was cut can then be fixed on master without moving the tag.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="${PUBLISH_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+if [[ ! -f "$REPO_ROOT/Cargo.toml" ]]; then
+  echo "error: $REPO_ROOT has no Cargo.toml; set PUBLISH_SOURCE_ROOT to the release tree." >&2
+  exit 1
+fi
 cd "$REPO_ROOT"
 
 EXECUTE=0
@@ -108,7 +117,7 @@ fi
 # recorded; recomputing it here proves the tarball about to be packaged carries
 # the bundle that was verified, not a rebuild or a partial download.
 if [[ -n "${WEB_DIST_DIGEST:-}" ]]; then
-  if ! actual_web_digest="$(bash "$REPO_ROOT/scripts/release/web_dist_digest.sh" web/dist)"; then
+  if ! actual_web_digest="$(bash "$SCRIPT_DIR/web_dist_digest.sh" web/dist)"; then
     echo "error: could not compute the web/dist digest; refusing to publish." >&2
     exit 1
   fi
@@ -127,7 +136,7 @@ META="$(cargo metadata --format-version 1 --no-deps)"
 # run or a resume. Versioned dev-dependencies survive Cargo packaging and must
 # already exist when their consumer uploads. Stream metadata: the full workspace
 # exceeds the platform limit for a single argv entry.
-ORDER="$(python3 "$REPO_ROOT/scripts/release/publish_order.py" "$VERSION" <<<"$META")" || {
+ORDER="$(python3 "$SCRIPT_DIR/publish_order.py" "$VERSION" <<<"$META")" || {
   echo "error: could not compute publish order." >&2
   exit 1
 }

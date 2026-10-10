@@ -1,0 +1,89 @@
+{
+  "frames": [
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "connect": "/ws/chat?agent=web&session_id=golden-ws-turn"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "message_count": 0,
+        "resumed": false,
+        "session_id": "golden-ws-turn",
+        "type": "session_start"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "type": "connect"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "message": "Connection established",
+        "type": "connected"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "send",
+      "payload": {
+        "content": "Say hello to the golden frames.",
+        "type": "message"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "content": "Hello, golden frames.",
+        "type": "chunk"
+      }
+    },
+    {
+      "channel": "ws",
+      "dir": "recv",
+      "payload": {
+        "cost_usd": null,
+        "full_response": "Hello, golden frames.",
+        "input_tokens": 10,
+        "last_input_tokens": 10,
+        "last_serving_model": "fixture-model",
+        "last_serving_provider_ref": "custom.fixture",
+        "max_context_tokens": 32000,
+        "model": "fixture-model",
+        "output_tokens": 5,
+        "provider": "custom.fixture",
+        "provider_ref": "custom.fixture",
+        "tokens_used": 15,
+        "type": "done",
+        "usage_by_provider": [
+          {
+            "cached_input_tokens": 0,
+            "cost_usd": 0.0,
+            "input_tokens": 10,
+            "model": "fixture-model",
+            "output_tokens": 5,
+            "provider_ref": "custom.fixture"
+          }
+        ]
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 1
+      }
+    }
+  ],
+  "scenario": "ws_chat_turn_completes"
+}

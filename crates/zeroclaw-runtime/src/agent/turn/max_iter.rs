@@ -6,11 +6,12 @@ use super::StreamDelta;
 use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
@@ -29,6 +30,12 @@ impl CompletionLimit {
             }
             Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
         }
+    }
+
+    /// The iteration-cap stop, shared by the `ErrorAtCap` exit and the
+    /// graceful-summary failure paths so all of them carry one code and one message.
+    fn stop(self) -> TurnStop {
+        TurnStop::close_out(TurnStopCode::MaxIterations, self.explanation())
     }
 }
 
@@ -61,6 +68,7 @@ async fn emit_summary_attempt_usage(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
+    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
@@ -78,8 +86,10 @@ pub(crate) async fn finish_after_max_iterations(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     config: Option<&Config>,
     multimodal_config: &MultimodalConfig,
+    security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    provider_image_state: Option<&mut super::ProviderImageState>,
     context_limits_for_route: impl Fn(&str, &str) -> ResolvedContextLimits + Send + Sync,
     crumb_present: &mut bool,
     reported_usage: Option<super::ReportedRequestUsage>,
@@ -102,7 +112,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -141,7 +151,9 @@ pub(crate) async fn finish_after_max_iterations(
         provider_name,
         model,
         dispatch_model,
-    )?;
+        security,
+    )
+    .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
@@ -181,6 +193,7 @@ pub(crate) async fn finish_after_max_iterations(
             )
             .await?
             .messages;
+            let prepared_message_count = messages.len();
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
             let mut selected_model = model.to_string();
@@ -208,6 +221,25 @@ pub(crate) async fn finish_after_max_iterations(
             } else {
                 Vec::new()
             };
+            let summary_image_route =
+                super::ProviderImageState::route(provider_name, &selected_model);
+            let quarantined_image_ids = provider_image_state
+                .map(|state| state.quarantined(&summary_image_route))
+                .unwrap_or_default();
+            if !quarantined_image_ids.is_empty() {
+                if !suffix_only {
+                    anyhow::bail!(crate::i18n::get_required_cli_string(
+                        "turn-context-hook-mutation-unsafe-error",
+                    ));
+                }
+                let transient_suffix = messages.split_off(prepared_message_count);
+                messages = super::suppress_quarantined_provider_images(
+                    &messages,
+                    &quarantined_image_ids,
+                    false,
+                );
+                messages.extend(transient_suffix);
+            }
             let tokens_before =
                 token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
             let mut dropped_messages = 0;
@@ -216,6 +248,7 @@ pub(crate) async fn finish_after_max_iterations(
                 let tokens =
                     token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
                 let mut trim = super::surface_oversized_dispatch_if_needed(
+                    injected_memory_preamble,
                     history,
                     crumb_present,
                     tokens,
@@ -239,6 +272,11 @@ pub(crate) async fn finish_after_max_iterations(
                     )
                     .await?
                     .messages;
+                    messages = super::suppress_quarantined_provider_images(
+                        &messages,
+                        &quarantined_image_ids,
+                        false,
+                    );
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
                     continue;
@@ -275,6 +313,11 @@ pub(crate) async fn finish_after_max_iterations(
                                 tokens_before_source: Some(source),
                                 tokens_after_source: Some(source),
                                 unsatisfiable_floor: floor.then_some(true),
+                                retained_context: Some(super::retained_context_snapshot(
+                                    injected_memory_preamble,
+                                    history,
+                                    *crumb_present,
+                                )),
                             })
                             .await;
                     }
@@ -369,7 +412,11 @@ pub(crate) async fn finish_after_max_iterations(
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
+            return Err(TurnStop::close_out(
+                TurnStopCode::MaxIterations,
+                format!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"),
+            )
+            .into());
         }
         SummaryCall::Done(Err(e)) => {
             ::zeroclaw_log::record!(
@@ -387,7 +434,12 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
-            return Err(e).context(exhaustion);
+            // The provider error stays the source; the stop rides alongside
+            // it so the exit is typed without losing what actually failed.
+            return Err(zeroclaw_api::turn_stop::tag(
+                e.context(exhaustion),
+                limit.stop(),
+            ));
         }
         SummaryCall::Done(Ok(resp)) => {
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
@@ -397,7 +449,7 @@ pub(crate) async fn finish_after_max_iterations(
 
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -431,7 +483,7 @@ pub(crate) async fn finish_after_max_iterations(
         display_text
     };
     if display_text.trim().is_empty() {
-        anyhow::bail!("{exhaustion}")
+        return Err(limit.stop().into());
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -550,6 +602,7 @@ mod graceful_summary_metering_tests {
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
+            &mut None,
             provider,
             &mut history,
             "custom",
@@ -567,6 +620,8 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -864,6 +919,7 @@ mod graceful_summary_metering_tests {
             ];
             let mut crumb_present = false;
             let result = finish_after_max_iterations(
+                &mut None,
                 &provider,
                 &mut history,
                 "custom",
@@ -881,7 +937,9 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
                 Some(&hooks),
+                None,
                 None,
                 |provider, model| {
                     assert_eq!(provider, "custom");
@@ -926,6 +984,147 @@ mod graceful_summary_metering_tests {
     }
 
     #[tokio::test]
+    async fn graceful_summary_omits_quarantined_paired_tool_image_before_and_after_trim() {
+        struct SummaryRouteHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for SummaryRouteHook {
+            fn name(&self) -> &str {
+                "summary-route-hook"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *model = "summary-model".into();
+                messages.push(ChatMessage::user("hook context ".repeat(20)));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_reference = format!("data:image/png;base64,{PNG_B64}");
+        let multimodal_config = MultimodalConfig::default();
+
+        for budget in [4096, 512] {
+            let assistant_content = super::super::parse_response::build_native_assistant_history(
+                "",
+                &[zeroclaw_api::model_provider::ToolCall {
+                    id: "toolu_image".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            );
+            let mut history = vec![
+                ChatMessage::user("obsolete context ".repeat(800)),
+                ChatMessage::assistant("obsolete answer"),
+                ChatMessage::user("capture the screenshot"),
+                ChatMessage::assistant(assistant_content),
+                ChatMessage::tool(
+                    serde_json::json!({
+                        "content": "captured screenshot",
+                        "tool_call_id": "toolu_image",
+                        "attachments": [{"kind": "image", "target": image_reference}],
+                    })
+                    .to_string(),
+                ),
+            ];
+            let prepared = super::super::vision_route::prepare_messages_for_iteration(
+                &history,
+                &multimodal_config,
+                false,
+                None,
+            )
+            .await
+            .expect("tool image prepares");
+            let submitted = zeroclaw_providers::multimodal::provider_image_ids(&prepared.messages);
+            assert_eq!(
+                submitted.len(),
+                1,
+                "the paired tool image must be provider-visible"
+            );
+
+            let mut provider_image_state = super::super::ProviderImageState::default();
+            provider_image_state.record_recovery(
+                super::super::ProviderImageState::route("custom", "summary-model"),
+                &[],
+                &submitted,
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                vision: true,
+                expected_request: Some(("summary-model", budget)),
+            };
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryRouteHook(Arc::clone(&hook_calls))));
+            let mut crumb_present = false;
+            let mut memory_preamble = None;
+
+            let out = finish_after_max_iterations(
+                &mut memory_preamble,
+                &provider,
+                &mut history,
+                "custom",
+                "original-model",
+                "original-model",
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::LocalIterations(2),
+                String::new(),
+                "summary-quarantined-tool-image",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                None,
+                &multimodal_config,
+                None,
+                Some(&hooks),
+                None,
+                Some(&mut provider_image_state),
+                |provider, model| {
+                    assert_eq!(provider, "custom");
+                    assert_eq!(model, "summary-model");
+                    ResolvedContextLimits {
+                        model_context_window: budget,
+                        ..ResolvedContextLimits::legacy_fallback(budget)
+                    }
+                },
+                &mut crumb_present,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await
+            .expect("graceful summary succeeds");
+
+            assert!(out.contains("wrap-up summary"));
+            assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+            let captured = seen.lock().unwrap();
+            assert!(captured[0].contains("hook context"));
+            assert!(
+                !captured[0].contains(PNG_B64),
+                "the quarantined paired tool image reached the summary provider: {}",
+                captured[0]
+            );
+            assert_eq!(crumb_present, budget == 512);
+            assert_eq!(
+                history
+                    .iter()
+                    .any(|message| message.content.contains("obsolete")),
+                budget == 4096
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
         for disable_soft_budget in [false, true] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -943,6 +1142,7 @@ mod graceful_summary_metering_tests {
             let mut crumb_present = false;
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
             let error = finish_after_max_iterations(
+                &mut None,
                 &provider,
                 &mut history,
                 "custom",
@@ -960,6 +1160,8 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 &MultimodalConfig::default(),
+                None,
+                None,
                 None,
                 None,
                 |_, _| ResolvedContextLimits {
@@ -991,6 +1193,7 @@ mod graceful_summary_metering_tests {
             let TurnEvent::HistoryTrimmed {
                 tokens_after,
                 unsatisfiable_floor,
+                retained_context,
                 ..
             } = rx.try_recv().unwrap()
             else {
@@ -998,40 +1201,43 @@ mod graceful_summary_metering_tests {
             };
             assert_eq!(unsatisfiable_floor, Some(true));
             assert!(tokens_after.unwrap() > budget as u64);
+            let retained = retained_context.expect("summary floor must preserve retained context");
+            assert!(!retained.breadcrumb);
+            assert_eq!(retained.retained_messages.len(), 2);
         }
     }
 
-    // The graceful-summary path now prepares the accumulated history through
-    // the full multimodal normalizer before dispatch, and the dispatch seam
-    // still strips loadable audio markers as a fail-closed backstop. A
-    // tool-result audio marker in the history must never reach the provider
-    // as a raw filesystem path the model would hallucinate over; this pins
-    // the combined contract on the max-iteration exit.
+    // The summary request must drop declared audio attachments before dispatch,
+    // just like an in-loop request. Legacy tool text is not scanned for markers.
     #[tokio::test]
-    async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
+    async fn graceful_summary_drops_declared_tool_audio_attachment() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
             ..Default::default()
         };
-        // A properly paired assistant tool_call + native tool-result JSON blob,
-        // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
-        // the exchange intact and the audio marker survives to dispatch. This
-        // also exercises stripping a marker embedded inside a tool-result JSON
-        // object (the native-dispatcher shape), not just plain text.
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: "/tmp/clip.wav".to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Audio,
+        }];
+        let tool_content = serde_json::json!({
+            "content": "recorded 3:00 PM",
+            "tool_call_id": "toolu_1",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and tell me what you hear"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_1"}]}"#),
-            ChatMessage::tool(
-                r#"{"content":"[AUDIO:/tmp/clip.wav] recorded 3:00 PM","tool_call_id":"toolu_1"}"#,
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1051,6 +1257,8 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1063,25 +1271,28 @@ mod graceful_summary_metering_tests {
         let captured = seen.lock().unwrap().join("\n");
         assert!(
             !captured.contains("/tmp/clip.wav"),
-            "raw audio path reached the provider on the max-iteration path: {captured}"
+            "declared audio path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "audio marker should be replaced with a placeholder: {captured}"
+            captured.contains("recorded 3:00 PM"),
+            "tool text should survive dropping the audio attachment: {captured}"
         );
     }
 
-    // The summary request is prepared like an in-loop request, so a
-    // tool-result image marker whose file is not an interpretable image is
-    // dropped by the normalizer with a model-facing note: the raw path never
-    // reaches the provider, and the model is told the image could not be
-    // loaded rather than being handed a path to hallucinate over.
+    // The summary request is prepared like an in-loop request, so an image a
+    // tool DECLARED whose file is not an interpretable image is dropped by
+    // the normalizer with a model-facing note: the raw path never reaches
+    // the provider, and the model is told the attachment could not be loaded
+    // rather than being handed a path to hallucinate over.
     #[tokio::test]
     async fn graceful_summary_drops_unloadable_tool_image_marker() {
         let temp = tempfile::tempdir().expect("temp dir");
         let bogus_image = temp.path().join("shot.txt");
         std::fs::write(&bogus_image, b"not an image").expect("write text bytes");
-        let marker = format!("[{}:{}]", "IMAGE", bogus_image.display());
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: bogus_image.display().to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
@@ -1089,25 +1300,27 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
-        // A properly paired assistant tool_call + native tool-result JSON
-        // blob, so the orphan sweep keeps the exchange intact and the marker
-        // reaches the summary preparation as a latest-run tool result.
+        // A properly paired assistant tool_call + declared native tool-result
+        // envelope, so the orphan sweep keeps the exchange intact and the
+        // declared attachment reaches the summary preparation as a
+        // latest-run tool result.
+        let tool_content = serde_json::json!({
+            "content": "shot",
+            "tool_call_id": "toolu_img",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_img"}]}"#),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": format!("{marker} shot"),
-                    "tool_call_id": "toolu_img",
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1127,6 +1340,8 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1142,8 +1357,8 @@ mod graceful_summary_metering_tests {
             "raw image path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            !captured.contains(&marker),
-            "the unloadable image marker must be dropped, not forwarded: {captured}"
+            !captured.contains("data:image"),
+            "the unloadable declared attachment must yield no image: {captured}"
         );
         assert!(
             captured.contains("could not be loaded"),
@@ -1151,11 +1366,12 @@ mod graceful_summary_metering_tests {
         );
     }
 
-    // A loadable local image and an already-inline data URI both reach the
-    // summary request as validated inline markers: the file is read,
-    // MIME-checked and inlined by the normalizer, and the inline marker
-    // passes through byte-identical. This pins the normalize decision for
-    // the summary path: the summary may see the turn's images.
+    // A loadable local image and an already-inline data URI, both DECLARED
+    // as attachments, reach the summary request as validated inline data
+    // URIs: the file is read, MIME-checked and inlined by the normalizer,
+    // and the inline attachment passes through byte-identical, so both
+    // arrive as the same payload. This pins the normalize decision for the
+    // summary path: the summary may see the turn's images.
     #[tokio::test]
     async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1169,8 +1385,16 @@ mod graceful_summary_metering_tests {
         )
         .expect("write PNG fixture");
         let inline_uri = format!("data:image/png;base64,{PNG_B64}");
-        let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
-        let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
+        let attachments = vec![
+            zeroclaw_api::media::RenderedMarker {
+                target: png_path.display().to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            },
+            zeroclaw_api::media::RenderedMarker {
+                target: inline_uri.to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            },
+        ];
 
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
@@ -1178,22 +1402,23 @@ mod graceful_summary_metering_tests {
             vision: true,
             ..Default::default()
         };
+        let tool_content = serde_json::json!({
+            "content": "both shots",
+            "tool_call_id": "toolu_two",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let mut history = vec![
             ChatMessage::user("call the tool and describe both screenshots"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_two"}]}"#),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": format!("{local_marker} and {inline_marker}"),
-                    "tool_call_id": "toolu_two",
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool(tool_content),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1213,6 +1438,8 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            None,
+            None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             None,
@@ -1228,13 +1455,233 @@ mod graceful_summary_metering_tests {
             "the local path must be inlined, not forwarded: {captured}"
         );
         assert!(
-            !captured.contains(&local_marker),
-            "the path-form marker must be replaced by its inline form: {captured}"
+            captured.contains("both shots"),
+            "the declared body is delivered verbatim: {captured}"
         );
         assert_eq!(
-            captured.matches(&inline_marker).count(),
+            captured.matches(&inline_uri).count(),
             2,
-            "both images must arrive as the same byte-identical inline marker: {captured}"
+            "both declared images must arrive inlined as the same payload: {captured}"
+        );
+    }
+
+    // Legacy control: a tool result whose body embeds image marker syntax
+    // with no declaration is never promoted, even when the referenced file
+    // is a valid image. Nothing is loaded, no note is appended, and the body
+    // is delivered as the legacy path delivers it: the one-shot seam's
+    // compatibility sweep replaces the path reference with a placeholder.
+    #[tokio::test]
+    async fn graceful_summary_does_not_promote_legacy_tool_body_markers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let png_path = temp.path().join("shot.png");
+        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .expect("write png signature");
+        let marker = format!("[{}:{}]", "IMAGE", png_path.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let tool_content = serde_json::json!({
+            "content": format!("saw {marker} in output"),
+            "tool_call_id": "toolu_legacy",
+        })
+        .to_string();
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe the screenshot"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
+            ChatMessage::tool(tool_content),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-legacy",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains("data:image"),
+            "a legacy body marker must not be promoted to an image: {captured}"
+        );
+        assert!(
+            !captured.contains("could not be loaded"),
+            "nothing is loaded for a legacy body, so no note is appended: {captured}"
+        );
+        // A legacy carrier is delivered as its bytes: the body reaches the
+        // provider verbatim, quoted marker syntax and raw path included, as
+        // text. Nothing infers, sweeps, or strips it.
+        let body = format!("saw {marker} in output");
+        assert!(
+            captured.contains(&body),
+            "the legacy body is delivered verbatim: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no seam rewrites a legacy carrier's body: {captured}"
+        );
+    }
+
+    // A declared count-zero tool result whose body quotes a path marker: the
+    // body is text under the attachment-identity contract, and the one-shot
+    // dispatch seam behind the graceful summary must deliver it byte for
+    // byte instead of replacing the quoted reference with a placeholder.
+    // Both carrier shapes are covered: the native envelope and the prompt
+    // carrier.
+    #[tokio::test]
+    async fn graceful_summary_keeps_declared_zero_tool_body_verbatim() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/example.png");
+        let body = format!("source: {marker} end");
+
+        // Native shape: a properly paired assistant tool_call plus a
+        // declared envelope with an empty attachments array, so the orphan
+        // sweep keeps the exchange intact.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let native_content = serde_json::json!({
+            "content": body,
+            "tool_call_id": "toolu_quote",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&[]),
+        })
+        .to_string();
+        let mut history = vec![
+            ChatMessage::user("call the tool and read the file"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_quote"}]}"#),
+            ChatMessage::tool(native_content.clone()),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-quote",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&native_content),
+            "the declared count-zero native body must arrive byte for byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no placeholder may be substituted at the seam: {captured}"
+        );
+
+        // Prompt shape: a count-zero prompt carrier in a user-role message.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+            ..Default::default()
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let mut history = vec![
+            ChatMessage::user("call the tool and read the file"),
+            ChatMessage::user(carrier.clone()),
+        ];
+        let out = finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "trace-req-img-quote-prompt",
+            &knobs,
+            None,
+            None,
+            None,
+            None,
+            &multimodal_config,
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&carrier),
+            "the declared count-zero prompt carrier must arrive byte for byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no placeholder may be substituted at the seam: {captured}"
         );
     }
 
@@ -1282,6 +1729,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1299,6 +1747,8 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1368,6 +1818,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1385,6 +1836,8 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1575,6 +2028,29 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    // A summary that is only a terminal marker passes the semantic-empty
+    // check (which strips think tags, not markers) and is emptied by display
+    // cleanup; that exit must carry the same typed stop as the other cap exits.
+    #[tokio::test]
+    async fn graceful_summary_of_only_a_terminal_marker_is_a_typed_max_iterations_stop() {
+        let provider = RawTextProvider {
+            text: "<|eom|>".to_string(),
+        };
+        let error = run_summary(&provider)
+            .await
+            .expect_err("a marker-only summary is not a terminal answer");
+        assert_eq!(
+            zeroclaw_api::turn_stop::turn_stop(&error)
+                .expect("marker-only exit must carry the typed stop")
+                .code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert_eq!(
+            error.to_string(),
+            "Agent exceeded maximum tool iterations (2)"
+        );
+    }
+
     #[tokio::test]
     async fn graceful_summary_chunk_suppresses_internal_tool_protocol_envelope() {
         let delta = emitted_chunk_for_raw_summary(
@@ -1621,6 +2097,36 @@ mod i18n_message_tests {
         assert!(
             msg.contains("maximum tool iterations"),
             "message should describe the limit: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn the_iteration_cap_stop_is_typed_and_says_what_it_always_said() {
+        let stop = CompletionLimit::LocalIterations(10).stop();
+        assert_eq!(stop.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            stop.to_string(),
+            "Agent exceeded maximum tool iterations (10)"
+        );
+        let err: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&err)
+                .expect("stop must survive the anyhow hop")
+                .code,
+            TurnStopCode::MaxIterations
+        );
+
+        let tree = CompletionLimit::ExecutionTree.stop();
+        assert_eq!(tree.code, TurnStopCode::MaxIterations);
+        assert_eq!(
+            tree.to_string(),
+            "Agent exhausted the execution-tree iteration budget"
         );
     }
 }

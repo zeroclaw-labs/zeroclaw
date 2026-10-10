@@ -161,7 +161,9 @@ jobs:
     # job-level `if` runs before the matrix expands, so the empty matrix is
     # never handed to fromJSON.
     if: needs.changes.outputs.source_builds == 'true'
-    runs-on: ubuntu-latest
+    # Alpine's ARM64 release link needs more memory than the hosted runner.
+    # Keep the existing x64 cross-build and release settings on the 32 GB class.
+    runs-on: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/arm64' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false

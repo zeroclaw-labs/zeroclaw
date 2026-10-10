@@ -275,9 +275,12 @@ fn matches_any_pattern(patterns: &[String], tool: &str) -> bool {
     patterns.iter().any(|p| glob_matches(p, tool))
 }
 
-/// Truncate serialised args to `max_bytes`. If 0, no truncation.
-/// Uses byte-oriented slicing with char-boundary alignment to avoid
-/// mixing byte length comparisons with char-count truncation.
+/// Retain at most `max_bytes` from the serialised args before appending the
+/// truncation marker. The marker and enclosing audit-payload JSON are outside
+/// this source-byte budget. If 0, no truncation.
+///
+/// Uses byte-oriented slicing with char-boundary alignment to avoid mixing byte
+/// length comparisons with char-count truncation.
 #[allow(clippy::cast_possible_truncation)]
 fn truncate_args(args: Value, max_bytes: u64) -> Value {
     if max_bytes == 0 {
@@ -823,9 +826,19 @@ mod tests {
     fn truncate_args_over_limit() {
         let args = serde_json::json!({"key": "a]long value that exceeds limit"});
         let result = truncate_args(args, 10);
-        assert!(result.is_string());
-        let s = result.as_str().unwrap();
-        assert!(s.ends_with("...[truncated]"));
+        assert_eq!(result, Value::String("{\"key\":\"a]...[truncated]".into()));
+    }
+
+    #[test]
+    fn truncate_args_tiny_limit_counts_only_retained_source_bytes() {
+        let result = truncate_args(serde_json::json!({"key": "value"}), 1);
+        assert_eq!(result, Value::String("{...[truncated]".into()));
+    }
+
+    #[test]
+    fn truncate_args_aligns_utf8_source_prefix_to_char_boundary() {
+        let result = truncate_args(serde_json::json!("éclair"), 2);
+        assert_eq!(result, Value::String("\"...[truncated]".into()));
     }
 
     #[test]

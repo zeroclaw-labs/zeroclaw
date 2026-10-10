@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = {$url} でアプリを作成し、ボッ�
 cli-integrations-chat-configure = {$command} を起動して設定を開き、{$channel} のインスタンスと認証情報を設定します。
 cli-integrations-chat-bind = チャンネルのエイリアスをエージェントに関連付け、ピアグループのアクセス権を確認します。
 cli-integrations-chat-enable = 設定とアクセス権を確認してから、チャンネルのインスタンスを有効にします。
+cli-integrations-chat-imessage-transport = AppleScript オートメーションでメッセージを送信し、ローカルの「メッセージ」データベースを読み取って受信します。
+cli-integrations-chat-imessage-permissions = 「メッセージ」を操作するための macOS の「オートメーション」と、メッセージデータベースを読み取るための「フルディスクアクセス」を許可します。
+cli-integrations-chat-generic-setup = {$command} を実行して「設定」を開き、{$channel} に必要なフィールド、ルーティング、アクセス権を設定します。設定を確認してから有効にしてください。
 cli-skills-about = スキル (ユーザー定義機能) を管理
 cli-sop-about = 標準操作手順 (SOP) を管理
 cli-migrate-about = 他のエージェントランタイムからデータを移行
@@ -788,6 +791,7 @@ cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインスト�
 cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、
 cli-desktop-blurb2 = CLI と同じゲートウェイに接続します。
 cli-config-all-configured = すべてのセクションは既に設定済みです。
+cli-config-initialized-sections = {$count} 個のセクションをデフォルト値で初期化しました:
 cli-config-schema-current = 設定は既に現在のスキーマバージョンです。
 cli-config-applied-ops = {$count} 件の操作を適用しました:
 cli-plugins-none = インストールされているプラグインはありません。
@@ -1003,6 +1007,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
     モデル切り替え: /models
+channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
 turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]

@@ -8,12 +8,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{
-    TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus, TerminalSettlementIntent,
+    TaskKind, TaskProgress, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus,
+    TerminalSettlementIntent,
 };
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 8;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -83,13 +84,15 @@ impl SqliteTaskStore {
                  depth           INTEGER NOT NULL DEFAULT 0,
                  parent_id       TEXT,
                  originator_route TEXT,
+                 originator_chain TEXT,
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
-                 error           TEXT
+                 error           TEXT,
+                 progress        TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
@@ -150,6 +153,26 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 8;",
         )
         .context("apply control-plane schema v8")?;
+    }
+    if version < 9 {
+        add_column_if_missing(
+            conn,
+            "tasks",
+            "originator_chain",
+            "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 9;")
+            .context("apply control-plane schema v9")?;
+    }
+    if version < 10 {
+        add_column_if_missing(
+            conn,
+            "tasks",
+            "progress",
+            "ALTER TABLE tasks ADD COLUMN progress TEXT",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 10;")
+            .context("apply control-plane schema v10")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -225,6 +248,29 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let status = status_from_db(&status_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     })?;
+    // A chain that does not parse is dropped, not surfaced as a read error: the
+    // row keeps whatever `originator_route` says, so a creator-stamped row loses
+    // ancestor access and nothing else. A row with no creator route either is
+    // indistinguishable from a pre-chain legacy row after this decode; a
+    // non-TEXT value in the column is still a conversion error above.
+    let originator_chain: Vec<String> = match row.get::<_, Option<String>>("originator_chain")? {
+        Some(raw) if !raw.is_empty() => match serde_json::from_str(&raw) {
+            Ok(chain) => chain,
+            Err(_) => {
+                let task_id: String = row.get("id")?;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                        })),
+                    "control-plane: task originator_chain is unreadable and was ignored; the creator route alone governs access"
+                );
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
     Ok(TaskRecord {
         id: row.get("id")?,
         kind,
@@ -236,6 +282,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         depth: row.get::<_, i64>("depth")? as u32,
         parent_id: row.get("parent_id")?,
         originator_route: row.get("originator_route")?,
+        originator_chain,
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
@@ -249,7 +296,31 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnapshot> {
         task: row_to_record(row)?,
         output: row.get("output")?,
         error: row.get("error")?,
+        progress: progress_from_row(row)?,
     })
+}
+
+/// Progress is advisory: a value that does not parse reads as absent rather
+/// than failing the snapshot that carries the task's lifecycle and output.
+fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<TaskProgress>> {
+    let Some(raw) = row.get::<_, Option<String>>("progress")? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&raw) {
+        Ok(progress) => Ok(Some(progress)),
+        Err(_) => {
+            let task_id: String = row.get("id")?;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "task_id": task_id,
+                    })),
+                "control-plane: task progress is unreadable and was ignored"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn row_to_settlement_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSettlementIntent> {
@@ -525,12 +596,19 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
     // status back to NULL/running (review finding— the documented idempotency).
+    // The chain is stored as a JSON string array; an empty chain stays NULL so
+    // pre-chain rows and non-delegate rows are indistinguishable at rest.
+    let originator_chain_db = if rec.originator_chain.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&rec.originator_chain).ok()
+    };
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
+             parent_id, originator_route, originator_chain, delivered, idem_key, principal_id,
              started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -543,6 +621,7 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.depth as i64,
             rec.parent_id,
             rec.originator_route,
+            originator_chain_db,
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
@@ -711,6 +790,31 @@ impl TaskRegistry for SqliteTaskStore {
         )
         .context("heartbeat task")?;
         Ok(())
+    }
+
+    async fn record_progress(
+        &self,
+        id: &str,
+        owner_boot_id: &str,
+        progress: &TaskProgress,
+    ) -> Result<bool> {
+        let encoded = serde_json::to_string(progress).context("encode task progress")?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET progress = ?1, heartbeat_at = ?2
+                 WHERE id = ?3 AND owner_boot_id = ?4 AND status = ?5",
+                params![
+                    encoded,
+                    now,
+                    id,
+                    owner_boot_id,
+                    status_to_db(TaskStatus::Running)
+                ],
+            )
+            .context("record task progress")?;
+        Ok(changed == 1)
     }
 
     async fn update_status(
@@ -959,6 +1063,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             originator_route: None,
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: None,
@@ -1010,6 +1115,98 @@ mod tests {
 
         assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
         assert_eq!(outbox_exists, 1);
+    }
+
+    #[tokio::test]
+    async fn originator_chain_round_trips_and_migrates() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        // A chained row round-trips root-first, ending at the creating caller.
+        let mut chained = rec("chain", "main", 1, "boot-1");
+        chained.originator_route = Some("middle".into());
+        chained.originator_chain = vec!["root".into(), "middle".into()];
+        s.create(chained).await.unwrap();
+        let got = s.get("chain").await.unwrap().unwrap();
+        assert_eq!(got.originator_route.as_deref(), Some("middle"));
+        assert_eq!(
+            got.originator_chain,
+            vec!["root".to_string(), "middle".to_string()]
+        );
+
+        // An empty chain stores NULL and reads back empty.
+        s.create(rec("no-chain", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        let got = s.get("no-chain").await.unwrap().unwrap();
+        assert!(got.originator_chain.is_empty());
+        {
+            let conn = s.conn.lock();
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT originator_chain FROM tasks WHERE id = ?1",
+                    params!["no-chain"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                stored.is_none(),
+                "an empty chain is stored as NULL, got {stored:?}"
+            );
+        }
+
+        // A v8 store (tasks table without the column) migrates to v9 on reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN originator_chain;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = reopened.conn.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+            let has_chain_column: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('tasks')
+                         WHERE name = 'originator_chain'
+                    )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                has_chain_column, 1,
+                "the v9 migration must add originator_chain to an existing tasks table"
+            );
+        }
+
+        // A malformed chain value fails closed to an empty chain, not an error.
+        reopened
+            .create(rec("migrated", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        {
+            let conn = reopened.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET originator_chain = 'not json' WHERE id = ?1",
+                params!["migrated"],
+            )
+            .unwrap();
+        }
+        let got = reopened.get("migrated").await.unwrap().unwrap();
+        assert!(
+            got.originator_chain.is_empty(),
+            "an unreadable chain fails closed to the creator route: {got:?}"
+        );
     }
 
     #[tokio::test]
@@ -1224,6 +1421,114 @@ mod tests {
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_none());
         s.heartbeat("a", "boot-1").await.unwrap(); // owner: stamps
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_progress_is_owner_gated_and_running_only() {
+        use super::super::task_registry::{TaskProgress, TaskProgressTool};
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("a", "main", 1, "boot-1")).await.unwrap();
+        let progress = TaskProgress {
+            last_activity_at: Some("2026-06-18T00:00:05Z".into()),
+            iterations: 2,
+            tools_completed: 1,
+            last_tool: Some(TaskProgressTool {
+                name: "shell".into(),
+                started_at: Some("2026-06-18T00:00:04Z".into()),
+                finished_at: Some("2026-06-18T00:00:05Z".into()),
+                success: Some(true),
+            }),
+            timeout_budget_secs: Some(300),
+            recent_tools: vec![TaskProgressTool {
+                name: "shell".into(),
+                ..TaskProgressTool::default()
+            }],
+            receipt_tail: vec!["zc-receipt:x".into()],
+        };
+
+        // Wrong boot: nothing written, heartbeat untouched.
+        assert!(
+            !s.record_progress("a", "boot-OTHER", &progress)
+                .await
+                .unwrap()
+        );
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
+        assert!(snap.task.heartbeat_at.is_none());
+
+        // Owner: round-trips and stamps the heartbeat.
+        assert!(s.record_progress("a", "boot-1", &progress).await.unwrap());
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert_eq!(snap.progress.as_ref(), Some(&progress));
+        assert!(snap.task.heartbeat_at.is_some());
+
+        // Terminal row: no write, the last running-state progress stays.
+        s.update_status("a", TaskStatus::Completed, Some("done".into()), None)
+            .await
+            .unwrap();
+        let mut later = progress.clone();
+        later.iterations = 99;
+        assert!(!s.record_progress("a", "boot-1", &later).await.unwrap());
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert_eq!(snap.progress.as_ref().map(|p| p.iterations), Some(2));
+        assert_eq!(snap.output.as_deref(), Some("done"));
+
+        // A malformed value reads as absent, never as a snapshot error.
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET progress = 'not json' WHERE id = ?1",
+                params!["a"],
+            )
+            .unwrap();
+        }
+        let snap = s.get_snapshot("a").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
+        assert_eq!(snap.output.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn progress_column_migrates_from_v9() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN progress;
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = reopened.conn.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+            let has_column: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('tasks')
+                         WHERE name = 'progress'
+                    )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                has_column, 1,
+                "the v10 migration must add progress to an existing tasks table"
+            );
+        }
+        reopened
+            .create(rec("migrated", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        let snap = reopened.get_snapshot("migrated").await.unwrap().unwrap();
+        assert!(snap.progress.is_none());
     }
 
     #[tokio::test]

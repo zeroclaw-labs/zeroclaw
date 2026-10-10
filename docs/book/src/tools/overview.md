@@ -21,7 +21,7 @@ section.
 
 ## Built-in tools
 
-A minimal build ships with:
+Built-in tools include the following. This list is not the core set; see [Tiers and the retained core set](../developing/tool-inventory.md#tiers-and-the-retained-core-set) for the core set and the tier of each tool the runtime registry builds.
 
 | Tool | What it does |
 |---|---|

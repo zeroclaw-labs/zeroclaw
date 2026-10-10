@@ -1036,6 +1036,11 @@ export default function SopCanvas({
           <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--pc-accent-light)">
             ⋔ {t('sops.switch')}
           </text>
+        ) : step?.decide || step?.unless_decided ? (
+          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--pc-accent-light)">
+            ◇ {step.decide ? t('sops.part_if_yes') : `${t('sops.part_unless')} ${step.unless_decided}`}
+            <title>{step.decide ?? `${t('sops.part_unless')} ${step.unless_decided}`}</title>
+          </text>
         ) : null}
         {state ? (
           <text x={12} y={64} fontSize="10" fill={nodeStateStroke(state)}>

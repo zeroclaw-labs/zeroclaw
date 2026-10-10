@@ -145,7 +145,16 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        // i18n-exempt: English fallback when Fluent (agent-runtime) is
+        // disabled. The fallback still carries `{$name}` placeholders, so
+        // substitute them here — without this, every argument-bearing
+        // message prints its placeholder literally (e.g. "Initialized
+        // {$count} section(s)").
+        let mut rendered = fallback.into();
+        for (name, value) in args {
+            rendered = rendered.replace(&format!("{{${name}}}"), value);
+        }
+        rendered
     }
 }
 
@@ -933,6 +942,8 @@ mod plugin_registry;
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
+mod relay_cli;
+#[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
 mod security_status;
@@ -989,11 +1000,15 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
+/// Package version and `git describe` build id stamped by `build.rs`, so
+/// `--version` and `status` name the commit this binary was built from.
+const VERSION: &str = env!("ZEROCLAW_VERSION");
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = VERSION)]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
@@ -1299,6 +1314,13 @@ Examples:
     Security {
         #[command(subcommand)]
         security_command: SecurityCommands,
+    },
+
+    /// Bind this daemon to a ZeroRelay account (self-serve enrollment)
+    #[cfg(feature = "agent-runtime")]
+    Relay {
+        #[command(subcommand)]
+        relay_command: RelayCommands,
     },
 
     Estop {
@@ -2935,7 +2957,7 @@ async fn run_quickstart_cli(
     };
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
             println!(
                 "{}",
@@ -2961,6 +2983,45 @@ async fn run_quickstart_cli(
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors,
+            },
+        ) => {
+            // The config was persisted (the agent exists) but a
+            // post-commit side effect — the personality files — failed.
+            // The committed config is not rolled back: report the partial
+            // success truthfully (no "complete" line), and preserve the
+            // historical nonzero failure result for this outcome.
+            eprintln!();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-quickstart-partial-personality-failure",
+                    &[("alias", &applied.alias)],
+                    "The agent config for {$alias} was saved, but installing its \
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
+                )
+            );
+            eprintln!();
+            for err in &errors {
+                eprintln!("  • {}: {}", quickstart_step_label(err.step), err.message);
+            }
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errors.len().to_string())],
+                )
+            )
         }
         Err(errs) => {
             eprintln!();
@@ -4646,6 +4707,37 @@ enum SecurityCommands {
     RelayRotateNodeId,
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum RelayCommands {
+    /// Claim this daemon into your ZeroRelay account with a one-time token.
+    ///
+    /// Derives the daemon's relay-registration identity, proves control of it
+    /// with an Ed25519 signature over the claim token, and POSTs the proof to the
+    /// control plane's `/v1/claim` endpoint. On success it writes `[relay]`
+    /// (enabled, url, node-id) so the daemon registers against the now-allowlisted
+    /// relay on its next start. The signing key is the same one the daemon
+    /// registers with, so the fingerprint proven here is the one the relay admits.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Claim this daemon into your ZeroRelay account with a one-time token.
+
+Derives the daemon's relay-registration identity, signs the claim token with it, \
+and POSTs the proof to the control plane. On success, writes [relay] so the daemon \
+registers against the relay on next start.
+
+Examples:
+  zeroclaw relay claim clm_XXXX --control https://control.zerorelay.net")]
+    Claim {
+        /// One-time claim token issued by your ZeroRelay account.
+        token: String,
+
+        /// Control-plane base URL, e.g. https://control.zerorelay.net.
+        #[arg(long)]
+        control: String,
+    },
+}
+
 /// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
 /// CA private-key at-rest protection sourced from the environment (decision:
 /// opt-in passphrase, 0600 floor; threat A4). `ZEROCLAW_CA_PASSPHRASE` (or a file
@@ -4681,14 +4773,22 @@ fn resolve_wss_client_auth(
         .map(|config| config.pinned_certs.clone())
         .unwrap_or_default();
     let byo_ca = client_auth
-        .filter(|config| config.enabled && !config.ca_cert_path.is_empty())
-        .map(|config| config.ca_cert_path.clone());
+        .and_then(zeroclaw_config::schema::WssClientAuthConfig::external_ca_path)
+        .map(str::to_string);
     Ok((byo_ca, pinned))
 }
 
 #[cfg(feature = "agent-runtime")]
-fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
-    if wss_cfg.sans.is_empty() {
+/// Server-certificate SANs shared by the WSS listener and the enrollment
+/// endpoint: `localhost`/`127.0.0.1`, the operator's `[wss].sans`, then
+/// `tailnet_sans` (resolved by `zeroclaw_runtime::tunnel::tailscale_server_sans`).
+/// Empty when there is nothing beyond the defaults, which keeps the
+/// default-SAN leaf reuse path in `ensure_server_materials_protected`.
+fn wss_server_sans(
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet_sans: &[String],
+) -> Vec<String> {
+    if wss_cfg.sans.is_empty() && tailnet_sans.is_empty() {
         return Vec::new();
     }
 
@@ -4697,10 +4797,89 @@ fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> 
         wss_cfg
             .sans
             .iter()
+            .chain(tailnet_sans)
             .filter(|value| !value.trim().is_empty())
             .cloned(),
     );
     sans
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The server-certificate SAN set for one daemon generation (one pass of the
+/// config-reload loop), shared by the WSS listener and the enrollment endpoint.
+///
+/// Both listeners materialize the same `<data_dir>/tls/server.*` leaf and each
+/// loads it into its own TLS acceptor, so they must agree on its SANs. The
+/// tailnet identity is therefore resolved once per generation and every
+/// listener receives that one answer; resolving it per listener let two
+/// `tailscale status` queries disagree (one failing, or a rename in between)
+/// and leave the listeners serving different leaves. A reload builds a fresh
+/// value, so a renamed node or reassigned tailnet IP is picked up then. This
+/// is the materialization the acceptors consume, not a second copy of config:
+/// the inputs are still read from live config and tailscaled at startup.
+#[derive(Clone, Default)]
+struct DaemonServerTls {
+    sans: Arc<tokio::sync::OnceCell<Vec<String>>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl DaemonServerTls {
+    /// Generate or reuse the server leaf under `tls_dir` with this
+    /// generation's SAN set. `discover` runs only for the first listener to
+    /// get here; later listeners reuse its outcome.
+    async fn materialize<F, Fut>(
+        &self,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        protection: &zeroclaw_tls::CaKeyProtection,
+        discover: F,
+    ) -> Result<zeroclaw_tls::ServerMaterials>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = zeroclaw_runtime::tunnel::TailnetSans>,
+    {
+        let sans = self
+            .sans
+            .get_or_try_init(|| async { effective_server_sans(tls_dir, wss_cfg, discover().await) })
+            .await?;
+        zeroclaw_tls::ensure_server_materials_protected(tls_dir, sans, protection)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The SAN set to request for the server leaf given the tailnet outcome.
+///
+/// When tailscaled cannot be queried the tailnet names are unknown, not
+/// absent, so the result never drops a name the existing leaf carries: it is
+/// the configured set plus every name already on the leaf. Configured
+/// additions still apply; a configured removal waits for the next start that
+/// can query tailscaled. An empty result keeps the generator's reuse path.
+fn effective_server_sans(
+    tls_dir: &Path,
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet: zeroclaw_runtime::tunnel::TailnetSans,
+) -> Result<Vec<String>> {
+    use zeroclaw_runtime::tunnel::TailnetSans;
+    match tailnet {
+        TailnetSans::NotApplicable => Ok(wss_server_sans(wss_cfg, &[])),
+        TailnetSans::Resolved(names) => Ok(wss_server_sans(wss_cfg, &names)),
+        TailnetSans::Unavailable { hostname_override } => {
+            let known: Vec<String> = hostname_override.into_iter().collect();
+            let mut sans = wss_server_sans(wss_cfg, &known);
+            let existing = zeroclaw_tls::server_leaf_sans(tls_dir)
+                .context("reading the existing WSS server certificate's SANs")?;
+            if let Some(existing) = existing
+                && !sans.is_empty()
+            {
+                for name in existing {
+                    if !sans.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                        sans.push(name);
+                    }
+                }
+            }
+            Ok(sans)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "agent-runtime"))]
@@ -4742,14 +4921,390 @@ mod wss_client_auth_tests {
         };
 
         assert_eq!(
-            wss_server_sans(&cfg),
+            wss_server_sans(&cfg, &[]),
             vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn wss_server_sans_appends_tailnet_names_after_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["zero".into()],
+            ..Default::default()
+        };
+        let tailnet = vec![
+            "node.tail1234.ts.net".to_string(),
+            "100.101.102.103".to_string(),
+        ];
+
+        assert_eq!(
+            wss_server_sans(&cfg, &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "zero".to_string(),
+                "node.tail1234.ts.net".to_string(),
+                "100.101.102.103".to_string(),
+            ]
+        );
+    }
+
+    use zeroclaw_runtime::tunnel::TailnetSans;
+
+    fn tailnet_names() -> Vec<String> {
+        vec![
+            "node.tail1234.ts.net".to_string(),
+            "node".to_string(),
+            "100.101.102.103".to_string(),
+        ]
+    }
+
+    fn wss_with_sans(sans: &[&str]) -> zeroclaw_config::schema::WssConfig {
+        zeroclaw_config::schema::WssConfig {
+            enabled: true,
+            sans: sans.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn leaf_fingerprint(tls_dir: &Path) -> String {
+        let der = zeroclaw_tls::load_certs(&tls_dir.join("server.crt").to_string_lossy())
+            .expect("server leaf");
+        zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref())
+    }
+
+    fn leaf_sans(tls_dir: &Path) -> Vec<String> {
+        zeroclaw_tls::server_leaf_sans(tls_dir)
+            .expect("read leaf")
+            .expect("leaf exists")
+    }
+
+    /// Run one listener's certificate step the way the WSS and enrollment
+    /// starters do, recording whether its discovery ran.
+    async fn materialize_as_listener(
+        shared: &DaemonServerTls,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        outcome: TailnetSans,
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> zeroclaw_tls::ServerMaterials {
+        shared
+            .materialize(
+                tls_dir,
+                wss_cfg,
+                &zeroclaw_tls::CaKeyProtection::None,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    outcome
+                },
+            )
+            .await
+            .expect("materialize server TLS")
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_tailnet_resolution_when_queries_would_differ() {
+        // WSS and enrollment share one tailnet resolution. Here the second
+        // listener's query would fail where the first succeeded: both must
+        // still load the same leaf, and it must carry the tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let wss = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let wss_leaf = leaf_fingerprint(&tls_dir);
+
+        let enroll = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            wss_leaf,
+            leaf_fingerprint(&tls_dir),
+            "the second listener replaced the leaf the first one loaded"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} missing from {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_resolution_when_the_first_query_fails() {
+        // Opposite order on fresh TLS state: the first listener's query fails
+        // and a later one would succeed. Both listeners must load the same
+        // leaf instead of the second regenerating it under the first.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+        let first = leaf_fingerprint(&tls_dir);
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first, leaf_fingerprint(&tls_dir));
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_keeps_names_the_existing_leaf_carries() {
+        // With configured SANs, a failed query must not regenerate the leaf
+        // without the previously discovered tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled reachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled unreachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "an outage must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    /// `tailscale status --json` as tailscaled reports it before receiving
+    /// its network map: exit status 0, OS hostname only, empty DNSName, null
+    /// TailscaleIPs, InNetworkMap false.
+    const NOT_READY_STATUS_JSON: &[u8] = br#"{
+        "BackendState": "Starting",
+        "Self": {
+            "HostName": "zcnode",
+            "DNSName": "",
+            "TailscaleIPs": null,
+            "InNetworkMap": false
+        }
+    }"#;
+
+    /// Discovery as production classifies a successful-but-not-ready status.
+    fn not_ready_status(hostname_override: Option<&str>) -> TailnetSans {
+        zeroclaw_runtime::tunnel::tailnet_sans_from_status(
+            Ok(zeroclaw_runtime::tunnel::parse_tailscale_self(
+                NOT_READY_STATUS_JSON,
+            )),
+            hostname_override.map(Into::into),
+        )
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_keeps_names_the_existing_leaf_carries() {
+        // A successful status with an empty identity is "not known yet"; with
+        // configured SANs it must not regenerate the leaf without its tailnet
+        // names, for either listener sharing this generation.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled ready.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled answers before its network map.
+        let shared = DaemonServerTls::default();
+        let wss =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+        let enroll =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "a not-ready status must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_with_override_keeps_discovered_names() {
+        // With a hostname override the not-ready path must keep the
+        // previously discovered names alongside it, not just the override.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            not_ready_status(Some("zero.tail1234.ts.net")),
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(
+            sans.contains(&"zero.tail1234.ts.net".to_string()),
+            "{sans:?}"
+        );
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_applies_configured_additions_without_stripping() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero"]),
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        // Operator adds a SAN while tailscaled is down.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero", "shard"]),
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(sans.contains(&"shard".to_string()), "{sans:?}");
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[test]
+    fn effective_server_sans_on_fresh_state_outage_uses_known_names() {
+        // No leaf yet and tailscaled down: only names known without it -
+        // loopback, [wss].sans, and the hostname override.
+        let dir = tempfile::tempdir().unwrap();
+        let sans = effective_server_sans(
+            dir.path(),
+            &wss_with_sans(&[]),
+            TailnetSans::Unavailable {
+                hostname_override: Some("zero.tail1234.ts.net".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
+        // Default config, nothing known: empty keeps the default leaf path.
+        assert!(
+            effective_server_sans(
+                dir.path(),
+                &wss_with_sans(&[]),
+                TailnetSans::Unavailable {
+                    hostname_override: None
+                },
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn wss_server_sans_tailnet_names_alone_still_keep_loopback() {
+        // No [wss].sans: tailnet names must not drop localhost/127.0.0.1,
+        // which local clients and the relay bridge dial.
+        let tailnet = vec!["node.tail1234.ts.net".to_string()];
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "node.tail1234.ts.net".to_string(),
+            ]
+        );
     }
 }
 
@@ -5613,6 +6168,29 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn install_daemon_sigbus_reset() -> Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a successful sigaction call initializes the output structure.
+    if unsafe { libc::sigaction(libc::SIGBUS, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the SIGBUS action");
+    }
+    // SAFETY: the preceding sigaction call succeeded.
+    let mut action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_DFL || action.sa_sigaction == libc::SIG_IGN {
+        return Ok(());
+    }
+
+    // Rust's handler may live on the same volume as the daemon. If that volume
+    // disappears, the kernel must restore SIG_DFL before entering the handler.
+    action.sa_flags |= libc::SA_RESETHAND;
+    // SAFETY: preserve the installed handler and mask; change only SA_RESETHAND.
+    if unsafe { libc::sigaction(libc::SIGBUS, &raw const action, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("installing the SIGBUS reset action");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -6169,6 +6747,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         bail!("--config-dir cannot be empty");
     }
 
+    #[cfg(target_os = "macos")]
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        install_daemon_sigbus_reset()?;
+    }
+
     #[cfg(feature = "agent-runtime")]
     crate::i18n::init(&crate::i18n::detect_locale());
 
@@ -6295,6 +6878,20 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunWindowsDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("Windows task runner requires --config-dir")?;
+        return service::run_windows_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunDesktopDaemon { port },
         ..
     } = &cli.command
@@ -6311,8 +6908,150 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
     }
 
+    // Standalone execution must resolve and acquire the actual runtime
+    // data directory before loading the executable config. This avoids both a
+    // stale pre-lock snapshot and refusing an independent ZEROCLAW_DATA_DIR
+    // merely because the default instance is running.
+    #[cfg(feature = "agent-runtime")]
+    let standalone_command = match &cli.command {
+        Commands::Agent { .. } => Some("agent"),
+        #[cfg(feature = "channel-acp-server")]
+        Commands::Acp { .. } => Some("acp"),
+        _ => None,
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership_path = if standalone_command.is_some() {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some(data_dir)
+    } else {
+        None
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership = if let (Some(command), Some(data_dir)) =
+        (standalone_command, standalone_ownership_path.as_ref())
+    {
+        Some(
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", command), ("path", &data_dir.display().to_string())],
+                        format!(
+                            "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": command,
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "standalone command refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // The daemon must own the config lifecycle before the executable config is
+    // loaded: a supported offline mutation committing between the config read
+    // and a post-load lock acquisition would otherwise be silently shadowed by
+    // the stale startup snapshot. Resolve the runtime identity first, acquire
+    // process ownership, then load the fresh protected snapshot. The guard
+    // transfers continuously across reload generations in the daemon loop.
+    #[cfg(feature = "agent-runtime")]
+    let mut daemon_ownership = if matches!(&cli.command, Commands::Daemon { .. }) {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some((
+            data_dir.clone(),
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", "daemon"), ("path", &data_dir.display().to_string())],
+                        format!(
+                            "Cannot run `zeroclaw daemon` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": "daemon",
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "daemon refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
+                })?,
+        ))
+    } else {
+        None
+    };
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(feature = "agent-runtime")]
+    if let Some((expected_data_dir, _)) = daemon_ownership.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during daemon startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+    }
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
     let running_executable =
         running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
@@ -6613,9 +7352,16 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }));
 
             // Register channel map factory for late-bound tool handle population.
-            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
-                let config_clone = config.clone();
-                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                },
+            ));
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             Box::pin(agent::run(
@@ -6630,7 +7376,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 session_state_file,
                 None,
                 zeroclaw_api::ingress::TurnOrigin::Interactive,
-                zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
+                zeroclaw_runtime::agent::loop_::AgentRunOverrides {
+                    execution_capability: standalone_authority
+                        .as_ref()
+                        .map(|authority| authority.execution_capability()),
+                    ..Default::default()
+                },
             ))
             .await
             .map(|_| ())
@@ -6643,6 +7394,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
+                let authority = standalone_authority.ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "standalone ACP config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("standalone ACP ownership was not acquired")
+                })?;
                 let mut acp_config = channels::acp_server::AcpServerConfig {
                     max_sessions: config.acp.max_sessions,
                     session_timeout_secs: config.acp.session_timeout_secs,
@@ -6669,11 +7429,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             );
                         })
                         .ok();
-                let server = if let Some(store) = store {
-                    channels::acp_server::AcpServer::new_with_store(config, acp_config, store)
-                } else {
-                    channels::acp_server::AcpServer::new(config, acp_config)
-                }
+                let server = channels::acp_server::AcpServer::new_stdio_with_authority(
+                    &authority, acp_config, store,
+                )
                 .with_connection_default_agent(agent);
                 std::sync::Arc::new(server).run().await
             }
@@ -6762,6 +7520,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     rotate_device,
                     port,
                     host,
+                    json,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let endpoint = format!("{host}:{port}");
@@ -6777,14 +7536,26 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     };
                     let rotating = action.is_rotation();
 
-                    match fetch_paircode(
+                    let fetched = fetch_paircode(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
                         &action,
                     )
-                    .await
-                    {
+                    .await;
+                    if json {
+                        let (code, message) = match fetched? {
+                            PaircodeResult::Code { code, message } => (Some(code), message),
+                            PaircodeResult::NoCode { message } => (None, message),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({ "pairing_code": code, "message": message })
+                        );
+                        return Ok(());
+                    }
+                    match fetched {
                         Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
@@ -6991,6 +7762,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // Cron delivery is registered earlier (before the command match)
             // so it works for both `daemon` and `gateway start`.
 
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::live_channel_map_for_agent(config, agent_alias)
+                },
+            ));
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
+                zeroclaw_channels::orchestrator::live_channel_map()
+            }));
+
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
@@ -7033,6 +7815,32 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "agent-runtime")]
+                registry.register_channel_registry_clearer(std::sync::Arc::new(|| {
+                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true);
+                }));
+
+                let mut iteration_config = current_config.clone();
+                iteration_config.gateway.host = host.clone();
+                if port != 0 {
+                    iteration_config.gateway.port = port;
+                }
+                // The ownership guard was acquired before the config load (and
+                // is transferred back here on every reload), so this generation
+                // adopts a snapshot that no offline mutation can have raced.
+                let (expected_data_dir, ownership) = daemon_ownership.take().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "daemon config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("daemon config ownership was not held for this generation")
+                })?;
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+                    iteration_config,
+                    ownership,
+                );
                 #[cfg(feature = "gateway")]
                 let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
                 #[cfg(feature = "gateway")]
@@ -7050,13 +7858,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
                     let sop_adapters = build_sop_adapters(&current_config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         current_config.sop.clone(),
                         &current_config.decision_models,
                         &current_config.data_dir,
                         &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
                     let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
                     if !unsettled.is_empty() {
@@ -7143,6 +7952,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     move |host,
                           port,
                           config,
+                          authority,
                           tx,
                           reload_controls,
                           tui_registry,
@@ -7168,6 +7978,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
+                                    authority,
                                     sop_driver_handles,
                                 ),
                             ))
@@ -7181,23 +7992,25 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_a = sop_audit.clone();
                     let sop_ds = sop_driver_sink.clone();
                     let plugin_webhooks = channel_plugin_webhooks.clone();
-                    move |config, cancel| {
+                    move |authority, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         let sop_driver_sink = sop_ds.clone();
                         let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
-                                config,
-                                Some(canvas_store),
-                                cancel,
-                                sop_engine,
-                                sop_audit,
-                                plugin_webhooks,
-                                sop_driver_sink,
-                            );
-                            Box::pin(channels).await
+                            Box::pin(
+                                zeroclaw_channels::orchestrator::start_channels_with_authority_and_plugin_webhooks(
+                                    authority,
+                                    Some(canvas_store),
+                                    cancel,
+                                    sop_engine,
+                                    sop_audit,
+                                    plugin_webhooks,
+                                    sop_driver_sink,
+                                ),
+                            )
+                            .await
                         })
                     }
                 }));
@@ -7238,23 +8051,44 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
+                let local_session_channel_factory: zeroclaw_runtime::rpc::dispatch::LocalRpcSessionChannelFactory =
+                    std::sync::Arc::new(|config, agent_alias| {
+                        zeroclaw_channels::orchestrator::build_local_rpc_session_channels(
+                            config,
+                            agent_alias,
+                        )
+                    });
+                registry.register_socket(Box::new(move |ctx, cancel, client_count, ready_tx| {
+                    let local_session_channel_factory =
+                        std::sync::Arc::clone(&local_session_channel_factory);
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(
+                        zeroclaw_runtime::rpc::local::run_local_listener_with_factory(
                             ctx,
                             cancel,
                             client_count,
                             ready_tx,
+                            Some(local_session_channel_factory),
                         )
                         .await
                     })
                 }));
 
-                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                // One server-certificate SAN resolution per generation, shared
+                // by the WSS listener and the enrollment endpoint.
+                let daemon_server_tls = DaemonServerTls::default();
+                let daemon_server_tls_for_wss = daemon_server_tls.clone();
+                let daemon_server_tls_for_enroll = daemon_server_tls;
+                registry.register_wss(Box::new(move |ctx, cancel, client_count| {
+                    let daemon_server_tls = daemon_server_tls_for_wss.clone();
                     Box::pin(async move {
-                        let (wss_cfg, data_dir) = {
+                        let (wss_cfg, enroll_cfg, tunnel_cfg, data_dir) = {
                             let cfg = ctx.config.read();
-                            (cfg.wss.clone(), cfg.data_dir.clone())
+                            (
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.tunnel.clone(),
+                                cfg.data_dir.clone(),
+                            )
                         };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
@@ -7289,14 +8123,25 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 // enrollment + CLI read paths use), else 0600.
                                 // [wss].sans adds the hostnames/IPs a remote client
                                 // uses to reach the daemon to the server cert. The
-                                // enrollment endpoint uses the same resolver so both
-                                // TLS surfaces present matching daemon identities.
-                                let server_sans = wss_server_sans(&wss_cfg);
-                                let mats = zeroclaw_tls::ensure_server_materials_protected(
-                                    &data_dir.join("tls"),
-                                    &server_sans,
-                                    &ca_key_protection_from_env(),
-                                )?;
+                                // enrollment endpoint shares this generation's
+                                // DaemonServerTls, so both TLS surfaces present
+                                // the same leaf. When reached over the tailnet,
+                                // the node's MagicDNS name and tailnet IPs are
+                                // added too.
+                                let mats = daemon_server_tls
+                                    .materialize(
+                                        &data_dir.join("tls"),
+                                        &wss_cfg,
+                                        &ca_key_protection_from_env(),
+                                        || {
+                                            zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                                &tunnel_cfg,
+                                                &wss_cfg,
+                                                &enroll_cfg,
+                                            )
+                                        },
+                                    )
+                                    .await?;
                                 (
                                     mats.server_cert_path.to_string_lossy().into_owned(),
                                     mats.server_key_path.to_string_lossy().into_owned(),
@@ -7490,11 +8335,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // this works with no gateway. It is NOT the mTLS RPC plane.
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
+                    let daemon_server_tls = daemon_server_tls_for_enroll.clone();
                     Box::pin(async move {
                         let (
                             enroll_cfg,
                             wss_cfg,
                             relay_cfg,
+                            tunnel_cfg,
                             data_dir,
                             startup_pairing_code_policy,
                         ) = {
@@ -7503,6 +8350,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
+                                cfg.tunnel.clone(),
                                 cfg.data_dir.clone(),
                                 cfg.gateway.pairing_code,
                             )
@@ -7527,13 +8375,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         //      trusts an external CA cert whose key the daemon does
                         //      not hold. It cannot sign - fail closed: do not open
                         //      the endpoint (provision client certs out of band).
-                        let byo_ca = wss_cfg
-                            .client_auth
-                            .as_ref()
-                            .filter(|c| c.enabled)
-                            .map(|c| !c.ca_cert_path.is_empty())
-                            .unwrap_or(false);
-                        if byo_ca {
+                        // Same predicate the tunnel uses to decide whether to
+                        // publish this endpoint (`daemon_tcp_services`).
+                        if wss_cfg.external_client_ca().is_some() {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -7555,12 +8399,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let ca_provided =
                             tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
                         let protection = ca_key_protection_from_env();
-                        let server_sans = wss_server_sans(&wss_cfg);
-                        let mats = zeroclaw_tls::ensure_server_materials_protected(
-                            &tls_dir,
-                            &server_sans,
-                            &protection,
-                        )?;
+                        let mats = daemon_server_tls
+                            .materialize(&tls_dir, &wss_cfg, &protection, || {
+                                zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                    &tunnel_cfg,
+                                    &wss_cfg,
+                                    &enroll_cfg,
+                                )
+                            })
+                            .await?;
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -7721,8 +8568,8 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         .map(|supervisor| supervisor.drivers.clone()),
                 );
 
-                let exit = Box::pin(daemon::run(
-                    current_config.clone(),
+                let exit = Box::pin(daemon::run_with_authority(
+                    authority,
                     host.clone(),
                     port,
                     registry,
@@ -7746,7 +8593,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     carried_sop_drivers = teardown.still_running;
                     carried_unsettled_sop_runs = teardown.unsettled_runs;
                 }
-                let exit = exit?;
+                let (exit, transferred_ownership) = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -7758,6 +8605,25 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
+                        // Continuous ownership: the previous generation drained
+                        // with the guard retained and returned it; the fresh
+                        // snapshot below is loaded while this process still owns
+                        // the config lifecycle.
+                        daemon_ownership = Some((
+                            expected_data_dir,
+                            transferred_ownership.ok_or_else(|| {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "daemon reload ownership transfer invariant failed"
+                                );
+                                anyhow::Error::msg("daemon reload did not retain config ownership")
+                            })?,
+                        ));
                         current_config = Box::pin(Config::load_or_init()).await?;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
@@ -7818,14 +8684,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
-            println!(
-                "{}",
-                ta(
-                    "cli-status-version",
-                    &[("v", env!("CARGO_PKG_VERSION"))],
-                    "Version"
-                )
-            );
+            println!("{}", ta("cli-status-version", &[("v", VERSION)], "Version"));
             println!(
                 "{}",
                 ta(
@@ -8395,6 +9254,13 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
         },
 
+        #[cfg(feature = "agent-runtime")]
+        Commands::Relay { relay_command } => match relay_command {
+            RelayCommands::Claim { token, control } => {
+                Box::pin(relay_cli::handle_claim(&mut config, &token, &control)).await
+            }
+        },
+
         Commands::Estop {
             estop_command,
             level,
@@ -8522,6 +9388,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
                 // Single SIGINT consumer for the CLI path: cancel the
                 // shared lifecycle token. Channels subscribe via
                 // set_cancel_token so the same signal reaches all
@@ -8535,13 +9402,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         config.sop.clone(),
                         &config.decision_models,
                         &config.data_dir,
                         &config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -8573,9 +9441,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                     }
                     _ => None,
                 };
+                // Standalone channel mode owns the live-pricing refresher.
+                zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
 
-                let result = Box::pin(channels::start_channels(
-                    config,
+                let result = Box::pin(channels::start_channels_with_authority(
+                    authority,
                     None,
                     cancel,
                     sop_engine,
@@ -8583,6 +9453,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     sop_driver_sink,
                 ))
                 .await;
+
                 // `channel start` runs one configuration generation and exits,
                 // but drivers still hold the engine; drain them before the
                 // process tears the subsystem down.
@@ -9083,7 +9954,6 @@ Add pricing to the active provider profile or supply a catalog entry."
                 comment,
                 json,
             } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
@@ -9092,8 +9962,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                if no_interactive {
-                    let val = value.ok_or_else(|| {
+                let selected_value = if no_interactive {
+                    value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -9104,8 +9974,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         anyhow::Error::msg(format!(
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
-                    })?;
-                    config.set_prop_persistent(&path, &val)?;
+                    })?
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -9121,9 +9990,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop_persistent(&path, &secret_value)?;
+                    secret_value
                 } else if let Some(val) = value {
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -9165,17 +10034,16 @@ Add pricing to the active provider profile or supply a catalog entry."
                         else {
                             anyhow::bail!("cancelled");
                         };
-                        config.set_prop_persistent(&path, &models[idx])?;
+                        models[idx].clone()
                     } else {
                         eprintln!(
                             "  no live catalog for `{provider_type}` — \
                              enter the model id manually."
                         );
-                        let m = Input::<String>::new()
+                        Input::<String>::new()
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
-                            .interact_text()?;
-                        config.set_prop_persistent(&path, &m)?;
+                            .interact_text()?
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -9194,7 +10062,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop_persistent(&path, &variants[selected])?;
+                        variants[selected].clone()
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -9224,17 +10092,62 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let edited = dialoguer::Editor::new()
                             .edit(&editor_content)?
                             .unwrap_or(editor_content);
-                        let val = edited
+                        edited
                             .lines()
                             .map(|l| l.trim())
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
-                            .join(", ");
-                        config.set_prop_persistent(&path, &val)?;
+                            .join(", ")
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
+                };
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership =
+                    if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
+                        match crate::alias_cli::route_agent_mutation(
+                            &mut config,
+                            "config/set",
+                            serde_json::json!({
+                                "prop": path,
+                                "value": selected_value,
+                                "comment": comment,
+                            }),
+                        )
+                        .await?
+                        {
+                            crate::alias_cli::AgentMutationRoute::Daemon(_) => {
+                                if json {
+                                    let envelope = if Config::prop_is_secret(&path) {
+                                        serde_json::json!({"path": path, "populated": true})
+                                    } else {
+                                        serde_json::json!({"path": path, "value": selected_value})
+                                    };
+                                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                                } else {
+                                    println!(
+                                        "{}",
+                                        ta("cli-config-updated", &[("path", &path)], "updated")
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                Some(ownership)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                if ensure_map_key_for_prop_path(&mut config, &path)? {
+                    let known_paths: Vec<String> =
+                        config.prop_fields().into_iter().map(|f| f.name).collect();
+                    path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                config.set_prop_persistent(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
@@ -9258,6 +10171,60 @@ Add pricing to the active provider profile or supply a catalog entry."
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if let Some(("agents", alias)) = section
+                    .as_deref()
+                    .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
+                {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/map-key-create",
+                        serde_json::json!({ "path": "agents", "key": alias }),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(value) => {
+                            let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+                                serde_json::from_value(value)
+                                    .context("decode daemon config-init response")?;
+                            let initialized = result
+                                .created
+                                .then(|| format!("{}.{}", result.path, result.key))
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(
+                                        &serde_json::json!({"initialized": initialized})
+                                    )?
+                                );
+                            } else if initialized.is_empty() {
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-config-all-configured",
+                                        "All sections already configured."
+                                    )
+                                );
+                            } else {
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-initialized-sections",
+                                        &[("count", "1")],
+                                        "Initialized {$count} section(s) with defaults:"
+                                    )
+                                );
+                                println!("  {}", initialized[0]);
+                            }
+                            return Ok(());
+                        }
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
@@ -9292,8 +10259,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     );
                 } else {
                     println!(
-                        "Initialized {} section(s) with defaults:",
-                        initialized.len()
+                        "{}",
+                        ta(
+                            "cli-config-initialized-sections",
+                            &[("count", &initialized.len().to_string())],
+                            "Initialized {$count} section(s) with defaults:"
+                        )
                     );
                     for name in &initialized {
                         println!("  {name}");
@@ -9375,7 +10346,6 @@ Add pricing to the active provider profile or supply a catalog entry."
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
@@ -9448,6 +10418,36 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // patch that leaves an already-enabled section alone.
                 #[cfg(feature = "agent-runtime")]
                 let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if ops.iter().any(|op| {
+                    let op_name = op.get("op").and_then(|value| value.as_str());
+                    let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
+                        path.strip_prefix('/')
+                            .map_or_else(|| path.to_string(), |path| path.replace('/', "."))
+                    });
+                    matches!(op_name, Some("add" | "replace" | "remove"))
+                        && path.as_deref().is_some_and(|path| {
+                            zeroclaw_config::alias_refs::agent_alias_for_prop_path(path).is_some()
+                        })
+                }) {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/get",
+                        serde_json::json!({}),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(_) => anyhow::bail!(
+                            "refusing agent-targeting config patch while the daemon owns config; use the daemon-backed config API"
+                        ),
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
@@ -10707,8 +11707,19 @@ async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
+    // The pairing-code admin routes accept only this run's admin token, which
+    // the gateway writes owner-only into its data directory at startup.
+    let admin_token =
+        zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that \
+             runs the gateway, while the gateway is running.",
+                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
+            ))
+        })?;
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
@@ -10719,6 +11730,10 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10726,6 +11741,10 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -10755,6 +11774,12 @@ async fn fetch_paircode(
         );
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
+
+    if status == reqwest::StatusCode::FORBIDDEN
+        && let Some(error) = json.get("error").and_then(|v| v.as_str())
+    {
+        anyhow::bail!("{error}");
+    }
 
     let message = json
         .get("message")
@@ -12473,7 +13498,7 @@ async fn run_gateway_if_enabled(
     host: &str,
     port: u16,
     config: zeroclaw::config::Config,
-    tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
@@ -12481,12 +13506,23 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    // With no daemon, this command owns what the daemon would: the
+    // live-pricing refresher and the gateway-start hook, which fires once
+    // the listener reports its bound address.
+    zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+    let hooks = config.hooks.enabled.then(|| {
+        std::sync::Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+            &config.hooks,
+        ))
+    });
+    let readiness =
+        zeroclaw_runtime::daemon::gateway_start_hook_reporter(hooks, host.to_string(), None);
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None, None, None,
+        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -12511,7 +13547,7 @@ async fn run_gateway_if_enabled(
     _host: &str,
     _port: u16,
     _config: zeroclaw::config::Config,
-    _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
@@ -14246,6 +15282,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn windows_daemon_cli_requires_config_dir_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "--config-dir",
+            "C:\\Users\\agent\\Zero Claw",
+            "service",
+            "run-windows-daemon",
+        ])
+        .expect("internal Windows task runner should parse");
+        assert_eq!(
+            cli.config_dir.as_deref(),
+            Some("C:\\Users\\agent\\Zero Claw")
+        );
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunWindowsDaemon,
+                ..
+            }
+        ));
+        assert!(
+            !Cli::command()
+                .render_help()
+                .to_string()
+                .contains("run-windows-daemon")
+        );
+    }
+
+    #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
         fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
             parts
@@ -14672,6 +15738,7 @@ mod tests {
                         rotate_device,
                         port,
                         host,
+                        json,
                     }),
             } => {
                 assert!(new);
@@ -14679,6 +15746,7 @@ mod tests {
                 assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
+                assert!(!json, "text output is the default");
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }

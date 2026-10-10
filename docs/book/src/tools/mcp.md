@@ -224,15 +224,19 @@ When an MCP `tools/call` result includes a content item shaped as
 `type: "resource"` with a nested `blob` (base64), ZeroClaw does **not** dump that
 base64 into the model context. Instead it materializes the bytes under the
 session workspace `uploads/` directory (same shared helper and 10 MB limit as
-ACP inbound `resource.blob`) and replaces the model-facing tool output with
-non-blob provenance text plus a `[Document: …]` or `[IMAGE:…]` marker. This is
+ACP inbound `resource.blob`) and redacts the blob from the model-facing tool output, replacing it
+with a `materialized` reference: a `[Document: …]` marker for
+non-image mimes, or the plain saved path for image mimes, with the
+image declared as an attachment on the tool result rather than
+written into the text as a marker. This is
 gated by content shape, not by tool name. Materialization does not auto-deliver
 the file to ACP clients; the agent still calls `deliver_file` when outbound
 delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
 
 The two other binary MCP content shapes are mapped as follows. A `type: "image"`
 item (base64 `data` + `mimeType`) is materialized the same way and its content
-item is rewritten to a text item carrying the `[IMAGE:<path>]` marker, which the
+item is rewritten to a text item carrying the plain saved path,
+with the image declared as an attachment on the tool result, which the
 multimodal pipeline lifts into a native provider image part; the item's
 `annotations`/`_meta` and other non-binary fields are preserved. Only the raster
 formats the vision pipeline accepts are materialized: PNG, JPEG, WebP, and GIF.

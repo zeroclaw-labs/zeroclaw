@@ -166,6 +166,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                security: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
