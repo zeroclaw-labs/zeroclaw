@@ -23739,7 +23739,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_approval_timeout_secs(120);
 
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
