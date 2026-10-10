@@ -8,11 +8,13 @@ use super::protocol_detect::{
 };
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
-    TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_parseable_tool_call, contains_tool_call_opener, contains_tool_protocol_tag_call,
-    looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
-    looks_like_tool_protocol_example, strip_trailing_terminal_markers,
-    tool_protocol_envelope_mentions_known_tool,
+    EXAMPLE_FRAMING_WINDOW, TERMINAL_MARKERS, ToolProtocolEnvelopeKind,
+    classify_tool_protocol_envelope, contains_parseable_tool_call, contains_tool_call_opener,
+    contains_tool_protocol_tag_call, embedded_tool_protocol_envelope_mentions_known_tool,
+    has_reply_example_context, looks_like_malformed_tool_protocol_envelope_for_known_tools,
+    looks_like_tool_protocol_envelope, looks_like_tool_protocol_example, names_known_tool,
+    strip_trailing_terminal_markers, tool_protocol_envelope_mentions_known_tool,
+    unframed_embedded_protocol_mentions_known_tool,
 };
 
 /// Which guard detector suppressed a candidate and where the candidate
@@ -20,7 +22,7 @@ use zeroclaw_tool_call_parser::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProtocolSuppressionDiagnostic {
     /// One of `tool_result`, `function_call`, `tagged`, `malformed`,
-    /// `active_tool_json`.
+    /// `embedded`, `active_tool_json`.
     pub(crate) detector: &'static str,
     /// Byte offset of the candidate into the released-then-pending text:
     /// a UTF-8 byte offset into the model text after `<think>` tag and
@@ -37,6 +39,17 @@ pub(crate) struct StreamTextGuard {
     // candidate text keeps accumulating once one is seeded.
     pending: String,
     pending_candidate_start: Option<usize>,
+    /// The tail of the prose already forwarded, so a candidate can be judged
+    /// with the same framing the completed-response check sees: an example
+    /// introduced in an earlier delta must not be suppressed here and
+    /// rejected later for no reason.
+    recent_prose: String,
+    /// Whether any prose released so far carried the loose example wording
+    /// the completed-response check judges a tagged or fenced example by,
+    /// over the whole reply. Kept apart from `recent_prose`, whose window
+    /// is the clause-level framing for bare objects and forgets an
+    /// introduction that arrived more than a few hundred bytes earlier.
+    example_context_released: bool,
     known_tool_names: HashSet<String>,
     has_active_tools: bool,
     // Text already delivered to the caller before the current candidate
@@ -47,6 +60,100 @@ pub(crate) struct StreamTextGuard {
     pub(crate) suppress_forwarding: bool,
     pub(crate) suppressed_protocol: bool,
     pub(crate) suppression: Option<ProtocolSuppressionDiagnostic>,
+}
+
+/// Byte offset of the outermost JSON object opener in `text` that has not
+/// been closed by the end of `text`, ignoring braces inside string
+/// literals. Only a brace that opens an object (`{` followed by a quoted
+/// key) counts, so a brace in prose does not; a JSON string cannot span a
+/// line, so a quote left open in prose stops mattering at the next line
+/// break. `None` when every such opener is closed, or there is none.
+fn first_unclosed_opener(text: &str) -> Option<usize> {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = text.as_bytes();
+    for (offset, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' || ch == '\n' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                let rest = &bytes[offset + 1..];
+                let opens_object = rest
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_some_and(|b| *b == b'"');
+                if opens_object {
+                    stack.push(offset);
+                }
+            }
+            '}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    stack.first().copied()
+}
+
+/// Whether the open object that begins `open_object` reads as a tool
+/// result: it names the result correlation key and no call-shaped key, so
+/// a model could only be quoting it. Any call-shaped key (the envelope
+/// keys, or the python stub's) makes it a call, whatever else it carries.
+fn open_prefix_is_result_shape(open_object: &str) -> bool {
+    if !open_object.contains("\"tool_call_id\"") {
+        return false;
+    }
+    let remainder = open_object.replace("\"tool_call_id\"", "");
+    ![
+        "\"tool_calls\"",
+        "\"toolcalls\"",
+        "\"function_call\"",
+        "\"arguments\"",
+        "\"parameters\"",
+        "\"name\"",
+        "\"function\"",
+        "\"call_id\"",
+        "\"tool_code\"",
+        "\"tool_name\"",
+    ]
+    .iter()
+    .any(|key| remainder.contains(key))
+}
+
+/// Whether a value nested inside the JSON `text` parses to (one level below
+/// its root) embeds a protocol object naming an active tool. The root is
+/// the caller's business; this catches a call envelope riding inside a
+/// result's content, which the result exemption must not let through.
+fn nested_values_embed_protocol(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    let trimmed = text.trim();
+    let body = json_fence_body(trimmed).unwrap_or(trimmed);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let children: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Object(map) => map.values().collect(),
+        serde_json::Value::Array(items) => items.iter().collect(),
+        _ => Vec::new(),
+    };
+    children.into_iter().any(|child| {
+        matches!(
+            child,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        ) && embedded_tool_protocol_envelope_mentions_known_tool(
+            &child.to_string(),
+            known_tool_names,
+        )
+    })
 }
 
 /// The byte offset just past the leading complete JSON value in `text`,
@@ -211,17 +318,97 @@ fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<(usize, 
 }
 
 impl StreamTextGuard {
-    pub(crate) fn new(available_tools: Option<&[crate::tools::ToolSpec]>) -> Self {
-        let available_tools = available_tools.unwrap_or(&[]);
-        let known_tool_names = available_tools
+    /// `available_tools` are the specs sent with the request (absent in
+    /// text-tool mode); `known_tool_names` are the tools active for the turn
+    /// regardless of how the request serializes them.
+    pub(crate) fn new(
+        available_tools: Option<&[crate::tools::ToolSpec]>,
+        known_tool_names: &HashSet<String>,
+    ) -> Self {
+        let mut names: HashSet<String> = known_tool_names
             .iter()
-            .map(|tool| tool.name.to_ascii_lowercase())
+            .map(|name| name.to_ascii_lowercase())
             .collect();
+        names.extend(
+            available_tools
+                .unwrap_or(&[])
+                .iter()
+                .map(|tool| tool.name.to_ascii_lowercase()),
+        );
         Self {
-            known_tool_names,
-            has_active_tools: !available_tools.is_empty(),
+            has_active_tools: !names.is_empty(),
+            known_tool_names: names,
             ..Self::default()
         }
+    }
+
+    /// Prose immediately before the current candidate: what was already
+    /// forwarded plus the held prefix of this chunk.
+    fn prose_before_candidate(&self) -> String {
+        let prefix = self
+            .pending_candidate_start
+            .and_then(|start| self.pending.get(..start))
+            .unwrap_or("");
+        format!("{}{}", self.recent_prose, prefix)
+    }
+
+    /// The parser's teaching-example exemption, judged the way the
+    /// completed-response check judges it: over the prose already streamed
+    /// PLUS the candidate, so every embedded object is measured against the
+    /// clause immediately before it, and withdrawn when the candidate still
+    /// carries an unframed protocol object naming an active tool. Asking the
+    /// candidate alone would miss a framing phrase that arrived in an earlier
+    /// delta; asking the framing alone would let one illustrated example
+    /// exempt a second, unframed leak after it.
+    fn candidate_is_framed_example(&self, candidate: &str) -> bool {
+        let prose_before = self.prose_before_candidate();
+        // A tagged call is judged by the reply as a whole on the completed
+        // path, so an introduction released long before the candidate still
+        // counts here; a bare object is judged by the clause before it,
+        // which `prose_before` carries.
+        let reply_wide_example = self.example_context_released
+            && (contains_tool_protocol_tag_call(candidate)
+                || matches!(
+                    classify_tool_protocol_envelope(candidate),
+                    Some(ToolProtocolEnvelopeKind::TaggedToolCall)
+                ));
+        (reply_wide_example
+            || looks_like_tool_protocol_example(candidate)
+            || looks_like_tool_protocol_example(&format!("{prose_before}{candidate}")))
+            && !unframed_embedded_protocol_mentions_known_tool(
+                &prose_before,
+                candidate,
+                &self.known_tool_names,
+            )
+    }
+
+    /// Whether releasing `text` would stream a protocol object for an active
+    /// tool. The candidate anchor is the last opener, but a release emits the
+    /// WHOLE buffer, so a leak whose identifying key the anchor search does
+    /// not recognize (a python tool stub, a unicode-escaped `tool_calls`, an
+    /// envelope inside other JSON) would otherwise ride out ahead of the
+    /// anchor. A tool-result shape quoted after a preamble is not a leak: the
+    /// release paths deliver it as a quotation and judge it on their own
+    /// terms.
+    fn buffer_embeds_leak(&self, text: &str) -> bool {
+        if !self.has_active_tools
+            || !embedded_tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names)
+        {
+            return false;
+        }
+        if self.candidate_has_prose_prefix()
+            && is_releasable_result(text)
+            && !nested_values_embed_protocol(text, &self.known_tool_names)
+        {
+            return false;
+        }
+        !(looks_like_tool_protocol_example(text)
+            || looks_like_tool_protocol_example(&format!("{}{}", self.recent_prose, text)))
+            || unframed_embedded_protocol_mentions_known_tool(
+                &self.recent_prose,
+                text,
+                &self.known_tool_names,
+            )
     }
 
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
@@ -247,6 +434,9 @@ impl StreamTextGuard {
                 self.pending_candidate_start = Some(start);
                 self.pending.push_str(chunk);
             } else {
+                if self.buffer_embeds_leak(chunk) {
+                    return self.suppress_protocol("embedded");
+                }
                 self.note_released(chunk);
                 return Some(chunk.to_string());
             }
@@ -294,9 +484,10 @@ impl StreamTextGuard {
                 };
                 forwarded.push_str(&text);
             }
-            if !self.suppressed_protocol && !self.pending.is_empty() {
-                let tail = std::mem::take(&mut self.pending);
-                self.note_released(&tail);
+            if !self.suppressed_protocol
+                && !self.pending.is_empty()
+                && let Some(tail) = self.release_pending()
+            {
                 forwarded.push_str(&tail);
             }
         }
@@ -355,7 +546,7 @@ impl StreamTextGuard {
             return None;
         }
 
-        if !looks_like_tool_protocol_example(candidate) {
+        if !self.candidate_is_framed_example(candidate) {
             if contains_tool_protocol_tag_call(candidate) {
                 return self.suppress_protocol("tagged");
             }
@@ -408,31 +599,46 @@ impl StreamTextGuard {
             if is_protocol && self.has_active_tools {
                 return self.suppress_protocol("function_call");
             }
-            return Some(self.release_pending());
+            return self.release_pending();
         }
 
         if complete_non_protocol_json(candidate, &self.known_tool_names) {
-            return Some(self.release_pending());
+            return self.release_pending();
         }
 
         None
     }
 
     /// Release the whole pending buffer as ordinary text: the candidate
-    /// turned out not to be protocol.
-    fn release_pending(&mut self) -> String {
+    /// turned out not to be protocol. The buffer is judged whole first,
+    /// because a release emits all of it, not only the candidate.
+    fn release_pending(&mut self) -> Option<String> {
+        if self.buffer_embeds_leak(&self.pending) {
+            return self.suppress_protocol("embedded");
+        }
         self.pending_candidate_start = None;
         let release = std::mem::take(&mut self.pending);
         self.note_released(&release);
-        release
+        Some(release)
     }
 
     /// Text delivered to the caller before a later candidate appears: it
     /// is part of the message, not protocol, and it positions any later
-    /// candidate past the start of the message.
+    /// candidate past the start of the message. Its tail is kept as the
+    /// framing a later candidate is judged against.
     fn note_released(&mut self, text: &str) {
         self.released_bytes += text.len();
         self.released_prose |= !text.trim().is_empty();
+        self.example_context_released |= has_reply_example_context(text);
+        self.recent_prose.push_str(text);
+        let keep = EXAMPLE_FRAMING_WINDOW * 2;
+        if self.recent_prose.len() > keep {
+            let mut cut = self.recent_prose.len() - keep;
+            while !self.recent_prose.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.recent_prose.drain(..cut);
+        }
     }
 
     /// Whether `span` — the body a json-labelled fence wraps, or the
@@ -481,6 +687,17 @@ impl StreamTextGuard {
     fn release_through(&mut self, mut boundary: usize, finalizing: bool) -> Option<String> {
         let mut release = String::new();
         loop {
+            // The head is judged whole before it goes out, as every other
+            // release is: the anchor sits on the LAST candidate, so a
+            // closed leak ahead of a quoted result (a named result, an
+            // envelope under an escaped key) rides in the head and must
+            // be withheld, not delivered with the quotation.
+            if self.buffer_embeds_leak(&self.pending[..boundary]) {
+                if let Some(prefix) = self.suppress_protocol("embedded") {
+                    release.push_str(&prefix);
+                }
+                return (!release.is_empty()).then_some(release);
+            }
             let head = self.pending[..boundary].to_string();
             self.pending.drain(..boundary);
             self.pending_candidate_start = None;
@@ -541,7 +758,11 @@ impl StreamTextGuard {
                 return Some(release);
             }
             // Plain text with no candidate: release it the way `push`
-            // releases a candidate-free chunk.
+            // releases a candidate-free chunk, leak check included.
+            if self.buffer_embeds_leak(&self.pending) {
+                self.suppress_protocol("embedded");
+                return Some(release);
+            }
             let tail = std::mem::take(&mut self.pending);
             self.note_released(&tail);
             release.push_str(&tail);
@@ -574,7 +795,26 @@ impl StreamTextGuard {
             detector,
             candidate_offset: self.released_bytes + candidate_start,
         });
-        let release = (candidate_start > 0).then(|| self.pending[..candidate_start].to_string());
+        // The finders anchor a candidate at the LAST opener, so a stub whose
+        // string content holds a brace of its own is anchored inside itself:
+        // the text ahead of the anchor then carries the stub's own opening,
+        // not only prose. Only the prose ahead of the outermost unclosed
+        // opener is released; the rest is the withheld object. A result
+        // shape left open ahead of the anchor is the one exception: a model
+        // cannot emit a result, so that text is a quotation and is delivered
+        // through the anchor, as the quoted-result release delivers it.
+        let prefix = &self.pending[..candidate_start];
+        let prose_end = match first_unclosed_opener(prefix) {
+            // The open object is judged whole, anchor and all: a call-shaped
+            // key behind the anchor still makes it a call.
+            Some(opener) if !open_prefix_is_result_shape(&self.pending[opener..]) => opener,
+            _ => candidate_start,
+        };
+        // The prose ahead of the anchor is judged whole too: a closed leak
+        // sitting there is not the anchor and has no unclosed opener, so
+        // nothing else would stop it from going out with the prose.
+        let release = (prose_end > 0 && !self.buffer_embeds_leak(&self.pending[..prose_end]))
+            .then(|| self.pending[..prose_end].to_string());
         self.pending.clear();
         self.pending_candidate_start = None;
         self.suppress_forwarding = true;
@@ -628,7 +868,7 @@ impl StreamTextGuard {
             return false;
         };
 
-        has_args && self.known_tool_names.contains(&name.to_ascii_lowercase())
+        has_args && names_known_tool(name, &self.known_tool_names)
     }
 
     /// Which detector (if any) marks `text` as an internal tool-protocol
@@ -693,10 +933,9 @@ impl StreamTextGuard {
                 return Some("function_call");
             }
             // A classified call-shaped envelope is judged solely by the
-            // verdict above: without active tool specs it is the text-tool
-            // channel, not a leak, and a tool name that is unknown to the
-            // registered set is left to the parse-issue detectors
-            // downstream.
+            // verdict above: with no tool active for the turn it is not a
+            // leak, and a tool name that is unknown to the active set is
+            // left to the parse-issue detectors downstream.
             return None;
         }
 
@@ -704,6 +943,17 @@ impl StreamTextGuard {
         // tool call is an internal protocol failure, not user-facing text.
         if looks_like_tool_protocol_envelope(text) {
             return Some("malformed");
+        }
+
+        // A protocol object for an active tool embedded in the held-back text
+        // (a python tool stub, or an envelope inside other JSON) is valid JSON
+        // that the checks above do not recognize; releasing it would stream a
+        // leak the final response check then rejects. A quoted tool result
+        // after a preamble was already handled above.
+        if self.has_active_tools
+            && embedded_tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names)
+        {
+            return Some("embedded");
         }
 
         if self.looks_like_active_tool_json(text) {
@@ -773,6 +1023,475 @@ impl StreamThinkTagStripper {
             return String::new();
         }
         std::mem::take(&mut self.pending)
+    }
+}
+
+#[cfg(test)]
+mod embedded_protocol_stream_tests {
+    use super::StreamTextGuard;
+
+    fn shell_names() -> std::collections::HashSet<String> {
+        std::collections::HashSet::from(["shell".to_string()])
+    }
+
+    fn shell_guard() -> StreamTextGuard {
+        let specs = vec![crate::tools::ToolSpec::new(
+            "shell",
+            "run a command",
+            serde_json::json!({"type": "object"}),
+        )];
+        StreamTextGuard::new(Some(&specs), &shell_names())
+    }
+
+    /// Text-tool mode: the request carries no native tool specs, but the
+    /// turn's known tool names are still supplied.
+    fn text_mode_shell_guard() -> StreamTextGuard {
+        StreamTextGuard::new(None, &shell_names())
+    }
+
+    const STUB: &str =
+        r#"{"content":"One moment.","tool_code":"print(shell(\"ls\"))","tool_name":"shell"}"#;
+
+    fn drive(guard: &mut StreamTextGuard, chunks: &[&str]) -> String {
+        let mut forwarded = String::new();
+        for chunk in chunks {
+            if let Some(out) = guard.push(chunk) {
+                forwarded.push_str(&out);
+            }
+        }
+        if let Some(out) = guard.finish() {
+            forwarded.push_str(&out);
+        }
+        forwarded
+    }
+
+    #[test]
+    fn python_tool_stub_leak_is_never_streamed() {
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &["Creating the draft now.\n", STUB, " Done shortly."],
+        );
+        assert!(
+            !forwarded.contains("tool_code"),
+            "stub bytes reached the stream: {forwarded:?}"
+        );
+        assert!(guard.suppressed_protocol, "the leak must be suppressed");
+    }
+
+    #[test]
+    fn stub_split_at_every_boundary_is_never_streamed() {
+        // A leak arrives in arbitrary deltas. Whatever the split, no protocol
+        // bytes may be forwarded before the turn is rejected — including the
+        // first half, which carries no recognizable protocol key yet.
+        let text = format!("Creating now. {STUB} Done shortly.");
+        let lead = "Creating now. ".len();
+        for split in lead..lead + STUB.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let mut guard = shell_guard();
+            let forwarded = drive(&mut guard, &[&text[..split], &text[split..]]);
+            assert!(
+                !forwarded.contains("tool_code") && !forwarded.contains("tool_name"),
+                "split at {split}: protocol bytes forwarded: {forwarded:?}"
+            );
+            assert!(
+                guard.suppressed_protocol,
+                "split at {split}: not suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_exempts_only_the_object_it_illustrates_when_streaming() {
+        // One framing phrase must not exempt everything that follows it.
+        // The completed-response check rejects this reply, so releasing it
+        // would put both stubs on screen before the turn is retried.
+        // One delta carrying both: the candidate runs from the first opener
+        // to the end, so judging the framing once for the whole candidate
+        // would release the unframed leak along with the illustration.
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[&format!(
+                "For example, the stub looks like this: {STUB} Now run it: {STUB}"
+            )],
+        );
+        assert!(
+            guard.suppressed_protocol,
+            "an unframed leak beside an illustration must be suppressed"
+        );
+        assert!(
+            !forwarded.contains("tool_code"),
+            "protocol bytes reached the stream: {forwarded:?}"
+        );
+
+        // Split across deltas, the illustration has already been streamed
+        // when the unframed leak arrives; the leak itself must still be
+        // suppressed rather than released on the earlier framing.
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                "For example, the stub looks like this: ",
+                STUB,
+                " Now run it: ",
+                STUB,
+            ],
+        );
+        assert!(guard.suppressed_protocol, "second leak must be suppressed");
+        assert_eq!(
+            forwarded.matches("tool_code").count(),
+            1,
+            "only the illustration may stream: {forwarded:?}"
+        );
+    }
+
+    #[test]
+    fn a_leak_ahead_of_the_candidate_anchor_is_not_released() {
+        // The anchor is the last opener, but a release emits the whole
+        // buffer. A unicode-escaped protocol key is invisible to the anchor
+        // search while the completed-response check detects it.
+        let escaped = r#"Running now: {"content":null,"\u0074ool_calls":[{"arguments":{"command":"id"},"id":"c1","name":"shell"}]}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[escaped]);
+        assert!(
+            !forwarded.contains("ool_calls"),
+            "escaped-key leak reached the stream: {forwarded:?}"
+        );
+        assert!(guard.suppressed_protocol);
+
+        // Same shape for a tool-result envelope, which the anchor search
+        // also does not key on.
+        let result_envelope =
+            r#"Result received: {"tool_call_id":"c1","name":"shell","content":{"files":["a"]}}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[result_envelope]);
+        assert!(
+            !forwarded.contains("tool_call_id"),
+            "tool-result leak reached the stream: {forwarded:?}"
+        );
+    }
+
+    #[test]
+    fn a_leak_ahead_of_a_quoted_result_is_not_released() {
+        // The anchor is the last candidate, an unnamed result after prose,
+        // which releases through its close. The named result ahead of it is
+        // a leak the completed check rejects, so it must not stream first.
+        let named_then_quoted = r#"Result received: {"tool_call_id":"c0","name":"shell","content":"x"} and {"tool_call_id":"c1","content":"ok"}"#;
+        for chunks in [vec![named_then_quoted], vec![named_then_quoted, " Done."]] {
+            let mut guard = shell_guard();
+            let forwarded = drive(&mut guard, &chunks);
+            assert!(
+                !forwarded.contains("tool_call_id"),
+                "named result leaked ahead of the quotation: {forwarded:?}"
+            );
+            assert!(guard.suppressed_protocol, "{chunks:?}");
+        }
+
+        // An envelope under an escaped key, invisible to the anchor search,
+        // ahead of the same quotation.
+        let escaped_then_quoted = r#"Running now: {"type":"\u0066unction_call","name":"shell","arguments":{"command":"id"},"call_id":"c0"} then {"tool_call_id":"c1","content":"ok"}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[escaped_then_quoted]);
+        assert!(
+            !forwarded.contains("unction_call") && !forwarded.contains("tool_call_id"),
+            "escaped-key envelope leaked ahead of the quotation: {forwarded:?}"
+        );
+        assert!(guard.suppressed_protocol);
+
+        // Genuinely quoted results, each after its own framing phrase, are
+        // an illustration on the completed path and stream unchanged here.
+        let framed = r#"For example, a result looks like this: {"tool_call_id":"c0","name":"shell","content":"x"} and a second one looks like this: {"tool_call_id":"c1","content":"ok"}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[framed]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(forwarded, framed);
+    }
+
+    #[test]
+    fn framed_examples_in_the_shipped_locales_stream() {
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":{"command":"ls"},"id":"c1","name":"shell"}]}"#;
+        for prose in [
+            "Por ejemplo, el protocolo se ve así: ",
+            "Par exemple, le protocole ressemble à ceci : ",
+            "例えば、プロトコルはこのようになります：",
+        ] {
+            let mut guard = shell_guard();
+            let forwarded = drive(&mut guard, &[prose, envelope]);
+            assert!(
+                !guard.suppressed_protocol,
+                "{prose:?} framed a documentation reply"
+            );
+            assert_eq!(forwarded, format!("{prose}{envelope}"));
+        }
+        // A phrase closed by a CJK sentence ender does not frame the leak
+        // that follows two sentences later.
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &["例如，格式如上。现在运行：", envelope]);
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("tool_calls"));
+    }
+
+    #[test]
+    fn a_tag_example_introduced_long_before_it_still_streams() {
+        // The completed check judges a tagged example by the whole reply,
+        // so the guard must not forget an introduction that scrolled out
+        // of its clause-level framing window.
+        let intro = "Sample tool call: ";
+        let explanation = "the runtime wraps each call in a tag so a provider without a native tool channel can still ask for one, and the runtime answers with a result in the same shape. ".repeat(4);
+        assert!(explanation.len() > zeroclaw_tool_call_parser::EXAMPLE_FRAMING_WINDOW * 2);
+        let tag = r#"<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(&mut guard, &[intro, &explanation, tag]);
+        assert!(!guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(forwarded, format!("{intro}{explanation}{tag}"));
+
+        // A bare envelope after the same long explanation is still judged
+        // by the clause before it, and that clause does not frame it.
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":{"command":"id"},"id":"c1","name":"shell"}]}"#;
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[intro, &explanation, "Running it now: ", envelope],
+        );
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("tool_calls"));
+    }
+
+    #[test]
+    fn inline_json_in_prose_keeps_streaming() {
+        // Holding an opener until it is identifiable must not hold an
+        // ordinary inline object forever: the value has closed, nothing
+        // further can identify it, and the rest of the reply would
+        // otherwise arrive in one burst at end of stream.
+        let mut guard = shell_guard();
+        let first = guard.push("Set this in your config: {\"retries\": 3} and restart.");
+        assert!(
+            first.is_some_and(|text| text.contains("retries")),
+            "inline JSON must stream as it arrives"
+        );
+        let second = guard.push(" Then run the doctor.");
+        assert!(
+            second.is_some_and(|text| text.contains("doctor")),
+            "streaming must continue after inline JSON"
+        );
+        assert!(!guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn a_tag_example_does_not_carry_a_bare_leak_onto_the_stream() {
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                r#"For example, a call looks like this: <tool_call>{"name":"shell","arguments":{"command":"id"}}</tool_call>"#,
+                " Now run it: ",
+                STUB,
+            ],
+        );
+        assert!(guard.suppressed_protocol, "bare leak not suppressed");
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_brace_inside_a_string_does_not_release_the_outer_stub() {
+        // `{placeholder}` inside the content string must not be mistaken for
+        // the start of the candidate: the unfinished outer stub is what has
+        // to be held, at every split.
+        let prose = "Creating now. ";
+        let stubs = [
+            "{\"content\":\"Status {placeholder} is ready\",\n\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+            // A lone closer inside the string must not count as the object
+            // closing.
+            "{\"content\":\"Done } now\",\n\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+        ];
+        for stub in stubs {
+            let text = format!("{prose}{stub}");
+            for split in prose.len() + 1..text.len() {
+                let (first, second) = text.split_at(split);
+                let mut guard = shell_guard();
+                let forwarded = drive(&mut guard, &[first, second]);
+                assert!(
+                    !forwarded.contains("tool_code") && !forwarded.contains("content"),
+                    "split at {split}: stub bytes streamed: {forwarded:?}"
+                );
+                assert!(
+                    guard.suppressed_protocol,
+                    "split at {split}: not suppressed"
+                );
+            }
+        }
+        // Completed inline JSON with a brace inside a string still streams.
+        let mut guard = shell_guard();
+        let first = guard.push("Set {\"greeting\":\"hi {name}\"} in the config and restart.");
+        assert!(first.is_some_and(|text| text.contains("greeting")));
+    }
+
+    #[test]
+    fn a_stub_carrying_a_result_key_does_not_get_its_opening_released() {
+        // Naming the result correlation key does not make a call-shaped
+        // stub a quotation: its opening stays withheld with the rest.
+        let mut guard = shell_guard();
+        let text = "Creating now. {\"tool_call_id\":\"call_1\",\"content\":\"Status {placeholder} is ready\",\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}";
+        let forwarded = drive(&mut guard, &[text]);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(forwarded, "Creating now. ", "{forwarded:?}");
+    }
+
+    #[test]
+    fn a_quoted_result_whose_content_carries_a_call_envelope_is_withheld() {
+        // The quotation rule covers a result; a call envelope for an active
+        // tool riding inside the result's content is still a leak, as the
+        // completed-response check would judge it.
+        let mut guard = shell_guard();
+        let text = "Here is what came back: {\"tool_call_id\":\"call_1\",\"content\":{\"tool_calls\":[{\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}]}}";
+        let forwarded = drive(&mut guard, &[text]);
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert!(!forwarded.contains("arguments"), "{forwarded:?}");
+    }
+
+    #[test]
+    fn braces_and_quotes_in_prose_do_not_move_the_release_boundary() {
+        // Prose braces, an interval bracket and a stray inch mark ahead of a
+        // leaking envelope are not JSON openers: the whole preamble streams.
+        let mut guard = shell_guard();
+        let text = "Intervals like [0, 1) are half-open, a 5\" screen fits, and {curly} is fine. Running it now:\n{\"tool_calls\":[{\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}]}";
+        let forwarded = drive(&mut guard, &[text]);
+        assert!(guard.suppressed_protocol, "{forwarded:?}");
+        assert_eq!(
+            forwarded,
+            "Intervals like [0, 1) are half-open, a 5\" screen fits, and {curly} is fine. Running it now:\n"
+        );
+    }
+
+    #[test]
+    fn a_complete_protocol_object_in_one_delta_is_held_and_judged() {
+        // A value that closes inside the chunk is still held when it shows a
+        // protocol key. A tool call arriving whole after prose is withheld;
+        // a tool result after prose is a quotation (a model cannot emit a
+        // result), so it is delivered, as the stream-guard tests pin.
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &["Done.\n{\"tool_calls\":[{\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}]}"],
+        );
+        assert!(!forwarded.contains("arguments"), "{forwarded:?}");
+        assert!(guard.suppressed_protocol);
+
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &["Done.\n{\"tool_call_id\":\"call_1\",\"content\":\"ok\"}"],
+        );
+        assert!(forwarded.contains("tool_call_id"), "{forwarded:?}");
+        assert!(!guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn many_openers_before_a_split_stub_do_not_release_it() {
+        // Harmless closed values must not exhaust the scan budget before a
+        // later unfinished stub. Neither delta can be held by the
+        // protocol-key rule on its own: the first carries no key, the second
+        // carries no opener.
+        let first = format!(
+            "Status: {} Creating now. {{\"content\":\"One moment.\",",
+            "[]".repeat(64)
+        );
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                &first,
+                "\"tool_code\":\"print(shell())\",\"tool_name\":\"shell\"}",
+            ],
+        );
+        assert!(
+            !forwarded.contains("tool_code") && !forwarded.contains("One moment."),
+            "stub bytes streamed: {forwarded:?}"
+        );
+        assert!(guard.suppressed_protocol, "not suppressed");
+    }
+
+    #[test]
+    fn a_stray_bracket_in_prose_does_not_hold_the_reply() {
+        let mut guard = shell_guard();
+        let first =
+            guard.push("Intervals like [0, 1) are half-open; a \"function\" maps [a, b] to reals.");
+        assert!(
+            first.is_some_and(|text| text.contains("reals")),
+            "prose with an unclosed bracket must keep streaming"
+        );
+    }
+
+    #[test]
+    fn a_framed_example_split_mid_object_still_streams() {
+        // Streaming parity at every chunk boundary: an example that is still
+        // arriving is naturally unfinished — past its `print(shell(` it
+        // already names the tool — and suppressing it would reject
+        // documentation the completed-response check exempts.
+        for split in 1..STUB.len() {
+            let (first, second) = STUB.split_at(split);
+            let mut guard = shell_guard();
+            let forwarded = drive(
+                &mut guard,
+                &["For example, the stub looks like this: ", first, second],
+            );
+            assert!(
+                !guard.suppressed_protocol,
+                "split at {split}: framed example suppressed"
+            );
+            assert!(
+                forwarded.ends_with(STUB),
+                "split at {split}: example not streamed whole: {forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_tool_mode_still_suppresses_a_stub_leak() {
+        let mut guard = text_mode_shell_guard();
+        let forwarded = drive(&mut guard, &["Creating now. ", STUB]);
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+        assert!(guard.suppressed_protocol);
+    }
+
+    #[test]
+    fn example_framed_in_an_earlier_delta_is_not_suppressed() {
+        // The framing clause streamed in a previous delta must exempt the
+        // object exactly as the completed-response check does.
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &[
+                "For example, the stub looks like this: ",
+                STUB,
+                " and that is all.",
+            ],
+        );
+        assert!(
+            !guard.suppressed_protocol,
+            "framed example must not be suppressed"
+        );
+        assert!(
+            forwarded.contains("tool_code"),
+            "framed example must reach the stream: {forwarded:?}"
+        );
+        assert!(zeroclaw_tool_call_parser::looks_like_tool_protocol_example(
+            &forwarded
+        ));
+    }
+
+    #[test]
+    fn unrelated_example_phrase_in_earlier_prose_does_not_exempt() {
+        let mut guard = shell_guard();
+        let forwarded = drive(
+            &mut guard,
+            &["For example, see the schema above. Run this now: ", STUB],
+        );
+        assert!(!forwarded.contains("tool_code"), "{forwarded:?}");
+        assert!(guard.suppressed_protocol);
     }
 }
 
@@ -1103,11 +1822,14 @@ mod stream_text_guard_tests {
     use super::{ProtocolSuppressionDiagnostic, StreamTextGuard};
 
     fn guard_with_tool() -> StreamTextGuard {
-        StreamTextGuard::new(Some(&[crate::tools::ToolSpec::new(
-            "shell",
-            "run a command",
-            serde_json::json!({"type": "object"}),
-        )]))
+        StreamTextGuard::new(
+            Some(&[crate::tools::ToolSpec::new(
+                "shell",
+                "run a command",
+                serde_json::json!({"type": "object"}),
+            )]),
+            &std::collections::HashSet::new(),
+        )
     }
 
     fn push_all(guard: &mut StreamTextGuard, chunks: &[&str]) -> String {
@@ -1146,7 +1868,9 @@ mod stream_text_guard_tests {
     fn guard_outcome_without_tools(
         chunks: &[&str],
     ) -> (String, bool, Option<ProtocolSuppressionDiagnostic>) {
-        guard_outcome_with(chunks, || StreamTextGuard::new(None))
+        guard_outcome_with(chunks, || {
+            StreamTextGuard::new(None, &std::collections::HashSet::new())
+        })
     }
 
     fn guard_with_specs(names: &[&str]) -> StreamTextGuard {
@@ -1160,7 +1884,7 @@ mod stream_text_guard_tests {
                 )
             })
             .collect();
-        StreamTextGuard::new(Some(&specs))
+        StreamTextGuard::new(Some(&specs), &std::collections::HashSet::new())
     }
 
     /// Tagged tool-call markup is never legitimate prose: it suppresses

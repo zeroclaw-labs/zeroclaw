@@ -249,6 +249,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
@@ -258,6 +259,7 @@ pub(crate) async fn call_provider(
     prepared_messages: &[ChatMessage],
     image_recovery_messages: Option<&[ChatMessage]>,
     request_tools: Option<&[ToolSpec]>,
+    known_tool_names: &std::collections::HashSet<String>,
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
@@ -285,14 +287,14 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         prepared_messages,
                         request_tools,
+                        known_tool_names,
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
                         ctx.on_delta,
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
-                    )
+                        ctx.draft_reasoning)
                     .await
                     {
                         Ok(streamed) => {
@@ -1265,6 +1267,7 @@ mod streaming_fallback_tests {
             ctx.cancellation_token = Some(&token);
             let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
             let recovery = [ChatMessage::user("image omitted")];
+            let known_tool_names = std::collections::HashSet::new();
             let call = call_provider(
                 &ctx,
                 &provider,
@@ -1274,6 +1277,7 @@ mod streaming_fallback_tests {
                 &original,
                 Some(&recovery),
                 None,
+                &known_tool_names,
                 false,
                 0,
             );
@@ -1319,6 +1323,7 @@ mod streaming_fallback_tests {
                 &original,
                 Some(&recovery),
                 None,
+                &std::collections::HashSet::new(),
                 false,
                 0,
             ),
@@ -1854,6 +1859,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -1952,6 +1958,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -2007,6 +2014,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -2143,6 +2151,7 @@ mod streaming_fallback_tests {
                 &[ChatMessage::user("go")],
                 None,
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -2266,6 +2275,7 @@ mod streaming_fallback_tests {
             &original,
             Some(&recovery),
             None,
+            &std::collections::HashSet::new(),
             false,
             0,
         )
@@ -2348,6 +2358,7 @@ mod streaming_fallback_tests {
                 &[ChatMessage::user("go")],
                 None,
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -2452,6 +2463,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -2523,6 +2535,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             None,
+            &std::collections::HashSet::new(),
             false,
             0,
         )
@@ -2595,6 +2608,7 @@ mod streaming_fallback_tests {
             &[ChatMessage::user("go")],
             None,
             None,
+            &std::collections::HashSet::new(),
             false,
             0,
         )
@@ -2787,6 +2801,7 @@ mod streaming_fallback_tests {
         let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
         let recovery = [ChatMessage::user("[image removed]")];
 
+        let known_tool_names = std::collections::HashSet::new();
         let call = call_provider(
             &ctx,
             &provider,
@@ -2796,6 +2811,7 @@ mod streaming_fallback_tests {
             &original,
             Some(&recovery),
             None,
+            &known_tool_names,
             true,
             0,
         );
@@ -2847,6 +2863,7 @@ mod streaming_fallback_tests {
             &original,
             Some(&recovery),
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -2893,6 +2910,7 @@ mod streaming_fallback_tests {
                 &original,
                 Some(&recovery),
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -3006,6 +3024,7 @@ mod streaming_fallback_tests {
                 &original,
                 Some(&recovery),
                 None,
+                &std::collections::HashSet::new(),
                 streaming,
                 0,
             )
@@ -3056,6 +3075,7 @@ mod streaming_fallback_tests {
                 &original,
                 Some(&recovery),
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -3213,6 +3233,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -3319,6 +3340,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -3578,6 +3600,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -3655,6 +3678,7 @@ mod streaming_fallback_tests {
                         &[ChatMessage::user("go")],
                         None,
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
