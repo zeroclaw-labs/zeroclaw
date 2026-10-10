@@ -176,6 +176,7 @@ zc-queue-help-enqueue = 将消息加入队列
 zc-queue-help-inject = 立即发送（跳过队列）
 zc-queue-edit-busy = 请先完成或清除当前消息，再编辑排队消息。
 zc-queue-dispatch-failed = 无法发送排队消息：{ $error }
+zc-queue-dispatch-requeued = 会话繁忙；消息已放回队列（已暂停）：{ $error }
 zc-logs-label-timestamp = 时间戳
 zc-logs-label-severity = 严重性
 zc-logs-label-category = 类别

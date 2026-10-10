@@ -176,6 +176,7 @@ zc-queue-help-enqueue = メッセージをキューに追加
 zc-queue-help-inject = 今すぐ送信（キューをスキップ）
 zc-queue-edit-busy = キュー済みメッセージを編集する前に、現在のメッセージを完了またはクリアしてください。
 zc-queue-dispatch-failed = キュー済みメッセージを送信できませんでした: { $error }
+zc-queue-dispatch-requeued = セッションが使用中です。メッセージをキューに戻しました（一時停止中）: { $error }
 zc-logs-label-timestamp = タイムスタンプ
 zc-logs-label-severity = 重大度
 zc-logs-label-category = カテゴリ

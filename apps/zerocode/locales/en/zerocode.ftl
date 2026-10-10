@@ -190,6 +190,7 @@ zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
 zc-queue-dispatch-failed = Could not send queued message: { $error }
+zc-queue-dispatch-requeued = Session busy; your message is back in the queue (paused): { $error }
 
 zc-logs-label-timestamp = Timestamp
 zc-logs-label-severity = Severity

@@ -176,6 +176,7 @@ zc-queue-help-enqueue = Mettre le message en file
 zc-queue-help-inject = Envoyer maintenant (ignorer la file)
 zc-queue-edit-busy = Terminez ou effacez le message en cours avant d'en modifier un en file d'attente.
 zc-queue-dispatch-failed = Impossible d'envoyer le message en file d'attente : { $error }
+zc-queue-dispatch-requeued = Session occupée ; votre message est de retour dans la file (en pause) : { $error }
 zc-logs-label-timestamp = Horodatage
 zc-logs-label-severity = Gravité
 zc-logs-label-category = Catégorie

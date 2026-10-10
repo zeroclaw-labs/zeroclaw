@@ -176,6 +176,7 @@ zc-queue-help-enqueue = Poner mensaje en cola
 zc-queue-help-inject = Enviar ahora (omitir cola)
 zc-queue-edit-busy = Termina o borra el mensaje actual antes de editar uno en cola.
 zc-queue-dispatch-failed = No se pudo enviar el mensaje en cola: { $error }
+zc-queue-dispatch-requeued = Sesión ocupada; tu mensaje volvió a la cola (en pausa): { $error }
 zc-logs-label-timestamp = Marca de tiempo
 zc-logs-label-severity = Severidad
 zc-logs-label-category = Categoría
