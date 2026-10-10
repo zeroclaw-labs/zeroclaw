@@ -892,6 +892,8 @@ mod channels;
 mod cli_input;
 mod commands;
 #[cfg(feature = "agent-runtime")]
+mod native_onboard;
+#[cfg(feature = "agent-runtime")]
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -1079,6 +1081,9 @@ enum EvalCommands {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create a separately owned native-provider instance, authorize it, and verify one bounded engine completion.
+    #[cfg(feature = "agent-runtime")]
+    NativeOnboard(native_onboard::Request),
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
     /// path. Interactive: the flags below pre-seed checklist selectors
@@ -6764,6 +6769,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     crate::i18n::init(&crate::i18n::detect_locale());
 
+    // A fresh bootstrap must claim its directory before any general loader
+    // creates config/auth/default state or applies global-root startup work.
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::NativeOnboard(request) = &cli.command {
+        return Box::pin(native_onboard::run(
+            cli.config_dir.as_deref(),
+            request.clone(),
+        ))
+        .await;
+    }
+
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
     if let Commands::Completions { shell } = &cli.command {
@@ -7306,6 +7322,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     match cli.command {
         Commands::Onboard { .. }
+        | Commands::NativeOnboard(_)
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
         | Commands::MarkdownSchema => {

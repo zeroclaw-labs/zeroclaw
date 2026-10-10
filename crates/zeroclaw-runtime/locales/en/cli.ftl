@@ -953,6 +953,26 @@ cli-auth-chatgpt-continue = Continue with ChatGPT: open {$url} in your browser. 
 cli-auth-chatgpt-saved = Saved ChatGPT registration chatgpt-plan:{$profile}. Bind an OpenAI provider alias explicitly before inference.
 cli-auth-chatgpt-response = {$text}
 cli-auth-plan-check-about = Complete one text-only request with an explicitly bound ChatGPT plan provider
+
+cli-native-onboard-about = Create a separate native-provider instance, authorize it, and verify one bounded engine completion
+cli-native-onboard-root-required = Native onboarding requires an explicit absolute --config-dir for a separate fresh instance.
+cli-native-onboard-root-refused = Native onboarding requires an absent directory or this command's matching owned fresh instance. No existing credentials or files were changed.
+cli-native-onboard-yolo-acceptance = YOLO requires --accept-yolo on this invocation.
+cli-native-onboard-api-acceptance = API billing requires --accept-api-billing on this invocation.
+cli-native-onboard-claude-unavailable = This build does not contain the native Claude Code onboarding provider. Use the dependent native-provider build; no instance was created.
+cli-native-onboard-plan-billing = ChatGPT plan onboarding requires subscription billing and owns its instance auth store; --native-config-dir is unsupported.
+cli-native-onboard-platform = Native onboarding currently requires macOS or Linux (including WSL).
+cli-native-onboard-arguments = Provide a nonempty model and valid provider, agent, and auth-profile aliases.
+cli-native-onboard-pending-auth = Native onboarding: pending_auth. Authorize only this separate instance; interrupted auth remains resumable.
+cli-native-onboard-cancelled = Native onboarding cancelled. Owned auth/config state was retained; this instance is not ready. Rerun the identical command to resume.
+cli-native-onboard-auth-failed = Native authorization failed. Owned state was retained; no readiness was claimed.
+cli-native-onboard-config-failed = Native onboarding configuration was rejected or could not be committed; owned auth was retained.
+cli-native-onboard-partial = Native onboarding saved configuration with incomplete side effects. Owned state was retained; this instance is not ready.
+cli-native-onboard-configured = Native onboarding: configured. Checking one bounded real engine completion under the accepted policy.
+cli-native-onboard-engine-failed = Native onboarding engine validation failed or timed out. Configured state was retained; this instance is not ready.
+cli-native-onboard-ready = Native onboarding: ready. This receipt records the last verified engine completion and policy, not ongoing account, quota, or policy authority.
+cli-native-onboard-state-failed = Native onboarding could not update its ownership receipt. Owned files were retained; no readiness was claimed.
+cli-native-onboard-failed = Native onboarding validation failed. Owned auth/config state was retained; no readiness was claimed.
 cli-auth-active = Active profiles:
 
 # ── misc main (errors, config, plugin info, estop fields, auth) ──
