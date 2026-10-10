@@ -10698,6 +10698,27 @@ async fn process_channel_message_body(
                                 );
                                 true
                             }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
