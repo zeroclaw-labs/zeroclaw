@@ -201,6 +201,30 @@ where
     }
 }
 
+/// Tailnet port the gateway is published on. Passed explicitly as `--https`
+/// so the advertised URL is derived from the same value as the command line.
+/// 443 is valid for both `serve` and `funnel` (funnel accepts only
+/// 443/8443/10000) and lets the URL omit the port.
+const GATEWAY_HTTPS_PORT: u16 = 443;
+
+/// `tailscale serve|funnel --https=443 <local_port>`: an HTTPS proxy on the
+/// tailnet port [`GATEWAY_HTTPS_PORT`] to `127.0.0.1:<local_port>`.
+fn gateway_serve_args(funnel: bool, local_port: u16) -> [String; 3] {
+    let subcommand = if funnel { "funnel" } else { "serve" };
+    [
+        subcommand.to_string(),
+        format!("--https={GATEWAY_HTTPS_PORT}"),
+        local_port.to_string(),
+    ]
+}
+
+/// The URL Tailscale serves the gateway at. The local port is never part of
+/// it: Tailscale listens on [`GATEWAY_HTTPS_PORT`] (443, the HTTPS default),
+/// not on the gateway's own port.
+fn gateway_public_url(hostname: &str) -> String {
+    format!("https://{hostname}")
+}
+
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
 /// `tailscale funnel` (public internet).
 /// Requires Tailscale installed and authenticated (`tailscale up`).
@@ -527,20 +551,17 @@ impl Tunnel for TailscaleTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        let subcommand = if self.funnel { "funnel" } else { "serve" };
-
         // Get the tailscale hostname for URL construction
         let hostname = self.resolve_hostname().await?;
 
-        // tailscale serve|funnel <port>
         let child = Command::new("tailscale")
-            .args([subcommand, &local_port.to_string()])
+            .args(gateway_serve_args(self.funnel, local_port))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
-        let public_url = format!("https://{hostname}:{local_port}");
+        let public_url = gateway_public_url(&hostname);
 
         let mut guard = self.proc.lock().await;
         *guard = Some(TunnelProcess {
@@ -682,6 +703,28 @@ mod tests {
     async fn health_check_is_false_before_start() {
         let tunnel = TailscaleTunnel::new(false, None);
         assert!(!tunnel.health_check().await);
+    }
+
+    #[test]
+    fn gateway_serve_args_pin_the_https_port() {
+        assert_eq!(
+            gateway_serve_args(false, 42617),
+            ["serve", "--https=443", "42617"]
+        );
+        assert_eq!(
+            gateway_serve_args(true, 42617),
+            ["funnel", "--https=443", "42617"]
+        );
+    }
+
+    #[test]
+    fn gateway_public_url_omits_the_local_port() {
+        // Regression: the URL used to be https://<host>:<local_port>, but
+        // Tailscale serves the gateway on 443, not on the gateway's own port.
+        assert_eq!(
+            gateway_public_url("node.tailnet.ts.net"),
+            "https://node.tailnet.ts.net"
+        );
     }
 
     #[tokio::test]
