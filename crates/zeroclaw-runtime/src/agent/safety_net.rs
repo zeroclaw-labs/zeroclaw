@@ -83,6 +83,28 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     }
 }
 
+/// A complete Anthropic SSE response for tests that drive the streaming turn
+/// path. Keep these fixtures protocol-valid so terminal-delivery tests do not
+/// accidentally exercise a truncated JSON response instead of their routing
+/// or accounting contract.
+fn anthropic_text_sse(text: &str, input_tokens: u64, output_tokens: u64) -> String {
+    let text = serde_json::to_string(text).expect("test text serializes");
+    format!(
+        "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-opus\",\"usage\":{{\"input_tokens\":{input_tokens}}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+    )
+}
+
 /// Build a cost-tracking context keyed on the serving provider's pricing.
 /// Mirrors ws.rs::process_chat_message — the pricing map keys ONLY the
 /// serving provider so a coherent Usage tuple yields the correct cost,
@@ -3062,12 +3084,15 @@ async fn usage_event_coherent_tuple_vision_route() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "vision analysis complete"}],
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "stop_reason": "end_turn",
-                "model": "claude-3-opus"
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse(
+                        "vision analysis complete",
+                        input_tokens,
+                        output_tokens,
+                    )),
+            )
             .mount(&server)
             .await;
 
@@ -3251,12 +3276,15 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "switched call served"}],
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "stop_reason": "end_turn",
-                "model": "claude-3-opus"
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse(
+                        "switched call served",
+                        input_tokens,
+                        output_tokens,
+                    )),
+            )
             .mount(&server)
             .await;
 
@@ -3437,12 +3465,15 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "content": [{"type": "text", "text": "switched call served"}],
-            "usage": {"input_tokens": input_tokens_b, "output_tokens": output_tokens_b},
-            "stop_reason": "end_turn",
-            "model": "claude-3-opus"
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_text_sse(
+                    "switched call served",
+                    input_tokens_b,
+                    output_tokens_b,
+                )),
+        )
         .mount(&server)
         .await;
 

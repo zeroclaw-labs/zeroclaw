@@ -12826,6 +12826,11 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+#[cfg(feature = "agent-runtime")]
+fn qualified_provider_identity(provider_type: impl std::fmt::Display, alias: &str) -> String {
+    format!("{provider_type}.{alias}")
+}
+
 /// Build the SOP channel-backed adapters from one shared channel map:
 /// - the approval ROUTE adapter, so a SOP that parks at a policied gate (or later
 ///   times out) can deliver its approval request / escalation notice to a real
@@ -12886,8 +12891,9 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 };
                 let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
                 Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::with_provider_name(
                         std::sync::Arc::from(provider),
+                        qualified_provider_identity(provider_type, alias),
                         model,
                     ),
                 ) as _)

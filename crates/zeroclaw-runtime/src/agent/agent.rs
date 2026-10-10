@@ -5485,6 +5485,7 @@ mod tests {
                 requested_model: model.into(),
                 category: Some("private-category".into()),
                 usage: self.usage.clone().map(Box::new),
+                provider_executed_tool_activity: false,
                 attempted_candidate: None,
                 attempted_candidate_index: None,
             })
@@ -15831,11 +15832,21 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Mock vision endpoint: a small plain-text answer with NO usage.
-        async fn vision_reply(Json(_body): Json<serde_json::Value>) -> Json<serde_json::Value> {
-            Json(serde_json::json!({
-                "choices": [{"message": {"content": "vision saw the image"}}]
-            }))
+        // The route is consumed as a compatible stream, so the mock must emit
+        // the corresponding terminal framing. It intentionally omits usage to
+        // exercise the terminal-snapshot path below.
+        async fn vision_reply(
+            Json(_body): Json<serde_json::Value>,
+        ) -> (
+            [(axum::http::header::HeaderName, &'static str); 1],
+            &'static str,
+        ) {
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                "data: {\"choices\":[{\"delta\":{\"content\":\"vision saw the image\"}}]}\n\n\
+                 data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                 data: [DONE]\n\n",
+            )
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

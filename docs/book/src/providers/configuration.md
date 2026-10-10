@@ -672,6 +672,34 @@ you declare on the alias entry. Two independent, ordered axes:
   resolves with **its own** credentials, endpoint, and model, a fallback never
   inherits the failing alias's key.
 
+### Incomplete terminal responses
+
+An incomplete terminal response is never presented as a successful answer.
+For example, an Anthropic response may reach an output or context limit, pause
+for an explicit continuation, or refuse the request. ZeroClaw records the
+terminal reason separately from response text and tool calls.
+
+Fallback is deliberately replay-safe rather than unconditional. If no text was
+exposed, no provider or client tool activity occurred, and the failed stream
+identifies its exact configured candidate, ZeroClaw asks Reliable to continue
+for an output/context limit or a pre-output refusal. Reliable advances to the
+next distinct candidate when one exists. If no distinct candidate exists, it
+may begin one documented non-streaming recovery operation of the same entry.
+That operation follows the entry's configured retry budget, is consumed once
+as a recovery operation, and is not fallback attribution. A missing
+candidate identity, paused turn, any visible partial output, or any tool
+activity returns an explicit incomplete result instead: replaying could
+duplicate a visible answer or a side effect.
+Continuation of a paused Anthropic turn is not yet implemented.
+
+Anthropic streaming is also fail-closed: an interrupted stream or malformed
+SSE frame is an explicit delivery failure, never a completed response.
+
+Provider-reported usage remains diagnostic. A documented pre-output Anthropic
+refusal is treated as informational rather than billable; other rejected,
+billable attempts remain separately accounted and are not merged into a later
+successful answer's context usage.
+
 ### Order of attempts
 
 The walk is depth-first: an alias's entire model list is exhausted before leaving
