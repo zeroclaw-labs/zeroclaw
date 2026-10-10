@@ -860,6 +860,7 @@ impl LiveSessionRefreshScope {
 /// travels with the values until they are published after the config commit.
 struct PreparedLiveSessionRefresh {
     session_id: String,
+    application_paths: Vec<Vec<String>>,
     /// Session-identity generation captured BEFORE the provider box was built.
     /// `apply_model_provider` rejects the write if the session was replaced
     /// under the same ID in the meantime (`session/new`, ACP rehydration), so
@@ -3205,7 +3206,7 @@ impl RpcDispatcher {
     #[allow(clippy::too_many_arguments)]
     async fn save_and_publish_config(
         &self,
-        commit: crate::live_config_authority::ConfigCommit,
+        mut commit: crate::live_config_authority::ConfigCommit,
         snapshot: zeroclaw_config::schema::Config,
         effects: RpcConfigCommitEffects,
     ) -> Result<(), JsonRpcError> {
@@ -3227,6 +3228,15 @@ impl RpcDispatcher {
         let revision = commit
             .next_revision()
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}")))?;
+        for refresh in &effects.prepared_sessions {
+            commit.register_application(
+                crate::config_application::ConfigApplicationTarget::Session {
+                    id: refresh.session_id.clone(),
+                    generation: refresh.session_generation,
+                },
+                refresh.application_paths.clone(),
+            );
+        }
         let ctx = Arc::clone(&self.ctx);
         let sessions = Arc::clone(&ctx.sessions);
         let reload_tx = self.ctx.reload_tx.clone();
@@ -3244,6 +3254,7 @@ impl RpcDispatcher {
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
                     Arc::clone(&accepted),
+                    Some(revision),
                 )
                 .await;
                 drain_channel_generation_without_dispatcher(
@@ -3669,7 +3680,7 @@ impl RpcDispatcher {
 
             // Config introspection
             Method::ConfigSections => self.handle_config_sections(),
-            Method::ConfigStatus => self.handle_config_status(),
+            Method::ConfigStatus => self.handle_config_status().await,
             Method::ConfigCatalog => self.handle_config_catalog(),
             Method::ConfigCatalogModels => {
                 Box::pin(self.handle_config_catalog_models(params)).await
@@ -9614,6 +9625,33 @@ impl RpcDispatcher {
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
+        // Application paths are recorded only on prepared sessions; with none
+        // live, skip the semantic diff and metadata derivation under the
+        // config writer lock.
+        if session_ids.is_empty() {
+            return Ok(prepared);
+        }
+        let previous = ctx.config.snapshot();
+        let changed_paths = Config::semantic_changed_paths(&previous, config).unwrap_or_default();
+        // Derive each snapshot's property metadata once, not once per path.
+        let (candidate_capabilities, previous_capabilities) = if changed_paths.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(config.application_capabilities()),
+                Some(previous.application_capabilities()),
+            )
+        };
+        let application_paths: Vec<_> = changed_paths
+            .into_iter()
+            .filter(|path| {
+                use zeroclaw_config::traits::ApplicationCapability::ModelProviderRefresh;
+                [&candidate_capabilities, &previous_capabilities]
+                    .into_iter()
+                    .flatten()
+                    .any(|capabilities| capabilities.capability(path) == ModelProviderRefresh)
+            })
+            .collect();
         for session_id in session_ids {
             // Capture the generation before acquiring the lock so we can
             // detect same-ID replacement while waiting.
@@ -9708,6 +9746,46 @@ impl RpcDispatcher {
                 &model_name,
             );
             prepared.push(PreparedLiveSessionRefresh {
+                application_paths: application_paths
+                    .iter()
+                    .filter(|path| {
+                        if let LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } =
+                            scope
+                            && let [root, category, family, alias, ..] = path.as_slice()
+                            && root == "providers"
+                            && category == "models"
+                        {
+                            let reference = format!("{family}.{alias}");
+                            if &reference == old_ref || &reference == new_ref {
+                                return true;
+                            }
+                        }
+                        let path_scope = match path.as_slice() {
+                            [root, category, family, alias, ..]
+                                if root == "providers" && category == "models" =>
+                            {
+                                Some(LiveSessionRefreshScope::ModelProvider(format!(
+                                    "{family}.{alias}"
+                                )))
+                            }
+                            [root, alias, field]
+                                if root == "agents" && field == "model_provider" =>
+                            {
+                                Some(LiveSessionRefreshScope::Agent(alias.clone()))
+                            }
+                            [root, ..] if root == "model_routes" => {
+                                Some(LiveSessionRefreshScope::ModelRoutes)
+                            }
+                            _ => None,
+                        };
+                        path_scope.is_some_and(|path_scope| {
+                            path_scope
+                                .resolve_provider_ref(config, &agent_alias, &overrides)
+                                .is_ok_and(|reference| reference.is_some())
+                        })
+                    })
+                    .cloned()
+                    .collect(),
                 session_id,
                 session_generation,
                 _model_provider_update: model_provider_update,
@@ -9734,10 +9812,12 @@ impl RpcDispatcher {
         ctx: Arc<RpcContext>,
         prepared: Vec<PreparedLiveSessionRefresh>,
         config_generation: Arc<Config>,
+        revision: Option<zeroclaw_config::live::ConfigRevision>,
     ) {
         for refresh in prepared {
             let PreparedLiveSessionRefresh {
                 session_id,
+                application_paths,
                 session_generation,
                 _model_provider_update,
                 model_provider,
@@ -9748,6 +9828,11 @@ impl RpcDispatcher {
                 temperature,
                 override_migration,
             } = refresh;
+            if revision
+                .is_some_and(|revision| ctx.config_authority.published_revision() != revision)
+            {
+                continue;
+            }
             // Migrate the stored override first so the session's own reference
             // and the provider box it is about to receive name the same alias
             // for the whole publication, still under this session's guard.
@@ -9775,6 +9860,17 @@ impl RpcDispatcher {
                     },
                 )
                 .await;
+            if let Some(revision) = revision {
+                ctx.config_authority.complete_application(
+                    revision,
+                    &crate::config_application::ConfigApplicationTarget::Session {
+                        id: session_id.clone(),
+                        generation: session_generation,
+                    },
+                    &application_paths,
+                    applied,
+                );
+            }
             if applied {
                 ctx.sessions
                     .clear_pending_generation(&session_id, session_generation)
@@ -9795,7 +9891,7 @@ impl RpcDispatcher {
             &LiveSessionRefreshScope::Agent(agent_alias.to_string()),
         )
         .await?;
-        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config)).await;
+        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config), None).await;
         Ok(())
     }
 
@@ -11152,8 +11248,51 @@ impl RpcDispatcher {
         to_result(ConfigSectionsResult { sections })
     }
 
-    fn handle_config_status(&self) -> RpcResult {
+    async fn handle_config_status(&self) -> RpcResult {
         use zeroclaw_config::sections::QUICKSTART_SECTIONS;
+        let application = self
+            .ctx
+            .sessions
+            .with_current_sessions(|sessions| {
+                let grants = self.recheck_authority_after_admission(Method::ConfigStatus)?;
+                let scoped_principal = self.auth.as_ref().filter(|auth| {
+                    auth.principal.is_authenticated()
+                        && grants.as_ref().is_some_and(|grants| !grants.admin)
+                });
+                use crate::config_application::ConfigApplicationTarget;
+                use zeroclaw_api::grants::{Resource, Verb};
+                Ok::<_, JsonRpcError>(self.ctx.config_authority.application_status_for_sessions(
+                    |target| {
+                        match target {
+                            ConfigApplicationTarget::Daemon => true,
+                            ConfigApplicationTarget::Session { id, generation } => sessions
+                                .get(id)
+                                .is_some_and(|session| session.generation == *generation),
+                        }
+                    },
+                    |target| match target {
+                        ConfigApplicationTarget::Daemon => true,
+                        ConfigApplicationTarget::Session { id, generation } => {
+                            sessions.get(id).is_some_and(|session| {
+                                session.generation == *generation
+                                    && scoped_principal.is_none_or(|auth| {
+                                        session.owner_principal_id.as_deref()
+                                            == Some(auth.principal.id.as_str())
+                                    })
+                                    && grants.as_ref().is_some_and(|grants| {
+                                        grants.permits(Resource::Sessions, Verb::Read)
+                                            && grants.may_use_agent(&session.agent_alias)
+                                    })
+                                    && (self.access_policy == RpcAccessPolicy::TrustedLocal
+                                        || session.owner_tui_id.as_deref().is_some_and(|owner| {
+                                            self.tui_id.as_deref() == Some(owner)
+                                        }))
+                            })
+                        }
+                    },
+                ))
+            })
+            .await?;
         let config = self.ctx.config.read().clone();
         let missing: Vec<String> = QUICKSTART_SECTIONS
             .iter()
@@ -11167,6 +11306,7 @@ impl RpcDispatcher {
             "all sections complete".to_string()
         };
         to_result(ConfigStatusResult {
+            application: Some(application),
             needs_quickstart,
             reason,
             has_partial_state: false,
@@ -36926,6 +37066,166 @@ mod tests {
         assert_eq!(
             temperature_for_session(dispatcher, session_id).await,
             expected
+        );
+    }
+
+    #[tokio::test]
+    async fn config_application_status_waits_for_the_real_session_acknowledgement() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.permission_profiles.insert(
+            "application-reader".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                grants: HashMap::from([
+                    (Resource::Config, vec![Verb::Read]),
+                    (Resource::Sessions, vec![Verb::Read, Verb::Create]),
+                ]),
+                ..Default::default()
+            },
+        );
+        for (alias, uid) in [("reader-one", 4242), ("reader-two", 4343)] {
+            config.users.insert(
+                alias.into(),
+                UserConfig {
+                    uid: Some(uid),
+                    permission_profiles: vec!["application-reader".into()],
+                    ..Default::default()
+                },
+            );
+        }
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let mut readers = Vec::new();
+        let mut owned_sessions = Vec::new();
+        for uid in [4242, 4343] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut reader =
+                RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "unix:test".into())
+                    .with_transport(
+                        crate::rpc::transport::TransportKind::Local,
+                        crate::security::auth_provider::Credential::Peercred { uid },
+                    );
+            reader.handle_initialize(&json!({})).await.unwrap();
+            let created = reader
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent", "keep_siblings": true
+                }))
+                .await
+                .unwrap();
+            owned_sessions.push(created["session_id"].as_str().unwrap().to_owned());
+            readers.push(reader);
+        }
+        let generation = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .unwrap();
+        let (entered, release, _) = dispatcher.ctx.sessions.set_test_gated_op_pause();
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let writer = Arc::clone(&dispatcher);
+        let task = zeroclaw_spawn::spawn!(async move {
+            writer
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model", "value": "new-model"
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        let pending = dispatcher.handle_config_status().await.unwrap();
+        let records = pending["application"]["records"].as_array().unwrap();
+        let record = records
+            .iter()
+            .find(|record| record["target"]["id"] == session_id)
+            .unwrap();
+        assert_eq!(record["target"]["generation"], generation);
+        assert_eq!(record["outcome"], "pending");
+        assert_eq!(
+            record["path"],
+            json!(["providers", "models", "openai", "test-provider", "model"])
+        );
+        assert_eq!(
+            record["revision"],
+            pending["application"]["published_revision"]
+        );
+        let applied_revision = record["revision"].clone();
+        dispatcher.ctx.sessions.clear_test_gated_op_pause();
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "new-model"
+        );
+        let applied = dispatcher.handle_config_status().await.unwrap();
+        let records = applied["application"]["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["target"]["id"] == session_id
+                    && record["outcome"] == "applied_live")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["target"]["kind"] == "daemon"
+                    && record["outcome"] == "queued_for_reload")
+        );
+        assert!(!applied.to_string().contains("test-key"));
+        for (reader, own_session) in readers.iter().zip(&owned_sessions) {
+            let status = reader.handle_config_status().await.unwrap();
+            let visible_sessions: Vec<_> = status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| record["target"]["kind"] == "session")
+                .collect();
+            assert_eq!(visible_sessions.len(), 1);
+            assert_eq!(visible_sessions[0]["target"]["id"], *own_session);
+            assert_eq!(visible_sessions[0]["outcome"], "applied_live");
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["target"]["kind"] == "session")
+                .count(),
+            3,
+            "the operator sees owned and legacy unowned sessions"
+        );
+        dispatcher
+            .handle_config_set(&json!({"prop": "gateway.port", "value": 42618}))
+            .await
+            .unwrap();
+        let later = dispatcher.handle_config_status().await.unwrap();
+        let record = later["application"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["target"]["id"] == session_id)
+            .unwrap();
+        assert_eq!(record["revision"], applied_revision);
+        dispatcher.ctx.sessions.remove(&session_id).await;
+        let retired = dispatcher.handle_config_status().await.unwrap();
+        assert!(
+            retired["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record["target"]["id"] != session_id)
         );
     }
 

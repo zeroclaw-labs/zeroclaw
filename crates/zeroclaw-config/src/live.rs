@@ -52,6 +52,12 @@ impl Default for ConfigEpoch {
     }
 }
 
+impl std::fmt::Display for ConfigEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Identity of one published config: authority epoch plus sequence.
 ///
 /// Copyable and comparable for equality only. Order-sensitive questions
@@ -65,6 +71,16 @@ pub struct ConfigRevision {
 }
 
 impl ConfigRevision {
+    /// The authority generation that owns this revision.
+    pub fn epoch(&self) -> ConfigEpoch {
+        self.epoch
+    }
+
+    /// Publication sequence within this revision's epoch.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     /// The first revision of a fresh epoch.
     pub(crate) fn initial(epoch: ConfigEpoch) -> Self {
         Self { epoch, sequence: 0 }
@@ -282,6 +298,20 @@ impl LiveConfigReadGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_application_revision_getters_project_the_published_identity() {
+        let live = LiveConfig::new(Config::default());
+        let initial = live.published_revision();
+        assert_eq!(initial.epoch(), live.epoch());
+        assert_eq!(initial.sequence(), 0);
+        assert_eq!(initial.epoch().to_string(), live.epoch().0.to_string());
+
+        let next = live.next_revision().unwrap();
+        live.publish(next, Config::default()).unwrap();
+        assert_eq!(next.epoch(), initial.epoch());
+        assert_eq!(next.sequence(), 1);
+    }
 
     fn config_with_agent(alias: &str) -> Config {
         let mut config = Config::default();

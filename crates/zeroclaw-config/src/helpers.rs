@@ -265,6 +265,7 @@ pub fn make_prop_field(
         description,
         derived_from_secret,
         credential_class,
+        application: crate::traits::ApplicationCapability::default(),
         tab,
         alias_source,
         multiline,

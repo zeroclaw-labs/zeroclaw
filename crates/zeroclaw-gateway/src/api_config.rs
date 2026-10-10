@@ -341,6 +341,7 @@ fn lookup_prop_field(
                     tab: zeroclaw_config::traits::ConfigTab::None,
                     alias_source: None,
                     multiline: false,
+                    application: Default::default(),
                 }
             })
         })
@@ -1299,6 +1300,7 @@ pub struct ReloadStatusResponse {
     /// Whether any config write has landed since the last admin reload and may
     /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
+    pub application: zeroclaw_runtime::config_application::ConfigApplicationStatus,
 }
 
 /// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
@@ -1307,7 +1309,12 @@ pub async fn handle_reload_status(State(state): State<AppState>) -> Response {
     let pending_reload = state
         .pending_reload
         .load(std::sync::atomic::Ordering::Relaxed);
-    axum::Json(ReloadStatusResponse { pending_reload }).into_response()
+    let application = state.config_authority.application_status();
+    axum::Json(ReloadStatusResponse {
+        pending_reload,
+        application,
+    })
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3632,6 +3639,78 @@ mod tests {
     // tests below fall through into real persistence (`persist_and_swap` ->
     // `save_dirty`), and a bare `Config::default()` would write the developer's
     // live `~/.zeroclaw/config.toml`.
+
+    #[tokio::test]
+    async fn config_application_reload_status_does_not_infer_adoption_from_flag_clearing() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.gateway.require_pairing = true;
+        config.gateway.paired_tokens = vec!["zc_paired".into()];
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &config.gateway.paired_tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let auth = Arc::new(
+            crate::principal_gate::GatewayInboundAuth::from_config(
+                &config,
+                Arc::clone(&state.pairing),
+            )
+            .unwrap(),
+        );
+        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let read = || {
+            axum::http::Request::builder()
+                .uri("/api/config/reload-status")
+                .header("authorization", "Bearer zc_paired")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let denied = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/config/reload-status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let (status, initial) = response_json(router.clone().oneshot(read()).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(initial["application"]["records"], serde_json::json!([]));
+        let write = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/config/prop")
+            .header("authorization", "Bearer zc_paired")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"path":"gateway.port","value":42618}"#,
+            ))
+            .unwrap();
+        let (status, _) = response_json(router.clone().oneshot(write).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, saved) = response_json(router.clone().oneshot(read()).await.unwrap()).await;
+        assert_eq!(saved["pending_reload"], true);
+        let records = saved["application"]["records"].as_array().unwrap();
+        assert!(records.iter().any(|record| record["path"]
+            == serde_json::json!(["gateway", "port"])
+            && record["outcome"] == "queued_for_reload"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record["target"]["kind"] == "daemon")
+        );
+        state
+            .pending_reload
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (_, cleared) = response_json(router.oneshot(read()).await.unwrap()).await;
+        assert_eq!(cleared["pending_reload"], false);
+        assert_eq!(cleared["application"], saved["application"]);
+    }
 
     #[tokio::test]
     async fn prop_get_surfaces_disabled_audit_warning() {
