@@ -253,6 +253,15 @@ without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
 Extraction is also capped, so a compressed archive cannot expand without bound
 in the temporary install area.
 
+Registry requests are bounded in time. Connecting to the registry or archive
+host may take at most 10 seconds, and a response may go at most 30 seconds
+without delivering data, both before its headers arrive and between reads of
+its body. Fetching the index must finish within 30 seconds, and downloading an
+archive within 30 minutes. A stalled registry or archive host therefore fails
+`zeroclaw plugin search` or `zeroclaw plugin install` instead of leaving it
+waiting, while a slow archive download that keeps delivering data is limited
+only by the 30-minute bound.
+
 Search is unauthenticated discovery. Install is the security boundary: registry
 installs use the configured plugin signature policy and trusted publisher keys,
 the same as local plugin installs through `PluginHost::install`.
