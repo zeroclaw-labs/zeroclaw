@@ -11342,7 +11342,7 @@ mod tests {
         assert_eq!(tail.len(), 1, "one signed tool result: {view}");
         let entry = tail[0].as_str().unwrap_or_default();
         assert!(
-            entry.starts_with("echo_tool: ") && entry.contains("zc-receipt-"),
+            entry.starts_with("calculator: ") && entry.contains("zc-receipt-"),
             "the tail carries the collector's `<tool>: <token>` entries: {view}"
         );
 
