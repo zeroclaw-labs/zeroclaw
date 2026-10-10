@@ -53,6 +53,7 @@ fn default_shell_for_platform() -> String {
     "sh".to_string()
 }
 
+#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "android"))))]
 fn first_available<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     mut available: impl FnMut(&str) -> bool,
@@ -75,7 +76,7 @@ fn is_supported_login_shell(shell: &str) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn shell_is_available(shell: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
 

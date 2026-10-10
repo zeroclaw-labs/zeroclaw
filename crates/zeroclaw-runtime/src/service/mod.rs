@@ -21,14 +21,17 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use tokio::process::Child;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::process::Command as TokioCommand;
-use zeroclaw_config::schema::{Config, resolve_runtime_dirs};
+use zeroclaw_config::schema::Config;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use zeroclaw_config::schema::resolve_runtime_dirs;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
@@ -48,6 +51,7 @@ const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -386,7 +390,7 @@ fn open_or_create_private_desktop_subdir(
     Ok(Dir::from_std_file(std_file))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn open_private_desktop_subdir(
     parent: &cap_std::fs::Dir,
     name: &Path,
@@ -684,6 +688,7 @@ fn open_private_desktop_file(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn desktop_config_dir() -> Result<PathBuf> {
     let (config_dir, _) = resolve_runtime_dirs().await?;
     normalize_desktop_config_dir(config_dir)
@@ -712,12 +717,14 @@ fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn desktop_log_path() -> Result<PathBuf> {
     Ok(desktop_config_dir()
         .await?
         .join("logs/zeroclaw-desktop-daemon.log"))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
     let mut line = prefix.to_string();
     if let Some(message) = message {
@@ -737,26 +744,31 @@ fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
     line
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn desktop_error_frame(error: &anyhow::Error) -> String {
     desktop_handshake_frame("ERROR", Some(&format!("{error:#}")))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn emit_desktop_frame(frame: &str) {
     let mut stdout = std::io::stdout().lock();
     let _ = std::io::Write::write_all(&mut stdout, frame.as_bytes());
     let _ = std::io::Write::flush(&mut stdout);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
     let line = desktop_handshake_frame(prefix, message);
     emit_desktop_frame(&line);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn emit_desktop_error(error: &anyhow::Error) {
     let frame = desktop_error_frame(error);
     emit_desktop_frame(&frame);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn handle_desktop_preflight<T>(
     result: Result<T>,
     emit_error: impl FnOnce(&anyhow::Error),

@@ -1,10 +1,18 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::sync::Arc;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
+use std::{process::Stdio, time::Duration};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 const BROWSER_OPEN_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open approved HTTP/HTTPS URLs in the system default browser (no scraping, no DOM automation).
@@ -159,10 +167,17 @@ impl Tool for BrowserOpenTool {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 async fn run_browser_launcher(command: tokio::process::Command, label: &str) -> Result<(), String> {
     run_browser_launcher_with_timeout(command, label, BROWSER_OPEN_LAUNCH_TIMEOUT).await
 }
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 async fn run_browser_launcher_with_timeout(
     mut command: tokio::process::Command,
     label: &str,
