@@ -12,8 +12,15 @@ import {
   triggerCronJob,
 } from '@/lib/api';
 import { agentBoundChannels, type AgentBoundChannel } from '@/lib/agentChannels';
+import {
+  CRON_DEFAULT_EXPRESSION,
+  cronSchedulePatchForEdit,
+  getGuidedCronExpression,
+  isValidCronExpression,
+} from '@/lib/cron';
 import { t } from '@/lib/i18n';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
+import CronFieldsInput from '@/components/CronFieldsInput';
 import ToolPicker from '@/components/ToolPicker';
 import type { CronJob, CronRun } from '@/types/api';
 import {
@@ -200,7 +207,7 @@ export default function Cron() {
 
   // Shared form state for both add and edit
   const [formName, setFormName] = useState('');
-  const [formSchedule, setFormSchedule] = useState('');
+  const [formSchedule, setFormSchedule] = useState(CRON_DEFAULT_EXPRESSION);
   const [formTimezone, setFormTimezone] = useState('');
   const [formCommand, setFormCommand] = useState('');
   const [formJobType, setFormJobType] = useState<'shell' | 'agent'>('shell');
@@ -217,13 +224,37 @@ export default function Cron() {
   const [agentOptions, setAgentOptions] = useState<string[]>([]);
   const [boundChannels, setBoundChannels] = useState<AgentBoundChannel[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
+  const [scheduleValid, setScheduleValid] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   const isEditing = modalJob !== null && modalJob !== 'add';
+  const editingJob = isEditing ? (modalJob as CronJob) : null;
+  const canEditSchedule =
+    modalJob === 'add' ||
+    (editingJob !== null && getGuidedCronExpression(editingJob.schedule) !== undefined);
+  const canEditTimezone = editingJob === null || editingJob.schedule.kind === 'cron';
+  const preservedSchedule = editingJob?.schedule ?? null;
+  const preservedScheduleLabel =
+    preservedSchedule?.kind === 'cron'
+      ? t('cron.schedule_type_cron')
+      : preservedSchedule?.kind === 'at'
+        ? t('cron.schedule_type_at')
+        : preservedSchedule?.kind === 'every'
+          ? t('cron.schedule_type_every')
+          : '';
+  const preservedScheduleValue =
+    preservedSchedule?.kind === 'cron'
+      ? preservedSchedule.expr
+      : preservedSchedule?.kind === 'at'
+        ? preservedSchedule.at
+          : preservedSchedule?.kind === 'every'
+            ? String(preservedSchedule.every_ms)
+            : '';
 
   const openAddModal = () => {
     setFormName('');
-    setFormSchedule('');
+    setFormSchedule(CRON_DEFAULT_EXPRESSION);
+    setScheduleValid(true);
     setFormTimezone(browserProvidedTimezone());
     setFormCommand('');
     setFormJobType('shell');
@@ -243,8 +274,12 @@ export default function Cron() {
 
   const openEditModal = (job: CronJob) => {
     const jobType = job.job_type === 'agent' ? 'agent' : 'shell';
+    const guidedSchedule = getGuidedCronExpression(job.schedule);
     setFormName(job.name ?? '');
-    setFormSchedule(job.expression);
+    setFormSchedule(
+      guidedSchedule ?? (job.schedule.kind === 'cron' ? job.schedule.expr : ''),
+    );
+    setScheduleValid(guidedSchedule !== undefined);
     setFormTimezone(scheduleTimezone(job) ?? '');
     setFormJobType(jobType);
     setFormAgent((job as CronJob & { agent_alias?: string }).agent_alias ?? 'default');
@@ -350,7 +385,7 @@ export default function Cron() {
 
   const handleSubmit = async () => {
     const isAgent = formJobType === 'agent';
-    if (!formSchedule.trim()) {
+    if (canEditSchedule && !formSchedule.trim()) {
       setFormError(t('cron.validation_error'));
       return;
     }
@@ -364,6 +399,12 @@ export default function Cron() {
     }
     setSubmitting(true);
     setFormError(null);
+
+    if (canEditSchedule && (!scheduleValid || !isValidCronExpression(formSchedule))) {
+      setFormError(t('cron.schedule_invalid'));
+      setSubmitting(false);
+      return;
+    }
 
     if (!isEditing && !formAgent.trim()) {
       setFormError(t('cron.agent_required_error'));
@@ -395,7 +436,7 @@ export default function Cron() {
           // name/schedule/prompt edit doesn't 422 with "missing field agent".
           agent: (modalJob as CronJob).agent_alias ?? '',
           name: formName.trim() || undefined,
-          schedule: formSchedule.trim(),
+          ...cronSchedulePatchForEdit((modalJob as CronJob).schedule, formSchedule),
         };
         if (timezone) {
           patch.tz = timezone;
@@ -703,16 +744,37 @@ export default function Cron() {
               </div>
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                  {t('cron.schedule_required')} <span className="text-status-error">*</span>
+                  {t(canEditSchedule ? 'cron.schedule_required' : 'cron.schedule')}
+                  {canEditSchedule && <span className="text-status-error"> *</span>}
                 </label>
-                <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder={t('cron.schedule_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm" />
+                {canEditSchedule ? (
+                  <CronFieldsInput
+                    value={formSchedule}
+                    onChange={setFormSchedule}
+                    onValidityChange={setScheduleValid}
+                  />
+                ) : (
+                  <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated p-3">
+                    <div className="text-xs font-medium uppercase tracking-wider text-pc-text-faint">
+                      {preservedScheduleLabel}
+                    </div>
+                    <code className="mt-2 block break-all text-sm text-pc-text-secondary">
+                      {preservedScheduleValue}
+                    </code>
+                    <p className="mt-2 text-xs text-pc-text-faint">
+                      {t('cron.schedule_preserved_note')}
+                    </p>
+                  </div>
+                )}
               </div>
-              <div>
-                <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                  {t('cron.timezone')}
-                </label>
-                <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder={t('cron.timezone_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono" />
-              </div>
+              {canEditTimezone && (
+                <div>
+                  <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                    {t('cron.timezone')}
+                  </label>
+                  <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder={t('cron.timezone_placeholder')} className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono" />
+                </div>
+              )}
 
               {/* Conditional fields based on job type */}
               {formJobType === 'shell' ? (
@@ -974,7 +1036,12 @@ export default function Cron() {
               <Button variant="ghost" size="md" onClick={closeModal}>
                 {t('cron.cancel')}
               </Button>
-              <Button variant="primary" size="md" onClick={handleSubmit} disabled={submitting}>
+              <Button
+                variant="primary"
+                size="md"
+                onClick={handleSubmit}
+                disabled={submitting || (canEditSchedule && !scheduleValid)}
+              >
                 {submitting
                   ? t(isEditing ? 'cron.saving' : 'cron.adding')
                   : t(isEditing ? 'cron.save' : 'cron.add_job')}
