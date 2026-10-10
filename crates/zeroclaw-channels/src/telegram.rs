@@ -6175,7 +6175,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// A flood-limit failure is different: Telegram has asked for no requests
     /// until `retry_after` has passed, so neither the resume nor the
     /// orchestrator's full-message fallback may send. It is reported as
-    /// [`FinalizePartialDelivery`] even when no chunk was accepted.
+    /// [`FinalizePartialDelivery`] when some chunks were accepted, and as
+    /// [`FinalizeUndelivered`] when none were, so the orchestrator neither
+    /// resends nor counts the reply as delivered.
     async fn finalize_send_chunks(
         &self,
         text: &str,
@@ -6184,6 +6186,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> anyhow::Result<()> {
         match self.send_text_chunks(text, chat_id, thread_id, 0).await {
             Ok(_) => Ok(()),
+            Err(SendChunksError {
+                delivered: 0,
+                rate_limited: true,
+                source,
+            }) => Err(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: format!("{source:#}"),
+            }
+            .into()),
             Err(SendChunksError {
                 delivered,
                 rate_limited: true,
@@ -24550,7 +24560,9 @@ mod tests {
     }
 
     /// A flood-limited finalize must not resume or let the orchestrator fall
-    /// back to a full resend: it reports `FinalizePartialDelivery`.
+    /// back to a full resend. With no chunk accepted it reports
+    /// `FinalizeUndelivered`, not `FinalizePartialDelivery`, so the reply is not
+    /// counted as sent.
     #[tokio::test]
     async fn finalize_send_chunks_does_not_resend_inside_flood_penalty() {
         use wiremock::matchers::{method, path_regex};
@@ -24568,10 +24580,16 @@ mod tests {
             .finalize_send_chunks("hello", "123", None)
             .await
             .unwrap_err();
-        let partial = err
-            .downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
-            .expect("rate-limited finalize must report FinalizePartialDelivery");
-        assert_eq!(partial.delivered, 0);
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "rate-limited finalize with nothing accepted must report FinalizeUndelivered, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing was accepted, so this must not look like partial delivery"
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "no resume inside the penalty window");
