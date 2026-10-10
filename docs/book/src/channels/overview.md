@@ -33,6 +33,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Discord | `channel-discord` | [Discord](./discord.md) |
 | Slack | `channel-slack` | [Slack](./slack.md) |
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
+| Microsoft Teams | `channel-msteams` | [Microsoft Teams](./msteams.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
