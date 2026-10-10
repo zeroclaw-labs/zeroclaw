@@ -45,7 +45,7 @@ const HOUSEKEEPING_JOBS: [&str; 19] = [
     "ci.yml/path-changes",
     "ci.yml/relay-container-smoke-changes",
     "ci.yml/windows-clippy-tools-changes",
-    "ci.yml/windows-service-smoke-changes",
+    "ci.yml/windows-required-changes",
     "ci.yml/nix-eval",
     "ci.yml/nix-hash-drift",
     "ci.yml/relay-container-smoke",
@@ -86,9 +86,8 @@ const COMPILE_JOBS: [&str; 12] = [
 const REUSABLE_COMPILE_JOBS: [&str; 1] = ["crates-preflight"];
 
 /// `use-blacksmith` inputs the rust-cache composite may receive. The matrix
-/// expression belongs to `build`, whose macOS and Windows legs stay on the
-/// GitHub-hosted cache; `'false'` belongs to the web job, which does not
-/// compile the workspace.
+/// expression belongs to `build`, whose macOS leg stays on the GitHub-hosted
+/// cache; `'false'` also belongs to the separate Windows jobs and the web job.
 const ALLOWED_CACHE_INPUTS: [&str; 3] = [
     "'true'",
     "'false'",
@@ -177,8 +176,8 @@ fn compile_jobs_pin_the_runner_label_instead_of_reading_it_from_fmt() {
              formatting error blocking merge"
         );
         let pins_label = if name == "build" {
-            // The Linux leg carries the label through the matrix; the macOS and
-            // Windows legs name their own GitHub-hosted images.
+            // The Linux leg carries the label through the matrix; macOS names
+            // its GitHub-hosted image. Windows is selected independently.
             block.contains(&format!("- os: {RUNNER_LABEL}\n"))
                 && block.contains("runs-on: ${{ matrix.os }}\n")
         } else {
@@ -291,6 +290,19 @@ fn the_required_gate_still_waits_for_formatting() {
         needs(gate).iter().any(|dependency| dependency == "fmt"),
         "CI Required Gate must keep needing fmt: it is the only thing that still \
          makes a formatting error block merge"
+    );
+    for name in ["windows-required-changes", "windows-build"] {
+        assert!(
+            needs(gate).iter().any(|dependency| dependency == name),
+            "CI Required Gate must directly consume {name} so selected Windows checks cannot silently skip"
+        );
+    }
+    let build = blocks.get("build").expect("ci.yml must define build");
+    assert!(
+        !needs(build)
+            .iter()
+            .any(|dependency| dependency == "windows-required-changes"),
+        "Linux/macOS compilation must not wait for Windows selection"
     );
 }
 

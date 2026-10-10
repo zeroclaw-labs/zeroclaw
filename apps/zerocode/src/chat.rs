@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -41,7 +41,20 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
+mod context_menu;
+#[cfg(test)]
+use context_menu::{
+    CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
+    URL_WITH_COPY_CONTEXT_ACTIONS,
+};
+use context_menu::{
+    ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
+};
+
+mod message_queue;
 mod transcript_layout;
+use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
+pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};
 use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -433,10 +446,7 @@ pub(crate) struct ResumeEntry {
 /// daemon.
 #[derive(Debug, Clone, Default)]
 struct ReconnectQueueState {
-    messages: VecDeque<QueuedMessage>,
-    next_id: u64,
-    paused: bool,
-    selected: Option<u64>,
+    message_queue: MessageQueue,
     composer_text: String,
     composer_attachments: Vec<PendingAttachment>,
 }
@@ -823,6 +833,7 @@ struct PromptCompletion {
     turn_generation: u64,
     error: Option<String>,
     transport_closed: bool,
+    cancelled: bool,
 }
 
 /// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
@@ -1316,7 +1327,7 @@ impl Chat {
             .chain(self.resume_backgrounds.iter_mut())
             .filter(|entry| entry.session_id == session_id)
         {
-            for message in entry.queue.messages.drain(..) {
+            for message in entry.queue.message_queue.clear() {
                 cleanup_report.merge(cleanup_attachment_temps(&message.attachments));
             }
         }
@@ -2780,10 +2791,19 @@ impl Chat {
             if completion.error.is_some() {
                 state.remove_optimistic_user_message(completion.turn_generation);
             }
-            // The response proves the handler returned, but only the missing
-            // terminal notification distinguishes completed from cancelled or
-            // failed. Settle conservatively so queued work cannot auto-run.
-            state.settle_turn_from_prompt_response();
+            // Keep a known pause or cancellation reason. Other successful
+            // responses still cannot prove clean completion without a terminal
+            // notification, so queued work stays paused conservatively.
+            let pause_reason = if completion.error.is_some()
+                || completion.cancelled
+                || state.cancel_started_at.is_some()
+                || state.message_queue.pause_reason() == Some(QueuePauseReason::Generic)
+            {
+                QueuePauseReason::Generic
+            } else {
+                QueuePauseReason::MissingCompletion
+            };
+            state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
                 state.set_info_notice(crate::i18n::t_args(
@@ -3613,6 +3633,9 @@ impl Chat {
                     client.connection_state(),
                     crate::client::ConnectionState::Disconnected { .. }
                 );
+            let cancelled = result
+                .as_ref()
+                .is_ok_and(|value| value["stop_reason"].as_str() == Some("cancelled"));
             let error = result.err().map(|e| format!("{} ({})", e.message, e.code));
             let _ = completion_tx
                 .send(PromptCompletion {
@@ -3620,6 +3643,7 @@ impl Chat {
                     turn_generation,
                     error,
                     transport_closed,
+                    cancelled,
                 })
                 .await;
         });
@@ -6329,7 +6353,10 @@ fn render_with_plan_placement(
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
         Some(crate::i18n::t_args(
-            "zc-queue-paused-ghost",
+            match state.message_queue.pause_reason() {
+                Some(QueuePauseReason::MissingCompletion) => "zc-queue-missing-completion-ghost",
+                _ => "zc-queue-paused-ghost",
+            },
             &[("key", &resume_queue_chord_label())],
         ))
     } else {
@@ -6589,8 +6616,8 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
         )));
         row_owner.push(None);
     } else {
-        for (idx, msg) in state.message_queue.iter().enumerate() {
-            let selected = state.queue_sel == Some(msg.id);
+        for (idx, msg) in state.message_queue.items().iter().enumerate() {
+            let selected = state.message_queue.selected() == Some(msg.id);
             let marker = if selected { "▶ " } else { "  " };
             let head_style = if selected {
                 theme::title_style()
@@ -6810,6 +6837,68 @@ fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> St
     serde_json::Value::Object(metadata).to_string()
 }
 
+fn foreground_subagent_input(name: &str, input_json: &str) -> Option<serde_json::Value> {
+    if !matches!(name, "spawn_subagent" | "delegate") || input_json.len() > TOOL_EXPANDED_MAX_BYTES
+    {
+        return None;
+    }
+    let input: serde_json::Value = serde_json::from_str(input_json).ok()?;
+    if input.get("prompt")?.as_str()?.trim().is_empty() {
+        return None;
+    }
+    if name == "delegate" {
+        if input
+            .get("action")
+            .is_some_and(|action| action.as_str() != Some("delegate"))
+            || input
+                .get("background")
+                .is_some_and(|background| background.as_bool() != Some(false))
+        {
+            return None;
+        }
+        match input.get("parallel") {
+            Some(serde_json::Value::Array(agents))
+                if !agents.is_empty()
+                    && agents
+                        .iter()
+                        .all(|agent| agent.as_str().is_some_and(|s| !s.trim().is_empty())) => {}
+            None if input
+                .get("agent")
+                .and_then(|agent| agent.as_str())
+                .is_some_and(|s| !s.trim().is_empty()) => {}
+            _ => return None,
+        }
+    }
+    Some(input)
+}
+
+fn delegate_response_parts<'a>(
+    input: &serde_json::Value,
+    result: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    if input.get("parallel").is_some() {
+        return None;
+    }
+    let agent = input.get("agent")?.as_str()?;
+    // Only separate the matching synchronous runtime envelope; never infer an outcome.
+    let newline = truncate_utf8(result, TOOL_EXPANDED_MAX_BYTES).find('\n')?;
+    let header = &result[..newline];
+    let details = header
+        .strip_prefix(&format!("[Agent '{agent}' ("))?
+        .strip_suffix(")]")?;
+    let identity = details.strip_suffix(", agentic").unwrap_or(details);
+    let (provider, model) = identity.split_once('/')?;
+    if provider.is_empty()
+        || model.is_empty()
+        || identity.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '(' | ')' | '[' | ']' | ',')
+        })
+    {
+        return None;
+    }
+    Some((&result[newline + 1..], details))
+}
+
 fn bounded_tool_output(raw_output: String) -> String {
     const MAX_OUTPUT: usize = 16 * 1024;
     const TRUNCATION_MARKER: &str = "…[truncated]";
@@ -6839,11 +6928,20 @@ fn render_tool_entry(
         Modifier::empty()
     };
     let marker = if disclosure.is_open() { "▼" } else { "▶" };
-    lines.push(Line::from(vec![Span::styled(
-        format!("{marker} [tool: {name}] "),
-        theme::tool_label_style().add_modifier(sel_mod),
-    )]));
-
+    let subagent_input = foreground_subagent_input(name, input_json);
+    let subagent_target = subagent_input
+        .as_ref()
+        .filter(|_| name == "delegate")
+        .map(
+            |input| match input.get("parallel").and_then(|value| value.as_array()) {
+                Some(agents) => agents
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => input["agent"].as_str().unwrap_or_default().to_string(),
+            },
+        );
     let preview = |text: &str, max_bytes: usize| {
         let (compact, limited) = terminal_safe_tool_text_limited(text, max_bytes, 1);
         if limited {
@@ -6852,6 +6950,25 @@ fn render_tool_entry(
             compact
         }
     };
+    let label = if subagent_input.is_some() {
+        let label = crate::i18n::t(if name == "spawn_subagent" {
+            "zc-chat-tool-subagent"
+        } else {
+            "zc-chat-tool-delegation"
+        });
+        if let Some(target) = subagent_target.as_deref() {
+            format!("{label} → {}", preview(target, 120))
+        } else {
+            label
+        }
+    } else {
+        format!("tool: {name}")
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("{marker} [{label}] "),
+        theme::tool_label_style().add_modifier(sel_mod),
+    )]));
+
     let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
         for (line_idx, text_line) in text.split('\n').enumerate() {
             let prefix = if line_idx == 0 {
@@ -6869,20 +6986,42 @@ fn render_tool_entry(
     let body_start = lines.len();
     let mut footer = None;
     let mut display_limited = false;
-    let render_generic_input = |lines: &mut Vec<Line<'static>>| {
-        let (input, limited) = if matches!(disclosure, ToolDisclosure::Full) {
-            terminal_safe_tool_text_limited(
-                input_json,
-                TOOL_EXPANDED_MAX_BYTES,
-                TOOL_EXPANDED_MAX_LINES,
-            )
+    let render_field = |lines: &mut Vec<Line<'static>>, label: &str, text: &str, preview_bytes| {
+        let (text, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(text, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
-            (preview(input_json, 120), false)
+            (preview(text, preview_bytes), false)
         };
-        push_text(lines, "input", &input);
+        push_text(lines, label, &text);
         limited
     };
+    let render_generic_input =
+        |lines: &mut Vec<Line<'static>>| render_field(lines, "input", input_json, 120);
     match name {
+        _ if subagent_input.is_some() => {
+            if let Some(input) = subagent_input.as_ref() {
+                if let Some(prompt) = input.get("prompt").and_then(|value| value.as_str()) {
+                    display_limited |=
+                        render_field(lines, &crate::i18n::t("zc-chat-tool-task"), prompt, 120);
+                }
+                if matches!(disclosure, ToolDisclosure::Full)
+                    && let Some(target) = subagent_target.as_deref()
+                    && terminal_safe_tool_text_limited(target, 120, 1).1
+                {
+                    display_limited |=
+                        render_field(lines, &crate::i18n::t("zc-chat-tool-target"), target, 120);
+                }
+                let projected_fields: &[&str] = match name {
+                    "delegate" if input.get("parallel").is_some() => &["prompt", "parallel"],
+                    "delegate" => &["prompt", "agent"],
+                    _ => &["prompt"],
+                };
+                let metadata = semantic_tool_metadata(input, projected_fields);
+                if metadata != "{}" {
+                    display_limited |= render_field(lines, "input", &metadata, 120);
+                }
+            }
+        }
         "file_edit" => {
             if disclosure.is_open() {
                 let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
@@ -6997,14 +7136,44 @@ fn render_tool_entry(
         )));
     }
 
-    if let Some(res) = result {
-        let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
-            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
+    if let Some(input) = subagent_input.as_ref() {
+        let missing = crate::i18n::t("zc-chat-tool-result-not-recorded");
+        let res = result.unwrap_or(&missing);
+        let (response, details) = if name == "delegate" {
+            delegate_response_parts(input, res)
+                .map(|(response, details)| (response, Some(details)))
+                .unwrap_or((res, None))
         } else {
-            (preview(res, 200), false)
+            (res, None)
         };
-        push_text(lines, "result", &result);
+        lines.push(Line::from(Span::styled(
+            format!("  {}:", crate::i18n::t("zc-chat-tool-response")),
+            theme::tool_label_style().add_modifier(sel_mod),
+        )));
+        let (response, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(
+                response,
+                TOOL_EXPANDED_MAX_BYTES,
+                TOOL_EXPANDED_MAX_LINES,
+            )
+        } else {
+            (preview(response, 200), false)
+        };
         display_limited |= limited;
+        for line in response.split('\n') {
+            lines.push(Line::from(Span::styled(
+                format!("    {line}"),
+                theme::input_style().add_modifier(sel_mod),
+            )));
+        }
+        if matches!(disclosure, ToolDisclosure::Full)
+            && let Some(details) = details
+        {
+            display_limited |=
+                render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
+        }
+    } else if let Some(res) = result {
+        display_limited |= render_field(lines, "result", res, 200);
     }
 
     if display_limited {
@@ -7297,12 +7466,7 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     let mut screen_row = 0u16;
     for line in lines {
         let rows = wrapped_rows(line, width);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let urls = recognized_url_ranges(&text);
+        let (text, urls) = actionable_url_ranges(line);
         if !urls.is_empty() {
             // Private color tags carry occurrence identity through Paragraph's
             // actual wrapping and alignment; these colors are never displayed.
@@ -7329,6 +7493,16 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
             });
         }
         screen_row = screen_row.saturating_add(rows);
+    }
+    regions
+}
+
+fn finalize_url_line_regions(lines: &mut [Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    let regions = url_line_regions_for_lines(lines, width);
+    for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
+        if disables_url_actions(span) {
+            span.style.underline_color = None;
+        }
     }
     regions
 }
@@ -7708,7 +7882,7 @@ fn render_conversation(
     // `visible_transient_slice` slices the cached history the same bounded
     // way idle frames do and appends this small overlay only once the
     // viewport window reaches it.
-    let overlay_lines: Vec<Line<'static>> = if transient {
+    let mut overlay_lines: Vec<Line<'static>> = if transient {
         state.build_overlay_lines(inner_width)
     } else {
         Vec::new()
@@ -7719,7 +7893,7 @@ fn render_conversation(
         Vec::new()
     };
     let transient_url_regions = if transient {
-        let mut regions = url_line_regions_for_lines(&overlay_lines, inner_width);
+        let mut regions = finalize_url_line_regions(&mut overlay_lines, inner_width);
         offset_url_line_regions(
             &mut regions,
             state.transcript_layout.view().cached_total_rows,
@@ -8828,12 +9002,7 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
 
 fn style_recognized_urls(lines: &mut [Line<'static>]) {
     for line in lines {
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let ranges = recognized_url_ranges(&text);
+        let (_, ranges) = actionable_url_ranges(line);
         if ranges.is_empty() {
             continue;
         }
@@ -8876,6 +9045,167 @@ fn style_recognized_urls(lines: &mut [Line<'static>]) {
     }
 }
 
+const DISABLED_URL_UNDERLINE_COLOR: ratatui::style::Color = ratatui::style::Color::Rgb(1, 0, 1);
+
+fn disables_url_actions(span: &Span<'static>) -> bool {
+    span.style.underline_color == Some(DISABLED_URL_UNDERLINE_COLOR)
+}
+
+fn disabled_url_actions_style() -> Style {
+    Style {
+        underline_color: Some(DISABLED_URL_UNDERLINE_COLOR),
+        ..Style::default()
+    }
+}
+
+fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, String)>) {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let mut disabled_ranges = Vec::new();
+    let mut offset = 0usize;
+    for span in &line.spans {
+        let end = offset + span.content.len();
+        if disables_url_actions(span) {
+            disabled_ranges.push((offset, end));
+        }
+        offset = end;
+    }
+    let urls = recognized_url_ranges(&text)
+        .into_iter()
+        .filter(|(start, end, _)| {
+            !disabled_ranges
+                .iter()
+                .any(|(disabled_start, disabled_end)| start < disabled_end && disabled_start < end)
+        })
+        .collect();
+    (text, urls)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableCellLine<'a> {
+    text: &'a str,
+    disabled_url_ranges: Vec<(usize, usize)>,
+}
+
+fn table_wrap_break(grapheme: &str) -> bool {
+    grapheme.chars().all(table_wrap_break_char)
+}
+
+fn table_wrap_break_char(ch: char) -> bool {
+    ch == '\u{200b}' || (ch != '\u{00a0}' && ch.is_whitespace())
+}
+
+fn table_fragment_content_range(text: &str) -> Range<usize> {
+    let mut range = text.len()..text.len();
+    for (offset, grapheme, _) in crate::display_width::grapheme_widths(text) {
+        if !table_wrap_break(grapheme) {
+            range.start = range.start.min(offset);
+            range.end = offset + grapheme.len();
+        }
+    }
+    range
+}
+
+fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
+    let fragments =
+        if text.is_empty() || budget == 0 || crate::display_width::display_width(text) <= budget {
+            vec![(0, text.len())]
+        } else {
+            let graphemes = crate::display_width::grapheme_widths(text)
+                .map(|(start, grapheme, width)| {
+                    (
+                        start,
+                        start + grapheme.len(),
+                        width,
+                        table_wrap_break(grapheme),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut fragments = Vec::new();
+            let mut start_index = 0usize;
+            while start_index < graphemes.len() {
+                let mut content_start = start_index;
+                while content_start < graphemes.len() && graphemes[content_start].3 {
+                    content_start += 1;
+                }
+                if content_start == graphemes.len() {
+                    fragments.push((graphemes[start_index].0, text.len()));
+                    break;
+                }
+                let mut width = 0usize;
+                let mut end_index = content_start;
+                let mut last_break = None;
+                while end_index < graphemes.len() {
+                    let next_width = width.saturating_add(graphemes[end_index].2);
+                    if end_index > content_start && next_width > budget {
+                        break;
+                    }
+                    width = next_width;
+                    end_index += 1;
+                    if graphemes[end_index - 1].3 {
+                        last_break = Some(end_index);
+                    }
+                    if width > budget {
+                        break;
+                    }
+                }
+                if end_index < graphemes.len() {
+                    end_index = last_break
+                        .filter(|index| *index > content_start)
+                        .unwrap_or(end_index);
+                }
+                // Keep break spaces in the source slice without giving them a
+                // separate display row or letting them consume the next row.
+                while end_index < graphemes.len() && graphemes[end_index].3 {
+                    end_index += 1;
+                }
+                let start = graphemes[start_index].0;
+                let end = graphemes[end_index - 1].1;
+                fragments.push((start, end));
+                start_index = end_index;
+            }
+            fragments
+        };
+
+    let mut disabled_url_ranges = vec![Vec::new(); fragments.len()];
+    let mut fragment_index = 0usize;
+    for (url_start, url_end, _) in recognized_url_ranges(text) {
+        while fragment_index < fragments.len() && fragments[fragment_index].1 <= url_start {
+            fragment_index += 1;
+        }
+        if fragment_index == fragments.len() {
+            break;
+        }
+        let (fragment_start, fragment_end) = fragments[fragment_index];
+        if fragment_start <= url_start && url_end <= fragment_end {
+            continue;
+        }
+
+        let mut overlap_index = fragment_index;
+        while overlap_index < fragments.len() && fragments[overlap_index].0 < url_end {
+            let (start, end) = fragments[overlap_index];
+            let overlap_start = start.max(url_start);
+            let overlap_end = end.min(url_end);
+            if overlap_start < overlap_end {
+                disabled_url_ranges[overlap_index]
+                    .push((overlap_start - start, overlap_end - start));
+            }
+            overlap_index += 1;
+        }
+    }
+    fragments
+        .into_iter()
+        .zip(disabled_url_ranges)
+        .map(|((start, end), disabled_url_ranges)| TableCellLine {
+            text: &text[start..end],
+            disabled_url_ranges,
+        })
+        .collect()
+}
+
 fn render_table(
     rows: Vec<Vec<String>>,
     alignments: Vec<pulldown_cmark::Alignment>,
@@ -8899,79 +9229,98 @@ fn render_table(
         }
     }
 
-    // Natural width per column = longest cell.
+    // Natural width per column = longest cell. Minimum width is the widest
+    // grapheme in the column so wrapping never splits or drops a display unit.
     let mut natural: Vec<usize> = vec![0; cols];
+    let mut minimum: Vec<usize> = vec![0; cols];
     for row in &grid {
         for (i, cell) in row.iter().enumerate() {
             natural[i] = natural[i].max(crate::display_width::display_width(cell.as_str()));
+            minimum[i] = minimum[i].max(
+                crate::display_width::grapheme_widths(cell)
+                    .map(|(_, _, width)| width)
+                    .max()
+                    .unwrap_or(0),
+            );
         }
     }
 
-    // Frame budget: `│` borders (cols+1) + one-cell padding either side
-    // of each cell (cols * 2).
-    let frame = (cols + 1) + cols * 2;
+    // Keep the normal one-cell padding on both sides when possible. Under
+    // pressure, shed that optional padding before reducing a column below its
+    // widest grapheme. Only a grid whose borders plus graphemes cannot fit may
+    // still exceed the viewport.
+    let border_width = cols + 1;
+    let minimum_total: usize = minimum.iter().sum();
+    let padding_per_cell: usize = if border_width + cols * 2 + minimum_total <= width as usize {
+        2
+    } else if border_width + cols + minimum_total <= width as usize {
+        1
+    } else {
+        0
+    };
+    let outer_left_padding = usize::from(padding_per_cell > 0);
+    let outer_right_padding = padding_per_cell.saturating_sub(outer_left_padding);
+    let frame = border_width + cols * padding_per_cell;
     let avail = (width as usize).saturating_sub(frame);
     let total_natural: usize = natural.iter().sum();
 
     let widths: Vec<usize> = if total_natural <= avail || total_natural == 0 {
         natural.clone()
     } else {
-        // Scale each column proportionally. Floor at 1 cell so columns
-        // don't vanish; the renderer collapses 1–3 cell columns to `…`.
-        natural
+        // Preserve every column and distribute the available content width
+        // proportionally. The minimum grid is wider than `width` only when the
+        // viewport cannot hold each column's widest grapheme plus its frame.
+        let mut widths = minimum.clone();
+        let remaining = avail.saturating_sub(minimum_total);
+        let extra = natural
             .iter()
-            .map(|n| ((*n * avail) / total_natural).max(1))
-            .collect()
+            .zip(&minimum)
+            .map(|(natural, minimum)| natural.saturating_sub(*minimum))
+            .collect::<Vec<_>>();
+        let total_extra: usize = extra.iter().sum();
+        if total_extra > 0 {
+            let mut remainders = Vec::with_capacity(cols);
+            for (index, extra_width) in extra.iter().copied().enumerate() {
+                let weighted = (extra_width as u128) * (remaining as u128);
+                widths[index] += usize::try_from(weighted / total_extra as u128)
+                    .unwrap_or(usize::MAX)
+                    .min(extra_width);
+                remainders.push((weighted % total_extra as u128, index));
+            }
+
+            let mut leftover = avail.saturating_sub(widths.iter().sum());
+            remainders.sort_unstable_by(|left, right| right.cmp(left));
+            for (_, index) in remainders {
+                if leftover == 0 {
+                    break;
+                }
+                if widths[index] < natural[index] {
+                    widths[index] += 1;
+                    leftover -= 1;
+                }
+            }
+        }
+        widths
     };
 
-    fn truncate_to(s: &str, budget: usize) -> String {
-        if budget == 0 {
-            return String::new();
-        }
-        let full_width = crate::display_width::display_width(s);
-        if full_width <= budget {
-            return s.to_string();
-        }
-        // Cell needs truncation but budget is too narrow to convey any
-        // content + ellipsis — collapse to a single `…`.
-        if budget < 2 {
-            return "\u{2026}".to_string();
-        }
-        let mut acc = String::new();
-        let mut used = 0usize;
-        // Walk graphemes so presentation sequences (⚠️, 🏔️) stay intact.
-        for (_offset, grapheme, w) in crate::display_width::grapheme_widths(s) {
-            if used + w + 1 > budget {
-                acc.push('\u{2026}');
-                return acc;
-            }
-            acc.push_str(grapheme);
-            used += w;
-            if used == budget {
-                return acc;
-            }
-        }
-        acc
-    }
-
-    fn pad_cell(s: &str, budget: usize, align: MdAlign) -> String {
+    fn cell_padding(s: &str, budget: usize, align: MdAlign) -> (usize, usize) {
         let w = crate::display_width::display_width(s);
         let slack = budget.saturating_sub(w);
         match align {
-            MdAlign::Right => format!("{}{}", " ".repeat(slack), s),
+            MdAlign::Right => (slack, 0),
             MdAlign::Center => {
                 let left = slack / 2;
                 let right = slack - left;
-                format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+                (left, right)
             }
-            MdAlign::None | MdAlign::Left => format!("{}{}", s, " ".repeat(slack)),
+            MdAlign::None | MdAlign::Left => (0, slack),
         }
     }
 
     let border = |left: &str, mid: &str, right: &str| -> Line<'static> {
         let mut s = String::from(left);
         for (i, w) in widths.iter().enumerate() {
-            s.push_str(&"\u{2500}".repeat(w + 2));
+            s.push_str(&"\u{2500}".repeat(w + padding_per_cell));
             if i + 1 < widths.len() {
                 s.push_str(mid);
             }
@@ -8980,29 +9329,67 @@ fn render_table(
         Line::from(Span::styled(s, theme::dim_style()))
     };
 
-    let render_row = |cells: &[String]| -> Line<'static> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
-        for (i, cell) in cells.iter().enumerate() {
-            let budget = widths[i];
-            let trimmed = truncate_to(cell, budget);
-            let align = alignments.get(i).copied().unwrap_or(MdAlign::None);
-            let padded = pad_cell(&trimmed, budget, align);
-            spans.push(Span::raw(format!(" {padded} ")));
-            spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
-        }
-        Line::from(spans)
+    let render_row = |cells: &[String]| -> Vec<Line<'static>> {
+        let wrapped_cells = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| wrap_table_cell(cell, widths[index]))
+            .collect::<Vec<_>>();
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
+
+        (0..row_height)
+            .map(|line_index| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
+                for (index, cell_lines) in wrapped_cells.iter().enumerate() {
+                    let align = alignments.get(index).copied().unwrap_or(MdAlign::None);
+                    if let Some(fragment) = cell_lines.get(line_index) {
+                        let content_range = table_fragment_content_range(fragment.text);
+                        let text_start = content_range.start;
+                        let text = &fragment.text[content_range];
+                        let (left_padding, right_padding) =
+                            cell_padding(text, widths[index], align);
+                        spans.push(Span::raw(" ".repeat(outer_left_padding + left_padding)));
+                        let mut cursor = 0usize;
+                        for (start, end) in &fragment.disabled_url_ranges {
+                            let start = start.saturating_sub(text_start).min(text.len());
+                            let end = end.saturating_sub(text_start).min(text.len());
+                            if start > cursor {
+                                spans.push(Span::raw(text[cursor..start].to_string()));
+                            }
+                            spans.push(Span::styled(
+                                text[start..end].to_string(),
+                                disabled_url_actions_style(),
+                            ));
+                            cursor = end;
+                        }
+                        spans.push(Span::raw(format!(
+                            "{}{}{}",
+                            &text[cursor..],
+                            " ".repeat(right_padding),
+                            " ".repeat(outer_right_padding),
+                        )));
+                    } else {
+                        spans.push(Span::raw(
+                            " ".repeat(outer_left_padding + widths[index] + outer_right_padding),
+                        ));
+                    }
+                    spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
+                }
+                Line::from(spans)
+            })
+            .collect()
     };
 
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(border("\u{250C}", "\u{252C}", "\u{2510}"));
     let mut iter = grid.into_iter();
     if let Some(header) = iter.next() {
-        out.push(render_row(&header));
+        out.extend(render_row(&header));
         out.push(border("\u{251C}", "\u{253C}", "\u{2524}"));
     }
     for row in iter {
-        out.push(render_row(&row));
+        out.extend(render_row(&row));
     }
     out.push(border("\u{2514}", "\u{2534}", "\u{2518}"));
     out
@@ -9254,123 +9641,6 @@ struct CachedCodeBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatContextMenuAction {
-    SendNow,
-    Copy,
-    AddToChat,
-    OpenLink,
-    CopyLink,
-    Edit,
-    Delete,
-}
-
-const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
-const CHARACTER_SELECTION_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::AddToChat,
-    ChatContextMenuAction::Copy,
-];
-const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-];
-const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::OpenLink,
-    ChatContextMenuAction::CopyLink,
-    ChatContextMenuAction::Copy,
-];
-const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
-    ChatContextMenuAction::SendNow,
-    ChatContextMenuAction::Copy,
-    ChatContextMenuAction::Edit,
-    ChatContextMenuAction::Delete,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuTarget {
-    Transcript(CopyHitRegion),
-    Url(UrlHitRegion),
-    UrlWithCopy {
-        url: UrlHitRegion,
-        copy: CopyHitRegion,
-    },
-    Queue(u64),
-}
-
-impl ChatContextMenuTarget {
-    fn actions(&self) -> &'static [ChatContextMenuAction] {
-        match self {
-            Self::Transcript(target) if target.kind == CopyHitKind::Transcript => {
-                CHARACTER_SELECTION_CONTEXT_ACTIONS
-            }
-            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
-            Self::Url(_) => URL_CONTEXT_ACTIONS,
-            Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
-            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
-        }
-    }
-
-    fn copy_kind(&self) -> Option<CopyHitKind> {
-        match self {
-            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
-            Self::Url(_) | Self::Queue(_) => None,
-        }
-    }
-
-    fn is_url(&self) -> bool {
-        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatContextMenu {
-    rect: Rect,
-    target: ChatContextMenuTarget,
-    selected: usize,
-}
-
-impl ChatContextMenu {
-    fn selected_action(&self) -> Option<ChatContextMenuAction> {
-        self.target.actions().get(self.selected).copied()
-    }
-
-    fn select_step(&mut self, delta: isize) {
-        let count = self.target.actions().len();
-        if count > 0 {
-            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
-        }
-    }
-
-    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
-        if self.rect.width <= 2 || self.rect.height <= 2 {
-            return None;
-        }
-        let inner = Rect::new(
-            self.rect.x + 1,
-            self.rect.y + 1,
-            self.rect.width - 2,
-            self.rect.height - 2,
-        );
-        if !mouse::in_rect(column, row, inner) {
-            return None;
-        }
-        let index = usize::from(row.saturating_sub(inner.y));
-        (index < self.target.actions().len()).then_some(index)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatContextMenuRequest {
-    AddToChat(CopyHitRegion),
-    CopyTranscript(CopyHitRegion),
-    OpenUrl(String),
-    CopyUrl(String),
-    Queue {
-        id: u64,
-        action: ChatContextMenuAction,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyFeedbackTarget {
     Code(usize),
     Overlay(Rect),
@@ -9380,20 +9650,6 @@ enum CopyFeedbackTarget {
 struct CopyFeedback {
     target: CopyFeedbackTarget,
     shown_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueueItemStatus {
-    Pending,
-    Injected,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct QueuedMessage {
-    pub id: u64,
-    pub text: String,
-    pub attachments: Vec<PendingAttachment>,
-    pub status: QueueItemStatus,
 }
 
 #[derive(Debug)]
@@ -9539,15 +9795,8 @@ pub struct ChatState {
     /// trim budget shows as a marker rather than the 100% point.
     pub context_model_window: Option<u64>,
     /// Outbound message queue; the front dispatches when the session is free.
-    message_queue: VecDeque<QueuedMessage>,
-    /// Monotonic id source for queued messages.
-    next_queue_id: u64,
-    /// Set on Cancel/Fail; freezes auto-dispatch until the user resumes.
-    queue_paused: bool,
-    resume_override: bool,
+    message_queue: MessageQueue,
     cancel_started_at: Option<Instant>,
-    /// Selected queued message id for sidebar edit/delete.
-    queue_sel: Option<u64>,
     /// Per-item clickable rects from the last sidebar draw, mapping a queued
     /// message id to its header-row rect. Drives left-click selection.
     queue_item_rects: Vec<(u64, ratatui::layout::Rect)>,
@@ -9645,12 +9894,8 @@ impl ChatState {
             context_input_tokens: None,
             context_max_tokens: None,
             context_model_window: None,
-            message_queue: VecDeque::new(),
-            next_queue_id: 0,
-            queue_paused: false,
-            resume_override: false,
+            message_queue: MessageQueue::default(),
             cancel_started_at: None,
-            queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
             queue_scroll: 0,
@@ -10222,11 +10467,7 @@ impl ChatState {
         let Some(menu) = self.context_menu.as_mut() else {
             return false;
         };
-        let Some(index) = menu.action_at(column, row) else {
-            return false;
-        };
-        menu.selected = index;
-        true
+        menu.select_at(column, row)
     }
 
     fn handle_context_menu_key(&mut self, key: &KeyEvent) -> Option<ChatContextMenuRequest> {
@@ -10251,35 +10492,8 @@ impl ChatState {
     }
 
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
-        let action = self.context_menu.as_ref()?.selected_action()?;
-        let menu = self.context_menu.take()?;
-        match (menu.target, action) {
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(target))
-            }
-            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::AddToChat)
-                if target.kind == CopyHitKind::Transcript =>
-            {
-                Some(ChatContextMenuRequest::AddToChat(target))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenLink) => {
-                Some(ChatContextMenuRequest::OpenUrl(url.url))
-            }
-            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyLink)
-            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
-                Some(ChatContextMenuRequest::CopyUrl(url.url))
-            }
-            (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
-                Some(ChatContextMenuRequest::CopyTranscript(copy))
-            }
-            (ChatContextMenuTarget::Queue(id), action) => {
-                Some(ChatContextMenuRequest::Queue { id, action })
-            }
-            (ChatContextMenuTarget::Transcript(_), _)
-            | (ChatContextMenuTarget::Url(_), _)
-            | (ChatContextMenuTarget::UrlWithCopy { .. }, _) => None,
-        }
+        self.context_menu.as_ref()?.selected_action()?;
+        self.context_menu.take()?.into_request()
     }
 
     fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
@@ -11329,10 +11543,13 @@ impl ChatState {
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
-        self.settle_turn_lifecycle(clean);
+        // A terminal notification resolves the earlier uncertainty, but the
+        // queued backlog still waits for the user's deliberate resume.
+        self.message_queue.acknowledge_terminal_notification();
+        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
     }
 
-    fn settle_turn_from_prompt_response(&mut self) {
+    fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -11352,10 +11569,10 @@ impl ChatState {
         // Preserve per-turn provenance for a delayed terminal notification;
         // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
-        self.settle_turn_lifecycle(false);
+        self.settle_turn_lifecycle(false, pause_reason);
     }
 
-    fn settle_turn_lifecycle(&mut self, clean: bool) {
+    fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
@@ -11363,10 +11580,7 @@ impl ChatState {
         let mut cleanup_report = self.cleanup_active_turn_attachments();
         cleanup_report.merge(self.input_bar.take_cleanup_report());
         self.surface_cleanup_report(cleanup_report);
-        if !clean && !self.resume_override && !self.message_queue.is_empty() {
-            self.queue_paused = true;
-        }
-        self.resume_override = false;
+        self.message_queue.settle_turn(clean, pause_reason);
     }
 
     pub fn enter_cancelling(&mut self) {
@@ -11492,41 +11706,13 @@ impl ChatState {
         }
     }
 
-    const QUEUE_CAP: usize = 32;
-
-    fn alloc_queue_id(&mut self) -> u64 {
-        let id = self.next_queue_id;
-        self.next_queue_id = self.next_queue_id.wrapping_add(1);
-        id
-    }
-
     pub fn enqueue_message(
         &mut self,
         text: String,
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
-        }
-        let pending = self.message_queue.len();
-        if pending >= Self::QUEUE_CAP {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t_args(
-                "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
-            ));
-        }
-        let id = self.alloc_queue_id();
-        self.message_queue.push_back(QueuedMessage {
-            id,
-            text,
-            attachments,
-            status: QueueItemStatus::Pending,
-        });
-        Ok(())
+        let result = self.message_queue.enqueue(text, attachments);
+        self.queue_admission_result(result)
     }
 
     pub fn inject_message(
@@ -11534,90 +11720,53 @@ impl ChatState {
         text: String,
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
-        }
-        if self.message_queue.len() >= Self::QUEUE_CAP {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t_args(
-                "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
-            ));
-        }
-        let id = self.alloc_queue_id();
-        let insert_at = self
+        let result = self
             .message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Pending)
-            .unwrap_or(self.message_queue.len());
-        self.message_queue.insert(
-            insert_at,
-            QueuedMessage {
-                id,
-                text,
-                attachments,
-                status: QueueItemStatus::Injected,
-            },
-        );
-        // An inject is the force-send-now intent: resume the queue and let it
-        // survive a cancel auto-pause, unlike a plain queued submission.
-        self.queue_paused = false;
-        if self.turn_in_flight {
-            self.resume_override = true;
-        }
-        Ok(())
+            .inject(text, attachments, self.turn_in_flight);
+        self.queue_admission_result(result)
+    }
+
+    fn queue_admission_result(
+        &mut self,
+        result: Result<(), (AdmissionError, Vec<PendingAttachment>)>,
+    ) -> Result<(), String> {
+        result.map_err(|(error, attachments)| {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
+            match error {
+                AdmissionError::Empty => crate::i18n::t("zc-queue-empty"),
+                AdmissionError::Full => crate::i18n::t_args(
+                    "zc-queue-full",
+                    &[("cap", &MessageQueue::CAPACITY.to_string())],
+                ),
+            }
+        })
     }
 
     fn next_dispatch_index(&self) -> Option<usize> {
-        if self.turn_in_flight {
-            return None;
-        }
-        if let Some(idx) = self
-            .message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Injected)
-        {
-            return Some(idx);
-        }
-        if self.queue_paused {
-            return None;
-        }
-        self.message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Pending)
+        self.message_queue.next_dispatch_index(self.turn_in_flight)
     }
 
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
-        let idx = self.next_dispatch_index()?;
-        let msg = self.message_queue.remove(idx)?;
-        self.resume_override = false;
-        if self.queue_sel == Some(msg.id) {
-            self.queue_sel = None;
-        }
-        Some(msg)
+        self.message_queue
+            .take_next_dispatchable(self.turn_in_flight)
     }
 
     /// Flip the queue pause state. Returns the new paused value so the caller
     /// can pump on resume and surface the right notice.
     pub fn toggle_queue_pause(&mut self) -> bool {
-        self.queue_paused = !self.queue_paused;
-        self.queue_paused
+        self.message_queue.toggle_pause()
     }
 
     pub fn queue_paused(&self) -> bool {
-        self.queue_paused
+        self.message_queue.paused()
     }
 
     /// Clear an explicit pause without bypassing the cancel auto-pause: a
     /// cancelled turn settles into the paused state and the backlog waits for a
     /// deliberate resume. Returns true if the queue was paused.
     pub fn resume_queue(&mut self) -> bool {
-        let was_paused = self.queue_paused;
-        self.queue_paused = false;
-        was_paused
+        self.message_queue.resume()
     }
 
     pub fn queue_len(&self) -> usize {
@@ -11626,10 +11775,7 @@ impl ChatState {
 
     fn reconnect_queue_state(&self) -> ReconnectQueueState {
         ReconnectQueueState {
-            messages: self.message_queue.clone(),
-            next_id: self.next_queue_id,
-            paused: self.queue_paused,
-            selected: self.queue_sel,
+            message_queue: self.message_queue.clone(),
             composer_text: self.input_bar.input().to_string(),
             composer_attachments: self.input_bar.reconnect_file_attachments(),
         }
@@ -11644,15 +11790,9 @@ impl ChatState {
         interrupted: bool,
         recovery_required: bool,
     ) {
-        self.message_queue = queue.messages;
-        self.next_queue_id = queue.next_id;
-        self.queue_paused = queue.paused;
-        self.queue_sel = queue
-            .selected
-            .filter(|id| self.message_queue.iter().any(|message| message.id == *id));
+        self.message_queue.restore(queue.message_queue);
         self.input_bar
             .load_for_edit(queue.composer_text, queue.composer_attachments);
-        self.resume_override = false;
         if recovery_required {
             self.last_error = Some(SessionError::ResyncFailed);
         }
@@ -11717,18 +11857,13 @@ impl ChatState {
     /// yet (e.g. the first message just opened the sidebar). Keeps keyboard
     /// delete/edit working without a manual open step.
     pub fn ensure_queue_selection(&mut self) {
-        if self.queue_sel.is_none()
-            && let Some(front) = self.message_queue.front()
-        {
-            self.queue_sel = Some(front.id);
-        }
+        self.message_queue.ensure_selection();
     }
 
     /// Select a queued item by id (mouse left-click in the sidebar). Ignores
     /// ids no longer present. Returns true when the selection changed.
     pub fn select_queued_by_id(&mut self, id: u64) -> bool {
-        if self.message_queue.iter().any(|m| m.id == id) && self.queue_sel != Some(id) {
-            self.queue_sel = Some(id);
+        if self.message_queue.select(id) {
             self.mark_dirty_full();
             true
         } else {
@@ -11766,82 +11901,38 @@ impl ChatState {
         }
     }
 
-    fn editable_ids(&self) -> Vec<u64> {
-        self.message_queue.iter().map(|m| m.id).collect()
-    }
-
     pub fn queue_select_step(&mut self, delta: isize) {
-        let ids = self.editable_ids();
-        if ids.is_empty() {
-            self.queue_sel = None;
-            return;
+        if self.message_queue.select_step(delta) {
+            self.mark_dirty_full();
         }
-        let cur = self
-            .queue_sel
-            .and_then(|id| ids.iter().position(|&x| x == id))
-            .unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(ids.len() as isize) as usize;
-        self.queue_sel = Some(ids[next]);
-        self.mark_dirty_full();
     }
 
     fn selected_queue_id(&self) -> Option<u64> {
-        self.queue_sel
-            .filter(|id| self.message_queue.iter().any(|message| message.id == *id))
+        self.message_queue.selected_id()
     }
 
     fn queued_text(&self, id: u64) -> Option<String> {
         self.message_queue
-            .iter()
-            .find(|message| message.id == id)
+            .message(id)
             .map(|message| message.text.clone())
     }
 
     fn promote_queued_by_id(&mut self, id: u64) -> bool {
-        let Some(position) = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)
-        else {
+        let Some(redraw) = self.message_queue.promote(id, self.turn_in_flight) else {
             return false;
         };
-        let pending = self.message_queue[position].status == QueueItemStatus::Pending;
-        if pending {
-            let Some(mut message) = self.message_queue.remove(position) else {
-                return false;
-            };
-            message.status = QueueItemStatus::Injected;
-            let insert_at = self
-                .message_queue
-                .iter()
-                .position(|queued| queued.status == QueueItemStatus::Pending)
-                .unwrap_or(self.message_queue.len());
-            self.message_queue.insert(insert_at, message);
-        }
-        let resumed = self.resume_queue();
-        if self.turn_in_flight {
-            self.resume_override = true;
-        }
-        if pending || resumed {
+        if redraw {
             self.mark_dirty_full();
         }
         true
     }
 
     fn delete_queued_by_id(&mut self, id: u64) -> bool {
-        let Some(position) = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)
-        else {
+        let Some(message) = self.message_queue.delete(id) else {
             return false;
         };
-        if let Some(message) = self.message_queue.remove(position) {
-            let cleanup_report = cleanup_attachment_temps(&message.attachments);
-            self.surface_cleanup_report(cleanup_report);
-        }
-        let ids = self.editable_ids();
-        self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
+        let cleanup_report = cleanup_attachment_temps(&message.attachments);
+        self.surface_cleanup_report(cleanup_report);
         self.mark_dirty_full();
         true
     }
@@ -11854,12 +11945,7 @@ impl ChatState {
     }
 
     fn take_queued_for_edit(&mut self, id: u64) -> Option<(String, Vec<PendingAttachment>)> {
-        let position = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)?;
-        let message = self.message_queue.remove(position)?;
-        self.queue_sel = self.editable_ids().first().copied();
+        let message = self.message_queue.take_for_edit(id)?;
         self.mark_dirty_full();
         Some((message.text, message.attachments))
     }
@@ -11899,12 +11985,8 @@ impl ChatState {
                 }
                 let pos = n - 1;
                 let mut cleanup_report = CleanupReport::default();
-                if let Some(msg) = self.message_queue.remove(pos) {
+                if let Some(msg) = self.message_queue.remove_at(pos) {
                     cleanup_report = cleanup_attachment_temps(&msg.attachments);
-                    if self.queue_sel == Some(msg.id) {
-                        let ids = self.editable_ids();
-                        self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
-                    }
                 }
                 self.mark_dirty_full();
                 append_cleanup_notice(
@@ -11917,13 +11999,9 @@ impl ChatState {
 
     fn clear_queue(&mut self) -> CleanupReport {
         let mut cleanup_report = CleanupReport::default();
-        for msg in self.message_queue.drain(..) {
+        for msg in self.message_queue.clear() {
             cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
-        self.next_queue_id = 0;
-        self.queue_paused = false;
-        self.resume_override = false;
-        self.queue_sel = None;
         cleanup_report
     }
 
@@ -11970,7 +12048,7 @@ impl ChatState {
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
-        self.resume_override = false;
+        self.message_queue.reset_resume_override();
         let cleanup_report = self.cleanup_active_turn_attachments();
         self.surface_cleanup_report(cleanup_report);
     }
@@ -16724,32 +16802,26 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
         let mut focused = resume_entry("sess-focused", "alpha", true);
-        focused.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "focused queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        focused.queue.next_id = 1;
-        focused.queue.paused = true;
+        focused
+            .queue
+            .message_queue
+            .enqueue("focused queue".to_string(), Vec::new())
+            .unwrap();
+        focused.queue.message_queue.toggle_pause();
         let mut bad_background = resume_entry("sess-bad", "beta", false);
-        bad_background.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "bad background queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        bad_background.queue.next_id = 1;
-        bad_background.queue.paused = true;
+        bad_background
+            .queue
+            .message_queue
+            .enqueue("bad background queue".to_string(), Vec::new())
+            .unwrap();
+        bad_background.queue.message_queue.toggle_pause();
         let mut healthy_background = resume_entry("sess-good", "gamma", false);
-        healthy_background.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "healthy background queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        healthy_background.queue.next_id = 1;
-        healthy_background.queue.paused = true;
+        healthy_background
+            .queue
+            .message_queue
+            .enqueue("healthy background queue".to_string(), Vec::new())
+            .unwrap();
+        healthy_background.queue.message_queue.toggle_pause();
         chat.set_resume_sessions(vec![focused, bad_background, healthy_background]);
 
         let init = tokio::spawn(async move {
@@ -16823,13 +16895,13 @@ mod tests {
         assert_eq!(
             chat.resume_focused
                 .as_ref()
-                .map(|entry| (entry.session_id.as_str(), entry.queue.messages.len())),
+                .map(|entry| (entry.session_id.as_str(), entry.queue.message_queue.len())),
             Some(("sess-focused", 1))
         );
         assert_eq!(
             chat.resume_backgrounds
                 .iter()
-                .map(|entry| (entry.session_id.as_str(), entry.queue.messages.len()))
+                .map(|entry| (entry.session_id.as_str(), entry.queue.message_queue.len()))
                 .collect::<Vec<_>>(),
             vec![("sess-bad", 1)]
         );
@@ -16839,7 +16911,7 @@ mod tests {
                 .map(|entry| (
                     entry.session_id.as_str(),
                     entry.was_focused,
-                    entry.queue.messages.len()
+                    entry.queue.message_queue.len()
                 ))
                 .collect::<Vec<_>>(),
             vec![
@@ -16934,7 +17006,9 @@ mod tests {
         prior
             .enqueue_message("keep queued".to_string(), Vec::new())
             .expect("queue message");
-        prior.queue_paused = true;
+        prior
+            .message_queue
+            .settle_turn(false, QueuePauseReason::MissingCompletion);
         prior.turn_in_flight = true;
         prior.turn_status = TurnStatus::WaitingForApproval;
         prior.pending_approval = Some(PendingApproval {
@@ -16961,8 +17035,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let entry = entries.remove(0);
         assert!(entry.interrupted);
-        assert_eq!(entry.queue.messages.len(), 1);
-        assert!(entry.queue.paused);
+        assert_eq!(entry.queue.message_queue.len(), 1);
+        assert_eq!(
+            entry.queue.message_queue.pause_reason(),
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(entry.queue.composer_text, "draft survives reconnect");
         assert_eq!(entry.queue.composer_attachments.len(), 1);
         assert_eq!(entry.queue.composer_attachments[0].filename, "keep.txt");
@@ -17005,7 +17082,10 @@ mod tests {
         );
         rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
         assert_eq!(rebuilt.queue_len(), 1);
-        assert!(rebuilt.queue_paused());
+        assert_eq!(
+            rebuilt.message_queue.pause_reason(),
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(rebuilt.input_bar.input(), "draft survives reconnect");
         assert_eq!(rebuilt.input_bar.pending_attachments().len(), 1);
         assert_eq!(
@@ -17045,6 +17125,30 @@ mod tests {
         }
         assert!(methods.contains(&Some(method::SESSION_APPROVE.to_string())));
         assert!(methods.contains(&None));
+
+        rebuilt.resume_queue();
+        rebuilt.turn_in_flight = true;
+        rebuilt
+            .inject_message("send after reconnect".to_string(), Vec::new())
+            .unwrap();
+        let snapshot = rebuilt.reconnect_queue_state();
+        assert!(
+            rebuilt.message_queue.resume_override(),
+            "snapshotting must preserve the old pane's armed override"
+        );
+        assert!(snapshot.message_queue.resume_override());
+        let mut adopted = state_for("sess-r", "alpha");
+        adopted.restore_reconnect_state(snapshot, true, false);
+        assert!(
+            !adopted.message_queue.resume_override(),
+            "adoption must discard the old turn's override"
+        );
+        adopted.turn_in_flight = true;
+        adopted.commit_turn(String::new(), false);
+        assert!(
+            adopted.queue_paused(),
+            "an adopted override must not suppress a later cancel auto-pause"
+        );
     }
 
     // ── Multi-session (agent sidebar) ────────────────────────────
@@ -18506,6 +18610,11 @@ mod tests {
         };
         assert!(!state.turn_in_flight);
         assert!(state.lag_reattach.is_none());
+        assert_eq!(
+            state.message_queue.pause_reason(),
+            Some(QueuePauseReason::MissingCompletion),
+            "the reload must retain why queued work paused"
+        );
         assert!(state.entries.iter().any(|entry| matches!(
             entry,
             ChatEntry::AgentMessage(message) if message.as_ref() == "durable answer"
@@ -19963,13 +20072,11 @@ mod tests {
         chat.session_order.push("sess-f".to_string());
         chat.session_order.push("sess-bg".to_string());
         let mut retained = resume_entry("sess-bg", "alpha", false);
-        retained.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "queued while disconnected".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        retained.queue.next_id = 1;
+        retained
+            .queue
+            .message_queue
+            .enqueue("queued while disconnected".to_string(), Vec::new())
+            .unwrap();
         chat.resume_backgrounds.push(retained);
 
         let retry = tokio::spawn(async move {
@@ -22970,12 +23077,11 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
         let mut retained = resume_entry("sess-failed", "beta", true);
-        retained.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "retained queue".into(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
+        retained
+            .queue
+            .message_queue
+            .enqueue("retained queue".into(), Vec::new())
+            .unwrap();
         chat.set_resume_sessions(vec![retained]);
         let add = tokio::spawn(async move {
             chat.add_agent_session("alpha").await;
@@ -23002,7 +23108,7 @@ mod tests {
         assert_eq!(chat.current_session_id(), Some("sess-new"));
         assert_eq!(chat.resume_backgrounds[0].session_id, "sess-failed");
         assert_eq!(
-            chat.resume_backgrounds[0].queue.messages[0].text,
+            chat.resume_backgrounds[0].queue.message_queue.items()[0].text,
             "retained queue"
         );
         assert_eq!(chat.tracked_session_count(), 2);
@@ -24383,7 +24489,12 @@ mod tests {
             if abandon {
                 chat.on_pane_blur();
                 assert_eq!(
-                    chat.resume_focused.as_ref().unwrap().queue.messages.len(),
+                    chat.resume_focused
+                        .as_ref()
+                        .unwrap()
+                        .queue
+                        .message_queue
+                        .len(),
                     1
                 );
             } else {
@@ -25125,6 +25236,274 @@ mod tests {
     }
 
     #[test]
+    fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
+        let mut s = state();
+        for id in ["child-a", "child-b"] {
+            s.apply_update(SessionUpdate::ToolCall {
+                session_id: "sess-1".into(),
+                tool_call_id: id.into(),
+                name: "spawn_subagent".into(),
+                raw_input: serde_json::json!({
+                    "prompt": "Inspect the parser", "agent": "extra-target", "parallel": [42],
+                }),
+            });
+        }
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".into(),
+            tool_call_id: "child-b".into(),
+            raw_output: "Error: this is quoted task content, not an outcome badge".into(),
+        });
+        let rendered = s
+            .entries()
+            .iter()
+            .map(|entry| {
+                let mut lines = Vec::new();
+                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                rendered_text(&lines)
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[0].contains("[Subagent]"));
+        assert!(rendered[0].contains("Task: Inspect the parser"));
+        assert!(rendered[0].contains(r#""agent":"extra-target""#));
+        assert!(rendered[0].contains(r#""parallel":[42]"#));
+        assert!(rendered[0].contains("Response:\n    Result not recorded"));
+        assert!(!rendered[0].contains("quoted task content"));
+        assert!(rendered[1].contains("Response:\n    Error: this is quoted task content"));
+        assert!(!rendered[1].contains("Failed"));
+        assert!(!rendered[1].contains("Completed"));
+    }
+
+    #[test]
+    fn subagent_card_restored_missing_result_does_not_claim_live_work() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+        let mut s = state();
+        s.load_history(
+            vec![MessageEntry {
+                role: "assistant".into(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("restored-child".into()),
+                tool_name: Some("delegate".into()),
+                tool_input: Some(serde_json::json!({
+                    "agent": "reviewer",
+                    "prompt": "Inspect the parser",
+                    "context": "Read only",
+                })),
+                ..Default::default()
+            }],
+            false,
+        );
+        let mut lines = Vec::new();
+        render_entry_into(
+            &s.entries()[0],
+            false,
+            false,
+            ToolDisclosure::Full,
+            80,
+            &mut lines,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.contains("[Delegation → reviewer]"));
+        assert!(text.contains("Task: Inspect the parser"));
+        assert!(text.contains("Read only"));
+        assert!(text.contains("Response:\n    Result not recorded"));
+        assert!(!text.contains("Running"));
+        assert!(!text.contains("Awaiting"));
+    }
+
+    #[test]
+    fn subagent_card_parallel_keeps_one_invocation_and_result_blocks() {
+        let input = serde_json::json!({
+            "action": "delegate",
+            "parallel": ["reader", "reviewer"],
+            "agent": "unused-target",
+            "prompt": "Inspect the parser",
+        })
+        .to_string();
+        let output = "--- reader (success=true) ---\nLooks good\n\n--- reviewer (success=false) ---\nError: timeout";
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "delegate",
+            &input,
+            Some(output),
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert_eq!(text.matches("[Delegation → reader, reviewer]").count(), 1);
+        assert!(text.contains(r#""agent":"unused-target""#));
+        assert!(text.contains("Response:\n"));
+        assert!(text.contains("--- reader (success=true) ---"));
+        assert!(text.contains("--- reviewer (success=false) ---"));
+    }
+
+    #[test]
+    fn subagent_card_background_and_management_keep_generic_evidence() {
+        for input in [
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "background": true}),
+            serde_json::json!({"action": "check_result", "task_id": "example-task"}),
+            serde_json::json!({"action": "await_sessions", "task_ids": ["example-task"]}),
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "background": "false"}),
+            serde_json::json!({"agent": "reviewer", "prompt": "Inspect", "parallel": [42]}),
+        ] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "delegate",
+                &input.to_string(),
+                Some("Task started"),
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.starts_with("▼ [tool: delegate]"));
+            assert!(text.contains("result: Task started"));
+            assert!(!text.contains("Status:"));
+            assert!(!text.contains("Completed"));
+        }
+    }
+
+    #[test]
+    fn subagent_card_bounds_display_escapes_controls_and_preserves_copy() {
+        let target = format!("reviewer{}target-tail", "x".repeat(140));
+        let input = serde_json::json!({
+            "agent": format!("{target}\u{1b}]52;c;payload\u{7}"),
+            "prompt": format!("{}task-tail", "task line\n".repeat(150)),
+        })
+        .to_string();
+        let result = format!("{}result-tail", "result line\n".repeat(150));
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "delegate",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed = rendered_text(&collapsed);
+        assert!(collapsed.contains("[Delegation → reviewer"));
+        assert!(!collapsed.contains("task-tail"));
+        assert!(!collapsed.contains("result-tail"));
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "delegate",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 4);
+        assert!(text.contains("Display limited"));
+        assert!(!text.contains("task-tail"));
+        assert!(!text.contains("result-tail"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{7}'));
+        assert!(text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        assert!(text.contains(&format!("Target: {target}")));
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("bounded-child"),
+            name: Arc::from("delegate"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains("task-tail"));
+        assert!(copied.contains("result-tail"));
+    }
+
+    #[test]
+    fn subagent_card_malformed_and_oversized_input_falls_back() {
+        for input in [
+            "not JSON".to_string(),
+            serde_json::json!({"prompt": 42}).to_string(),
+            serde_json::json!({"prompt": "x".repeat(TOOL_EXPANDED_MAX_BYTES)}).to_string(),
+        ] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "spawn_subagent",
+                &input,
+                None,
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.starts_with("▼ [tool: spawn_subagent]"));
+            assert!(!text.contains("Status:"));
+            assert!(text.len() <= TOOL_EXPANDED_MAX_BYTES + 150);
+        }
+    }
+
+    #[test]
+    fn subagent_card_response_precedes_matching_runtime_details_and_copy_stays_raw() {
+        let input = r#"{"agent":"fable","prompt":"Reply with the test result"}"#;
+        let result = "[Agent 'fable' (anthropic/model, agentic)]\nsubagent test complete.";
+        for disclosure in [ToolDisclosure::Collapsed, ToolDisclosure::Full] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "delegate",
+                input,
+                Some(result),
+                false,
+                disclosure,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains("[Delegation → fable]"));
+            assert!(text.contains("Response:\n    subagent test complete."));
+            assert!(!text.contains("Status:"));
+            assert!(!text.contains("[Agent 'fable'"));
+            if matches!(disclosure, ToolDisclosure::Full) {
+                assert!(text.contains("Details: anthropic/model, agentic"));
+                assert!(text.find("subagent test complete.") < text.find("Details:"));
+            } else {
+                assert!(!text.contains("anthropic/model"));
+            }
+        }
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("enveloped-child"),
+            name: Arc::from("delegate"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        assert!(clipboard_text(&entry).contains(result));
+        for raw in [
+            "[Agent 'other' (anthropic/model)]\nresponse",
+            "[Agent 'fable' ()]\nresponse",
+            "[Agent 'fable' (garbage)]\nresponse",
+            "[Agent 'fable' ( )]\nresponse",
+            "[Agent 'fable' (/model)]\nresponse",
+            "[Agent 'fable' (anthropic/)]\nresponse",
+            "[Agent 'fable' (anthropic/model, unknown)]\nresponse",
+            "[Agent 'fable' (anthropic/model)] without newline",
+            "Error executing delegate: Missing 'agent' parameter",
+        ] {
+            let mut lines = Vec::new();
+            render_tool_entry(
+                &mut lines,
+                "delegate",
+                input,
+                Some(raw),
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains(&raw.replace('\n', "\n    ")));
+            assert!(!text.contains("Details:"));
+        }
+        assert!(
+            delegate_response_parts(
+                &serde_json::json!({"agent": "fable"}),
+                "[Agent 'fable' (anthropic/\u{1b}model)]\nresponse",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn tool_entry_disclosure_shows_full_retained_content_only_when_expanded() {
         let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(180));
         let result = format!(
@@ -25681,7 +26060,7 @@ mod tests {
             state
                 .enqueue_message("delete me".to_string(), Vec::new())
                 .expect("queue message");
-            state.message_queue[0].id
+            state.message_queue.items()[0].id
         };
         let old_queue = Rect::new(50, 4, 24, 8);
         let moved_queue = Rect::new(50, 12, 24, 8);
@@ -25754,7 +26133,7 @@ mod tests {
                 let state = active_state(&mut chat);
                 state.enqueue_message("first".into(), Vec::new()).unwrap();
                 state.enqueue_message("second".into(), Vec::new()).unwrap();
-                let selected = state.message_queue[1].id;
+                let selected = state.message_queue.items()[1].id;
                 state.select_queued_by_id(selected);
                 let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
                 terminal
@@ -25807,7 +26186,7 @@ mod tests {
                     chat.handle_queue_mouse(event(kind), queue).await;
                 }
                 let state = active_state(&mut chat);
-                assert_eq!(state.queue_sel, Some(selected), "{overlay}");
+                assert_eq!(state.message_queue.selected(), Some(selected), "{overlay}");
                 assert_eq!(state.queue_scroll, 0, "{overlay}");
                 assert!(state.context_menu.is_none(), "{overlay}");
 
@@ -25865,7 +26244,7 @@ mod tests {
             .enqueue_message("retained".into(), Vec::new())
             .unwrap();
         state.queue_sidebar_rect = Some(Rect::new(1, 1, 22, 8));
-        state.queue_item_rects = vec![(state.message_queue[0].id, Rect::new(1, 1, 22, 1))];
+        state.queue_item_rects = vec![(state.message_queue.items()[0].id, Rect::new(1, 1, 22, 1))];
         chat.stash_active();
         chat.handle_queue_mouse(
             MouseEvent {
@@ -25897,7 +26276,7 @@ mod tests {
             state
                 .enqueue_message("delete me".to_string(), Vec::new())
                 .expect("queue message");
-            state.message_queue[0].id
+            state.message_queue.items()[0].id
         };
         let conversation = Rect::new(0, 0, 56, 24);
         let queue = Rect::new(56, 0, 24, 3);
@@ -27347,34 +27726,436 @@ mod tests {
     }
 
     #[test]
-    fn md_table_truncates_when_width_is_tight() {
-        let out = rendered(
-            "| col |\n|-----|\n| this cell is far too long for a tiny width |\n",
-            20,
+    fn md_table_wraps_cells_without_losing_the_grid_or_content() {
+        let width = 32;
+        let lines = markdown_to_lines(
+            "| key | value |\n|-----|-------|\n| mode | this cell is far too long for one row |\n",
+            width,
         );
-        assert!(out.contains('\u{2026}'), "expected ellipsis: {out}");
+        let out = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !out.contains('\u{2026}'),
+            "wrapped content must not truncate: {out}"
+        );
+        for word in ["this", "cell", "far", "too", "long", "for", "one", "row"] {
+            assert!(
+                out.contains(word),
+                "missing {word:?} from wrapped table: {out}"
+            );
+        }
+        let data_lines = out
+            .lines()
+            .filter(|line| {
+                line.contains("mode")
+                    || ["this", "cell", "long", "row"]
+                        .iter()
+                        .any(|word| line.contains(word))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_lines.len() > 1,
+            "data row should grow vertically: {out}"
+        );
+        assert!(
+            data_lines
+                .iter()
+                .all(|line| line.starts_with('\u{2502}') && line.ends_with('\u{2502}')),
+            "every wrapped line must retain table borders: {out}"
+        );
+        assert!(
+            lines.iter().all(|line| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                crate::display_width::display_width(&text) <= width as usize
+            }),
+            "feasible table lines must stay within width {width}: {out}"
+        );
     }
 
     #[test]
-    fn md_table_truncated_url_is_not_actionable() {
+    fn md_table_wrapped_url_fragments_are_not_actionable() {
         let lines = markdown_to_lines(
             "| col |\n|-----|\n| https://example.com/a/very/long/path |\n\nhttps://example.org/ok\n",
             24,
         );
-        let truncated = lines
+        let wrapped_fragments = lines
             .iter()
             .flat_map(|line| &line.spans)
-            .find(|span| span.content.contains("https://") && span.content.contains('\u{2026}'))
-            .expect("truncated table URL");
-        assert_ne!(truncated.style.fg, Some(theme::active().accent));
-        assert_ne!(
-            truncated.style.add_modifier(Modifier::UNDERLINED),
-            truncated.style
+            .filter(|span| disables_url_actions(span))
+            .collect::<Vec<_>>();
+        assert!(!wrapped_fragments.is_empty(), "wrapped table URL fragments");
+        assert!(
+            wrapped_fragments.iter().all(|span| {
+                span.style.fg != Some(theme::active().accent)
+                    && !span.style.add_modifier.contains(Modifier::UNDERLINED)
+            }),
+            "partial table URLs must not look actionable: {lines:?}"
+        );
+        let reconstructed = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| disables_url_actions(span))
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(
+            reconstructed.contains("https://example.com/a/very/long/path"),
+            "wrapped URL content must remain complete: {reconstructed:?}"
         );
 
         let regions = url_line_regions_for_lines(&lines, 24);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].urls[0].2, "https://example.org/ok");
+        let expected_row = lines
+            .iter()
+            .take_while(|line| {
+                !line
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("https://example.org/ok"))
+            })
+            .map(|line| wrapped_rows(line, 24))
+            .fold(0u16, u16::saturating_add);
+        assert_eq!(regions[0].row, expected_row);
+    }
+
+    #[test]
+    fn md_table_fitting_url_remains_actionable() {
+        let lines = markdown_to_lines("| col |\n|-----|\n| https://example.com/ok |\n", 80);
+        let regions = url_line_regions_for_lines(&lines, 80);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, "https://example.com/ok");
+    }
+
+    #[test]
+    fn md_table_neighbor_url_remains_actionable_when_another_cell_wraps() {
+        let first_cell = "0123456789012345678901234567890123456789";
+        let url = "https://a.co";
+        let lines = markdown_to_lines(
+            &format!("| value | link |\n|-------|------|\n| {first_cell} | {url} |\n"),
+            58,
+        );
+        let fragments = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| disables_url_actions(span))
+            .collect::<Vec<_>>();
+        assert!(
+            fragments.is_empty(),
+            "non-URL wrapping must not suppress a neighboring URL: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content.chars().any(|ch| ch.is_ascii_digit()))
+                })
+                .count()
+                > 1,
+            "first cell should wrap into a taller row: {lines:?}"
+        );
+
+        let regions = url_line_regions_for_lines(&lines, 58);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, url);
+        let expected_row = lines
+            .iter()
+            .take_while(|line| !line.spans.iter().any(|span| span.content.contains(url)))
+            .map(|line| wrapped_rows(line, 58))
+            .fold(0u16, u16::saturating_add);
+        assert_eq!(regions[0].row, expected_row);
+    }
+
+    #[test]
+    fn md_table_fitting_url_remains_actionable_beside_split_url_in_same_cell() {
+        let split_url = "https://example.com/a/very/long/path";
+        let fitting_url = "https://b.co";
+        let lines = markdown_to_lines(
+            &format!("| links |\n|-------|\n| {split_url} {fitting_url} |\n"),
+            32,
+        );
+        let regions = url_line_regions_for_lines(&lines, 32);
+        assert_eq!(
+            regions.len(),
+            1,
+            "only the complete URL should be actionable"
+        );
+        assert_eq!(regions[0].urls.len(), 1);
+        assert_eq!(regions[0].urls[0].2, fitting_url);
+
+        let reconstructed = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(
+                [
+                    ' ', '\u{2502}', '\u{250C}', '\u{2500}', '\u{2510}', '\u{251C}', '\u{253C}',
+                    '\u{2524}', '\u{2514}', '\u{2534}', '\u{2518}',
+                ],
+                "",
+            );
+        assert!(reconstructed.contains(split_url));
+        assert!(reconstructed.contains(fitting_url));
+    }
+
+    #[test]
+    fn md_table_cell_wrapping_preserves_break_characters_exactly() {
+        for input in ["a  b", "a\u{200b}b"] {
+            let reconstructed = wrap_table_cell(input, 2)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<String>();
+            assert_eq!(reconstructed, input);
+        }
+    }
+
+    #[test]
+    fn md_table_wrap_spaces_do_not_add_blank_or_indented_rows() {
+        for (input, budget, expected) in [
+            ("30 Dec 2025", 3, vec!["30", "Dec", "202", "5"]),
+            ("Senior Dev", 6, vec!["Senior", "Dev"]),
+            ("a  b", 2, vec!["a", "b"]),
+        ] {
+            let wrapped = wrap_table_cell(input, budget);
+            assert_eq!(
+                wrapped.iter().map(|line| line.text).collect::<String>(),
+                input
+            );
+            assert_eq!(
+                wrapped
+                    .iter()
+                    .map(|line| line.text.trim_matches(table_wrap_break_char))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let lines = render_table(
+                vec![vec![input.to_string()]],
+                vec![pulldown_cmark::Alignment::None],
+                (budget + 4) as u16,
+            );
+            let rows = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .filter(|line| line.starts_with('\u{2502}'))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), expected.len());
+            for (row, text) in rows.iter().zip(expected) {
+                assert_eq!(row, &format!("\u{2502} {text:<budget$} \u{2502}"));
+                assert!(crate::display_width::display_width(row) <= budget + 4);
+            }
+        }
+    }
+
+    #[test]
+    fn md_table_url_markers_are_consumed_before_cached_and_streaming_display() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let width = 24;
+        let source = |url: &str| {
+            format!("| links |\n|---|\n| https://example.com/a/very/long/path |\n\n{url}\n")
+        };
+        let mut chat = state();
+        chat.browse_cursor = Some(0);
+        chat.entries
+            .push(ChatEntry::AgentMessage(Arc::from(source("https://a.co"))));
+        for mode in 0..4 {
+            match mode {
+                0 => chat.mark_dirty_full(),
+                1 => {
+                    chat.entries
+                        .push(ChatEntry::AgentMessage(Arc::from(source("https://b.co"))));
+                    chat.mark_dirty_append();
+                }
+                2 | 3 => {
+                    if mode == 3 {
+                        let line_start = chat.transcript_layout.view().cached_line_ranges[1].1;
+                        chat.transcript_layout
+                            .fixture_mut()
+                            .cached_line_screen_ranges[line_start]
+                            .0 = u16::MAX;
+                    }
+                    chat.entries[1] = ChatEntry::AgentMessage(Arc::from(source("https://c.co")));
+                    chat.mark_dirty_tail(1);
+                }
+                _ => unreachable!(),
+            }
+            chat.rebuild_lines(width);
+            let view = chat.transcript_layout.view();
+            assert!(
+                view.cached_lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| !disables_url_actions(span))
+            );
+            assert!(
+                view.cached_lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            );
+            let urls = view
+                .cached_url_regions
+                .iter()
+                .flat_map(|region| &region.urls)
+                .map(|(_, _, url)| url.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                urls,
+                match mode {
+                    0 => vec!["https://a.co"],
+                    1 => vec!["https://a.co", "https://b.co"],
+                    _ => vec!["https://a.co", "https://c.co"],
+                }
+            );
+        }
+
+        chat.browse_cursor = None;
+        chat.mark_dirty_full();
+        chat.streaming_text = source("https://d.co");
+        let area = Rect::new(0, 0, width + 2, 80);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut chat, area);
+            })
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.underline_color != DISABLED_URL_UNDERLINE_COLOR)
+        );
+        assert!(
+            chat.url_hit_regions
+                .iter()
+                .any(|hit| hit.url == "https://d.co")
+        );
+        assert!(
+            !chat
+                .url_hit_regions
+                .iter()
+                .any(|hit| hit.url.starts_with("https://example.com"))
+        );
+    }
+
+    #[test]
+    fn md_table_cell_wrapping_handles_more_than_u16_max_whitespace() {
+        let input = " ".repeat(70_000);
+        let wrapped = wrap_table_cell(&input, 65_536);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(
+            wrapped.iter().map(|line| line.text).collect::<String>(),
+            input
+        );
+    }
+
+    #[test]
+    fn md_table_cell_fitting_unicode_and_zero_width_content_stays_whole() {
+        for (input, budget) in [
+            ("\u{754c}", 2),
+            ("\u{200b}", 1),
+            ("e\u{301}", 1),
+            (" \u{301}a", 2),
+            ("\u{00a0}a", 2),
+        ] {
+            let wrapped = wrap_table_cell(input, budget);
+            assert_eq!(
+                wrapped,
+                vec![TableCellLine {
+                    text: input,
+                    disabled_url_ranges: Vec::new(),
+                }]
+            );
+            if input != "\u{200b}" {
+                assert_eq!(&input[table_fragment_content_range(input)], input);
+            }
+        }
+    }
+
+    #[test]
+    fn md_table_wraps_wide_graphemes_without_exceeding_feasible_width() {
+        let width = 8;
+        let lines = markdown_to_lines("| A |\n|---|\n| \u{754c}\u{754c}\u{754c} |\n", width);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered.matches('\u{754c}').count(), 3);
+        assert!(lines.iter().all(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            crate::display_width::display_width(&text) <= width as usize
+        }));
+    }
+
+    #[test]
+    fn md_table_sheds_optional_padding_before_clipping_wide_graphemes() {
+        for width in [7, 10] {
+            let lines = markdown_to_lines("| A | B |\n|---|---|\n| \u{754c} | \u{754c} |\n", width);
+            let rendered = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| { crate::display_width::display_width(line) <= width as usize }),
+                "representable table must fit width {width}: {rendered:?}"
+            );
+            assert_eq!(
+                rendered
+                    .iter()
+                    .map(|line| line.matches('\u{754c}').count())
+                    .sum::<usize>(),
+                2,
+                "wide graphemes must remain visible at width {width}: {rendered:?}"
+            );
+            assert!(
+                rendered.iter().all(|line| {
+                    matches!(
+                        line.chars().next(),
+                        Some('\u{250C}' | '\u{251C}' | '\u{2514}' | '\u{2502}')
+                    ) && matches!(
+                        line.chars().last(),
+                        Some('\u{2510}' | '\u{2524}' | '\u{2518}' | '\u{2502}')
+                    )
+                }),
+                "compacted table must retain its border at width {width}: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -27480,7 +28261,7 @@ mod tests {
     #[test]
     fn md_table_with_no_width_still_emits_lines() {
         // Defensive: zero width must not panic and must not emit infinite
-        // padding. The truncation rule collapses every column to `…`.
+        // padding. The minimum grapheme-safe grid may exceed an impossible viewport.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
     }
@@ -27913,14 +28694,14 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         s.enqueue_message("b".to_string(), Vec::new()).unwrap();
-        let second = s.message_queue[1].id;
+        let second = s.message_queue.items()[1].id;
         assert!(s.select_queued_by_id(second));
-        assert_eq!(s.queue_sel, Some(second));
+        assert_eq!(s.message_queue.selected(), Some(second));
         // Re-selecting the same id reports no change.
         assert!(!s.select_queued_by_id(second));
         // Unknown id is ignored.
         assert!(!s.select_queued_by_id(9999));
-        assert_eq!(s.queue_sel, Some(second));
+        assert_eq!(s.message_queue.selected(), Some(second));
     }
 
     #[test]
@@ -27981,14 +28762,15 @@ mod tests {
             .unwrap();
         s.enqueue_message("ordinary two".to_string(), Vec::new())
             .unwrap();
-        let promoted_id = s.message_queue[2].id;
-        s.queue_paused = true;
+        let promoted_id = s.message_queue.items()[2].id;
+        s.toggle_queue_pause();
 
         assert!(s.promote_queued_by_id(promoted_id));
         assert!(!s.queue_paused());
-        assert!(s.resume_override);
+        assert!(s.message_queue.resume_override());
         assert_eq!(
             s.message_queue
+                .items()
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
@@ -27999,7 +28781,7 @@ mod tests {
                 "ordinary two"
             ]
         );
-        let promoted = &s.message_queue[1];
+        let promoted = &s.message_queue.items()[1];
         assert_eq!(promoted.id, promoted_id);
         assert_eq!(promoted.status, QueueItemStatus::Injected);
         assert_eq!(promoted.attachments.len(), 1);
@@ -28012,12 +28794,13 @@ mod tests {
         s.turn_in_flight = true;
         s.inject_message("first".to_string(), Vec::new()).unwrap();
         s.inject_message("second".to_string(), Vec::new()).unwrap();
-        let second_id = s.message_queue[1].id;
+        let second_id = s.message_queue.items()[1].id;
 
         assert!(s.promote_queued_by_id(second_id));
         assert!(s.promote_queued_by_id(second_id));
         assert_eq!(
             s.message_queue
+                .items()
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
@@ -28031,7 +28814,7 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("first".to_string(), Vec::new()).unwrap();
         s.enqueue_message("second".to_string(), Vec::new()).unwrap();
-        let second_id = s.message_queue[1].id;
+        let second_id = s.message_queue.items()[1].id;
         let transcript_bounds = Rect::new(5, 2, 30, 12);
         s.transcript_snapshot = Some(transcript_snapshot(
             transcript_bounds,
@@ -28039,12 +28822,12 @@ mod tests {
         ));
         s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 3));
         s.queue_item_rects = vec![
-            (s.message_queue[0].id, Rect::new(41, 3, 28, 1)),
+            (s.message_queue.items()[0].id, Rect::new(41, 3, 28, 1)),
             (second_id, Rect::new(41, 4, 28, 1)),
         ];
 
         assert!(s.open_queue_context_menu(45, 4));
-        assert_eq!(s.queue_sel, Some(second_id));
+        assert_eq!(s.message_queue.selected(), Some(second_id));
         let menu = s.context_menu.as_ref().expect("queue menu opens");
         assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
         assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
@@ -28088,14 +28871,17 @@ mod tests {
             .unwrap();
         s.ensure_queue_selection();
         let id = s.selected_queue_id().unwrap();
-        let before_selection = s.queue_sel;
+        let before_selection = s.message_queue.selected();
 
         assert_eq!(s.queued_text(id).as_deref(), Some("copy me"));
         assert_eq!(s.queue_len(), 1);
-        assert_eq!(s.queue_sel, before_selection);
-        assert_eq!(s.message_queue[0].id, id);
-        assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
-        assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+        assert_eq!(s.message_queue.selected(), before_selection);
+        assert_eq!(s.message_queue.items()[0].id, id);
+        assert_eq!(s.message_queue.items()[0].status, QueueItemStatus::Pending);
+        assert_eq!(
+            s.message_queue.items()[0].attachments[0].filename,
+            "keep.txt"
+        );
     }
 
     #[tokio::test]
@@ -28109,7 +28895,7 @@ mod tests {
         active
             .enqueue_message("send now".to_string(), Vec::new())
             .unwrap();
-        let id = active.message_queue[0].id;
+        let id = active.message_queue.items()[0].id;
         chat.phase = ChatPhase::Active(Box::new(active));
 
         let first = tokio::spawn(async move {
@@ -28141,7 +28927,10 @@ mod tests {
             panic!("expected active chat");
         };
         assert!(matches!(state.turn_status, TurnStatus::Cancelling));
-        assert_eq!(state.message_queue[0].status, QueueItemStatus::Injected);
+        assert_eq!(
+            state.message_queue.items()[0].status,
+            QueueItemStatus::Injected
+        );
 
         chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
             id,
@@ -28167,7 +28956,7 @@ mod tests {
         active
             .enqueue_message("recover me".to_string(), Vec::new())
             .unwrap();
-        let id = active.message_queue[0].id;
+        let id = active.message_queue.items()[0].id;
         chat.phase = ChatPhase::Active(Box::new(active));
 
         let action = tokio::spawn(async move {
@@ -28275,7 +29064,10 @@ mod tests {
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         assert!(s.queue_sidebar_open(), "non-empty queue → sidebar open");
         s.ensure_queue_selection();
-        assert!(s.queue_sel.is_some(), "first enqueue seeds a selection");
+        assert!(
+            s.message_queue.selected().is_some(),
+            "first enqueue seeds a selection"
+        );
         s.delete_selected_queued();
         assert!(
             !s.queue_sidebar_open(),
@@ -28492,7 +29284,7 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.queue_paused = true;
+        s.toggle_queue_pause();
         s.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(1, 1, 6, 1),
             text: Arc::<str>::from("stale"),
@@ -28535,7 +29327,7 @@ mod tests {
     fn queue_cap_enforced() {
         let mut s = state();
         s.turn_in_flight = true;
-        for i in 0..ChatState::QUEUE_CAP {
+        for i in 0..MessageQueue::CAPACITY {
             s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
         }
         assert!(
@@ -29156,6 +29948,10 @@ mod tests {
         assert!(!active.turn_in_flight);
         assert!(matches!(active.turn_status, TurnStatus::Idle));
         assert!(active.queue_paused());
+        assert_eq!(
+            active.message_queue.pause_reason(),
+            Some(QueuePauseReason::MissingCompletion)
+        );
         assert_eq!(active.queue_len(), 1);
         assert!(
             active
@@ -29163,6 +29959,159 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
+        );
+
+        // Reach the production Chat renderer's final terminal cells, rather
+        // than asserting only the source string or input-bar helper.
+        use ratatui::{Terminal, backend::TestBackend};
+        let hint = crate::i18n::t_args(
+            "zc-queue-missing-completion-ghost",
+            &[("key", &resume_queue_chord_label())],
+        );
+        let dock_width = crate::config::SidebarSection::default().width;
+        for width in [80, 120] {
+            let area = Rect::new(0, 0, width, 24);
+            let conversation = Rect::new(0, 0, width - dock_width, area.height);
+            let queue = Rect::new(conversation.width, 0, dock_width, 3);
+            let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+            terminal
+                .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
+                .unwrap();
+            let rendered = overlay_text(&terminal, area);
+            assert!(
+                rendered.contains(&hint),
+                "missing full recovery hint at {width} with {dock_width}-column dock: {rendered}"
+            );
+            let row = rendered.lines().find(|row| row.contains(&hint)).unwrap();
+            println!("{width}x24 terminal cells: {}", row.trim_end());
+        }
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "uncertain work must not dispatch"
+        );
+        assert!(active_state(&mut chat).resume_queue());
+        chat.pump_all_queues();
+        let follow_up =
+            next_rpc_request(&mut writer_rx, "explicit resume dispatches backlog").await;
+        assert_eq!(follow_up["params"]["prompt"], "wait for explicit resume");
+        assert!(!active_state(&mut chat).queue_paused());
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_preserves_known_pause_reasons() {
+        for (scenario, manual_pause, local_cancel, stop_reason) in [
+            ("manual pause", true, false, "end_turn"),
+            ("external cancellation", false, false, "cancelled"),
+            (
+                "local cancellation after streaming",
+                false,
+                true,
+                "end_turn",
+            ),
+        ] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active
+                .enqueue_message("hello".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+            let active = active_state(&mut chat);
+            active
+                .enqueue_message("queued follow-up".to_string(), Vec::new())
+                .unwrap();
+            if manual_pause {
+                active.toggle_queue_pause();
+            }
+            if local_cancel {
+                active.enter_cancelling();
+                active.apply_update(SessionUpdate::AgentMessageChunk {
+                    session_id: "sess-1".to_string(),
+                    text: "last streamed chunk".to_string(),
+                });
+                assert!(!matches!(active.turn_status, TurnStatus::Cancelling));
+                assert!(active.cancel_started_at.is_some());
+            }
+            respond_ok(
+                &chat.rpc_out,
+                &request,
+                serde_json::json!({
+                    "session_id": "sess-1",
+                    "stop_reason": stop_reason,
+                    "content": ""
+                }),
+            );
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+
+            let active = active_state(&mut chat);
+            assert!(!active.turn_in_flight, "{scenario}");
+            assert_eq!(
+                active.message_queue.pause_reason(),
+                Some(QueuePauseReason::Generic),
+                "{scenario}"
+            );
+            assert_eq!(active.queue_len(), 1, "{scenario}");
+            chat.pump_all_queues();
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "{scenario} must not dispatch backlog"
+            );
+            assert!(active_state(&mut chat).resume_queue());
+            chat.pump_all_queues();
+            let follow_up = next_rpc_request(&mut writer_rx, "resume dispatches backlog").await;
+            assert_eq!(
+                follow_up["params"]["prompt"], "queued follow-up",
+                "{scenario}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_cancelled_response_preserves_injection_override() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+        let active = active_state(&mut chat);
+        active
+            .enqueue_message("backlog".to_string(), Vec::new())
+            .unwrap();
+        active.enter_cancelling();
+        active
+            .inject_message("urgent".to_string(), Vec::new())
+            .unwrap();
+        respond_ok(
+            &chat.rpc_out,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "stop_reason": "cancelled",
+                "content": ""
+            }),
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(
+            active.turn_in_flight,
+            "injected work must dispatch after settlement"
+        );
+        assert!(!active.queue_paused());
+        assert_eq!(active.queue_len(), 1);
+        let urgent =
+            next_rpc_request(&mut writer_rx, "injection dispatches despite cancellation").await;
+        assert_eq!(urgent["params"]["prompt"], "urgent");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "backlog waits for the injected turn"
         );
     }
 
@@ -29190,6 +30139,9 @@ mod tests {
             })
             .unwrap();
         chat.drain_notifications();
+        active_state(&mut chat)
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .unwrap();
         respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
         tokio::task::yield_now().await;
         chat.drain_prompt_completions();
@@ -29207,6 +30159,15 @@ mod tests {
             .unwrap();
         chat.drain_notifications();
 
+        let active = active_state(&mut chat);
+        assert_eq!(
+            active.message_queue.pause_reason(),
+            Some(QueuePauseReason::Generic)
+        );
+        assert!(
+            active.take_next_dispatchable().is_none(),
+            "a late signal must not resume work"
+        );
         let replies = active_state(&mut chat)
             .entries()
             .iter()
@@ -29630,6 +30591,9 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(active));
         chat.pump_all_queues();
         let request = next_rpc_request(&mut writer_rx, "busy prompt should be sent").await;
+        active_state(&mut chat)
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .unwrap();
         respond_err(
             &chat.rpc_out,
             &request,
@@ -29640,6 +30604,11 @@ mod tests {
         chat.drain_prompt_completions();
 
         let active = active_state(&mut chat);
+        assert_eq!(
+            active.message_queue.pause_reason(),
+            Some(QueuePauseReason::Generic)
+        );
+        assert!(active.take_next_dispatchable().is_none());
         assert!(!active.turn_in_flight);
         assert!(
             active.first_message.is_none(),

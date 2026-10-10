@@ -1006,6 +1006,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
     切换模型：/models
+channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
 turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]

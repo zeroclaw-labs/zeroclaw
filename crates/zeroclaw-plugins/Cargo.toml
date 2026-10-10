@@ -49,7 +49,6 @@ async-trait = "0.1"
 base64 = "0.22"
 jsonschema = { version = "0.48", default-features = false }
 ring = "0.17"
-same-file = "1.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = "2.0"
@@ -80,9 +79,18 @@ webpki-roots = { version = "1.0.6", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Payload admission walks from the retained package-root handle with
+# `openat` and no-follow flags instead of reopening absolute pathnames.
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(not(unix))'.dependencies]
+# The pathname-checked payload admission used where that walk is unavailable.
+same-file = "1.0"
+
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3.26"
-tokio = { version = "1.50", default-features = false, features = ["io-util", "net"] }
+tokio = { version = "1.50", default-features = false, features = ["io-util", "net", "test-util"] }
 zeroclaw-config = { path = "../zeroclaw-config" }
 zeroclaw-spawn.workspace = true

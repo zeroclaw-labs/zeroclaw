@@ -51,7 +51,7 @@ jobs:
       matrix:
         include:
           - name: macOS
-            os: macos-14
+            os: macos-15
             nextest-platform: mac
             timeout-minutes: 45
           - name: Windows

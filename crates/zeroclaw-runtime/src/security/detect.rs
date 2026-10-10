@@ -468,6 +468,10 @@ struct FailedSeatbeltSandbox {
 #[cfg(target_os = "macos")]
 impl Sandbox for FailedSeatbeltSandbox {
     fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
+    fn check_initialization(&self) -> std::io::Result<()> {
         Err(std::io::Error::new(
             self.error.kind(),
             format!("Seatbelt initialization failed: {}", self.error),
@@ -746,6 +750,15 @@ mod tests {
         };
         assert!(!sandbox.is_available());
         assert_eq!(sandbox.name(), "sandbox-exec");
+        let initialization_error = sandbox.check_initialization().unwrap_err();
+        assert_eq!(
+            initialization_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            initialization_error.to_string(),
+            "Seatbelt initialization failed: policy unavailable"
+        );
         for _ in 0..2 {
             let mut command = std::process::Command::new("/bin/echo");
             command.arg("must not run");
@@ -795,6 +808,7 @@ mod tests {
             );
             assert_eq!(sandbox.name(), "sandbox-exec");
             assert!(!sandbox.is_available());
+            assert!(sandbox.check_initialization().is_err());
             let mut command = std::process::Command::new("/bin/echo");
             let error = sandbox.wrap_command(&mut command).unwrap_err();
             assert!(
@@ -812,6 +826,7 @@ mod tests {
                 &extra_roots,
             );
             assert_eq!(disabled.name(), "none");
+            assert!(disabled.check_initialization().is_ok());
             assert!(disabled.wrap_command(&mut command).is_ok());
         }
     }

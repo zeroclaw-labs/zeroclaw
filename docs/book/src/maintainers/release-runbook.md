@@ -14,7 +14,7 @@ Last verified against the `v0.8.2` release cycle.
 
 ## The process in seven steps
 
-1. [Generate `CHANGELOG-next.md` using the changelog skill](#step-1-generate-changelog-nextmd)
+1. [Generate `CHANGELOG-next.md` using the changelog skill, with the binary size table](#step-1-generate-changelog-nextmd)
 2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
 3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
 4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
@@ -59,6 +59,100 @@ gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
 ```
 
 The composed text appears in the run's job summary.
+
+### Record the binary size change
+
+Before the version bump, measure the release binary of the previous release
+and of current `master`, then paste the `compare` table into
+`CHANGELOG-next.md` as a `## Binary size` section before Contributors, inside
+a `text` code block. `CHANGELOG-next.md` becomes the release body, so the table
+ships with the release. The table reports local builds of the two source
+revisions on one machine. It does not measure the published archives, which
+the release workflow builds per target with its pinned toolchain and target
+flags, so state the measuring target triple next to the table.
+
+`scripts/ci/binary_size_report.sh` runs on Linux or macOS and needs Python 3.11
+or newer. Its `measure` command builds the `zeroclaw` binary of each `zeroclaw`
+policy profile in `dev/ci/dependency-footprint.toml` with the `release` Cargo
+profile. For each policy profile the report records the binary's bytes,
+SHA-256, and path, the target triple, and the resolved features. The report
+also records the `release` Cargo profile settings from `Cargo.toml`, the Cargo
+and rustc versions, the build variables that change code generation
+(`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, the
+target's `RUSTFLAGS` and linker variables, and `ZEROCLAW_BUILD_ID`), the
+source revision with a worktree digest, and the `Cargo.lock` digest.
+
+Measure each side from its own clean checkout on the same machine and user
+account, and keep the reports outside both checkouts, because an untracked
+file inside a checkout marks its next measurement as dirty:
+
+```sh
+git worktree add ../zeroclaw-vPREV vPREV
+./scripts/ci/binary_size_report.sh measure --repo-root ../zeroclaw-vPREV \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir ../zeroclaw-vPREV/target-size --output ../size-vPREV.json
+./scripts/ci/binary_size_report.sh measure \
+  --profile foundation --profile agent-runtime \
+  --profile root-default --profile standard-distribution \
+  --target-dir target-size --output ../size-next.json
+./scripts/ci/binary_size_report.sh compare ../size-vPREV.json ../size-next.json \
+  --output ../size-compare.json
+```
+
+These commands measure the four policy profiles that describe what users run:
+`foundation` (`--no-default-features`), `agent-runtime`, `root-default` (the
+Cargo defaults a source build gets), and `standard-distribution` (the feature
+set of the release archives). Without `--profile`, `measure` builds every
+`zeroclaw` policy profile, including `ci-all` and `hardware-probe`, which are
+CI and hardware aggregates rather than shipped builds. Pass `--target <triple>`
+to build for another target. Without it, `measure` resolves the
+`standard-distribution` features for the host triple, so the per-target
+exclusions in `Cargo.toml` apply as they do for that target's release
+archive.
+
+`compare` prints the table, headed by each side's revision and whether it was
+dirty, and writes the JSON result to the file named by `--output`, or to
+stdout without it.
+
+The binary embeds registry source paths under `CARGO_HOME` and a build stamp
+from `git describe` or `ZEROCLAW_BUILD_ID`. The same source measured on
+another machine or user account can therefore produce different bytes, and
+`compare` cannot detect such a pair. Other inputs change the binary without
+being recorded either: C compiler variables such as `CC` and `CFLAGS`, the
+macOS SDK and deployment target, and Cargo settings in a user-level
+`~/.cargo/config.toml`. Measure both sides on the same machine and user
+account, from the same shell environment.
+
+`measure` refuses to start a build when `RUSTC` or `CARGO_BUILD_RUSTC` is set,
+when a `CARGO_PROFILE_RELEASE_*` variable overrides the `release` Cargo
+profile, when a selected policy profile does not build the `zeroclaw`
+package, or when a policy profile's target directory is inside the checkout
+but not ignored by Git. After each build it refuses a binary that Cargo reports
+at a different path than expected, for example when `CARGO_BUILD_TARGET` or a
+`build.target` setting applies without `--target`. `compare` refuses reports
+that differ in Cargo or rustc version, host, target, `release` Cargo profile
+settings, recorded build variables, policy, or set of policy profiles. A policy
+profile whose resolved features or binary path changed between the reports is
+listed as not comparable, with its added and removed features, instead of
+getting a delta.
+
+Each policy profile builds in its own target directory,
+`<target-dir>/<profile-id>`, which repeats the dependency build per policy
+profile. On macOS arm64 these directories took 0.8 GB for `foundation`,
+1.2 GB for `agent-runtime`, 1.4 GB for `root-default`, and 2.5 GB for
+`standard-distribution`. The first build of a policy profile is a full
+fat-LTO release build that takes several minutes; a repeat run on unchanged
+sources finishes without rebuilding. Clean up when the table is in the
+changelog:
+
+```sh
+rm -rf target-size
+git worktree remove ../zeroclaw-vPREV
+```
+
+For the full target matrix, the job summary of the Cross-Platform Build
+workflow lists each binary's bytes and SHA-256.
 
 ---
 
@@ -447,6 +541,7 @@ Once `publish` completes, confirm:
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
+[ ] Release notes contain the binary size table from step 1
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the

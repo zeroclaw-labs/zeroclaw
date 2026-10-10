@@ -10,10 +10,10 @@
 # the operator-facing plugin config surface that zeroclaw-plugins compiles
 # against, so a change there can break this job while nothing under
 # crates/zeroclaw-plugins moves.
-# The root-package channel activation and channel egress e2e targets are listed
-# individually because they are the pieces of this job's coverage that live
-# outside a crate directory: they drive zeroclaw-runtime, which zeroclaw-plugins
-# cannot depend on without inverting the crate graph, so they have to be root
+# The root-package channel e2e targets are listed individually because they are
+# the pieces of this job's coverage that live outside a crate directory: they
+# drive zeroclaw-runtime, which zeroclaw-plugins cannot depend on without
+# inverting the crate graph, so they have to be root
 # `zeroclaw` test targets. The root binary's plugin modules are listed for the
 # same reason: `mod plugins` and the plugin registry only compile under
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
@@ -30,6 +30,7 @@ while IFS= read -r path; do
         crates/zeroclaw-plugins/*|\
         crates/zeroclaw-runtime/*|\
         crates/zeroclaw-config/*|\
+        tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
         src/plugins/*|src/plugin_registry.rs|src/main.rs|\

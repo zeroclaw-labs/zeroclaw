@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -61,6 +62,10 @@ pub struct BrowserTool {
     session_name: Option<String>,
     backend: String,
     headed: Option<bool>,
+    /// Test-only override for the agent-browser binary path; `None` in every
+    /// constructor and set only by `set_agent_browser_bin_for_tests`, so
+    /// production always launches the installed `agent-browser`.
+    agent_browser_bin: Option<std::path::PathBuf>,
     #[cfg(feature = "browser-native")]
     native_headless: bool,
     #[cfg(feature = "browser-native")]
@@ -245,6 +250,7 @@ impl BrowserTool {
             session_name,
             backend,
             headed,
+            agent_browser_bin: None,
             #[cfg(feature = "browser-native")]
             native_headless,
             #[cfg(feature = "browser-native")]
@@ -553,12 +559,17 @@ impl BrowserTool {
     }
 
     fn agent_browser_command(&self) -> Command {
-        let agent_browser_bin = if cfg!(target_os = "windows") {
-            "agent-browser.cmd"
-        } else {
-            "agent-browser"
+        let mut cmd = match &self.agent_browser_bin {
+            Some(bin) => Command::new(bin),
+            None => {
+                let agent_browser_bin = if cfg!(target_os = "windows") {
+                    "agent-browser.cmd"
+                } else {
+                    "agent-browser"
+                };
+                Command::new(agent_browser_bin)
+            }
         };
-        let mut cmd = Command::new(agent_browser_bin);
 
         match self.headed {
             Some(true) => {
@@ -582,6 +593,15 @@ impl BrowserTool {
         }
 
         cmd
+    }
+
+    /// Point `agent_browser_command` at a fake binary for tests. The only
+    /// setter for [`Self::agent_browser_bin`]: production keeps `None` and
+    /// launches the installed `agent-browser`. Unix-only because every
+    /// caller drives a `#!/bin/sh` fake binary.
+    #[cfg(all(test, unix))]
+    fn set_agent_browser_bin_for_tests(&mut self, bin: std::path::PathBuf) {
+        self.agent_browser_bin = Some(bin);
     }
 
     /// Execute a browser action via agent-browser CLI
@@ -835,6 +855,32 @@ impl BrowserTool {
         // conversion — so the backends write exactly the path that was allowed.
         *path = Some(self.validate_screenshot_target(path_str).await?);
         Ok(())
+    }
+
+    /// Allocate a workspace target for an agent-browser screenshot that
+    /// arrived with no `path`, mirroring the `screenshot` tool's
+    /// `screenshot_{timestamp}.png` default with a distinct
+    /// `browser_screenshot_` prefix and millisecond timestamps so two calls
+    /// inside the same second do not collide. The name is resolved against
+    /// the workspace by the same `validate_screenshot_target` flow that
+    /// covers an explicit relative path (there is no second resolver), so
+    /// the backend writes inside the workspace allowlist and the produced
+    /// image can be declared. An allocated name that already exists is a
+    /// plain error: `validate_screenshot_target` permits an existing
+    /// regular file, so the never-overwrite check lives here, at the
+    /// allocation site.
+    async fn allocate_agent_browser_screenshot_target(&self) -> anyhow::Result<String> {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
+        let filename = format!("browser_screenshot_{timestamp}.png");
+        let full = self.security.resolve_tool_path(&filename);
+        if full.exists() {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-allocated-target-exists",
+                &[("filename", &filename)],
+            );
+            anyhow::bail!("{msg}");
+        }
+        Ok(filename)
     }
 
     /// The single canonical screenshot-destination validator. Applies the same
@@ -1185,7 +1231,9 @@ impl BrowserTool {
                         .await
                         .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
 
-                    // Return success with the path information
+                    // Return success with the path information; the written
+                    // PNG is declared as an attachment so the model can see
+                    // it without anyone scanning the text for the path.
                     let output = serde_json::to_string_pretty(&json!({
                         "backend": "computer_use",
                         "action": action,
@@ -1198,7 +1246,11 @@ impl BrowserTool {
                         success: true,
                         output: output.into(),
                         error: None,
-                    });
+                    }
+                    .with_attachment(RenderedMarker {
+                        target: path_str.to_string(),
+                        kind: MarkerKind::Image,
+                    }));
                 }
 
                 let output = parsed
@@ -1270,16 +1322,53 @@ impl BrowserTool {
         backend: ResolvedBackend,
     ) -> anyhow::Result<ToolResult> {
         // Validate screenshot path before any backend writes a file
+        let mut screenshot_target: Option<String> = None;
         if matches!(action, BrowserAction::Screenshot { .. }) {
+            // A pathless screenshot on the agent-browser backend would
+            // otherwise save to that backend's own default directory,
+            // outside the workspace allowlist, and its printed path could
+            // never be declared. Allocate a workspace name here so the same
+            // validated flow below covers the call; rust-native keeps
+            // inlining a pathless capture.
+            if let (BrowserAction::Screenshot { path, .. }, ResolvedBackend::AgentBrowser) =
+                (&mut action, backend)
+                && path.is_none()
+            {
+                *path = Some(self.allocate_agent_browser_screenshot_target().await?);
+            }
             self.validate_screenshot_path(&mut action).await?;
+            if let BrowserAction::Screenshot {
+                path: Some(target), ..
+            } = &action
+            {
+                screenshot_target = Some(target.clone());
+            }
         }
 
-        match backend {
+        let result = match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
+        };
+
+        // A screenshot the backend wrote to the validated target is a
+        // produced image: declare it so the model can see it. Nothing
+        // downstream infers attachments from the path printed in the text,
+        // and the text itself is unchanged. (A screenshot with no `path`
+        // argument is allocated a workspace target before dispatch on the
+        // agent-browser backend, so it is declared here too; the
+        // rust-native path still inlines the PNG instead of saving it.)
+        match (result, screenshot_target) {
+            (Ok(mut result), Some(target)) if result.success => {
+                result = result.with_attachment(RenderedMarker {
+                    target,
+                    kind: MarkerKind::Image,
+                });
+                Ok(result)
+            }
+            (result, _) => result,
         }
     }
 
@@ -1409,7 +1498,7 @@ impl Tool for BrowserTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path for screenshot"
+                    "description": "File path for screenshot (agent-browser default: browser_screenshot_<timestamp>.png in the workspace)"
                 },
                 "ms": {
                     "type": "integer",
@@ -3676,6 +3765,304 @@ mod tests {
         );
     }
 
+    /// The same real 1×1 PNG the `image_info` tests use: the fake
+    /// agent-browser must write decodable image bytes, not a marker string.
+    #[cfg(unix)]
+    const MINIMAL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// The [`MINIMAL_PNG`] bytes as a POSIX `printf` format string: octal
+    /// escapes only, so the fake binary needs no `base64` (whose decode flag
+    /// differs between macOS and GNU) and no here-doc quoting tricks.
+    #[cfg(unix)]
+    fn minimal_png_sh_literal() -> String {
+        let mut out = String::with_capacity(MINIMAL_PNG.len() * 4);
+        for byte in MINIMAL_PNG {
+            out.push_str(&format!("\\{byte:03o}"));
+        }
+        out
+    }
+
+    /// Write a fake `agent-browser` shell script into `dir` (mode 0o755):
+    /// given `screenshot <path> --json` it writes [`MINIMAL_PNG`] to
+    /// `<path>` and prints the agent-browser success JSON echoing that path,
+    /// so the tests exercise the real command execution and declaration
+    /// path. A missing or option-shaped path argument is a failure, which
+    /// keeps a misrouted no-path invocation from scribbling on the cwd.
+    #[cfg(unix)]
+    fn write_fake_agent_browser(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let png = minimal_png_sh_literal();
+        let script = format!(
+            "#!/bin/sh\n\
+             set -e\n\
+             # fake agent-browser: `screenshot <path> --json` writes a real PNG\n\
+             case \"$2\" in -*|'') echo 'fake agent-browser: expected a path argument' >&2; exit 1 ;; esac\n\
+             printf '{png}' > \"$2\"\n\
+             printf '{{\"success\":true,\"data\":{{\"path\":\"%s\"}}}}\\n' \"$2\"\n"
+        );
+        let bin = dir.join("fake-agent-browser");
+        std::fs::write(&bin, script).expect("fake agent-browser script must be writable");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("fake agent-browser script must be executable");
+        bin
+    }
+
+    /// Production-boundary proof for the pathless agent-browser screenshot:
+    /// `execute_action` must allocate a workspace target before dispatch
+    /// (the backend's own default directory is outside the allowlist and
+    /// its printed path may never be promoted), hand it to the real command
+    /// path, and declare the file the backend wrote. Deleting the
+    /// allocation `if` in `execute_action` fails the attachment assert; so
+    /// does deleting the declaration match below it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_pathless_screenshot_declares_the_allocated_workspace_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let bin = write_fake_agent_browser(tmp.path());
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(
+                BrowserAction::Screenshot {
+                    path: None,
+                    full_page: false,
+                },
+                ResolvedBackend::AgentBrowser,
+            )
+            .await
+            .expect("a pathless agent-browser screenshot must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the allocated workspace target must be declared as exactly one attachment"
+        );
+        assert_eq!(attachments[0].kind, MarkerKind::Image);
+        let target = attachments[0].target.as_str();
+        let target_path = std::path::Path::new(target);
+        assert!(
+            target_path.is_absolute(),
+            "the declared target must be the canonical absolute path, got: {target}"
+        );
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        assert_eq!(
+            target_path.parent(),
+            Some(ws_canonical.as_path()),
+            "the target's parent must canonicalize to the workspace tempdir, got: {target}"
+        );
+        let filename = target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the allocated filename must be valid UTF-8");
+        assert!(
+            filename.starts_with("browser_screenshot_") && filename.ends_with(".png"),
+            "the allocated name must carry the browser_screenshot_ prefix and .png suffix, got: {filename}"
+        );
+
+        let written = std::fs::read(target_path).expect("the backend must write the target");
+        let png_signature: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        assert!(
+            written.starts_with(png_signature),
+            "the file at the allocated target must be a real PNG"
+        );
+
+        let text = result.output.as_str();
+        assert!(
+            text.contains(target),
+            "the text must carry agent-browser's own path echo, got: {text}"
+        );
+        assert!(
+            !text.contains("(media attachment omitted)"),
+            "the marker must ride the attachment declaration, never the tool text: {text}"
+        );
+
+        // The declaration must survive the carrier protocol in both shapes:
+        // the native envelope (`render_native_attachments` round trip) and
+        // the prompt carrier, with `image_refs` naming the same target.
+        let native_envelope = json!({
+            "tool_call_id": "call-1",
+            "content": text,
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
+        })
+        .to_string();
+        let native_parts = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&native_envelope)
+            .expect("the native envelope must parse");
+        assert!(native_parts.declared);
+        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
+            .expect("a tool-role message must classify");
+        assert_eq!(
+            zeroclaw_api::tool_carrier::image_refs(&native_classified),
+            vec![target.to_string()]
+        );
+
+        let prompt_carrier =
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
+        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
+            .expect("the prompt carrier must classify");
+        assert!(prompt_parts.declared);
+        assert_eq!(
+            zeroclaw_api::tool_carrier::image_refs(&prompt_parts),
+            vec![target.to_string()]
+        );
+    }
+
+    /// The allocation only fills in a missing path: an explicit target must
+    /// pass through unchanged. The backend writes the requested file and
+    /// the declaration names exactly that file, with no allocated
+    /// `browser_screenshot_` name created alongside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_explicit_path_screenshot_declares_the_explicit_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let bin = write_fake_agent_browser(tmp.path());
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(
+                BrowserAction::Screenshot {
+                    path: Some("explicit_shot.png".into()),
+                    full_page: false,
+                },
+                ResolvedBackend::AgentBrowser,
+            )
+            .await
+            .expect("an explicit-path agent-browser screenshot must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the explicit target must still be declared exactly once"
+        );
+        assert_eq!(attachments[0].kind, MarkerKind::Image);
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        let target = std::path::Path::new(attachments[0].target.as_str());
+        assert_eq!(
+            target.parent(),
+            Some(ws_canonical.as_path()),
+            "the explicit target must resolve inside the workspace, got: {target:?}"
+        );
+        assert_eq!(
+            target.file_name().and_then(|name| name.to_str()),
+            Some("explicit_shot.png"),
+            "the declared target must be the explicit file, not an allocated name"
+        );
+        let written = std::fs::read(target).expect("the backend must write the explicit target");
+        assert!(
+            written.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']),
+            "the explicit target must hold the real PNG bytes"
+        );
+
+        let workspace_files: Vec<String> = std::fs::read_dir(&ws)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        assert_eq!(
+            workspace_files,
+            vec!["explicit_shot.png".to_string()],
+            "only the explicit target may exist in the workspace"
+        );
+    }
+
+    /// Write a fake `agent-browser` that answers `get title --json` with a
+    /// caller-chosen title string, for the text-only negative control.
+    #[cfg(unix)]
+    fn write_fake_agent_browser_title(dir: &std::path::Path, title: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\n\
+             set -e\n\
+             # fake agent-browser: `get title --json` echoes a fixed title\n\
+             printf '{{\"success\":true,\"data\":{{\"title\":\"%s\"}}}}\\n' '{title}'\n"
+        );
+        let bin = dir.join("fake-agent-browser-title");
+        std::fs::write(&bin, script).expect("fake agent-browser script must be writable");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("fake agent-browser script must be executable");
+        bin
+    }
+
+    /// Negative control for the producer: a non-screenshot agent-browser
+    /// result whose text names a real, permitted PNG inside the workspace
+    /// declares nothing. The path reaches the model as text, and neither
+    /// carrier shape yields an image ref from it. Only the screenshot
+    /// producer declares images; no text is scanned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_text_result_naming_a_png_declares_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let png_path = std::fs::canonicalize(&ws).unwrap().join("real.png");
+        std::fs::write(&png_path, MINIMAL_PNG).unwrap();
+        let png_str = png_path.to_str().expect("tempdir path is UTF-8");
+        assert!(
+            png_path.is_file(),
+            "precondition: a real PNG exists at {png_str}"
+        );
+
+        let bin = write_fake_agent_browser_title(tmp.path(), png_str);
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(BrowserAction::GetTitle, ResolvedBackend::AgentBrowser)
+            .await
+            .expect("the fake get-title call must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert!(
+            attachments.is_empty(),
+            "a text result naming a PNG must declare nothing, got: {attachments:?}"
+        );
+        let text = result.output.as_str();
+        assert!(
+            text.contains(png_str),
+            "the PNG path must reach the model as text verbatim, got: {text}"
+        );
+
+        let native_envelope = json!({
+            "tool_call_id": "call-1",
+            "content": text,
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
+        })
+        .to_string();
+        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
+            .expect("a tool-role message must classify");
+        assert!(
+            zeroclaw_api::tool_carrier::image_refs(&native_classified).is_empty(),
+            "the native carrier must not turn the quoted path into an image ref"
+        );
+
+        let prompt_carrier =
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
+        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
+            .expect("the prompt carrier must classify");
+        assert!(
+            zeroclaw_api::tool_carrier::image_refs(&prompt_parts).is_empty(),
+            "the prompt carrier must not turn the quoted path into an image ref"
+        );
+    }
+
     /// `Tool::execute` raw-input boundary: a present non-string `path` must be
     /// rejected up front — the same contract the ComputerUse path enforces —
     /// rather than silently coerced to `None` (which would make the local
@@ -4123,6 +4510,38 @@ mod tests {
                 "the validated destination must NOT be forwarded to the sidecar: {body}"
             );
         }
+
+        // The written screenshot is declared as the one image attachment; the
+        // JSON text (including the printed path) is unchanged, and nothing
+        // about the declaration rewrites the output.
+        assert!(result.success, "precondition: the screenshot succeeded");
+        assert_eq!(
+            result.output.attachments().len(),
+            1,
+            "a written screenshot declares exactly one attachment"
+        );
+        assert_eq!(
+            result.output.attachments()[0].kind,
+            zeroclaw_api::media::MarkerKind::Image
+        );
+        let expected_target = std::fs::canonicalize(ws.join("screenshot.png"))
+            .expect("canonical target")
+            .display()
+            .to_string();
+        assert_eq!(
+            result.output.attachments()[0].target,
+            expected_target,
+            "the declared target is the validated local destination"
+        );
+        assert!(
+            result.output.as_str().contains("\"path\""),
+            "the text still carries the path field verbatim: {}",
+            result.output.as_str()
+        );
+        assert!(
+            !result.output.as_str().contains("[IMAGE:"),
+            "the declaration never rides the text as marker syntax"
+        );
     }
 
     /// Fail-closed contract for a path-bearing screenshot: the tool must NOT

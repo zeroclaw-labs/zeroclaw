@@ -1596,8 +1596,78 @@ mod tests {
         );
     }
 
+    fn emit_bootstrap_capture_noise(count: usize) {
+        // Join a real unrelated emitting thread before continuing, so the
+        // amount/order of noise is controlled without a timeout or sleep.
+        std::thread::spawn(move || {
+            for sequence in 0..count {
+                zeroclaw_log::record!(
+                    INFO,
+                    zeroclaw_log::Event::new(
+                        "bootstrap-capture-control",
+                        zeroclaw_log::Action::Note
+                    )
+                    .with_attrs(serde_json::json!({"capture_noise": sequence})),
+                    "unrelated capture control event"
+                );
+            }
+        })
+        .join()
+        .expect("noise producer joined");
+    }
+
     #[test]
     fn bootstrap_truncation_warn_reaches_the_log_pipeline() {
+        assert_bootstrap_warn_capture(0, 0, false, true);
+    }
+
+    #[test]
+    fn bootstrap_truncation_capture_non_lagged_control() {
+        assert_bootstrap_warn_capture(8, 0, false, true);
+    }
+
+    #[test]
+    fn bootstrap_truncation_capture_lagged_retained_control() {
+        assert_bootstrap_warn_capture(64, 0, true, true);
+    }
+
+    #[test]
+    fn bootstrap_truncation_capture_overwritten_control() {
+        assert_bootstrap_warn_capture(0, 64, true, false);
+    }
+
+    fn assert_bootstrap_warn_capture(
+        before: usize,
+        after: usize,
+        expect_lagged: bool,
+        expect_retained: bool,
+    ) {
+        // A process-global hook cannot exclude ordinary emitters that do not
+        // take the test guard. Isolate this synchronous capture in the current
+        // lib-test executable, running only the same named test. No larger ring
+        // or deadline can guarantee that an already evicted WARN is retained.
+        let test_name = std::thread::current()
+            .name()
+            .expect("named lib test")
+            .to_owned();
+        const CHILD: &str = "ZEROCLAW_TEST_BOOTSTRAP_CAPTURE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name.as_str()) {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("lib test executable"))
+                    .args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &test_name)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("run isolated bootstrap capture");
+            assert!(
+                output.status.success(),
+                "isolated capture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let agents_path = workspace.path().join("AGENTS.md");
 
@@ -1610,7 +1680,9 @@ mod tests {
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut witness = tx.subscribe();
         zeroclaw_log::set_broadcast_hook(tx);
+        emit_bootstrap_capture_noise(before);
 
         let warned = note_bootstrap_truncation(
             &agents_path,
@@ -1621,22 +1693,61 @@ mod tests {
             },
             6_000,
         );
+        emit_bootstrap_capture_noise(after);
         zeroclaw_log::clear_broadcast_hook();
         assert!(warned, "the first report of this path warns");
 
         // Other tests in this binary emit events without taking the hook
         // lock, so the channel may hold unrelated frames: find ours by
         // error key and file rather than assuming it is the only frame.
+        // A second receiver shares the original cursor. Inspect it without
+        // consuming the actual collector, proving lag independently of its loop.
+        let first = witness.try_recv();
+        let lagged = matches!(
+            first,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        );
+        assert_eq!(lagged, expect_lagged, "unexpected control lag: {first:?}");
+        let is_ours = |candidate: &serde_json::Value| {
+            candidate["attributes"]["error_key"] == "agent.bootstrap_file_truncated"
+                && candidate["attributes"]["workspace"] == workspace.path().display().to_string()
+        };
+        let mut retained = first.as_ref().is_ok_and(is_ours);
+        loop {
+            match witness.try_recv() {
+                Ok(candidate) => retained |= is_ours(&candidate),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(retained, expect_retained, "control retained-WARN mismatch");
+        println!(
+            "CAPTURE_CONTROL before={before} after={after} lagged={lagged} retained={retained}"
+        );
+
         let mut frame = None;
-        while let Ok(candidate) = rx.try_recv() {
+        loop {
+            let candidate = match rx.try_recv() {
+                Ok(candidate) => candidate,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            };
             let attrs = &candidate["attributes"];
             if attrs["error_key"] == "agent.bootstrap_file_truncated"
                 && attrs["file"] == "AGENTS.md"
+                && attrs["workspace"] == workspace.path().display().to_string()
                 && attrs["total_chars"].as_u64() == Some(13_985)
             {
                 frame = Some(candidate);
                 break;
             }
+        }
+        if !expect_retained {
+            assert!(frame.is_none(), "an overwritten WARN must not be invented");
+            return;
         }
         let frame = frame.expect("the bootstrap truncation WARN frame reached the hook");
         assert_eq!(frame["severity_text"], "WARN");
