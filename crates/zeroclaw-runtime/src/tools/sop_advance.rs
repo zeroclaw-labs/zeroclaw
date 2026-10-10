@@ -157,7 +157,7 @@ impl Tool for SopAdvanceTool {
         };
 
         // Lock engine, advance step, snapshot data for audit, then drop lock
-        let (action, step_result_ok, finished_run) = {
+        let (action, step_result_ok, finished_run, refusal) = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -205,6 +205,12 @@ impl Tool for SopAdvanceTool {
                     // started that run or is merely advancing one someone
                     // else started. Checked and cancelled under the SAME
                     // engine lock `advance_step` used.
+                    // The refusal is carried out of the lock instead of returned from
+                    // inside it: the engine already accepted this step and, on a
+                    // successful cancellation, closed the run, so the audit below
+                    // must still record both before the refusal goes back.
+                    let mut refusal: Option<String> = None;
+                    let mut cancelled_run = None;
                     if self.caller_ceiling.is_some()
                         && let Some(parked_id) = crate::sop::executor::parked_run_id(&action)
                     {
@@ -214,42 +220,41 @@ impl Tool for SopAdvanceTool {
                         // removing the run from `active_runs`, so a
                         // persistence failure leaves it genuinely still
                         // active - report that failure, not a false success.
-                        if let Err(e) = engine.cancel_run(&parked_id) {
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "run_id": parked_id,
-                                    "error": e.to_string(),
-                                })),
-                                "bounded sop_advance: parked run could not be cancelled"
-                            );
-                            return Ok(ToolResult {
-                                success: false,
-                                output: ToolOutput::default(),
-                                error: Some(format!(
+                        match engine.cancel_run(&parked_id) {
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": parked_id,
+                                            "error": e.to_string(),
+                                        })
+                                    ),
+                                    "bounded sop_advance: parked run could not be cancelled"
+                                );
+                                refusal = Some(format!(
                                     "sop_advance: refused — run {parked_id} left outside this \
                                      turn (parked or pending on a dependency), which a bounded \
                                      caller's tool ceiling cannot follow past this turn; the run \
                                      could NOT be cancelled ({e}) and may still be active - \
                                      treat it as unresolved, not closed"
-                                )),
-                            });
+                                ));
+                            }
+                            Ok(_) => {
+                                cancelled_run = engine.get_run(&parked_id).cloned();
+                                refusal = Some(format!(
+                                    "sop_advance: refused — run {parked_id} left outside this turn \
+                                     (parked or pending on a dependency), which a bounded caller's \
+                                     tool ceiling cannot follow past this turn; the run has been \
+                                     cancelled"
+                                ));
+                            }
                         }
-                        return Ok(ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!(
-                                "sop_advance: refused — run {parked_id} left outside this turn \
-                                 (parked or pending on a dependency), which a bounded caller's \
-                                 tool ceiling cannot follow past this turn; the run has been \
-                                 cancelled"
-                            )),
-                        });
                     }
                     // Snapshot finished run for audit (Completed/Failed/Cancelled)
                     let finished = match &action {
@@ -259,9 +264,14 @@ impl Tool for SopAdvanceTool {
                         _ => None,
                     };
                     // Only audit step result when advance succeeded
-                    (Ok(action), Some(step_result_clone), finished)
+                    (
+                        Ok(action),
+                        Some(step_result_clone),
+                        cancelled_run.or(finished),
+                        refusal,
+                    )
                 }
-                Err(e) => (Err(e), None, None),
+                Err(e) => (Err(e), None, None, None),
             }
         };
 
@@ -296,6 +306,15 @@ impl Tool for SopAdvanceTool {
             && let Some(ref run) = finished_run
         {
             collector.record_run_complete(run);
+        }
+
+        // Nothing is handed to the live driver for a run this call refused.
+        if let Some(error) = refusal {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
         }
 
         if let Ok(ref action) = action {
@@ -831,6 +850,68 @@ mod tests {
         assert!(
             !step_keys.is_empty(),
             "step audit should be written on success"
+        );
+    }
+
+    /// The step the engine accepted and the run it then cancelled are both
+    /// audited. Returning the refusal from inside the engine lock used to skip
+    /// `log_step_result` and `log_run_complete`, so the memory record kept the
+    /// earlier status and omitted the accepted step.
+    #[tokio::test]
+    async fn advance_into_a_park_under_ceiling_still_audits_the_step_and_the_cancelled_run() {
+        let (engine, run_id) = engine_with_active_run_from(test_sop_gated_at_step_two());
+        let tmp = tempfile::tempdir().unwrap();
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(SopAuditLogger::new(memory.clone()));
+        let tool = SopAdvanceTool::new(Arc::clone(&engine))
+            .with_audit(Arc::clone(&audit))
+            .with_caller_ceiling(Some(sealed_ceiling(&["sop_advance"])));
+
+        let result = tool
+            .execute(json!({
+                "run_id": run_id,
+                "status": "completed",
+                "output": "Step 1 done"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success
+                && result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cancelled")),
+            "the run must be refused and cancelled: {result:?}"
+        );
+        let entries = memory
+            .list(
+                Some(&zeroclaw_memory::traits::MemoryCategory::Custom(
+                    "sop".into(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().any(|e| e.key.starts_with("sop_step_")),
+            "the step the engine accepted is audited: {:?}",
+            entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>()
+        );
+        let stored = audit
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .expect("the run record exists");
+        assert_eq!(
+            stored.status,
+            SopRunStatus::Cancelled,
+            "the audit record ends in the cancelled state"
         );
     }
 }

@@ -148,7 +148,7 @@ impl Tool for SopExecuteTool {
         };
 
         // Lock engine, start run, snapshot run for audit, then drop lock
-        let (action, run_snapshot) = {
+        let (action, run_snapshot, cancelled_run, refusal) = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -170,10 +170,17 @@ impl Tool for SopExecuteTool {
                     // ceiling before granting the step agent full authority.
                     // Cancel it under the SAME engine lock this action came
                     // from, so no concurrent resolve can land in between.
+                    // The refusal is carried out of the lock instead of returned from
+                    // inside it, so the audit below records the start of the run
+                    // and, once it is cancelled, its final state.
+                    let mut refusal: Option<String> = None;
+                    let mut cancelled_run = None;
+                    let mut start_snapshot = None;
                     if self.caller_ceiling.is_some()
                         && let Some(run_id) = crate::sop::executor::parked_run_id(&action)
                     {
                         let run_id = run_id.to_string();
+                        start_snapshot = engine.get_run(&run_id).cloned();
                         // `cancel_run` persists the terminal record BEFORE
                         // removing the run from `active_runs` (`finish_run_
                         // with_gate_event`), so a persistence failure here
@@ -181,48 +188,48 @@ impl Tool for SopExecuteTool {
                         // "has been cancelled" regardless would tell the
                         // caller the escape was closed when it was not -
                         // report the cancellation failure itself instead.
-                        if let Err(e) = engine.cancel_run(&run_id) {
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "run_id": run_id,
-                                    "error": e.to_string(),
-                                })),
-                                "bounded sop_execute: parked run could not be cancelled"
-                            );
-                            return Ok(ToolResult {
-                                success: false,
-                                output: ToolOutput::default(),
-                                error: Some(format!(
+                        match engine.cancel_run(&run_id) {
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": run_id,
+                                            "error": e.to_string(),
+                                        })
+                                    ),
+                                    "bounded sop_execute: parked run could not be cancelled"
+                                );
+                                refusal = Some(format!(
                                     "sop_execute: refused — SOP '{sop_name}' left outside this \
                                      turn (parked or pending on a dependency), which a bounded \
                                      caller's tool ceiling cannot follow past this turn; run \
                                      {run_id} could NOT be cancelled ({e}) and may still be \
                                      active - treat it as unresolved, not closed"
-                                )),
-                            });
+                                ));
+                            }
+                            Ok(_) => {
+                                cancelled_run = engine.get_run(&run_id).cloned();
+                                refusal = Some(format!(
+                                    "sop_execute: refused — SOP '{sop_name}' left outside this turn \
+                                     (parked or pending on a dependency), which a bounded caller's \
+                                     tool ceiling cannot follow past this turn; run {run_id} has \
+                                     been cancelled"
+                                ));
+                            }
                         }
-                        return Ok(ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!(
-                                "sop_execute: refused — SOP '{sop_name}' left outside this turn \
-                                 (parked or pending on a dependency), which a bounded caller's \
-                                 tool ceiling cannot follow past this turn; run {run_id} has \
-                                 been cancelled"
-                            )),
-                        });
                     }
-                    let run_id = action_run_id(&action);
-                    let snapshot = run_id.and_then(|id| engine.get_run(id).cloned());
-                    (Ok(action), snapshot)
+                    let snapshot = start_snapshot.or_else(|| {
+                        action_run_id(&action).and_then(|id| engine.get_run(id).cloned())
+                    });
+                    (Ok(action), snapshot, cancelled_run, refusal)
                 }
-                Err(e) => (Err(e), None),
+                Err(e) => (Err(e), None, None, None),
             }
         };
 
@@ -238,6 +245,29 @@ impl Tool for SopExecuteTool {
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "SOP audit log_run_start failed"
             );
+        }
+
+        // A run this call cancelled is closed in the audit trail too.
+        if let Some(ref audit) = self.audit
+            && let Some(ref run) = cancelled_run
+            && let Err(e) = audit.log_run_complete(run).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP audit log_run_complete failed"
+            );
+        }
+
+        // Nothing is handed to the live driver for a run this call refused.
+        if let Some(error) = refusal {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
         }
 
         if let Ok(ref action) = action {
@@ -754,5 +784,53 @@ mod tests {
         let tool = SopExecuteTool::new(engine);
         assert_eq!(tool.name(), "sop_execute");
         assert!(tool.parameters_schema()["required"].is_array());
+    }
+
+    /// A refused run is still audited: its start, then its cancelled final
+    /// state. Returning the refusal from inside the engine lock used to skip
+    /// the audit trail, so the memory record never showed the run at all.
+    #[tokio::test]
+    async fn execute_supervised_sop_under_ceiling_still_audits_the_run_start_and_its_cancellation()
+    {
+        let engine = engine_with_sops(vec![test_sop("test-sop", SopExecutionMode::Supervised)]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
+        let tool = SopExecuteTool::new(Arc::clone(&engine))
+            .with_audit(Arc::clone(&audit))
+            .with_caller_ceiling(Some(sealed_ceiling(&["sop_execute"])));
+
+        let result = tool.execute(json!({"name": "test-sop"})).await.unwrap();
+
+        assert!(
+            !result.success
+                && result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("has been cancelled")),
+            "the run must be refused and cancelled: {result:?}"
+        );
+        let keys = audit.list_runs().await.unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "the refused run is in the audit trail: {keys:?}"
+        );
+        let run_id = keys[0].trim_start_matches("sop_run_").to_string();
+        let stored = audit
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .expect("the run record exists");
+        assert_eq!(
+            stored.status,
+            SopRunStatus::Cancelled,
+            "the audit record ends in the cancelled state"
+        );
     }
 }

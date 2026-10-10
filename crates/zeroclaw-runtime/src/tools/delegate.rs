@@ -1926,6 +1926,22 @@ impl DelegateTool {
         }
     }
 
+    /// `true` for any tool that is not an MCP wrapper. For one, whether the
+    /// server it belongs to is among `granted`, the servers a target's own
+    /// bundles resolve to. A wrapper whose server cannot be resolved is not
+    /// granted: an unroutable name is not a grant.
+    fn mcp_tool_is_granted(tool: &Arc<dyn Tool>, granted: &[String]) -> bool {
+        match tool
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::tools::McpToolWrapper>())
+        {
+            None => true,
+            Some(wrapper) => wrapper
+                .server_name()
+                .is_some_and(|server| granted.iter().any(|name| name == server)),
+        }
+    }
+
     /// Resolve every configured skill bundle alias to its directory.
     /// Empty list / no matches → caller falls back to the workspace default.
     fn resolve_skill_bundle_dirs(&self, bundle_aliases: &[String]) -> Vec<String> {
@@ -5601,6 +5617,12 @@ impl DelegateTool {
                         .filter(|tool| tool.name() != Self::NAME)
                         .filter(|tool| self.security.is_tool_allowed(tool.name()))
                         .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        // An MCP tool is held by this hop only if the TARGET's own
+                        // bundles grant its server. This set is also what
+                        // `sub_delegate_tool` hands a further hop as ITS parents, so a
+                        // server this target was not granted must not be in it: the
+                        // next target would otherwise recover the tool through this one.
+                        .filter(|tool| Self::mcp_tool_is_granted(tool, &target_mcp_servers))
                         .cloned()
                         .collect()
                 };
@@ -23800,6 +23822,125 @@ command = "rm independent-delegate-marker"
         assert!(
             independent.caller_command_bounds.is_empty(),
             "an independent target must not inherit the caller's command chain"
+        );
+    }
+
+    /// The tool names the LEAF is offered in `caller -> middle -> leaf`. The
+    /// caller and the leaf are granted the MCP server `srv` through their
+    /// bundles; the middle agent is granted it only when `middle_granted`.
+    async fn leaf_offered_tool_names(middle_granted: bool) -> Vec<String> {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig};
+
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("leaf done").await;
+        let base = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let mut config = (*base).clone();
+        config.mcp.servers = vec![McpServerConfig {
+            name: "srv".to_string(),
+            ..McpServerConfig::default()
+        }];
+        config.mcp_bundles.insert(
+            "srv_bundle".to_string(),
+            McpBundleConfig {
+                servers: vec!["srv".to_string()],
+                exclude: Vec::new(),
+            },
+        );
+        let holders: &[&str] = if middle_granted {
+            &["caller", "middle", "leaf"]
+        } else {
+            &["caller", "leaf"]
+        };
+        for alias in holders {
+            config
+                .agents
+                .get_mut(*alias)
+                .expect("fixture agent exists")
+                .mcp_bundles = vec!["srv_bundle".to_string()];
+        }
+        let config = Arc::new(config);
+        let tool = bounded_subdelegation_tool(&config);
+        tool.parent_tools
+            .write()
+            .push(mcp_fixture_tool("srv", "do_thing"));
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "fan out",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            provider
+                .tool_message()
+                .is_some_and(|message| message.contains("leaf done")),
+            "the chain must reach the leaf"
+        );
+        let bodies = requests.lock().unwrap();
+        let body = bodies.first().expect("the leaf made a provider request");
+        let parsed = http_request_json(body.as_bytes());
+        parsed["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A bounded hop can only hand its target what it holds itself. MCP
+    /// admission is decided per server at each hop, so the middle agent's
+    /// nested delegate must be handed only the tools the middle agent was
+    /// admitted, or the leaf recovers a server's tool through it that the
+    /// middle agent never had.
+    #[tokio::test]
+    async fn bounded_nested_hop_cannot_recover_an_mcp_server_its_caller_was_not_granted() {
+        let offered = leaf_offered_tool_names(false).await;
+
+        // Control: the leaf was offered tools at all, and holds the server.
+        assert!(
+            offered.iter().any(|name| name == "calculator"),
+            "control: the leaf must be offered the tool both hops hold, got {offered:?}"
+        );
+        assert!(
+            !offered.iter().any(|name| name == "srv__do_thing"),
+            "the leaf must not recover a server its caller was not granted, got {offered:?}"
+        );
+    }
+
+    /// The positive side: when the middle agent IS granted the server, the
+    /// leaf keeps it, so the fix costs no functionality.
+    #[tokio::test]
+    async fn bounded_nested_hop_keeps_an_mcp_server_its_caller_was_granted() {
+        let offered = leaf_offered_tool_names(true).await;
+
+        assert!(
+            offered.iter().any(|name| name == "srv__do_thing"),
+            "a server granted at every hop must reach the leaf, got {offered:?}"
         );
     }
 
