@@ -100,6 +100,11 @@ pub fn default_memory_backend_key() -> &'static str {
 }
 
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
+    // An empty value is the config layer's documented "no storage" input
+    // (`Config::resolve_active_storage`), not an unrecognised backend name.
+    if backend.trim().is_empty() {
+        return MemoryBackendKind::None;
+    }
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
@@ -194,6 +199,12 @@ mod tests {
                 .any(|b| b.key == "qdrant"),
             "qdrant is configurable but not an onboarding option"
         );
+    }
+
+    #[test]
+    fn classify_treats_an_empty_backend_as_disabled_not_unknown() {
+        assert_eq!(classify_memory_backend(""), MemoryBackendKind::None);
+        assert_eq!(classify_memory_backend("   "), MemoryBackendKind::None);
     }
 
     #[test]
