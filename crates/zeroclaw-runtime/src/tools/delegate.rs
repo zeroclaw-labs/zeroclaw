@@ -2086,6 +2086,27 @@ impl DelegateTool {
         won
     }
 
+    async fn supervise_background_worker(
+        worker: tokio::task::JoinHandle<()>,
+        store: Arc<dyn crate::control_plane::TaskRegistry>,
+        task_id: String,
+        owner_pid: u32,
+        owner_boot_id: String,
+    ) {
+        if worker.await.is_err() {
+            Self::supervise_terminal_transition(&task_id, || {
+                crate::control_plane::reaper::recover_exited_delegate_worker(
+                    store.as_ref(),
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                )
+            })
+            .await;
+            Self::background_task_cancels().lock().remove(&task_id);
+        }
+    }
+
     async fn supervise_settlement_intent(
         store: &dyn crate::control_plane::TaskRegistry,
         task_id: &str,
@@ -3265,6 +3286,8 @@ impl DelegateTool {
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
+        let supervisor_store = Arc::clone(&terminal_store);
+        let supervisor_boot_id = terminal_owner_boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         // Receipt continuity for detached work: capture the launching turn's
@@ -3317,7 +3340,7 @@ impl DelegateTool {
         );
         let progress_flusher = zeroclaw_spawn::spawn!(progress_flusher);
 
-        zeroclaw_spawn::spawn!(
+        let worker = zeroclaw_spawn::spawn!(
             TOOL_LOOP_THREAD_ID.scope(
                 parent_thread_id,
                 scope_delegate_session_key(
@@ -3460,6 +3483,15 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
         );
+
+        let supervisor_task_id = task_id.clone();
+        zeroclaw_spawn::spawn!(Self::supervise_background_worker(
+            worker,
+            supervisor_store,
+            supervisor_task_id,
+            terminal_owner_pid,
+            supervisor_boot_id,
+        ));
 
         Ok(ToolResult {
             success: true,
@@ -5257,7 +5289,13 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, CountingEchoTool, GateTool);
+    zeroclaw_api::mock_tool_attribution!(
+        EchoTool,
+        FakeMcpTool,
+        CountingEchoTool,
+        GateTool,
+        PanickingTool
+    );
 
     fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
         TaskRecord {
@@ -5762,6 +5800,157 @@ mod tests {
         assert_eq!(snapshot.task.owner_boot_id, "boot-new");
         assert!(snapshot.output.is_none());
         assert!(snapshot.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn exited_worker_recovers_settlement_with_live_parent_and_preserves_winners() {
+        for scenario in [
+            "published",
+            "missing",
+            "no-intent",
+            "cancelled",
+            "transferred",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let owner_pid = std::process::id();
+            let owner_boot_id = "test-boot";
+            let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let mut task = task_record(&task_id, TaskStatus::Running);
+            task.owner_pid = owner_pid;
+            store.create(task).await.unwrap();
+            let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into())
+                .with_caller_alias("caller")
+                .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+            tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+            let path = tool.results_dir().join(format!("{task_id}.json"));
+            let bytes = DelegateTool::serialize_result(&BackgroundDelegateOutput {
+                task_id: task_id.clone(),
+                output: Some("recovered worker output".into()),
+            })
+            .unwrap();
+            let worker_store = Arc::clone(&store);
+            let worker_task_id = task_id.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let worker = zeroclaw_spawn::spawn!(async move {
+                if scenario != "no-intent" {
+                    assert!(
+                        worker_store
+                            .persist_terminal_settlement_intent(
+                                crate::control_plane::task_registry::TerminalSettlementIntent {
+                                    task_id: worker_task_id.clone(),
+                                    owner_pid,
+                                    owner_boot_id: owner_boot_id.into(),
+                                    desired_status: TaskStatus::Completed,
+                                    artifact_path: path.display().to_string(),
+                                    artifact_ref: Some(format!("artifact:{worker_task_id}.json")),
+                                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                                    terminal_error: None,
+                                },
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    if scenario != "missing" {
+                        DelegateTool::write_bytes_atomic(&path, &bytes)
+                            .await
+                            .unwrap();
+                    }
+                }
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let abort = worker.abort_handle();
+            let supervisor_store = Arc::clone(&store);
+            let supervisor_task_id = task_id.clone();
+            let supervisor = zeroclaw_spawn::spawn!(DelegateTool::supervise_background_worker(
+                worker,
+                supervisor_store,
+                supervisor_task_id,
+                owner_pid,
+                owner_boot_id.into(),
+            ));
+            ready_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                !supervisor.is_finished(),
+                "live worker must not be reclaimed"
+            );
+            assert_eq!(
+                crate::control_plane::reaper::recovery_pass(store.as_ref(), owner_boot_id)
+                    .await
+                    .unwrap(),
+                0,
+                "a live parent still suppresses process-based recovery",
+            );
+            let before = tool
+                .handle_await_sessions(&json!({
+                    "task_ids": [task_id], "timeout_ms": 0,
+                }))
+                .await
+                .unwrap();
+            let before: serde_json::Value = serde_json::from_str(&before.output).unwrap();
+            assert_eq!(before["pending"], json!([task_id]));
+            if scenario == "cancelled" {
+                assert!(
+                    store
+                        .transition_terminal(
+                            &task_id,
+                            TaskStatus::Cancelled,
+                            None,
+                            Some("cancelled".into()),
+                        )
+                        .await
+                        .unwrap()
+                );
+            } else if scenario == "transferred" {
+                store
+                    .claim_owner(&task_id, owner_pid, "next-boot")
+                    .await
+                    .unwrap();
+            }
+            abort.abort();
+            tokio::time::timeout(Duration::from_secs(5), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+            let snapshot = store.get_snapshot(&task_id).await.unwrap().unwrap();
+            let expected = match scenario {
+                "published" => TaskStatus::Completed,
+                "cancelled" => TaskStatus::Cancelled,
+                "transferred" => TaskStatus::Running,
+                _ => TaskStatus::Failed,
+            };
+            assert_eq!(snapshot.task.status, expected, "{scenario}");
+            let checked = tool
+                .handle_check_result(&json!({"task_id": task_id}))
+                .await
+                .unwrap();
+            let checked: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+            assert_eq!(checked["status"], json!(expected), "{scenario}");
+            let awaited = tool
+                .handle_await_sessions(&json!({
+                    "task_ids": [task_id], "timeout_ms": 0,
+                }))
+                .await
+                .unwrap();
+            let awaited: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+            assert_eq!(
+                awaited["results"][0]["status"],
+                json!(expected),
+                "{scenario}"
+            );
+            if scenario == "published" {
+                assert_eq!(checked["output"], "recovered worker output");
+                assert_eq!(awaited["completed"], 1);
+            } else if scenario == "transferred" {
+                assert_eq!(snapshot.task.owner_boot_id, "next-boot");
+                assert!(snapshot.error.is_none());
+            } else {
+                assert!(snapshot.error.is_some());
+            }
+        }
     }
 
     #[tokio::test]
@@ -6881,6 +7070,30 @@ mod tests {
                 output: format!("echo:{value}").into(),
                 error: None,
             })
+        }
+    }
+
+    struct PanickingTool {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Panics to exercise background worker exit recovery."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            panic!("background worker panic fixture");
         }
     }
 
@@ -10126,6 +10339,78 @@ mod tests {
             "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
             receipts[0]
         );
+    }
+
+    #[tokio::test]
+    async fn execute_background_recovers_panicking_worker_through_check_result() {
+        let (server, _captured) = start_scripted_chat_server(&[chat_completion_tool_call(
+            "panic_tool",
+            "call_panic_bg",
+            json!({}),
+        )])
+        .await;
+        let temp = TempDir::new().unwrap();
+        let mut config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["target"], "bounded"),
+                ("target", &[], "bounded"),
+            ],
+            &[("bounded", 2, 20)],
+        );
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .risk_profiles
+            .get_mut("target")
+            .unwrap()
+            .auto_approve
+            .push("panic_tool".into());
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let tool = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(temp.path().join("workspace"))
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(PanickingTool {
+                entered: Arc::clone(&entered),
+            })])));
+
+        // Exercise production spawning, not the supervisor helper directly.
+        let started = tool
+            .execute(json!({"agent": "target", "prompt": "panic", "background": true}))
+            .await
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the real background worker must invoke the panicking tool");
+
+        let checked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let checked = tool
+                    .execute(json!({"action": "check_result", "task_id": task_id}))
+                    .await
+                    .unwrap();
+                let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+                if view["status"] != json!(TaskStatus::Running) {
+                    assert_eq!(view["status"], json!(TaskStatus::Failed), "{view}");
+                    break checked;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("production supervisor must settle the exited worker while its parent is alive");
+        assert!(!checked.success, "{checked:?}");
+        assert!(checked.error.is_some(), "{checked:?}");
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert_eq!(snapshot.task.owner_pid, std::process::id());
     }
 
     #[tokio::test]
