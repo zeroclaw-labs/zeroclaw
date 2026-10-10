@@ -41107,6 +41107,8 @@ mod tests {
             Ok("fallback".to_string())
         }
 
+        // Keep the pre-1.99 method name while the workspace MSRV remains 1.96.
+        #[allow(deprecated)]
         async fn chat(
             &self,
             _request: zeroclaw_providers::ChatRequest<'_>,

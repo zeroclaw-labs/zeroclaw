@@ -1196,16 +1196,14 @@ mod tests {
     }
 
     #[test]
+    // This type retains the canonical inputs; `is_empty` only means both diffs are empty.
+    #[allow(clippy::assert_is_empty)]
     fn diff_is_empty_when_declaration_matches_grant_in_any_order() {
         let diff = diff_declaration(
             &v(&["b.example.com", "a.example.com"]),
             &v(&["a.example.com", "b.example.com", "a.example.com"]),
         );
-        assert_eq!(
-            diff,
-            Vec::<String>::new(),
-            "same set, different order/dupes: {diff:?}"
-        );
+        assert!(diff.is_empty(), "same set, different order/dupes: {diff:?}");
         assert!(!should_report_diff(&diff));
     }
 

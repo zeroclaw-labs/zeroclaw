@@ -5282,7 +5282,7 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
+        assert_eq!(
             effective_server_sans(
                 dir.path(),
                 &wss_with_sans(&[]),
@@ -5290,8 +5290,8 @@ mod wss_client_auth_tests {
                     hostname_override: None
                 },
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            Vec::<String>::new()
         );
     }
 
@@ -19750,10 +19750,9 @@ type = "string"
             runtime_accepts_row(&config, &instance_key),
             "the repaired row must be one the runtime's own constructor accepts"
         );
-        assert!(
-            egress_grant_gap_lines(&config, &manifest)
-                .expect("gap lines must build")
-                .is_empty()
+        assert_eq!(
+            egress_grant_gap_lines(&config, &manifest).expect("gap lines must build"),
+            Vec::<String>::new()
         );
     }
 
@@ -19810,11 +19809,13 @@ type = "string"
         // A row that grants nothing has nothing to inherit or keep.
         config.plugins.entries[0].egress_hosts.clear();
         config.plugins.entries[0].egress_allow_private.clear();
-        assert!(
-            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
+        assert_eq!(
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]),
+            Vec::<String>::new()
         );
-        assert!(
-            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]).is_empty()
+        assert_eq!(
+            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]),
+            Vec::<String>::new()
         );
     }
 

@@ -426,7 +426,7 @@ jobs:
           bash scripts/ci/windows_test_scope.test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
       - name: Select required Windows jobs
         id: select
         shell: bash
@@ -606,7 +606,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           targets: x86_64-pc-windows-msvc
       - uses: ./.github/actions/rust-cache
         id: rust-cache
