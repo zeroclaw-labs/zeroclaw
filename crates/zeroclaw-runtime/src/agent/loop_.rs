@@ -10890,7 +10890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_falls_back_after_repeated_malformed_tool_protocol() {
+    async fn run_tool_call_loop_fails_after_repeated_malformed_tool_protocol() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#,
@@ -10968,13 +10968,9 @@ mod tests {
             turn_id: &turn_id,
         })
         .await
-        .expect("malformed tool protocol should return a safe fallback");
+        .expect_err("malformed tool protocol exhaustion must fail the turn");
 
-        assert_eq!(
-            result,
-            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output")
-        );
-        assert!(!result.contains("toolcalls"));
+        assert!(result.is::<crate::agent::turn::MalformedToolProtocolExhausted>());
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             0,
@@ -10988,6 +10984,12 @@ mod tests {
 
         let fallback =
             crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+        assert!(!fallback.contains("toolcalls"));
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some(fallback.as_str()),
+            "the safe diagnostic must remain in conversation history"
+        );
         let mut event_chunks = Vec::new();
         while let Some(event) = event_rx.recv().await {
             if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {

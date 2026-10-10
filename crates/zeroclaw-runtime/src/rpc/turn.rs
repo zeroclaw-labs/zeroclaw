@@ -1128,6 +1128,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_tool_protocol_exhaustion_is_a_terminal_failure() {
+        let expected =
+            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+        let err = StreamedTurnError {
+            error: crate::agent::turn::MalformedToolProtocolExhausted.into(),
+            committed_response: expected.clone(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), expected.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed tool protocol exhaustion must fail"),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "Agent turn failed: provider exhausted malformed tool-protocol retries"
+        );
+        assert_eq!(outcome.user_message(), Some(expected.as_str()));
+    }
+
+    #[test]
     fn provider_terminal_completion_keeps_retry_diagnostic_out_of_rpc_delivery() {
         use zeroclaw_providers::{
             ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
