@@ -17544,9 +17544,13 @@ mod tests {
         assert_eq!(result["size_bytes"], json!(payload.len()), "{committed}");
         assert_eq!(result["deduplicated"], json!(false), "{committed}");
         let stored = std::path::PathBuf::from(result["workspace_path"].as_str().unwrap());
+        // Compare resolved paths: the reply carries the canonical path without
+        // the Windows verbatim prefix, while the fixture's temp root can be
+        // spelled through a symlink or an 8.3 short name.
         assert!(
-            stored.starts_with(std::fs::canonicalize(&agent_workspace).unwrap())
-                || stored.starts_with(&agent_workspace),
+            std::fs::canonicalize(&stored)
+                .unwrap()
+                .starts_with(std::fs::canonicalize(&agent_workspace).unwrap()),
             "the upload lands in the agent workspace: {committed}"
         );
         assert_eq!(std::fs::read(&stored).unwrap(), payload);
