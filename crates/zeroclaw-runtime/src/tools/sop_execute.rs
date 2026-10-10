@@ -54,6 +54,13 @@ impl SopExecuteTool {
         self
     }
 
+    /// Whether this instance carries a caller ceiling. Test-only: it lets a
+    /// registry-level test prove the factory wired one in.
+    #[cfg(test)]
+    pub(crate) fn has_caller_ceiling(&self) -> bool {
+        self.caller_ceiling.is_some()
+    }
+
     /// A fresh instance sharing this one's live `engine`/`audit` handles
     /// (the same shared SOP engine, not a rebuild — there is only one), bound
     /// to `ceiling`. Used by the `Bounded` delegate rebuild in `delegate.rs`,

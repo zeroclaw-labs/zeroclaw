@@ -46,6 +46,13 @@ impl SopAdvanceTool {
         self
     }
 
+    /// Whether this instance carries a caller ceiling. Test-only: it lets a
+    /// registry-level test prove the factory wired one in.
+    #[cfg(test)]
+    pub(crate) fn has_caller_ceiling(&self) -> bool {
+        self.caller_ceiling.is_some()
+    }
+
     /// A fresh instance sharing this one's live `engine`/`audit`/`collector`
     /// handles, bound to `ceiling`. See `SopExecuteTool::rebound_with_ceiling`.
     pub(crate) fn rebound_with_ceiling(

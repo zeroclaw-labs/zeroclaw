@@ -3500,13 +3500,22 @@ fn all_tools_with_runtime_on_thread(
     if let Some(ref sop_engine) = sop_engine {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
+            // `sop_execute` and `sop_advance` can leave a run parked for an
+            // external resume that no ceiling follows, so under a ceiling they
+            // cancel it (see their `caller_ceiling` guards). Every registry
+            // built here with a ceiling - a restricted `run`, a peer relay, a
+            // cron-fired job, a re-assembled SOP step - gets that guard, not
+            // only the bounded delegate rebuild.
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine))
                     .with_audit(Arc::clone(sop_audit))
-                    .with_initiator(agent_alias),
+                    .with_initiator(agent_alias)
+                    .with_caller_ceiling(caller_ceiling.clone()),
             ));
             tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_caller_ceiling(caller_ceiling.clone()),
             ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine))
@@ -3515,9 +3524,14 @@ fn all_tools_with_runtime_on_thread(
             ));
         } else {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_initiator(agent_alias)
+                    .with_caller_ceiling(caller_ceiling.clone()),
             ));
-            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopAdvanceTool::new(Arc::clone(sop_engine))
+                    .with_caller_ceiling(caller_ceiling.clone()),
+            ));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
             ));
@@ -5586,6 +5600,98 @@ permissions = ["http_client"]
             names.contains(&"sop_workshop"),
             "sop_workshop must be registered when procedural memory is enabled"
         );
+    }
+
+    /// Every registry the factory builds under a ceiling must hand out
+    /// `sop_execute` and `sop_advance` that carry it: a restricted `run`, a peer
+    /// relay, a cron-fired job and a re-assembled SOP step all come through
+    /// here, and each of them would otherwise get the instance whose parked run
+    /// resumes outside the ceiling. Both construction branches (with and
+    /// without an audit logger) are exercised.
+    #[test]
+    fn sop_execute_and_advance_built_under_a_caller_ceiling_carry_it() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+        let engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        for with_audit in [true, false] {
+            for ceiling in [
+                None,
+                Some(Arc::new(std::sync::OnceLock::from(vec![
+                    "sop_execute".to_string(),
+                ]))),
+            ] {
+                let expect = ceiling.is_some();
+                let audit =
+                    with_audit.then(|| Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem))));
+                let tools = all_tools_with_runtime(
+                    Arc::new(Config::default()),
+                    &security,
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                    "test-agent",
+                    Arc::new(NativeRuntime::new()),
+                    Arc::clone(&mem),
+                    None,
+                    None,
+                    &browser,
+                    &http,
+                    &zeroclaw_config::schema::WebFetchConfig::default(),
+                    tmp.path(),
+                    &HashMap::new(),
+                    None,
+                    &cfg,
+                    None,
+                    false,
+                    None,
+                    Some(Arc::clone(&engine)),
+                    audit,
+                    None,
+                    ceiling,
+                )
+                .expect("tool registry builds")
+                // The raw instances: the boxed registry wraps each tool in a
+                // delegating shell that does not forward `as_any`.
+                .unfiltered_tool_arcs;
+                let execute = tools
+                    .iter()
+                    .find(|t| t.name() == "sop_execute")
+                    .and_then(|t| t.as_any())
+                    .and_then(|any| any.downcast_ref::<SopExecuteTool>())
+                    .expect("sop_execute registers and exposes its type");
+                let advance = tools
+                    .iter()
+                    .find(|t| t.name() == "sop_advance")
+                    .and_then(|t| t.as_any())
+                    .and_then(|any| any.downcast_ref::<SopAdvanceTool>())
+                    .expect("sop_advance registers and exposes its type");
+                assert_eq!(
+                    execute.has_caller_ceiling(),
+                    expect,
+                    "sop_execute (audit: {with_audit}, ceiling: {expect})"
+                );
+                assert_eq!(
+                    advance.has_caller_ceiling(),
+                    expect,
+                    "sop_advance (audit: {with_audit}, ceiling: {expect})"
+                );
+            }
+        }
     }
 
     /// The registry factory is where a ceiling enters a turn that is not a
