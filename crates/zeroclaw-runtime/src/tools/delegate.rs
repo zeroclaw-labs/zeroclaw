@@ -9026,10 +9026,17 @@ mod tests {
         .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CountingEchoTool {
             executions: Arc::clone(&executions),
         })])));
+        // The rooted target policy creates the agent workspace under the
+        // config's install root, so keep it out of the real `$HOME/.zeroclaw`.
+        let root_dir = TempDir::new().unwrap();
         if rooted {
             use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
-            let mut root_config = Config::default();
+            let mut root_config = Config {
+                data_dir: root_dir.path().join("data"),
+                config_path: root_dir.path().join("config.toml"),
+                ..Config::default()
+            };
             root_config.risk_profiles.insert(
                 "caller_profile".to_string(),
                 RiskProfileConfig {
@@ -13286,8 +13293,15 @@ mod tests {
             AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
         };
 
+        // Resolving the caller and target policies creates their workspaces
+        // under the config's install root; keep them out of `$HOME/.zeroclaw`.
+        let tmp = TempDir::new().unwrap();
         let build = |caller_cost: u32, target_cost: u32| {
-            let mut config = Config::default();
+            let mut config = Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
             for (profile, cost) in [
                 ("caller_profile", caller_cost),
                 ("target_profile", target_cost),
@@ -16272,10 +16286,17 @@ command = "rm independent-delegate-marker"
     /// Build a config where `caller` (`broad` profile) can delegate, but
     /// `target` is a different-profile peer that is not in the explicit
     /// delegate roster. This exercises the reachable-set rejection path.
-    fn config_with_narrowed_target() -> Arc<zeroclaw_config::schema::Config> {
+    /// The config is rooted in the returned `TempDir` so resolving agent
+    /// policies creates workspaces there, not in the real `$HOME/.zeroclaw`.
+    fn config_with_narrowed_target() -> (Arc<zeroclaw_config::schema::Config>, TempDir) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-        let mut config = Config::default();
+        let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
         config.risk_profiles.insert(
             "broad".to_string(),
             RiskProfileConfig {
@@ -16309,7 +16330,7 @@ command = "rm independent-delegate-marker"
                 ..AliasedAgentConfig::default()
             },
         );
-        Arc::new(config)
+        (Arc::new(config), temp_dir)
     }
 
     #[tokio::test]
@@ -16318,7 +16339,7 @@ command = "rm independent-delegate-marker"
         // the target is on a narrower profile, but it is not listed in the
         // caller's delegates roster and is not a same-profile peer, so the
         // reachability gate must refuse.
-        let config = config_with_narrowed_target();
+        let (config, _fixture_dir) = config_with_narrowed_target();
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
         let mut delegate_agents = HashMap::new();

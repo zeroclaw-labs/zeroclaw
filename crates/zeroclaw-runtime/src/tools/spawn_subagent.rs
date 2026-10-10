@@ -338,10 +338,25 @@ impl Tool for SpawnSubagentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
-    fn config_with_agent(alias: &str) -> Config {
-        let mut config = Config::default();
+    /// A `Config::default()` rooted under a fresh temp dir instead of the
+    /// real `$HOME/.zeroclaw`: an admitted spawn runs `agent::run`, which
+    /// opens the memory and session databases under `data_dir`. Keep the
+    /// returned `TempDir` alive for the duration of the test.
+    fn isolated_config() -> (TempDir, Config) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        (tmp, config)
+    }
+
+    fn config_with_agent(alias: &str) -> (TempDir, Config) {
+        let (tmp, mut config) = isolated_config();
         config
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
@@ -352,12 +367,12 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        (tmp, config)
     }
 
     #[tokio::test]
     async fn closed_authority_rejects_subagent_before_construction() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let tool = SpawnSubagentTool::new(
             Arc::new(config),
@@ -380,8 +395,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_or_missing_prompt_is_rejected() {
+        let (_tmp, config) = config_with_agent("alpha");
         let tool = SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
+            Arc::new(config),
             "alpha",
             Arc::new(SecurityPolicy::default()),
         );
@@ -433,8 +449,9 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_recursive_spawn_when_caller_is_subagent() {
+        let (_tmp, config) = config_with_agent("alpha");
         let tool = SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
+            Arc::new(config),
             "alpha",
             Arc::new(SecurityPolicy::default()),
         )
@@ -457,8 +474,9 @@ mod tests {
         // (e.g. no model provider configured in this minimal harness),
         // but it MUST NOT trip the depth-cap refusal. Pin that the
         // depth-cap error is absent.
+        let (_tmp, config) = config_with_agent("alpha");
         let tool = SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
+            Arc::new(config),
             "alpha",
             Arc::new(SecurityPolicy::default()),
         )
@@ -476,8 +494,8 @@ mod tests {
 
     // ── risk-profile tool gates spawn_subagent ──
 
-    fn config_with_allowed_tools(alias: &str, allowed_tools: Vec<String>) -> Config {
-        let mut config = Config::default();
+    fn config_with_allowed_tools(alias: &str, allowed_tools: Vec<String>) -> (TempDir, Config) {
+        let (tmp, mut config) = isolated_config();
         config.risk_profiles.insert(
             "default".to_string(),
             RiskProfileConfig {
@@ -492,11 +510,11 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        (tmp, config)
     }
 
-    fn config_with_deny_all_tools(alias: &str) -> Config {
-        let mut config = Config::default();
+    fn config_with_deny_all_tools(alias: &str) -> (TempDir, Config) {
+        let (tmp, mut config) = isolated_config();
         config.risk_profiles.insert(
             "default".to_string(),
             RiskProfileConfig {
@@ -511,7 +529,7 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        (tmp, config)
     }
 
     #[tokio::test]
@@ -519,7 +537,7 @@ mod tests {
         // Parent's non-empty risk_profile.allowed_tools omits
         // "spawn_subagent" — the tool itself refuses pre-spawn so the
         // dispatch-site filter doesn't have to be the only line of defense.
-        let config = config_with_allowed_tools("alpha", vec!["shell".into()]);
+        let (_tmp, config) = config_with_allowed_tools("alpha", vec!["shell".into()]);
         let tool = SpawnSubagentTool::new(
             Arc::new(config),
             "alpha",
@@ -543,7 +561,7 @@ mod tests {
         // spawn_subagent, the tool does NOT short-circuit on the gate.
         // It may still fail later for unrelated reasons; pin only that
         // the gate refusal is absent.
-        let config =
+        let (_tmp, config) =
             config_with_allowed_tools("alpha", vec!["spawn_subagent".into(), "shell".into()]);
         let tool = SpawnSubagentTool::new(
             Arc::new(config),
@@ -566,7 +584,7 @@ mod tests {
         // `allowed_tools = []` is legacy-unrestricted, so the gate must not
         // refuse. The spawn may still fail later for unrelated reasons; pin
         // only that the gate refusal is absent.
-        let config = config_with_allowed_tools("alpha", vec![]);
+        let (_tmp, config) = config_with_allowed_tools("alpha", vec![]);
         let tool = SpawnSubagentTool::new(
             Arc::new(config),
             "alpha",
@@ -585,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_risk_profile_deny_all_tools() {
-        let config = config_with_deny_all_tools("alpha");
+        let (_tmp, config) = config_with_deny_all_tools("alpha");
         let tool = SpawnSubagentTool::new(
             Arc::new(config),
             "alpha",
@@ -605,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_risk_profile_uses_legacy_deny_all_sentinel() {
-        let config = config_with_allowed_tools(
+        let (_tmp, config) = config_with_allowed_tools(
             "alpha",
             vec![
                 RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
@@ -637,11 +655,8 @@ mod tests {
             max_actions_per_hour: 2,
             ..SecurityPolicy::default()
         });
-        let tool = SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
-            "alpha",
-            Arc::clone(&security),
-        );
+        let (_tmp, config) = config_with_agent("alpha");
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", Arc::clone(&security));
 
         for attempt in 1..=2 {
             let result = tool
@@ -680,11 +695,8 @@ mod tests {
             max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
-        let tool = SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
-            "alpha",
-            Arc::clone(&security),
-        );
+        let (_tmp, config) = config_with_agent("alpha");
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", Arc::clone(&security));
 
         for _ in 0..3 {
             let result = tool
@@ -797,8 +809,9 @@ mod tests {
     fn spawn_subagent_dyn_tool_implements_attributable() {
         use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
+        let (_tmp, config) = config_with_agent("alpha");
         let tool: Box<dyn Tool> = Box::new(SpawnSubagentTool::new(
-            Arc::new(config_with_agent("alpha")),
+            Arc::new(config),
             "alpha",
             Arc::new(SecurityPolicy::default()),
         ));
