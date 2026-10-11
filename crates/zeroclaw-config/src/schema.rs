@@ -2630,6 +2630,78 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Opper ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OpperEndpoint {
+    #[default]
+    Default,
+}
+
+impl OpperEndpoint {
+    /// Canonical Opper endpoint. Single source of truth: `CompatFamilySpec::DEFAULT_URL`
+    /// for `OpperModelProviderConfig` references this const so the schema and factory
+    /// surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.opper.ai/v3/compat";
+}
+
+impl ModelEndpoint for OpperEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.opper"]
+pub struct OpperModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod opper_tests {
+    use super::*;
+
+    #[test]
+    fn opper_endpoint_uri() {
+        assert_eq!(
+            OpperEndpoint::Default.uri(),
+            "https://api.opper.ai/v3/compat"
+        );
+    }
+
+    #[test]
+    fn opper_config_defaults_empty() {
+        let cfg = OpperModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn opper_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.opper.default]
+model = "claude-sonnet-4-6"
+"#;
+        let config: Config = toml::from_str(toml).expect("opper alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .opper
+            .get("default")
+            .expect("opper.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3736,6 +3808,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    OpperModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,

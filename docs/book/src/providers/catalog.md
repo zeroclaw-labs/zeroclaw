@@ -525,6 +525,27 @@ model = "..."
 api_key = "..."
 ```
 
+**Opper**: slot `opper`. The EU-hosted AI gateway, with models from 50+
+providers behind one OpenAI-compatible endpoint. The endpoint is
+`https://api.opper.ai/v3/compat` with bearer-token auth. Model IDs are bare
+pool names, for example `claude-sonnet-4-6` or `gpt-5.4-mini`, and Opper picks
+the route for each request. A `provider/model` ID such as
+`anthropic/claude-sonnet-4-6` pins one route. Without a key, the model picker
+lists Opper's models from models.dev. Once a key is set, ZeroClaw lists models
+from Opper's live `/models` endpoint. Key from
+[platform.opper.ai](https://platform.opper.ai). Use the canonical `opper` slot
+only. `opper-ai` and `opper_ai` are not runtime aliases.
+
+```toml
+[providers.models.opper.default]
+model = "claude-sonnet-4-6"
+api_key = "..."
+```
+
+To bridge an existing `OPPER_API_KEY` shell variable into ZeroClaw's
+schema-mirror env surface, set
+`ZEROCLAW_providers__models__opper__default__api_key="$OPPER_API_KEY"`.
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
