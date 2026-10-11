@@ -28,6 +28,12 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
   from the backend registry, so the options you see are exactly the ones this
   build supports.
 
+## Field labels and full details
+
+Config field rows use readable labels and keep long values to a one-line preview. Open Help while a field is selected to read its exact configuration path, complete description, and current value. The help view scrolls, including long array values and paths. Filtering continues to match the configuration path.
+
+An unset field is shown as `<unset>`, secret values remain hidden, and environment overrides are marked. Unit and default explanations come from the field description. A current value does not establish whether you explicitly configured it or inherited a default.
+
 ## Local UI settings (`zerocode-config.toml`)
 
 Some settings describe how *zerocode itself* draws its panes rather than how the

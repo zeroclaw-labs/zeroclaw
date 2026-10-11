@@ -339,6 +339,68 @@ fn localize_section_metadata(section: &mut ConfigSectionEntry) {
     localize_section_metadata_with(section, &crate::i18n::try_t_locale);
 }
 
+fn readable_field_label(path: &str) -> String {
+    crate::i18n::try_t(&config_i18n_key("field", path, Some("label"))).unwrap_or_else(|| {
+        path.split('.')
+            .map(|segment| {
+                segment
+                    .split(['_', '-'])
+                    .filter(|word| !word.is_empty())
+                    .map(|word| match word {
+                        "api" | "url" | "uri" | "id" | "mcp" | "tts" | "http" | "tls" | "json"
+                        | "rpc" | "cpu" | "gpu" => word.to_uppercase(),
+                        _ => {
+                            let mut chars = word.chars();
+                            chars.next().map_or_else(String::new, |first| {
+                                first.to_uppercase().collect::<String>() + chars.as_str()
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
+    })
+}
+
+fn field_value_display(field: &ConfigFieldEntry) -> String {
+    if !field.populated {
+        crate::i18n::t("zc-config-field-unset")
+    } else if field.is_secret {
+        crate::i18n::t("zc-config-field-secret-set")
+    } else {
+        field.value.as_ref().map_or_else(
+            || crate::i18n::t("zc-config-field-value-unavailable"),
+            |value| match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            },
+        )
+    }
+}
+
+fn field_summary(text: &str, width: usize) -> String {
+    let text = text.replace(['\n', '\r', '\t'], " ");
+    if crate::display_width::display_width(&text) <= width {
+        return text;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut summary = String::new();
+    let mut used = 0;
+    for (_, grapheme, cells) in crate::display_width::grapheme_widths(&text) {
+        if used + cells > width - 1 {
+            break;
+        }
+        summary.push_str(grapheme);
+        used += cells;
+    }
+    summary.push('…');
+    summary
+}
+
 /// Joined up/down display chords for list navigation footers.
 fn nav_keys() -> String {
     use crate::keymap::ConfigTabAction as A;
@@ -678,7 +740,7 @@ impl App {
                         _ => default(),
                     }
                 } else {
-                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    let help = crate::i18n::t("zc-config-footer-action-field-details");
                     format!(
                         " {}={}  {}={}  ?={}",
                         tab_key(T::Enter),
@@ -1131,6 +1193,63 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    fn relative_field_path<'a>(&self, field: &'a ConfigFieldEntry) -> &'a str {
+        let prefix = match &self.screen {
+            Screen::FieldList { prefix, .. } | Screen::FieldEdit { prefix, .. } => prefix,
+            _ => return &field.path,
+        };
+        field
+            .path
+            .strip_prefix(prefix)
+            .and_then(|path| path.strip_prefix('.'))
+            .filter(|path| !path.is_empty())
+            .unwrap_or(&field.path)
+    }
+
+    fn selected_field_index(&self) -> Option<usize> {
+        match &self.screen {
+            Screen::FieldEdit { field_idx, .. } => Some(*field_idx),
+            Screen::FieldList { .. } if !self.is_composite_tab() => {
+                let tab_indices = self.tab_field_indices();
+                let paths = self.field_labels_for_tab(&tab_indices);
+                let visible = self.filtered_indices(&paths);
+                visible
+                    .get(self.visible_field_cursor())
+                    .and_then(|&index| tab_indices.get(index))
+                    .copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn field_description(&self, field: &ConfigFieldEntry) -> String {
+        translated_config_value(
+            config_i18n_key("field", self.relative_field_path(field), Some("help")),
+            &field.description,
+            &crate::i18n::try_t_locale,
+        )
+    }
+
+    fn field_details(&self) -> Option<String> {
+        let field = self.fields.get(self.selected_field_index()?)?;
+        let mut details = vec![
+            readable_field_label(self.relative_field_path(field)),
+            crate::i18n::t_args("zc-config-field-path", &[("path", &field.path)]),
+        ];
+        if field.is_env_overridden {
+            details.push(crate::i18n::t("zc-config-field-environment-override"));
+        }
+        let description = self.field_description(field);
+        if !description.is_empty() {
+            details.push(String::new());
+            details.push(description);
+        }
+        details.push(String::new());
+        details.push(crate::i18n::t("zc-config-field-current-value"));
+        details.push(field_value_display(field));
+        Some(details.join("\n"))
     }
 
     /// Helper: visible field count for the regular (non-composite) field list.
@@ -4018,10 +4137,13 @@ impl App {
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
-        } else if let Some(field) = self.fields.get(self.field_cursor) {
+        } else if let Some(field) = self.selected_field_index().and_then(|i| self.fields.get(i)) {
             frame.render_widget(
-                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(Span::styled(
+                    self.field_description(field),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
                 r.help,
             );
         }
@@ -4034,37 +4156,25 @@ impl App {
                 .position(|&i| i == self.field_cursor)
                 .unwrap_or(0)
         };
-        let selected_field = visible.get(cursor).copied();
-
+        let row_width = r.main.width.saturating_sub(4) as usize;
+        let label_width = (row_width / 2).min(36);
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&i| {
                 let f = &self.fields[i];
-                let short_name =
-                    &tab_names[tab_indices.iter().position(|&ti| ti == i).unwrap_or(0)];
-                let val_display = if f.is_secret {
-                    "••••••".to_string()
-                } else {
-                    f.value
-                        .as_ref()
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_else(|| "<unset>".to_string())
-                };
-
+                let label = field_summary(
+                    &readable_field_label(self.relative_field_path(f)),
+                    label_width,
+                );
+                let value = field_value_display(f);
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
-                let press_hint = if Some(i) == selected_field {
-                    let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
-                    format!(
-                        "  \u{2500}\u{2192} {}",
-                        crate::i18n::t_args("zc-config-field-edit-hint", &[("keys", &enter_key)])
-                    )
-                } else {
-                    String::new()
-                };
-                let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
+                let value_width = row_width.saturating_sub(
+                    crate::display_width::display_width(&label) + 3 + env_marker.len(),
+                );
+                let line = format!(
+                    "{label} = {}{env_marker}",
+                    field_summary(&value, value_width)
+                );
 
                 let style = if f.populated {
                     theme::body_style()
@@ -4303,8 +4413,11 @@ impl App {
                 render_filter_bar(frame, r.help, buf);
             } else {
                 frame.render_widget(
-                    Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                        .wrap(Wrap { trim: false }),
+                    Paragraph::new(Span::styled(
+                        self.field_description(field),
+                        theme::dim_style(),
+                    ))
+                    .wrap(Wrap { trim: false }),
                     r.help,
                 );
             }
@@ -4353,8 +4466,11 @@ impl App {
         } else {
             // Text input (masked for secrets) — help text always visible.
             frame.render_widget(
-                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(Span::styled(
+                    self.field_description(field),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
                 r.help,
             );
             let type_prefix = crate::i18n::t("zc-config-field-type-prefix");
@@ -4549,6 +4665,9 @@ impl crate::widgets::HelpContext for App {
         }
         let mut node = self.zeroclaw_help_context();
         node.entries.insert(0, section_nav);
+        if self.zeroclaw_pane == ZeroclawPane::Detail {
+            node.description = self.field_details();
+        }
         node
     }
 }
@@ -5153,6 +5272,104 @@ mod tests {
             group_key: String::new(),
             shape: None,
             cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_details_follow_filtered_selection_and_preserve_paths_and_masking() {
+        use crate::widgets::HelpContext;
+        let mut manager = test_manager();
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents".into(), "demo".into()],
+        };
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let mut stale = field("agents.demo.enabled");
+        stale.description = "Old selection".into();
+        let mut selected = field("agents.demo.precheck.timeout_secs");
+        selected.description = "Timeout in seconds. Unset inherits the default.".into();
+        selected.value = Some(serde_json::json!("23"));
+        selected.populated = true;
+        selected.is_env_overridden = true;
+        manager.fields = vec![stale, selected];
+        manager.field_cursor = 0;
+        manager.filter = Some("precheck.timeout_secs".into());
+        manager.filter_cursor = 0;
+        let details = manager.help_context().description.unwrap();
+        assert!(details.contains("Path: agents.demo.precheck.timeout_secs"));
+        assert!(details.contains(&manager.fields[1].description));
+        assert!(details.contains("Environment override is active."));
+        assert!(details.ends_with("23"));
+        assert!(!details.contains("Old selection"));
+
+        manager.fields[1].is_secret = true;
+        manager.fields[1].value = Some(serde_json::json!("must-stay-hidden"));
+        let details = manager.help_context().description.unwrap();
+        assert!(details.ends_with("Set (hidden)"));
+        assert!(!details.contains("must-stay-hidden"));
+        manager.fields[1].populated = false;
+        assert!(manager.field_details().unwrap().ends_with("<unset>"));
+        manager.filter = Some("no-matches".into());
+        assert!(manager.help_context().description.is_none());
+    }
+
+    #[tokio::test]
+    async fn field_details_are_read_only_in_an_editor_and_keep_complete_array_values() {
+        let mut manager = test_manager();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "risk_profiles.demo".into(),
+            breadcrumb: vec!["risk_profiles".into(), "demo".into()],
+            field_idx: 0,
+        };
+        let mut array = field("risk_profiles.demo.allowed_commands");
+        array.kind = PropKind::StringArray;
+        array.populated = true;
+        let value = format!("[\"{}\"]", "long-item-".repeat(40));
+        array.value = Some(serde_json::json!(value));
+        manager.fields = vec![array];
+        manager.edit_buf = "unsaved draft".into();
+        assert!(manager.field_details().unwrap().ends_with(&value));
+        assert_eq!(manager.edit_buf, "unsaved draft");
+        assert_eq!(
+            manager.relative_field_path(&manager.fields[0]),
+            "allowed_commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_rows_keep_value_summaries_visible_at_narrow_and_common_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for width in [60, 120] {
+            let mut manager = test_manager();
+            manager.screen = Screen::FieldList {
+                section_idx: 0,
+                prefix: "risk_profiles.demo".into(),
+                breadcrumb: vec!["risk_profiles".into(), "demo".into()],
+            };
+            let mut array = field("risk_profiles.demo.allowed_commands");
+            array.kind = PropKind::StringArray;
+            array.populated = true;
+            array.value = Some(serde_json::json!(format!("[\"{}\"]", "界".repeat(80))));
+            manager.fields = vec![array];
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| manager.draw_field_list(frame, frame.area(), 0, &[]))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Allowed Commands = ["), "{width}: {text}");
+            assert!(
+                text.contains('…'),
+                "long array should visibly indicate omitted content"
+            );
+            assert!(manager.field_details().unwrap().contains(&"界".repeat(80)));
         }
     }
 
