@@ -110,6 +110,8 @@ mod tests {
                 attachments: vec![],
                 in_reply_to: None,
                 references: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
             })
@@ -130,6 +132,8 @@ mod tests {
                 attachments: vec![],
                 in_reply_to: None,
                 references: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
             })
