@@ -716,6 +716,8 @@ fn apply_builtin_prompt_scope(
     deferred_section: &str,
     use_native_tools: bool,
     strict_tool_parsing: bool,
+    max_system_prompt_chars: usize,
+    mut canonical_prompt: Option<&str>,
 ) {
     let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
     let instructions =
@@ -728,6 +730,36 @@ fn apply_builtin_prompt_scope(
         .iter_mut()
         .filter(|message| message.role == "system")
     {
+        // Hooks may append instructions outside the assembly cap. Preserve an
+        // exact suffix, using the cap applied by scoped refresh to identify its base.
+        let hook_suffix = if instructions.is_empty() {
+            None
+        } else {
+            canonical_prompt
+                .take()
+                .and_then(|canonical| {
+                    message
+                        .content
+                        .strip_prefix(canonical)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            let refresh_cap = TOOL_PROTOCOL_PROMPTS
+                                .try_with(|prompts| prompts.max_chars)
+                                .unwrap_or(max_system_prompt_chars);
+                            let capped = crate::agent::system_prompt::finalize_system_prompt(
+                                canonical.to_owned(),
+                                refresh_cap,
+                            );
+                            message.content.strip_prefix(&capped).map(str::to_owned)
+                        })
+                })
+                .filter(|suffix| !suffix.is_empty())
+        };
+        if let Some(suffix) = hook_suffix.as_ref() {
+            message
+                .content
+                .truncate(message.content.len() - suffix.len());
+        }
         // A same-agent step shares history, but its discovery route is narrower.
         // Reconcile only the request clone, preserving unrelated prompt sections.
         let mut catalogue_inserted = false;
@@ -750,13 +782,11 @@ fn apply_builtin_prompt_scope(
                 let section_end = message.content[body..]
                     .find("\n## ")
                     .map_or(message.content.len(), |offset| body + offset);
+                let section_end = message.content[body..section_end]
+                    .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                    .map_or(section_end, |offset| body + offset);
                 let (end, complete) = if heading == "## Deferred Built-in Tools\n" {
                     let close = "</available-deferred-builtin-tools>";
-                    // Prompt budgeting may cut the catalogue before its close,
-                    // then append the runtime's timestamp orientation directly.
-                    let section_end = message.content[body..section_end]
-                        .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
-                        .map_or(section_end, |offset| body + offset);
                     message.content[body..section_end]
                         .find(close)
                         .map_or((section_end, false), |offset| {
@@ -782,8 +812,21 @@ fn apply_builtin_prompt_scope(
             }
         }
         if !instructions.is_empty() {
-            message.content.push('\n');
-            message.content.push_str(&instructions);
+            // Keep orientation at the tail so finalization cannot retain it twice.
+            let insertion = message
+                .content
+                .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                .unwrap_or(message.content.len());
+            message
+                .content
+                .insert_str(insertion, &format!("\n{instructions}"));
+            message.content = crate::agent::system_prompt::finalize_system_prompt(
+                std::mem::take(&mut message.content),
+                max_system_prompt_chars,
+            );
+            if let Some(suffix) = hook_suffix {
+                message.content.push_str(&suffix);
+            }
         }
     }
 }
@@ -1575,6 +1618,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    // Config-backed loops resolve the executing alias; configless Agent turns
+    // already carry this cap in their transient protocol context. Zero is unlimited.
+    let max_system_prompt_chars = config
+        .zip(agent_alias)
+        .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
+        .or_else(|| {
+            TOOL_PROTOCOL_PROMPTS
+                .try_with(|prompts| prompts.max_chars)
+                .ok()
+        })
+        .unwrap_or(0);
+
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
@@ -2101,6 +2156,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 section,
                 use_native_tools,
                 strict_tool_parsing,
+                max_system_prompt_chars,
+                turn_state
+                    .history
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .map(|message| message.content.as_str()),
             );
         }
         if context_token_budget > 0 {
@@ -2259,6 +2320,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         section,
                         use_native_tools,
                         strict_tool_parsing,
+                        max_system_prompt_chars,
+                        turn_state
+                            .history
+                            .iter()
+                            .find(|message| message.role == "system")
+                            .map(|message| message.content.as_str()),
                     );
                 }
                 provider_request_messages = trimmed_post_hook;
@@ -4223,7 +4290,16 @@ async fn drive_live_sop_actions(
                                                 None => security,
                                             },
                                             multimodal_config,
-                                            config,
+                                            config: if owned.is_some() {
+                                                Some(execution_config.as_deref().unwrap_or(
+                                                    sop_reassembly
+                                                        .as_ref()
+                                                        .expect("owned implies a reassembly handle")
+                                                        .config,
+                                                ))
+                                            } else {
+                                                config
+                                            },
                                             hooks,
                                             activated_tools: eff_activated,
                                             // Deliberately NOT the outer round's
@@ -7235,10 +7311,10 @@ mod sop_step_reassembly_tests {
         let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
         scope_tool_protocol_prompts(prompts, async {
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
             // Trim rebuilds the projected request, then refreshes the cached section.
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
         })
         .await;
         assert_eq!(
@@ -7261,6 +7337,59 @@ mod sop_step_reassembly_tests {
         }
         assert_eq!(request[1].content, prompt);
         assert_eq!(history[0].content, prompt);
+
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let uncapped = format!("Identity: \u{03bb}\u{732b}\n{prompt}{orientation}");
+        for (cap, hook) in [
+            (orientation.chars().count() + 30, ""),
+            (orientation.chars().count() + 30, "\nHOOK_INSTRUCTION"),
+            (10_000, ""),
+            (0, ""),
+        ] {
+            let input = crate::agent::system_prompt::finalize_system_prompt(uncapped.clone(), cap);
+            let mut history = vec![ChatMessage::system(&input)];
+            let mut request = history.clone();
+            let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+                uncapped.clone(),
+                uncapped.clone(),
+                cap,
+            ));
+            scope_tool_protocol_prompts(prompts, async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+                let parent = history[0].content.clone();
+                for _ in 0..2 {
+                    if !hook.is_empty() {
+                        // Content-mutating hooks run once per request, not during trim.
+                        request = vec![ChatMessage::system(format!("{parent}{hook}"))];
+                    }
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+                    apply_builtin_prompt_scope(
+                        &mut request,
+                        &tools,
+                        &names,
+                        "",
+                        false,
+                        false,
+                        cap,
+                        Some(&parent),
+                    );
+                    let base = request[0]
+                        .content
+                        .strip_suffix(hook)
+                        .expect("hook suffix survives");
+                    assert!(cap == 0 || base.chars().count() <= cap);
+                    assert!(base.ends_with(orientation));
+                    assert_eq!(base.matches(orientation).count(), 1);
+                    assert!(!request[0].content.contains("denied_tool"));
+                    if cap == 0 || cap == 10_000 {
+                        assert!(request[0].content.contains("**allowed_tool**"));
+                        assert!(request[0].content.contains("## Tool Use Protocol"));
+                    }
+                    assert_eq!(history[0].content, parent);
+                }
+            })
+            .await;
+        }
 
         let mut activated = crate::tools::ActivatedToolSet::new();
         activated.set_deferred_builtin_specs(tools.iter().map(|tool| tool.spec()).collect());
@@ -7330,6 +7459,8 @@ mod sop_step_reassembly_tests {
                         &section,
                         native,
                         false,
+                        cap.unwrap_or(0),
+                        None,
                     );
                     assert!(request[0].content.chars().count() <= before_chars);
                     if let Some(cap) = cap {
@@ -7367,7 +7498,7 @@ mod sop_step_reassembly_tests {
 
         let strict_prompt = &prompt[prompt.find("## Safety").unwrap()..];
         let mut strict = vec![ChatMessage::system(strict_prompt)];
-        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true);
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
         assert!(
             !strict[0]
                 .content
@@ -7377,7 +7508,7 @@ mod sop_step_reassembly_tests {
         assert!(!strict[0].content.contains("**allowed_tool**"));
         assert!(strict[0].content.contains("Keep hardware guidance."));
         let mut strict = vec![ChatMessage::system(truncated)];
-        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true);
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
         assert!(!strict[0].content.contains("denied_tool"));
         assert!(
             !strict[0]

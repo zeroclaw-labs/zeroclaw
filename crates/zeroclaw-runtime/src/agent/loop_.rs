@@ -8512,7 +8512,15 @@ mod tests {
             }
         }
 
-        for (native, allow_search) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (native, allow_search, cap, configless) in [
+            (false, false, 0, false),
+            (true, false, 0, false),
+            (false, true, 0, false),
+            (true, true, 0, false),
+            (false, false, 900, false),
+            (false, false, 10_000, false),
+            (false, false, 900, true),
+        ] {
             let turn_id = uuid::Uuid::new_v4().to_string();
             let mut responses = vec![
                 ChatResponse {
@@ -8634,6 +8642,21 @@ mod tests {
                     .collect(),
             );
             let workspace = tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.runtime_profiles.insert(
+                "scoped".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_system_prompt_chars: Some(cap),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("scoped"),
+                    ..Default::default()
+                },
+            );
             let parent_prompt = super::build_system_prompt_for_turn(
                 workspace.path(),
                 "mock-model",
@@ -8663,13 +8686,25 @@ mod tests {
                 "## Hardware Access\nRetain hardware guidance.\n\n## Safety",
                 1,
             );
+            let parent_prompt =
+                crate::agent::system_prompt::finalize_system_prompt(parent_prompt, cap);
+            let scoped_prompts = Arc::new(crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                parent_prompt.clone(),
+                parent_prompt.clone(),
+                cap,
+            ));
             let mut history = vec![
                 ChatMessage::system(&parent_prompt),
                 ChatMessage::user("start the scoped sop"),
             ];
             let observer = NoopObserver;
 
-            let result = run_tool_call_loop(ToolLoop {
+            let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut history_has_trim_breadcrumb = false;
+            let mut injected_memory_preamble = None;
+            let turn = run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
@@ -8685,28 +8720,28 @@ mod tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
-                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                    config: None,
+                    multimodal_config: &multimodal_config,
+                    config: (!configless).then_some(&config),
                     max_tool_iterations: 6,
                     hooks: None,
                     excluded_tools: &[],
                     dedup_exempt_tools: &[],
                     activated_tools: Some(&activated),
                     model_switch_callback: None,
-                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    pacing: &pacing,
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
-                    knobs: &LoopKnobs::default(),
+                    knobs: &knobs,
                     security: None,
                 },
                 history: &mut history,
                 // Test transcripts start fresh: no prior trim, no crumb.
-                history_has_trim_breadcrumb: &mut false,
-                injected_memory_preamble: &mut None,
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
                 channel_name: "agent",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -8722,8 +8757,12 @@ mod tests {
                 ingress: IngressContext::sub_turn(),
                 agent_alias: Some("test-agent"),
                 turn_id: &turn_id,
-            })
-            .await
+            });
+            let result = if configless {
+                crate::agent::turn::scope_tool_protocol_prompts(scoped_prompts, turn).await
+            } else {
+                turn.await
+            }
             .expect("scoped SOP execution should complete");
 
             assert_eq!(result, "outer done");
@@ -8758,8 +8797,25 @@ mod tests {
                     .content
                     .as_str()
             };
-            assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
+            if cap == 0 || cap == 10_000 {
+                assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
+            }
             for index in [1, 2] {
+                if cap > 0 {
+                    assert!(prompt(index).chars().count() <= cap);
+                    assert!(
+                        prompt(index)
+                            .trim_end()
+                            .ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION.trim_end()),
+                        "orientation missing: cap={cap}, configless={configless}, request={index}"
+                    );
+                    assert_eq!(
+                        prompt(index)
+                            .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                            .count(),
+                        1
+                    );
+                }
                 assert_eq!(
                     prompt(index).contains("<available-deferred-builtin-tools>"),
                     allow_search
@@ -8769,8 +8825,10 @@ mod tests {
                     assert!(prompt(index).contains("allowed_tool - "));
                     assert!(!prompt(index).contains("**allowed_tool**"));
                 }
-                assert!(prompt(index).contains("Retain hardware guidance."));
-                if !native && !allow_search {
+                if cap == 0 || cap == 10_000 {
+                    assert!(prompt(index).contains("Retain hardware guidance."));
+                }
+                if !native && !allow_search && (cap == 0 || cap == 10_000) {
                     assert_eq!(prompt(index).matches("## Tool Use Protocol").count(), 1);
                     assert!(prompt(index).contains("**allowed_tool**"));
                     assert!(prompt(index).contains("Parameters:"));
