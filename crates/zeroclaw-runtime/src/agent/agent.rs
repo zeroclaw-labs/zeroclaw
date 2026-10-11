@@ -3428,23 +3428,59 @@ impl Agent {
     }
 
     fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
-        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
-            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
-            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
-        )))
+        let cap = self.config.resolved.max_system_prompt_chars;
+        if !self.session_prompt_attachments.is_empty() {
+            // Validate both complete host+attachment variants against the
+            // configured ceiling before allowing protocol swaps. Subsequent
+            // head-retaining truncation would discard the required attachment
+            // tail, so it is disabled only for this already-validated pair.
+            return Ok(Arc::new(
+                crate::agent::turn::ToolProtocolPrompts::with_required_prompts(
+                    self.build_system_prompt_with_dispatcher_and_cap(&NativeToolDispatcher, cap)?,
+                    self.build_system_prompt_with_dispatcher_and_cap(&XmlToolDispatcher, cap)?,
+                ),
+            ));
+        }
+        Ok(Arc::new(
+            crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                // The turn may switch transport after construction. Both
+                // variants must be complete before any request-only cap.
+                self.build_system_prompt_with_dispatcher_and_cap(&NativeToolDispatcher, 0)?,
+                self.build_system_prompt_with_dispatcher_and_cap(&XmlToolDispatcher, 0)?,
+                cap,
+            ),
+        ))
     }
 
     fn build_system_prompt_with_dispatcher(
         &self,
         dispatcher: &dyn ToolDispatcher,
     ) -> Result<String> {
-        let mut prompt = self.build_system_prompt_without_session_prompt_attachments(dispatcher)?;
-        append_required_session_prompt_attachments(
-            &mut prompt,
-            &self.session_prompt_attachments,
+        self.build_system_prompt_with_dispatcher_and_cap(
+            dispatcher,
             self.config.resolved.max_system_prompt_chars,
-        )?;
-        Ok(prompt)
+        )
+    }
+
+    fn build_system_prompt_with_dispatcher_and_cap(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+        max_chars: usize,
+    ) -> Result<String> {
+        let mut prompt = self.build_system_prompt_without_session_prompt_attachments(dispatcher)?;
+        if self.session_prompt_attachments.is_empty() {
+            // Preserve the ordinary Agent's upstream truncation behavior.
+            Ok(crate::agent::system_prompt::finalize_system_prompt(
+                prompt, max_chars,
+            ))
+        } else {
+            append_required_session_prompt_attachments(
+                &mut prompt,
+                &self.session_prompt_attachments,
+                max_chars,
+            )?;
+            Ok(prompt)
+        }
     }
 
     /// Build the complete host-authored prompt before the mutable session
@@ -3501,7 +3537,6 @@ impl Agent {
         let mut prompt = self
             .prompt_builder
             .build_with_approval_policy(&ctx, &prompt_always_ask)?;
-        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -3524,6 +3559,9 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
         }
+        // Keep the runtime orientation at the end of the complete prompt so
+        // truncation cannot retain an earlier copy and append a second one.
+        append_timestamp_orientation(&mut prompt);
         Ok(prompt)
     }
 
@@ -4518,7 +4556,7 @@ impl Agent {
                 new_messages: new_msgs,
             });
         }
-        let tool_protocol_prompts = match self.tool_protocol_prompts() {
+        let mut tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
                 let notice = self.trim_history(Some(&turn_id));
@@ -5025,16 +5063,24 @@ impl Agent {
                             new_model,
                         )
                     {
-                        if let Err(error) = self
+                        // Rebuild the per-turn protocol prompts too: a capped
+                        // native request is built from them, so keeping the
+                        // turn-start pair would send the pre-switch model
+                        // label and workspace instructions.
+                        let refreshed = self
                             .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
-                        {
-                            let notice = self.trim_history(Some(&turn_id));
-                            forward_history_trim_notice(&event_tx, notice).await;
-                            return Err(StreamedTurnError {
-                                error,
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
+                            .and_then(|()| self.tool_protocol_prompts());
+                        match refreshed {
+                            Ok(prompts) => tool_protocol_prompts = prompts,
+                            Err(error) => {
+                                let notice = self.trim_history(Some(&turn_id));
+                                forward_history_trim_notice(&event_tx, notice).await;
+                                return Err(StreamedTurnError {
+                                    error,
+                                    committed_response,
+                                    new_messages: new_msgs,
+                                });
+                            }
                         }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
@@ -8888,6 +8934,61 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn streamed_agent_caps_fully_assembled_system_prompt_on_every_turn() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            agent.config.resolved.compact_context = true;
+            agent.config.resolved.max_system_prompt_chars = 4_000;
+            // MCP/tool guidance is appended after the base identity prompt.
+            // The cap must cover this tail, even when the dispatcher switches
+            // from native to XML tool instructions at the turn boundary.
+            agent.mcp_pinned = vec![zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                key: "docs__large".into(),
+                rendered: format!("<mcp-resource>{}</mcp-resource>", "界".repeat(5_000)),
+            }];
+            let assert_capped = |prompt: &str| {
+                assert_eq!(prompt.chars().count(), 4_000);
+                assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+                assert_eq!(
+                    prompt
+                        .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .count(),
+                    1,
+                    "the capped prompt must not repeat the timestamp orientation"
+                );
+                assert!(prompt.contains("## Project Context"));
+            };
+
+            let initial = agent.build_system_prompt().expect("initial prompt");
+            assert_capped(&initial);
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(initial))];
+            agent.set_tool_dispatcher(Box::new(XmlToolDispatcher));
+            let ConversationMessage::Chat(rebuilt) = &agent.history[0] else {
+                panic!("rebuilt system prompt must be a chat message");
+            };
+            assert_capped(&rebuilt.content);
+            assert!(rebuilt.content.contains(XML_TOOLS_MARKER));
+
+            for message in ["first", "follow-up"] {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .expect("streamed Agent turn should succeed");
+            }
+            let captured = captured.lock();
+            assert_eq!(captured.len(), 2);
+            for request in captured.iter() {
+                let system = request
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .expect("provider-visible system prompt");
+                assert_capped(&system.content);
+                assert!(system.content.contains(XML_TOOLS_MARKER));
+            }
+        }
+
+        #[tokio::test]
         async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
             let (provider, captured) = capturing_provider(true);
             let mut agent = test_agent_with_provider(provider, Vec::new());
@@ -9048,6 +9149,99 @@ mod tests {
             agent
                 .tool_protocol_prompts()
                 .expect("every dispatch protocol prompt must fit after a preflight-admitted write");
+        }
+
+        #[tokio::test]
+        async fn session_prompt_finite_budget_preserves_complete_provider_requests() {
+            for supports_native in [false, true] {
+                for streamed in [false, true] {
+                    let (provider, captured) = capturing_provider(supports_native);
+                    let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+                    agent.mcp_pinned = vec![zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                        key: "docs__policy".into(),
+                        rendered: "<mcp-resource>HOST_POLICY_CONTROL</mcp-resource>".into(),
+                    }];
+                    let attachment =
+                        "## Session Prompts\n- id: \"task\"; content: \"retain 界 task\"\n";
+                    let host_chars = agent
+                        .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
+                        .unwrap()
+                        .chars()
+                        .count();
+                    agent.config.resolved.max_system_prompt_chars =
+                        host_chars + 2 + attachment.chars().count();
+                    agent.set_session_prompt_attachments(attachment.into());
+
+                    for message in ["first", "follow-up"] {
+                        if streamed {
+                            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                            agent.turn_streamed(message, tx, None).await.unwrap();
+                        } else {
+                            agent.turn(message).await.unwrap();
+                        }
+                    }
+                    let captured = captured.lock();
+                    assert_eq!(captured.len(), 2);
+                    for request in captured.iter() {
+                        let system = request.iter().find(|m| m.role == "system").unwrap();
+                        assert!(system.content.ends_with(attachment));
+                        assert!(system.content.contains("HOST_POLICY_CONTROL"));
+                        assert!(system.content.contains(TIMESTAMP_ORIENTATION));
+                        assert_eq!(system.content.contains(XML_TOOLS_MARKER), !supports_native);
+                        assert!(
+                            system.content.chars().count()
+                                <= agent.config.resolved.max_system_prompt_chars
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn session_prompt_alternate_protocol_overflow_refuses_provider_dispatch() {
+            for streamed in [false, true] {
+                let (provider, captured) = capturing_provider(true);
+                let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+                let attachment = "## Session Prompts\n- id: \"task\"; content: \"retain task\"\n";
+                let native_chars = agent
+                    .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)
+                    .unwrap()
+                    .chars()
+                    .count();
+                let xml_chars = agent
+                    .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
+                    .unwrap()
+                    .chars()
+                    .count();
+                assert!(
+                    xml_chars > native_chars,
+                    "must exercise alternate-protocol overflow"
+                );
+                agent.config.resolved.max_system_prompt_chars =
+                    native_chars + 2 + attachment.chars().count();
+                agent.set_session_prompt_attachments(attachment.into());
+                agent
+                    .build_system_prompt()
+                    .expect("selected native prompt fits");
+                let error = if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                    agent
+                        .turn_streamed("go", tx, None)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                } else {
+                    agent.turn("go").await.unwrap_err().to_string()
+                };
+                assert!(
+                    error.contains("refusing to dispatch without them"),
+                    "{error}"
+                );
+                assert!(
+                    captured.lock().is_empty(),
+                    "overflow must fail before any provider call"
+                );
+            }
         }
 
         #[test]
@@ -18308,6 +18502,186 @@ model_provider = "custom.only"
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_model_switch_refreshes_capped_native_request() {
+        assert_streamed_model_switch_prompt("").await;
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_model_switch_preserves_session_prompt_attachments() {
+        assert_streamed_model_switch_prompt(
+            "## Session Prompts\n- id: \"task\"; content: \"retain switched task\"\n",
+        )
+        .await;
+    }
+
+    async fn assert_streamed_model_switch_prompt(attachments: &str) {
+        use axum::{Json, Router, response::IntoResponse};
+
+        // The switch target is a native-tool (OpenAI) provider whose requests
+        // are captured, so the post-switch request itself can be inspected.
+        // Every path is served and recorded, so a provider-side URL change
+        // shows up in the failure message instead of a bare 404.
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let seen_by_server = Arc::clone(&seen);
+        let app = Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured);
+                let seen = Arc::clone(&seen_by_server);
+                async move {
+                    seen.lock().push(format!("{method} {}", uri.path()));
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    let stream = body["stream"].as_bool().unwrap_or(false);
+                    captured.lock().push(body);
+                    if stream {
+                        let chunk = serde_json::json!({
+                            "choices": [{"delta": {"content": "switched answer"}, "finish_reason": "stop"}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "switched answer"},
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake switched provider");
+        let address = listener.local_addr().expect("fake provider address");
+        zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake switched provider");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            reliability: zeroclaw_config::schema::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 0,
+                ..zeroclaw_config::schema::ReliabilityConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "switched")
+                .expect("openai model_provider type slot");
+            entry.api_key = Some("switched-key".to_string());
+            entry.uri = Some(format!("http://{address}"));
+            entry.model = Some("switched-model".to_string());
+            // Chat Completions keeps the request shape (system message,
+            // native `tools`) straightforward to inspect.
+            entry.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+        }
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live_config: None,
+            live: None,
+        };
+        // Any cap makes a native request come from the per-turn protocol
+        // prompts rather than from the (rebuilt) history prompt.
+        let cap = 200_000;
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                max_system_prompt_chars: cap,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamSwitchTriggerProvider {
+                call_count: Arc::new(Mutex::new(0usize)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "openai.switched".to_string(),
+                    target_model: "switched-model".to_string(),
+                })],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        agent.set_session_prompt_attachments(attachments.into());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            agent.turn_streamed("please switch the model", event_tx, None),
+        )
+        .await
+        .expect("streamed turn must not hang");
+        assert!(
+            response.is_ok(),
+            "the switched provider answers the turn: {:?}; requests seen: {:?}",
+            response.err().map(|error| error.to_string()),
+            seen.lock()
+        );
+        assert_eq!(agent.model_name, "switched-model");
+
+        let requests = requests.lock();
+        let request = requests
+            .first()
+            .expect("the switched provider must receive the post-switch request");
+        let system = request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("the post-switch request must carry a system prompt");
+        assert!(
+            request.get("tools").is_some(),
+            "the post-switch request must use the native tool protocol"
+        );
+        assert!(
+            system.contains("Model: switched-model"),
+            "the capped native request must be rebuilt for the switched model"
+        );
+        assert!(
+            !system.contains("Model: gpt-4o-mini"),
+            "the capped native request must not reuse the turn-start prompt"
+        );
+        assert!(system.chars().count() <= cap);
+        if !attachments.is_empty() {
+            assert!(
+                system.ends_with(attachments),
+                "model refresh must retain the complete attachment"
+            );
+        }
     }
 
     fn turn_datetime_agent(

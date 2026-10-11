@@ -441,6 +441,11 @@ pub(crate) struct ResumeEntry {
     queue: ReconnectQueueState,
     interrupted: bool,
     recovery_required: bool,
+    /// The last turn ended `Failed` (`SessionError::TurnFailed`). The rebuilt
+    /// pane reloads the transcript but not the client-side status, so the
+    /// red sidebar dot is carried here. `SessionLost` is not carried: the
+    /// rebuild re-attaches the session, which is what clears it.
+    turn_failed: bool,
 }
 
 /// Client-owned queue and composer state that cannot be reconstructed from the
@@ -969,6 +974,7 @@ impl Chat {
                     || self
                         .session_resync_in_flight
                         .contains_key(&state.session_id),
+                turn_failed: state.last_error == Some(SessionError::TurnFailed),
             });
         }
 
@@ -1731,6 +1737,7 @@ impl Chat {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         });
         self.pick_or_start_session(&agent_alias).await;
     }
@@ -2330,6 +2337,7 @@ impl Chat {
                         entry.queue,
                         entry.interrupted,
                         entry.recovery_required,
+                        entry.turn_failed,
                     );
                 }
                 if !self.session_order.contains(&state.session_id) {
@@ -2536,6 +2544,7 @@ impl Chat {
             entry.queue.clone(),
             entry.interrupted,
             entry.recovery_required,
+            entry.turn_failed,
         );
         Ok(state)
     }
@@ -11962,17 +11971,23 @@ impl ChatState {
     /// Restore the queue and composer state the client owns across a transport
     /// rebuild. Transcript, pending interactions, and terminal turn state come
     /// from (or are reconciled with) the daemon instead of being snapshotted.
+    /// The red-dot status is the exception: `load_history` never sets
+    /// `last_error`, so a failed last turn or a failed reconciliation is
+    /// carried from the old pane.
     fn restore_reconnect_state(
         &mut self,
         queue: ReconnectQueueState,
         interrupted: bool,
         recovery_required: bool,
+        turn_failed: bool,
     ) {
         self.message_queue.restore(queue.message_queue);
         self.input_bar
             .load_for_edit(queue.composer_text, queue.composer_attachments);
         if recovery_required {
             self.last_error = Some(SessionError::ResyncFailed);
+        } else if turn_failed {
+            self.last_error = Some(SessionError::TurnFailed);
         }
         if interrupted {
             self.entries
@@ -12316,12 +12331,18 @@ impl ChatState {
         self.entries
             .push(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
         self.info_message = None;
-        // The reload clears `last_error` unconditionally: a stale `ResyncFailed`
-        // from this very resync must not stick once the snapshot proves the
-        // transcript is readable again. The carried outcome below then
-        // re-applies `SessionLost`/`TurnFailed` if the finished turn itself
-        // failed.
-        self.last_error = None;
+        // The reload clears the connection-class errors: a stale
+        // `ResyncFailed` from this very resync must not stick once the
+        // snapshot proves the transcript is readable again. `TurnFailed`
+        // survives: a lag reload covers every tracked session, idle ones
+        // included, and reloading does not change whether the last turn
+        // failed. Every dispatch from this pane clears it in
+        // `push_user_message`, so a `TurnFailed` here belongs to the last
+        // turn this pane sent. The carried outcome below then re-applies
+        // `SessionLost`/`TurnFailed` if the finished turn itself failed.
+        if self.last_error != Some(SessionError::TurnFailed) {
+            self.last_error = None;
+        }
         // Consume the outcome captured by the terminal-frame intercept
         // (`drain_notifications`), handed over by the apply that took
         // `lag_reattach` whole. Owner: that one reload; nothing else may
@@ -13253,6 +13274,7 @@ mod tests {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         }
     }
 
@@ -17262,7 +17284,12 @@ mod tests {
             }],
             false,
         );
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+            entry.turn_failed,
+        );
         assert_eq!(rebuilt.queue_len(), 1);
         assert_eq!(
             rebuilt.message_queue.pause_reason(),
@@ -17320,7 +17347,7 @@ mod tests {
         );
         assert!(snapshot.message_queue.resume_override());
         let mut adopted = state_for("sess-r", "alpha");
-        adopted.restore_reconnect_state(snapshot, true, false);
+        adopted.restore_reconnect_state(snapshot, true, false, false);
         assert!(
             !adopted.message_queue.resume_override(),
             "adoption must discard the old turn's override"
@@ -17563,6 +17590,374 @@ mod tests {
         let entries = chat.resume_entries();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].recovery_required);
+    }
+
+    /// A notification-lag reload covers idle sessions too. It resolves
+    /// `ResyncFailed` but must not turn a failed last turn green.
+    #[test]
+    fn notification_resync_reload_keeps_failed_turn_and_clears_resync_failed() {
+        let history = || {
+            vec![crate::client::MessageEntry {
+                role: "assistant".to_string(),
+                content: "durable answer".to_string(),
+                ..Default::default()
+            }]
+        };
+
+        let mut failed = state();
+        failed.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        failed.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        assert_eq!(failed.sidebar_status(), SidebarStatus::Errored);
+
+        let mut unreconciled = state();
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        unreconciled.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(unreconciled.last_error, None);
+        assert_eq!(unreconciled.sidebar_status(), SidebarStatus::Ready);
+    }
+
+    /// A daemon restart rebuilds the pane, and the rebuilt `ChatState` starts
+    /// with `last_error` clear. A failed last turn must keep its red dot; a
+    /// lost session is resolved by the rebuild's own re-attach and comes back
+    /// ready.
+    #[tokio::test]
+    async fn reconnect_rebuild_keeps_failed_turn_red_and_clears_session_lost() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(focused.last_error, Some(SessionError::TurnFailed));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            chat.background[0].last_error,
+            Some(SessionError::SessionLost)
+        );
+
+        let entries = chat.resume_entries();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let mut rebuilt = state_for(&entry.session_id, &entry.agent_alias);
+            assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+            rebuilt.restore_reconnect_state(
+                entry.queue,
+                entry.interrupted,
+                entry.recovery_required,
+                entry.turn_failed,
+            );
+            match entry.session_id.as_str() {
+                "sess-a" => {
+                    assert_eq!(rebuilt.last_error, Some(SessionError::TurnFailed));
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Errored);
+                }
+                "sess-b" => {
+                    assert_eq!(rebuilt.last_error, None);
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+                }
+                other => panic!("unexpected resume entry {other}"),
+            }
+        }
+    }
+
+    /// Render the production agent sidebar (`AgentSidebar::draw`) for every
+    /// session `chat` tracks and read the status dot back from the terminal
+    /// cells: `(session_id, glyph, foreground color)` per row, in sidebar
+    /// order. The rows are the same `session_summaries()` the app hands the
+    /// sidebar each frame.
+    fn rendered_sidebar_dots(chat: &Chat) -> Vec<(String, String, ratatui::style::Color)> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let rows = chat.session_summaries();
+        let area = Rect::new(0, 0, 24, 8);
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat.pane_kind),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Session rows start inside the panel border, one per line.
+        rows.iter()
+            .enumerate()
+            .map(|(i, summary)| {
+                let x = area.x + 1;
+                let y = area.y + 1 + i as u16;
+                let text = (x..area.x + area.width - 1)
+                    .map(|col| buf[(col, y)].symbol())
+                    .collect::<String>();
+                assert!(
+                    text.contains(summary.agent_alias.as_str()),
+                    "row {i} should show {}: {text:?}",
+                    summary.agent_alias
+                );
+                (
+                    summary.session_id.clone(),
+                    buf[(x, y)].symbol().to_string(),
+                    buf[(x, y)].fg,
+                )
+            })
+            .collect()
+    }
+
+    /// Final-interface check for the reconnect transition: the real sidebar
+    /// is drawn before the rebuild and again after a fresh `Chat` re-attached
+    /// every carried session through `init()` against a fake daemon. The
+    /// failed-turn session keeps its red dot; the session-lost one (the
+    /// connection-error control, resolved by the re-attach itself) comes back
+    /// green.
+    #[tokio::test]
+    async fn reconnect_rebuild_renders_failed_turn_red_and_recovered_session_lost_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the socket drops"
+        );
+
+        // The daemon restarted: the app layer snapshots the pane and builds a
+        // fresh one on the new socket, exactly as `app.rs` does.
+        let entries = chat.resume_entries();
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<String>(16);
+        let reconnect_rpc = Arc::new(RpcOutbound::new(reconnect_tx));
+        let reconnect_client = Arc::new(RpcClient::with_rpc(Arc::clone(&reconnect_rpc)));
+        let mut rebuilt = Chat::new(reconnect_client, PaneKind::Chat);
+        rebuilt.set_resume_sessions(entries);
+        let mut init = tokio::spawn(async move {
+            let _ = rebuilt.init().await;
+            rebuilt
+        });
+
+        // Fake daemon: answer whatever the rebuild asks for, by method, until
+        // `init` returns.
+        let rebuilt = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    joined = &mut init => break joined.expect("rebuild init task"),
+                    line = reconnect_rx.recv() => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&line.expect("rpc channel open"))
+                                .expect("RPC request should be JSON");
+                        match frame["method"].as_str() {
+                            Some(method::AGENTS_STATUS) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "agents": [
+                                        {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                                        {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                                    ]
+                                }),
+                            ),
+                            Some(method::SESSION_NEW) => {
+                                let sid = frame["params"]["session_id"].clone();
+                                respond_ok(
+                                    &reconnect_rpc,
+                                    &frame,
+                                    serde_json::json!({ "session_id": sid, "workspace_dir": "/w" }),
+                                );
+                            }
+                            Some(method::CONFIG_LIST) => {
+                                respond_ok(&reconnect_rpc, &frame, serde_json::json!([]));
+                            }
+                            Some(method::SESSION_MESSAGES) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "messages": [
+                                        { "role": "user", "content": "ask" },
+                                        { "role": "assistant", "content": "durable answer" }
+                                    ],
+                                    "total": 2
+                                }),
+                            ),
+                            other => panic!("unexpected reconnect frame: {other:?}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reconnect rebuild should finish");
+
+        assert_eq!(
+            rendered_sidebar_dots(&rebuilt),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), green),
+            ],
+            "after the rebuild the failed turn stays red; the re-attached lost session is green"
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-a").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-b").unwrap().last_error,
+            None
+        );
+    }
+
+    /// Final-interface check for the notification-lag transition: a channel
+    /// overflow reloads every tracked session from a fake daemon, then the
+    /// real sidebar is drawn. The failed-turn session keeps its red dot; the
+    /// session whose earlier reload had failed (the connection-error control)
+    /// recovers to green.
+    #[tokio::test]
+    async fn notification_lag_reload_renders_failed_turn_red_and_recovered_resync_failed_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut failed = state_for("sess-failed", "alpha");
+        failed.push_user_message(Some("ask".to_string()), Vec::new());
+        failed.apply_update(turn_complete(
+            "sess-failed",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        let mut unreconciled = state_for("sess-unreconciled", "beta");
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        chat.phase = ChatPhase::Active(Box::new(failed));
+        chat.background.push(unreconciled);
+        chat.session_order = vec!["sess-failed".to_string(), "sess-unreconciled".to_string()];
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-unreconciled".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the lag"
+        );
+
+        // Overflow the 64-frame notification channel so the drain reports
+        // Lagged and reloads every tracked session.
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        assert!(chat.session_resync_in_flight.contains_key("sess-failed"));
+        assert!(
+            chat.session_resync_in_flight
+                .contains_key("sess-unreconciled")
+        );
+
+        // Fake daemon: both sessions are idle with a readable transcript.
+        for _ in 0..4 {
+            let frame = next_rpc_request(&mut writer_rx, "lag recovery reloads each session").await;
+            let sid = frame["params"]["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match frame["method"].as_str() {
+                Some(method::SESSION_STATE) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": sid, "state": "idle" }),
+                ),
+                Some(method::SESSION_MESSAGES) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [
+                            { "role": "user", "content": "ask" },
+                            { "role": "assistant", "content": "durable answer" }
+                        ],
+                        "total": 2
+                    }),
+                ),
+                other => panic!("unexpected recovery frame: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sessions should finish resync");
+        chat.tick_transport_events();
+        assert!(chat.session_resync_in_flight.is_empty());
+
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                (
+                    "sess-unreconciled".to_string(),
+                    "\u{25cf}".to_string(),
+                    green
+                ),
+            ],
+            "after the lag reload the failed turn stays red; the recovered reload is green"
+        );
+        assert_eq!(
+            chat.state_for_session("sess-failed").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            chat.state_for_session("sess-unreconciled")
+                .unwrap()
+                .last_error,
+            None
+        );
     }
 
     #[tokio::test]

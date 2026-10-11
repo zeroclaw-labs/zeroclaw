@@ -564,14 +564,67 @@ async fn streamed_prefix_relays_only_unforwarded_native_narration_suffix() {
 #[derive(Clone)]
 pub(crate) struct ToolProtocolPrompts {
     text_tools_section: String,
+    max_chars: usize,
+    /// Caller-validated complete variants for attachment-bearing turns. This
+    /// is rendered per-turn input, not a durable session or policy cache.
+    /// Selecting the canonical variant avoids separator growth from repeated
+    /// section removal/insertion and never truncates a required attachment.
+    required_pair: Option<(String, String)>,
+    /// The capped native request prompt, built from the complete native
+    /// prompt. Only set when a cap applies: a history prompt that was capped
+    /// for the text transport can have lost `## Safety` and later sections
+    /// inside its long tool section, so removing that section cannot rebuild
+    /// a complete native prompt from it.
+    native_request: Option<String>,
 }
 
 impl ToolProtocolPrompts {
-    pub(crate) fn new(_native: String, text: String) -> Self {
+    /// Both complete prompts must already satisfy the caller's finite budget.
+    pub(crate) fn with_required_prompts(native: String, text: String) -> Self {
         let text_tools_section = tool_section_bounds(&text)
             .map(|bounds| text[bounds].to_string())
             .unwrap_or_default();
-        Self { text_tools_section }
+        Self {
+            text_tools_section,
+            max_chars: 0,
+            native_request: None,
+            required_pair: Some((native, text)),
+        }
+    }
+
+    fn required_prompt(&self, use_native_tools: bool) -> Option<&str> {
+        self.required_pair.as_ref().map(|(native, text)| {
+            if use_native_tools {
+                native.as_str()
+            } else {
+                text.as_str()
+            }
+        })
+    }
+
+    /// Uncapped prompts for tests that exercise only the protocol swap.
+    #[cfg(test)]
+    pub(crate) fn new(native: String, text: String) -> Self {
+        Self::with_max_chars(native, text, 0)
+    }
+
+    /// `native` and `text` are the complete (uncapped) prompts for each
+    /// transport; `max_chars` caps provider-bound requests (0 = no cap).
+    pub(crate) fn with_max_chars(native: String, text: String, max_chars: usize) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        let native_request = (max_chars > 0).then(|| {
+            let mut native = native;
+            replace_tool_protocol_section(&mut native, "", true);
+            crate::agent::system_prompt::finalize_system_prompt(native, max_chars)
+        });
+        Self {
+            text_tools_section,
+            max_chars,
+            native_request,
+            required_pair: None,
+        }
     }
 }
 
@@ -594,22 +647,69 @@ fn refresh_scoped_tool_protocol_prompt(
     use_native_tools: bool,
 ) {
     let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        // History keeps the swapped prompt without re-capping it; only the
+        // provider-bound copy is capped. A capped native request is rebuilt
+        // from the complete native prompt, never from a capped text history.
+        let mut history_prompts = None;
         if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
-            replace_tool_protocol_section(
-                &mut system.content,
-                &prompts.text_tools_section,
-                use_native_tools,
-            );
+            let before = system.content.clone();
+            if let Some(required) = prompts.required_prompt(use_native_tools) {
+                system.content = required.to_owned();
+                refresh_prompt_anchor(std::slice::from_mut(system), use_native_tools);
+            } else {
+                replace_tool_protocol_section(
+                    &mut system.content,
+                    &prompts.text_tools_section,
+                    use_native_tools,
+                );
+            }
+            history_prompts = Some((before, system.content.clone()));
         }
         if let Some(system) = request_messages
             .iter_mut()
             .find(|message| message.role == "system")
         {
-            replace_tool_protocol_section(
-                &mut system.content,
-                &prompts.text_tools_section,
-                use_native_tools,
-            );
+            // A `before_llm_call` hook may append to the request's system
+            // prompt. Cap only the swapped base and re-append that suffix, so
+            // hook text reaches the model as it does on the CLI path. The
+            // request may already be finalized (the post-trim rebuild).
+            let rebuilt = history_prompts.and_then(|(before, swapped)| {
+                let canonical = prompts.required_prompt(use_native_tools).or_else(|| {
+                    use_native_tools
+                        .then_some(prompts.native_request.as_deref())
+                        .flatten()
+                });
+                let base = match canonical {
+                    Some(canonical) => {
+                        let mut selected = [ChatMessage::system(canonical.to_owned())];
+                        refresh_prompt_anchor(&mut selected, use_native_tools);
+                        let [selected] = selected;
+                        selected.content
+                    }
+                    _ => swapped,
+                };
+                let capped =
+                    crate::agent::system_prompt::finalize_system_prompt(base, prompts.max_chars);
+                let suffix = system
+                    .content
+                    .strip_prefix(before.as_str())
+                    .or_else(|| system.content.strip_prefix(capped.as_str()))?
+                    .to_string();
+                Some(capped + &suffix)
+            });
+            if let Some(rebuilt) = rebuilt {
+                system.content = rebuilt;
+            } else {
+                replace_tool_protocol_section(
+                    &mut system.content,
+                    &prompts.text_tools_section,
+                    use_native_tools,
+                );
+                system.content = crate::agent::system_prompt::finalize_system_prompt(
+                    std::mem::take(&mut system.content),
+                    prompts.max_chars,
+                );
+            }
         }
     });
 }
@@ -617,8 +717,11 @@ fn refresh_scoped_tool_protocol_prompt(
 fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
     let start = prompt.find("## Tools\n")?;
     let following = &prompt[start..];
+    // A capped prompt may have lost `## Safety`; never let the section run
+    // into the trailing timestamp orientation that the cap preserves.
     let end = following
         .find("\n\n## Safety")
+        .or_else(|| following.find(crate::agent::prompt::TIMESTAMP_ORIENTATION))
         .map_or(prompt.len(), |offset| start + offset);
     Some(start..end)
 }
@@ -4374,6 +4477,240 @@ mod surface3_tests {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
         ))
+    }
+
+    #[tokio::test]
+    async fn scoped_complete_session_prompt_protocol_switch_keeps_finite_budget() {
+        let host = format!(
+            "Identity\n\n## Safety\n\nIMMUTABLE_POLICY\n\nMCP_CONTROL{}",
+            crate::agent::prompt::TIMESTAMP_ORIENTATION
+        );
+        let mut native = host.clone();
+        let mut text = host.replace("## Safety", "## Tools\n\nXML_GUIDANCE\n\n## Safety");
+        let attachment = "## Session Prompts\n- id: \"task\"; content: \"retain task\"\n";
+        let cap = text.chars().count() + 2 + attachment.chars().count();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut native,
+            attachment,
+            cap,
+        )
+        .unwrap();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut text, attachment, cap,
+        )
+        .unwrap();
+        // Attachment-bearing Agent pairs have already passed the finite cap;
+        // they must never be head-truncated during a later protocol swap.
+        let prompts = Arc::new(ToolProtocolPrompts::with_required_prompts(
+            native.clone(),
+            text,
+        ));
+        let mut history = vec![ChatMessage::system(native)];
+        scope_tool_protocol_prompts(prompts, async {
+            for native_tools in [false, true, false, true] {
+                let mut request = history.clone();
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native_tools);
+                let system = &request[0].content;
+                assert!(system.ends_with(attachment));
+                assert!(system.contains("IMMUTABLE_POLICY"));
+                assert!(system.contains("MCP_CONTROL"));
+                assert!(
+                    system.chars().count() <= cap,
+                    "protocol switching grew a validated prompt past its cap: {} > {cap}",
+                    system.chars().count()
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_protocol_switch_caps_request_and_keeps_history_lossless() {
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let native = format!(
+            "## Tools\n\nsmall\n\n## Safety\n\n{}\n\n<mcp-resource>pinned</mcp-resource>{}",
+            "safe".repeat(20),
+            orientation
+        );
+        let text = format!(
+            "## Tools\n\n{}\n\n## Safety\n\n{}{}",
+            "tool guidance ".repeat(150),
+            "safe".repeat(20),
+            orientation,
+        );
+        // The cap fits the native prompt but not the text tool section, so
+        // a native -> text -> native sequence must truncate only requests.
+        let cap = native.chars().count() + 100;
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native.clone(),
+            text,
+            cap,
+        ));
+        let assert_request = |prompt: &str| {
+            assert!(prompt.chars().count() <= cap);
+            assert!(prompt.ends_with(orientation));
+            assert_eq!(prompt.matches(orientation).count(), 1);
+        };
+        let mut history = vec![ChatMessage::system(native.clone())];
+        scope_tool_protocol_prompts(prompts, async {
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            assert_request(&request[0].content);
+            assert!(request[0].content.contains("tool guidance"));
+            assert!(
+                history[0]
+                    .content
+                    .contains("<mcp-resource>pinned</mcp-resource>"),
+                "history must keep the complete swapped prompt"
+            );
+
+            // The next provider call is prepared from history again. Native
+            // mode drops the tool section; everything else must survive.
+            let mut expected = native.clone();
+            replace_tool_protocol_section(&mut expected, "", true);
+            assert!(expected.contains("<mcp-resource>pinned</mcp-resource>"));
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            assert_eq!(history[0].content, expected, "swap back must be lossless");
+            assert_eq!(request[0].content, expected);
+        })
+        .await;
+    }
+
+    fn capped_switch_fixture() -> (String, Arc<ToolProtocolPrompts>, usize) {
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let native = format!(
+            "## Identity\n\nme\n\n## Safety\n\n{}{orientation}",
+            "safe".repeat(20)
+        );
+        let text = format!(
+            "## Tools\n\n{}\n\n## Safety\n\n{}{orientation}",
+            "tool guidance ".repeat(150),
+            "safe".repeat(20),
+        );
+        let cap = native.chars().count() + 100;
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native.clone(),
+            text,
+            cap,
+        ));
+        (native, prompts, cap)
+    }
+
+    #[tokio::test]
+    async fn scoped_protocol_refresh_keeps_hook_appended_text() {
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let (native, prompts, cap) = capped_switch_fixture();
+        let hook = "\n\nHOOK_INSTRUCTION";
+        scope_tool_protocol_prompts(prompts, async {
+            // No switch: the built prompt plus the hook's text, unchanged.
+            let mut history = vec![ChatMessage::system(native.clone())];
+            let mut request = vec![ChatMessage::system(format!("{native}{hook}"))];
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            assert_eq!(request[0].content, format!("{native}{hook}"));
+            assert_eq!(history[0].content, native);
+
+            // Native -> text: the swapped base is capped, the hook's text
+            // still follows it.
+            let mut request = vec![ChatMessage::system(format!("{native}{hook}"))];
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            let base = request[0]
+                .content
+                .strip_suffix(hook)
+                .expect("hook text must survive the switch");
+            assert!(base.contains("tool guidance"));
+            assert_eq!(base.chars().count(), cap);
+            assert!(base.ends_with(orientation));
+
+            // A rebuilt request (post-trim) is already finalized: refreshing
+            // it again must leave it unchanged.
+            let finalized = request[0].content.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            assert_eq!(request[0].content, finalized);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_protocol_refresh_caps_text_request_on_later_iterations() {
+        let (native, prompts, cap) = capped_switch_fixture();
+        let mut history = vec![ChatMessage::system(native)];
+        scope_tool_protocol_prompts(prompts, async {
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            // History now holds the uncapped text prompt; the next iteration
+            // stays on text and must still be capped.
+            assert!(history[0].content.chars().count() > cap);
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            assert_eq!(request[0].content.chars().count(), cap);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_switch_to_native_keeps_safety_when_text_history_was_cut_in_tools() {
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let tail = format!(
+            "## Safety\n\n{}\n\n<mcp-resource>pinned</mcp-resource>{orientation}",
+            "safe".repeat(20)
+        );
+        let native = format!("## Identity\n\nme\n\n## Tools\n\nsmall\n\n{tail}");
+        let text = format!(
+            "## Identity\n\nme\n\n## Tools\n\n{}\n\n{tail}",
+            "tool guidance ".repeat(150)
+        );
+        // The cap fits the native prompt, but cuts the text prompt inside its
+        // tool section, so the text-seeded history has lost `## Safety`.
+        let cap = native.chars().count() + 50;
+        let seeded = crate::agent::system_prompt::finalize_system_prompt(text.clone(), cap);
+        assert!(!seeded.contains("## Safety"));
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(native, text, cap));
+        let mut history = vec![ChatMessage::system(seeded)];
+        scope_tool_protocol_prompts(prompts, async {
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            let prompt = &request[0].content;
+            assert!(prompt.contains("## Safety"), "native request lost Safety");
+            assert!(prompt.contains("<mcp-resource>pinned</mcp-resource>"));
+            assert!(!prompt.contains("tool guidance"));
+            assert!(prompt.chars().count() <= cap);
+            assert!(prompt.ends_with(orientation));
+            assert_eq!(prompt.matches(orientation).count(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_protocol_switch_keeps_orientation_when_cap_removed_safety() {
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        // A capped native prompt can end inside the tool section, before
+        // `## Safety`, with only the preserved orientation after it.
+        let native = format!("## Identity\n\nme\n\n## Tools\n\nsmall\n\n{orientation}");
+        let text = format!(
+            "## Tools\n\n{}\n\n## Safety\n\nsafe{}",
+            "tool guidance ".repeat(5),
+            orientation,
+        );
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(native.clone(), text, 0));
+        let mut history = vec![ChatMessage::system(native.clone())];
+        let mut request = history.clone();
+        scope_tool_protocol_prompts(prompts, async {
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            for prompt in [&history[0].content, &request[0].content] {
+                assert!(prompt.contains("tool guidance"));
+                assert!(prompt.ends_with(orientation));
+                assert_eq!(prompt.matches(orientation).count(), 1);
+            }
+            let mut request = history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            for prompt in [&history[0].content, &request[0].content] {
+                assert!(!prompt.contains("tool guidance"));
+                assert!(prompt.ends_with(orientation));
+                assert!(prompt.starts_with("## Identity\n\nme\n\n"));
+            }
+        })
+        .await;
     }
 
     #[test]
