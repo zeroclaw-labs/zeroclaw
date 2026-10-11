@@ -10,8 +10,10 @@ use super::outcome::{
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::{StreamProviderFailure, consume_provider_streaming_response};
-use crate::agent::cost::check_tool_loop_budget;
-use crate::cost::types::BudgetCheck;
+use crate::agent::cost::{
+    check_tool_loop_budget, grant_tool_loop_budget_override, tool_loop_budget_override_allowed,
+};
+use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
@@ -243,6 +245,121 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         return Err(TurnStop::fatal(TurnStopCode::BudgetExhausted, message).into());
     }
     Ok(())
+}
+
+/// How long the budget-override prompt waits for an answer before the turn
+/// stops as it would without one. Longer than a tool approval: the turn is
+/// paused, nothing is spent while it waits, and long tasks are often left
+/// running unattended.
+pub(crate) const BUDGET_OVERRIDE_WAIT: Duration = Duration::from_secs(600);
+
+/// Budget gate for the main tool loop. Like [`enforce_tool_loop_budget`],
+/// but when a shared daily or monthly limit is exceeded, `cost.allow_override`
+/// is on and the turn has a channel that can answer approvals, the turn
+/// pauses and asks the operator. Approval lifts that limit for the rest of
+/// its period for every session of the daemon (the override lives on the
+/// shared cost tracker); deny, timeout, or no answer stops the turn exactly
+/// as before. Per-agent delegation ceilings are never offered.
+pub(crate) async fn gate_tool_loop_budget(ctx: &TurnCtx<'_>) -> Result<()> {
+    let mut granted: Vec<UsagePeriod> = Vec::new();
+    // A day override can still meet an exhausted month, so up to one prompt
+    // per period; a limit still exceeded after its own grant (a per-hop
+    // ceiling) falls through to the hard stop.
+    while let Some(BudgetCheck::Exceeded {
+        current_usd,
+        limit_usd,
+        period,
+        agent_alias: None,
+    }) = check_tool_loop_budget()
+    {
+        let Some(channel) = ctx.channel else { break };
+        if granted.contains(&period) || !tool_loop_budget_override_allowed() {
+            break;
+        }
+        if !ask_budget_override(ctx, channel, current_usd, limit_usd, period).await?
+            || !grant_tool_loop_budget_override(period)
+        {
+            break;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(::serde_json::json!({
+                    "current_usd": current_usd,
+                    "limit_usd": limit_usd,
+                    "period": format!("{period:?}"),
+                })),
+            "cost limit overridden by the operator for the rest of the period"
+        );
+        granted.push(period);
+    }
+    enforce_tool_loop_budget()
+}
+
+/// Ask the operator whether to override the exceeded `period` limit.
+/// `Ok(true)` only for an operator's approval; a runtime fail-closed answer
+/// (timeout, unreachable client) or a channel that cannot ask is `Ok(false)`.
+/// Cancelling the turn while the prompt is open returns `ToolLoopCancelled`.
+async fn ask_budget_override(
+    ctx: &TurnCtx<'_>,
+    channel: &dyn zeroclaw_api::channel::Channel,
+    current_usd: f64,
+    limit_usd: f64,
+    period: UsagePeriod,
+) -> Result<bool> {
+    let key = match period {
+        UsagePeriod::Day => "turn-cost-limit-override-day",
+        UsagePeriod::Month => "turn-cost-limit-override-month",
+        UsagePeriod::Session => return Ok(false),
+    };
+    let request = zeroclaw_api::channel::ChannelApprovalRequest {
+        tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+        arguments_summary: crate::i18n::get_required_cli_string_with_args(
+            key,
+            &[
+                ("spent", &format!("{current_usd:.2}")),
+                ("limit", &format!("{limit_usd:.2}")),
+            ],
+        ),
+        raw_arguments: None,
+        position: None,
+    };
+    let recipient = ctx.channel_reply_target.unwrap_or_default();
+    super::approval_gate::flush_narration_before_prompt(ctx, channel).await;
+    let ask =
+        channel.request_approval_attributed_with_timeout(recipient, &request, BUDGET_OVERRIDE_WAIT);
+    let answer = if let Some(cancel) = ctx.cancellation_token {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolLoopCancelled.into()),
+            answer = ask => answer,
+        }
+    } else {
+        ask.await
+    };
+    Ok(match answer {
+        Ok(Some(attributed)) => {
+            !attributed.source.is_runtime_fail_closed()
+                && matches!(
+                    attributed.response,
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
+                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+                )
+        }
+        Ok(None) => false,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                "cost limit override prompt failed; stopping the turn"
+            );
+            false
+        }
+    })
 }
 
 /// One provider call: streaming via `consume_provider_streaming_response`
@@ -3708,5 +3825,214 @@ mod tests {
         // BudgetExhausted stop is unreachable here — pinned so a future change
         // that makes it fire closed is caught.
         assert!(enforce_tool_loop_budget().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod budget_override_tests {
+    use super::super::context::TurnCtx;
+    use super::*;
+    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+    use crate::cost::CostTracker;
+    use crate::cost::types::TokenUsage;
+    use crate::observability::NoopObserver;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
+    use zeroclaw_api::channel::{
+        ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
+        ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
+    use zeroclaw_api::turn_stop::turn_stop;
+    use zeroclaw_config::schema::{CostConfig, PacingConfig};
+
+    /// A back-channel that answers every approval with a fixed response and
+    /// records what it was asked.
+    struct ScriptedChannel {
+        answer: AttributedApprovalResponse,
+        asked: Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl ScriptedChannel {
+        fn answering(answer: AttributedApprovalResponse) -> Self {
+            Self {
+                answer,
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Attributable for ScriptedChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ScriptedChannel {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval_attributed_with_timeout(
+            &self,
+            _recipient: &str,
+            request: &ChannelApprovalRequest,
+            timeout: Duration,
+        ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+            self.asked.lock().push((request.tool_name.clone(), timeout));
+            Ok(Some(self.answer.clone()))
+        }
+    }
+
+    /// A tracker with $3.00 spent today against a $1.00 daily limit.
+    fn over_limit_tracker(tmp: &tempfile::TempDir, allow_override: bool) -> Arc<CostTracker> {
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 1.0,
+                allow_override,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        Arc::new(tracker)
+    }
+
+    fn ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        channel: Option<&'a dyn Channel>,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer,
+            provider_name: "stub",
+            model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel,
+            draft_reasoning: StreamReasoningMode::Status,
+            agent_alias: None,
+            turn_id: "budget-override-test",
+            serving_provider_name: None,
+            serving_model: None,
+        }
+    }
+
+    async fn gate(tracker: &Arc<CostTracker>, ctx: &TurnCtx<'_>) -> Result<()> {
+        let scope = ToolLoopCostTrackingContext::new(Arc::clone(tracker), Arc::default());
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(scope), gate_tool_loop_budget(ctx))
+            .await
+    }
+
+    fn is_budget_stop(result: &Result<()>) -> bool {
+        result.as_ref().is_err_and(|err| {
+            turn_stop(err).is_some_and(|stop| stop.code == TurnStopCode::BudgetExhausted)
+        })
+    }
+
+    #[tokio::test]
+    async fn approval_overrides_the_limit_and_the_turn_continues() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tracker = over_limit_tracker(&tmp, true);
+        let channel = ScriptedChannel::answering(AttributedApprovalResponse::operator(
+            ChannelApprovalResponse::Approve,
+        ));
+        let (observer, pacing) = (NoopObserver, PacingConfig::default());
+
+        let result = gate(&tracker, &ctx(&observer, &pacing, Some(&channel))).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            *channel.asked.lock(),
+            vec![(
+                zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+                BUDGET_OVERRIDE_WAIT
+            )]
+        );
+
+        // The override is on the shared tracker: the next check passes
+        // without asking again.
+        let again = gate(&tracker, &ctx(&observer, &pacing, Some(&channel))).await;
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(channel.asked.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_or_timeout_stops_the_turn() {
+        for answer in [
+            AttributedApprovalResponse::operator(ChannelApprovalResponse::Deny),
+            AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Approve,
+                ApprovalSource::TimedOut,
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let tracker = over_limit_tracker(&tmp, true);
+            let channel = ScriptedChannel::answering(answer);
+            let (observer, pacing) = (NoopObserver, PacingConfig::default());
+
+            let result = gate(&tracker, &ctx(&observer, &pacing, Some(&channel))).await;
+            assert!(is_budget_stop(&result), "{result:?}");
+            assert_eq!(channel.asked.lock().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_prompt_without_allow_override_or_a_channel() {
+        let (observer, pacing) = (NoopObserver, PacingConfig::default());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tracker = over_limit_tracker(&tmp, false);
+        let channel = ScriptedChannel::answering(AttributedApprovalResponse::operator(
+            ChannelApprovalResponse::Approve,
+        ));
+        let result = gate(&tracker, &ctx(&observer, &pacing, Some(&channel))).await;
+        assert!(is_budget_stop(&result), "{result:?}");
+        assert!(channel.asked.lock().is_empty());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tracker = over_limit_tracker(&tmp, true);
+        let result = gate(&tracker, &ctx(&observer, &pacing, None)).await;
+        assert!(is_budget_stop(&result), "{result:?}");
     }
 }

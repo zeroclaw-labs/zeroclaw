@@ -570,6 +570,11 @@ zc-chat-approval-action-allow = Allow
 zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
+# Cost-limit notice: the daemon paused a turn at the cost limit and asks whether to override it.
+zc-chat-cost-limit-title = COST LIMIT REACHED
+zc-chat-cost-limit-override = Override and continue
+zc-chat-cost-limit-stop = Stop
+zc-chat-cost-limit-wait = If you do not answer within { $minutes } min, this turn stops.
 
 
 zc-chat-clipboard-you = You: { $text }

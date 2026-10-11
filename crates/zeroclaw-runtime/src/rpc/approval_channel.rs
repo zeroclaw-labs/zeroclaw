@@ -112,6 +112,22 @@ impl Channel for RpcApprovalChannel {
             .await
     }
 
+    /// Honour the caller's budget on the pending entry itself. The trait
+    /// default would wrap `request_approval_attributed`, whose own 120 s
+    /// deadline fires first, so a caller asking for longer (the budget
+    /// override prompt) would be cut short.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        RpcApprovalChannel::request_approval_attributed_with_timeout(
+            self, recipient, request, timeout,
+        )
+        .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,
@@ -371,6 +387,39 @@ mod tests {
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
+    }
+
+    /// Through `dyn Channel`, the caller's budget must reach the pending
+    /// entry and the client frame. The trait default would wrap the 120 s
+    /// inner deadline, so a longer budget was silently cut short.
+    #[tokio::test]
+    async fn trait_with_timeout_uses_caller_budget() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch: Arc<dyn Channel> =
+            Arc::new(make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending)));
+        let request = ChannelApprovalRequest {
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "limit reached".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_attributed_with_timeout(
+                "",
+                &request,
+                std::time::Duration::from_secs(600),
+            )
+            .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["timeout_secs"], 600);
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve));
+        let result = task.await.unwrap().unwrap().expect("an operator answer");
+        assert_eq!(result.response, ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]

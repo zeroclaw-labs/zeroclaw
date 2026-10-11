@@ -189,6 +189,31 @@ pub struct CostTracker {
     /// delegation's checks and records keep agreeing for its whole
     /// lifetime.
     enforcement_mode: EnforcementMode,
+    /// Shared limits the operator chose to override for the rest of the
+    /// current reporting period (`cost.allow_override`). Shared by every
+    /// tracker derived from the same base, so one decision covers every
+    /// session and delegation of the daemon. In memory only: a restart
+    /// clears it.
+    overrides: Arc<Mutex<BudgetOverrides>>,
+}
+
+/// Reporting periods whose shared limit the operator overrode. Each entry
+/// names the period it was granted for, so it stops matching on its own at
+/// the next UTC day or month rollover.
+#[derive(Default, Clone, Copy)]
+struct BudgetOverrides {
+    day: Option<NaiveDate>,
+    month: Option<(i32, u32)>,
+}
+
+impl BudgetOverrides {
+    fn covers_day(self, period: ReportingPeriod) -> bool {
+        self.day == Some(period.day)
+    }
+
+    fn covers_month(self, period: ReportingPeriod) -> bool {
+        self.month == Some((period.year, period.month))
+    }
 }
 
 /// Cheap process-local totals for one optional agent attribution bucket.
@@ -222,7 +247,32 @@ impl CostTracker {
             session_totals: Arc::new(Mutex::new(HashMap::new())),
             budget_scope: BudgetScope::Shared,
             enforcement_mode: EnforcementMode::Live,
+            overrides: Arc::new(Mutex::new(BudgetOverrides::default())),
         })
+    }
+
+    /// Lift the shared daily or monthly limit for the rest of the current
+    /// reporting period, for every tracker derived from this one. Returns
+    /// `false` (and records nothing) when `cost.allow_override` is off in
+    /// the live config, so the policy check lives here and callers cannot
+    /// grant an override the operator did not allow. Per-agent delegation
+    /// ceilings are never lifted. `Session` is not a budget period and is
+    /// refused.
+    pub fn grant_override(&self, period: UsagePeriod) -> bool {
+        self.grant_override_at_period(period, ReportingPeriod::current())
+    }
+
+    fn grant_override_at_period(&self, period: UsagePeriod, at: ReportingPeriod) -> bool {
+        if !self.config.read().allow_override {
+            return false;
+        }
+        let mut overrides = self.overrides.lock();
+        match period {
+            UsagePeriod::Day => overrides.day = Some(at.day),
+            UsagePeriod::Month => overrides.month = Some((at.year, at.month)),
+            UsagePeriod::Session => return false,
+        }
+        true
     }
 
     fn config_snapshot(&self) -> CostConfig {
@@ -384,6 +434,7 @@ impl CostTracker {
             session_totals: Arc::clone(&self.session_totals),
             budget_scope,
             enforcement_mode,
+            overrides: Arc::clone(&self.overrides),
         }
     }
 
@@ -457,16 +508,26 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs_at_period(period)?;
         let day = storage.reporting_period().day;
+        let overrides = *self.overrides.lock();
+        let day_overridden = overrides.covers_day(period);
+        let month_overridden = overrides.covers_month(period);
 
         // Check daily limit (shared). A shared-capped scope tightens the
         // global daily limit by its per-hop ceiling; the global limit is
         // read live from the shared config handle each call, so an operator
-        // reload applies to running delegates at their next check.
+        // reload applies to running delegates at their next check. An
+        // operator override for today lifts only the global limit: a
+        // per-hop ceiling still binds.
+        let global_daily_limit = if day_overridden {
+            f64::INFINITY
+        } else {
+            config.daily_limit_usd
+        };
         let shared_daily_limit = match &self.budget_scope {
             BudgetScope::SharedCapped { daily_ceiling_usd } => {
-                config.daily_limit_usd.min(*daily_ceiling_usd)
+                global_daily_limit.min(*daily_ceiling_usd)
             }
-            BudgetScope::Shared | BudgetScope::Agent { .. } => config.daily_limit_usd,
+            BudgetScope::Shared | BudgetScope::Agent { .. } => global_daily_limit,
         };
         let projected_daily = daily_cost + estimated_cost_usd;
         if projected_daily > shared_daily_limit {
@@ -505,9 +566,9 @@ impl CostTracker {
             }
         }
 
-        // Check monthly limit
+        // Check monthly limit (unless overridden for this month)
         let projected_monthly = monthly_cost + estimated_cost_usd;
-        if projected_monthly > config.monthly_limit_usd {
+        if !month_overridden && projected_monthly > config.monthly_limit_usd {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: monthly_cost,
                 limit_usd: config.monthly_limit_usd,
@@ -516,12 +577,14 @@ impl CostTracker {
             });
         }
 
-        // Check warning thresholds
+        // Check warning thresholds. An overridden period already passed its
+        // limit with the operator's consent; warning about it again on
+        // every call would be noise.
         let warn_threshold = f64::from(config.warn_at_percent.min(100)) / 100.0;
         let daily_warn_threshold = config.daily_limit_usd * warn_threshold;
         let monthly_warn_threshold = config.monthly_limit_usd * warn_threshold;
 
-        if projected_daily >= daily_warn_threshold {
+        if !day_overridden && projected_daily >= daily_warn_threshold {
             return Ok(BudgetCheck::Warning {
                 current_usd: daily_cost,
                 limit_usd: config.daily_limit_usd,
@@ -529,7 +592,7 @@ impl CostTracker {
             });
         }
 
-        if projected_monthly >= monthly_warn_threshold {
+        if !month_overridden && projected_monthly >= monthly_warn_threshold {
             return Ok(BudgetCheck::Warning {
                 current_usd: monthly_cost,
                 limit_usd: config.monthly_limit_usd,
@@ -3572,5 +3635,164 @@ mod tests {
             ),
             "day D must read zero descendant spend: the older record was dropped"
         );
+    }
+
+    /// An operator override lifts the shared daily limit for the rest of the
+    /// UTC day it was granted on, for derived trackers too, and expires by
+    /// itself at the next day. Per-hop and per-agent ceilings still bind.
+    #[test]
+    fn override_lifts_shared_daily_limit_until_rollover() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 1.0,
+                monthly_limit_usd: 500.0,
+                allow_override: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let day_d = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let day_d1 = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let period = |day: NaiveDate| ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        let usage_on = |cost_usd: f64, day: NaiveDate| {
+            usage_costing_at(
+                cost_usd,
+                Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+            )
+        };
+        base.record_usage(usage_on(1.50, day_d)).unwrap();
+        base.record_usage(usage_on(1.50, day_d1)).unwrap();
+
+        let exceeded_day = |check: BudgetCheck| {
+            matches!(
+                check,
+                BudgetCheck::Exceeded {
+                    period: UsagePeriod::Day,
+                    agent_alias: None,
+                    ..
+                }
+            )
+        };
+        assert!(exceeded_day(
+            base.check_budget_at_period(0.0, period(day_d)).unwrap()
+        ));
+
+        assert!(base.grant_override_at_period(UsagePeriod::Day, period(day_d)));
+        assert!(matches!(
+            base.check_budget_at_period(0.0, period(day_d)).unwrap(),
+            BudgetCheck::Allowed
+        ));
+        // A tracker derived after (or before) the grant shares it.
+        assert!(matches!(
+            base.derived_shared()
+                .check_budget_at_period(0.0, period(day_d))
+                .unwrap(),
+            BudgetCheck::Allowed
+        ));
+        // A per-hop ceiling is not lifted by the operator override.
+        assert!(exceeded_day(
+            base.derived_shared_capped(1.0)
+                .check_budget_at_period(0.0, period(day_d))
+                .unwrap()
+        ));
+        // Neither is a per-agent ceiling.
+        assert!(matches!(
+            base.derived_for_agent("child", 0.5)
+                .check_budget_at_period(0.6, period(day_d))
+                .unwrap(),
+            BudgetCheck::Exceeded {
+                agent_alias: Some(_),
+                ..
+            }
+        ));
+        // The next UTC day enforces the limit again.
+        assert!(exceeded_day(
+            base.check_budget_at_period(0.0, period(day_d1)).unwrap()
+        ));
+    }
+
+    /// An overridden day does not lift the monthly limit; that needs its own
+    /// decision.
+    #[test]
+    fn day_override_does_not_lift_monthly_limit() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 1.0,
+                monthly_limit_usd: 2.0,
+                allow_override: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let at = ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        tracker
+            .record_usage(usage_costing_at(
+                2.50,
+                Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+            ))
+            .unwrap();
+
+        assert!(tracker.grant_override_at_period(UsagePeriod::Day, at));
+        assert!(matches!(
+            tracker.check_budget_at_period(0.0, at).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Month,
+                ..
+            }
+        ));
+        assert!(tracker.grant_override_at_period(UsagePeriod::Month, at));
+        assert!(matches!(
+            tracker.check_budget_at_period(0.0, at).unwrap(),
+            BudgetCheck::Allowed
+        ));
+    }
+
+    /// With `allow_override` off, a grant is refused and enforcement stays.
+    #[test]
+    fn override_refused_when_not_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 0.01,
+                allow_override: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
+            .unwrap();
+
+        assert!(!tracker.grant_override(UsagePeriod::Day));
+        assert!(!tracker.grant_override(UsagePeriod::Session));
+        assert!(matches!(
+            tracker.check_budget(0.0).unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
     }
 }

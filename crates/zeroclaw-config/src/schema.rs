@@ -7390,7 +7390,10 @@ pub struct CostConfig {
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
 
-    /// Allow requests to exceed budget with --override flag (default: false)
+    /// When a shared daily or monthly limit is exceeded, pause the turn and
+    /// ask the operator (on channels that answer approvals) whether to
+    /// override it for the rest of the period, instead of stopping
+    /// (default: false)
     #[tab(Limits)]
     #[serde(default)]
     pub allow_override: bool,

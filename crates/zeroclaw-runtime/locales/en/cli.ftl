@@ -1063,6 +1063,10 @@ turn-failed-attachment-omitted = [attachment omitted: the provider rejected it o
 # one requested, so silent model downgrades stay visible on direct-turn
 # surfaces (WS, RPC/ZeroCode, ACP).
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
+# Budget-override prompt (`cost.allow_override`): shown on the operator's
+# approval surface when a turn would exceed the shared cost limit.
+turn-cost-limit-override-day = Today's cost limit is reached: ${ $spent } spent of ${ $limit }. Override it and keep going for the rest of today (UTC)? Stopping ends this turn.
+turn-cost-limit-override-month = This month's cost limit is reached: ${ $spent } spent of ${ $limit }. Override it and keep going for the rest of the month (UTC)? Stopping ends this turn.
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*

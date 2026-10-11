@@ -106,6 +106,13 @@ pub struct ApprovalPosition {
     pub total: u32,
 }
 
+/// `ChannelApprovalRequest::tool_name` of the runtime's budget-override
+/// prompt. Not a real tool: the runtime sends it when a turn would exceed a
+/// shared cost limit and `cost.allow_override` is on, and clients match it to
+/// show the prompt as a cost-limit notice instead of a tool card. Approve
+/// lifts the limit for the rest of the period; anything else stops the turn.
+pub const COST_LIMIT_OVERRIDE_APPROVAL: &str = "cost_limit_override";
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {

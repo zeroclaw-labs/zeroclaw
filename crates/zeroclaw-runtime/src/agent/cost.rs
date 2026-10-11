@@ -1,5 +1,5 @@
 use crate::cost::CostTracker;
-use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage, UsagePeriod};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -647,6 +647,28 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
             ctx.tracker
                 .map(|tracker| tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
         })
+}
+
+/// The scoped tracker for this turn, when cost tracking is scoped.
+fn scoped_tool_loop_tracker() -> Option<Arc<CostTracker>> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|ctx| ctx.tracker)
+}
+
+/// Whether the operator may override an exceeded shared limit for this turn
+/// (`cost.allow_override` in the live config). `false` when unscoped.
+pub fn tool_loop_budget_override_allowed() -> bool {
+    scoped_tool_loop_tracker().is_some_and(|tracker| tracker.config().allow_override)
+}
+
+/// Record the operator's override of the shared `period` limit for the rest
+/// of the current reporting period. Returns `false` when unscoped or when
+/// the tracker refuses (`cost.allow_override` is off).
+pub fn grant_tool_loop_budget_override(period: UsagePeriod) -> bool {
+    scoped_tool_loop_tracker().is_some_and(|tracker| tracker.grant_override(period))
 }
 
 #[cfg(test)]

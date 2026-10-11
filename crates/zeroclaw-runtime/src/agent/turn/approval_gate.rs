@@ -15,6 +15,24 @@ pub(crate) enum ApprovalGateOutcome {
     Cancelled,
 }
 
+/// Narration rides the async delta queue to the draft updater, while an
+/// approval call goes to the channel directly and can overtake it. A flush
+/// barrier waits until the updater consumed (and flushed) the turn's
+/// narration, so the user sees the preceding message before the prompt.
+pub(crate) async fn flush_narration_before_prompt(
+    ctx: &TurnCtx<'_>,
+    ch: &dyn zeroclaw_api::channel::Channel,
+) {
+    if ch.supports_turn_flush_narration()
+        && let Some(tx) = ctx.on_delta
+    {
+        let (barrier, ack) = StreamDelta::flush_barrier();
+        if tx.send(barrier).await.is_ok() {
+            let _ = ack.await;
+        }
+    }
+}
+
 /// Run the approval flow for one tool call (upstream loop body, approval
 /// section): resolve the tool's approval requirement, prompt interactively on
 /// CLI or via the channel's inline approval on non-interactive channels
@@ -51,19 +69,7 @@ pub(crate) async fn gate_tool_approval(
                     position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
-                // Narration rides the async delta queue to the draft updater,
-                // while this approval call goes to the channel directly and
-                // can overtake it. A flush barrier waits until the updater
-                // consumed (and flushed) the turn's narration, so the user
-                // sees the pre-tool message before the approval prompt.
-                if ch.supports_turn_flush_narration()
-                    && let Some(tx) = ctx.on_delta
-                {
-                    let (barrier, ack) = StreamDelta::flush_barrier();
-                    if tx.send(barrier).await.is_ok() {
-                        let _ = ack.await;
-                    }
-                }
+                flush_narration_before_prompt(ctx, ch).await;
                 let response = if let Some(cancel) = ctx.cancellation_token {
                     tokio::select! {
                         biased;

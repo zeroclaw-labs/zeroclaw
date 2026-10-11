@@ -63,7 +63,7 @@ pub(crate) use parse_response::{
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
-    ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
+    ProviderCallOutcome, announce_llm_request, call_provider, gate_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
@@ -2255,7 +2255,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // state, and a rejected turn never reaches the provider — announcing
         // first would claim the agent is waiting on a model that is never
         // called.
-        enforce_tool_loop_budget()?;
+        gate_tool_loop_budget(&ctx).await?;
 
         if strict_tool_parsing
             && !tool_specs.is_empty()
