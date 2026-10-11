@@ -2,7 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
-use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
+use crate::tools::shell_env::apply_shell_environment;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -211,14 +211,7 @@ impl Tool for SkillShellTool {
                 });
             }
         };
-        cmd.env_clear();
-
-        // Only pass safe environment variables
-        for var in SAFE_SHELL_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
+        apply_shell_environment(&mut cmd, &self.security, self.runtime.as_ref());
 
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
@@ -621,6 +614,198 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(unix)]
+    async fn check_launcher_environment(
+        test_name: &str,
+        docker: bool,
+        shell: bool,
+        passthrough: bool,
+    ) {
+        const CHILD: &str = "ZEROCLAW_LAUNCHER_ENV_TEST_CHILD";
+        const PASSTHROUGH: &str = "ZEROCLAW_TEST_SKILL_PASSTHROUGH";
+        const SENTINEL: &str = "ZEROCLAW_TEST_SENTINEL_API_KEY";
+        if std::env::var(CHILD).as_deref() == Ok(test_name) {
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec!["echo".into(), "env".into()],
+                shell_env_passthrough: if passthrough {
+                    vec![
+                        format!(" {PASSTHROUGH} "),
+                        PASSTHROUGH.into(),
+                        "BAD-NAME".into(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                ..SecurityPolicy::default()
+            });
+            let runtime: Arc<dyn RuntimeAdapter> = if docker {
+                Arc::new(crate::platform::DockerRuntime::new(
+                    zeroclaw_config::schema::DockerRuntimeConfig {
+                        mount_workspace: false,
+                        memory_limit_mb: Some(512),
+                        cpu_limit: Some(1.0),
+                        read_only_rootfs: true,
+                        ..Default::default()
+                    },
+                ))
+            } else {
+                Arc::new(NativeRuntime::new())
+            };
+            let command = if docker { "echo probe" } else { "env" };
+            let result = if shell {
+                crate::tools::shell::ShellTool::new(security, runtime)
+                    .execute(serde_json::json!({"command": command, "approved": true}))
+                    .await
+                    .unwrap()
+            } else {
+                let mut skill = sample_skill_tool();
+                skill.command = command.into();
+                skill.args.clear();
+                SkillShellTool::new_with_runtime("probe", &skill, security, runtime)
+                    .execute(serde_json::json!({}))
+                    .await
+                    .unwrap()
+            };
+            assert!(result.success, "{:?}", result.error);
+            let output = result.output.to_string();
+            let lines: Vec<_> = output.lines().collect();
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{SENTINEL}="))),
+                "{output}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.starts_with("BAD-NAME=")),
+                "{output}"
+            );
+            assert_eq!(
+                lines.contains(&"ZEROCLAW_TEST_SKILL_PASSTHROUGH=selected-value"),
+                passthrough,
+                "{output}"
+            );
+            for assignment in [
+                "CONTAINER_HOST=unix:///launcher-podman.sock",
+                "DOCKER_HOST=unix:///launcher-docker.sock",
+            ] {
+                assert_eq!(lines.contains(&assignment), docker, "{output}");
+            }
+            assert!(
+                lines.iter().any(|line| line.starts_with("PATH=")),
+                "{output}"
+            );
+            if docker {
+                let args: Vec<_> = lines
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("ARG="))
+                    .collect();
+                assert!(
+                    !args.contains(&"--env"),
+                    "launcher variables must not be forwarded into the guest: {output}"
+                );
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--memory", "512m"]),
+                    "{output}"
+                );
+                assert!(
+                    args.windows(2).any(|pair| pair == ["--cpus", "1"]),
+                    "{output}"
+                );
+                assert!(args.contains(&"--read-only"), "{output}");
+            }
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let launcher_dir = tempfile::tempdir().unwrap();
+        let launcher = launcher_dir.path().join("docker");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\n/usr/bin/env\nprintf 'ARG=%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([
+            launcher_dir.path(),
+            std::path::Path::new("/usr/bin"),
+            std::path::Path::new("/bin"),
+        ])
+        .unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .env_clear()
+            .args([
+                "--exact",
+                &format!("tools::skill_tool::tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, test_name)
+            .env("PATH", path)
+            .env("HOME", launcher_dir.path())
+            .env("CONTAINER_HOST", "unix:///launcher-podman.sock")
+            .env("DOCKER_HOST", "unix:///launcher-docker.sock")
+            .env(PASSTHROUGH, "selected-value")
+            .env(SENTINEL, "sentinel-must-not-leak")
+            .env("BAD-NAME", "invalid-must-not-leak")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(120), child.output())
+            .await
+            .expect("isolated launcher environment test timed out")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{test_name}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed;"),
+            "exact child regression was not executed: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_docker_launcher_environment() {
+        check_launcher_environment("skill_docker_launcher_environment", true, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_docker_launcher_environment() {
+        check_launcher_environment("shell_docker_launcher_environment", true, true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_configured_environment_passthrough() {
+        check_launcher_environment(
+            "skill_configured_environment_passthrough",
+            false,
+            false,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_native_environment_filtering() {
+        check_launcher_environment("skill_native_environment_filtering", false, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_docker_configured_environment_passthrough() {
+        check_launcher_environment(
+            "skill_docker_configured_environment_passthrough",
+            true,
+            false,
+            true,
+        )
+        .await;
     }
 
     #[cfg(windows)]
