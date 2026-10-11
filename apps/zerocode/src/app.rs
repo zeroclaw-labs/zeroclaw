@@ -2349,8 +2349,8 @@ pub async fn run(
                     &dispatch_state,
                     reload_confirm || help_overlay.is_some() || sidebar.picker_open(),
                     mode,
-                    &chat_pane,
-                    &acp_pane,
+                    &mut chat_pane,
+                    &mut acp_pane,
                     &key,
                 ) {
                     continue;
@@ -2846,8 +2846,8 @@ fn copy_disconnected_composer(
     dispatch_state: &PostPollDispatchState,
     app_modal_owns_keys: bool,
     mode: Mode,
-    chat: &chat::Chat,
-    acp: &acp::Acp,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
     key: &KeyEvent,
 ) -> bool {
     !app_modal_owns_keys
@@ -5271,7 +5271,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let client = Arc::new(crate::client::RpcClient::with_rpc(outbound));
-        let chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
         let mut pane = acp::Acp::new(client);
         pane.activate_session_for_test("editor-test");
         pane.handle_paste("selected draft");
@@ -5306,20 +5306,59 @@ mod tests {
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &copy
         ));
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                copy_disconnected_composer(
+                    &disconnected,
+                    false,
+                    Mode::Acp,
+                    &mut chat,
+                    &mut pane,
+                    &copy,
+                ),
+                "known copy failure must not fall through to global quit"
+            );
+        });
+        assert_eq!(pane.info_message().unwrap().text, expected);
         assert!(
-            !copy_disconnected_composer(&disconnected, true, Mode::Acp, &chat, &pane, &copy,),
+            pane.wants_quit_chord(&copy),
+            "failed copy retains the selected draft"
+        );
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(copy_disconnected_composer(
+                &disconnected,
+                false,
+                Mode::Acp,
+                &mut chat,
+                &mut pane,
+                &copy,
+            ));
+        });
+        assert_eq!(pane.info_message().unwrap().text, outcome.notice());
+        assert!(
+            !copy_disconnected_composer(
+                &disconnected,
+                true,
+                Mode::Acp,
+                &mut chat,
+                &mut pane,
+                &copy,
+            ),
             "an app-level overlay must exclude hidden composer copy"
         );
         assert!(!copy_disconnected_composer(
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
         ));
         assert!(
@@ -5336,8 +5375,8 @@ mod tests {
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &copy
         ));
         assert!(should_handle_global_quit(

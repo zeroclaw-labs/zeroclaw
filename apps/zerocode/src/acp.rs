@@ -178,7 +178,7 @@ impl Acp {
         self.inner.wants_quit_chord(key)
     }
 
-    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
+    pub(crate) fn copy_composer_selection(&mut self, key: &KeyEvent) -> bool {
         self.inner.copy_composer_selection(key)
     }
 

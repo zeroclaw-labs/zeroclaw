@@ -105,7 +105,9 @@ Undo history belongs to the current draft and retains at most 100 edit groups. C
 
 Selection shortcuts act on the focused composer, not the queue sidebar. Copying selected input does not cancel a running turn or quit; with no input selection, Control+C retains its cancel/quit behavior. Dialogs and transcript browsing keep their own shortcuts. Use `/attach` to browse files; the configurable **browse files** action has no default shortcut because Primary+A now selects text. The Help overlay shows the current configured bindings.
 
-Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. Clipboard copy uses the terminal's OSC 52 support; bracketed paste remains available.
+Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. On a local Linux desktop, text copy uses `wl-copy` for Wayland or `xclip` for X11 when the corresponding display is available and the tool is installed. Ubuntu users can install the optional writer with `sudo apt install wl-clipboard` or `sudo apt install xclip`. A successful local writer reports `Copied`; a writer error preserves the selection and reports the failure.
+
+SSH sessions, other platforms, and sessions without an available local writer use the terminal's OSC 52 support. Feedback says `Requested` because sending the sequence cannot confirm that the terminal changed the clipboard. Unsupported terminals can ignore that request; an OSC 52-capable terminal is a workaround. Composer Cut still removes the selected text after an emitted terminal request, and Undo restores it if delivery failed. A known write failure leaves the draft intact. Bracketed paste remains available.
 
 ## CLI flags
 

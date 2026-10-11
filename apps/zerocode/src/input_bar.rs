@@ -878,13 +878,9 @@ impl InputBarState {
     }
 
     /// Purely local clipboard output; safe without a daemon connection.
-    pub(crate) fn copy_selection(&self) -> bool {
-        if let Some((start, end)) = self.selection.filter(|(start, end)| start < end) {
-            mouse::copy_osc52(&self.input[start..end]);
-            true
-        } else {
-            false
-        }
+    pub(crate) fn copy_selection(&self) -> Option<std::io::Result<clipboard::CopyOutcome>> {
+        let (start, end) = self.selection.filter(|(start, end)| start < end)?;
+        Some(clipboard::copy_text(&self.input[start..end]))
     }
 
     /// Resolve ownership through the same configured action table as dispatch.
@@ -1533,15 +1529,20 @@ impl InputBarState {
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CopySelection | IbWidgetAction::Cut) => {
-                if self.copy_selection() {
-                    if action == Some(IbWidgetAction::Cut) {
-                        self.edit(|state| {
-                            state.delete_selection();
-                        });
+                return match self.copy_selection() {
+                    Some(Ok(outcome)) => {
+                        if action == Some(IbWidgetAction::Cut) {
+                            self.edit(|state| {
+                                state.delete_selection();
+                            });
+                        }
+                        InputBarAction::StatusMessage(outcome.notice())
                     }
-                    return InputBarAction::Consumed;
-                }
-                return InputBarAction::NotHandled;
+                    Some(Err(error)) => {
+                        InputBarAction::StatusMessage(clipboard::copy_failure_notice(&error))
+                    }
+                    None => InputBarAction::NotHandled,
+                };
             }
             Some(IbWidgetAction::SelectAll) => {
                 self.selection_anchor = Some(0);
@@ -2815,6 +2816,54 @@ mod tests {
         ));
         bar.undo();
         assert!(bar.input().is_empty());
+    }
+
+    #[test]
+    fn failed_copy_and_cut_preserve_selected_draft_and_consume_keys() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for key in ['c', 'x'] {
+            let mut bar = input_bar_with_shared_commands();
+            bar.load_for_edit("selected draft".into(), Vec::new());
+            bar.selection = Some((0, bar.input.len()));
+            bar.selection_anchor = Some(0);
+            let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+            let expected = clipboard::copy_failure_notice(&error);
+            let action = clipboard::with_copy_result(Err(error), || {
+                bar.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL))
+            });
+            assert!(
+                matches!(action, InputBarAction::StatusMessage(message) if message == expected)
+            );
+            assert_eq!(bar.input(), "selected draft");
+            assert_eq!(bar.selection, Some((0, bar.input.len())));
+            assert_eq!(bar.selection_anchor, Some(0));
+        }
+    }
+
+    #[test]
+    fn terminal_requested_cut_reports_delivery_and_remains_undoable() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("selected draft".into(), Vec::new());
+        bar.selection = Some((0, bar.input.len()));
+        bar.selection_anchor = Some(0);
+        let outcome = clipboard::CopyOutcome::TerminalRequested;
+        let action = clipboard::with_copy_result(Ok(outcome), || {
+            bar.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        });
+        assert!(
+            matches!(action, InputBarAction::StatusMessage(message) if message == outcome.notice())
+        );
+        assert!(bar.input().is_empty());
+        bar.undo();
+        assert_eq!(bar.input(), "selected draft");
+        assert_eq!(bar.selection, Some((0, bar.input.len())));
     }
 
     #[test]
