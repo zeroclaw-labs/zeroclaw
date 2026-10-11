@@ -4464,15 +4464,89 @@ async fn seed_plugin_config_entries(
     Ok(())
 }
 
+/// Name the recovery command when install is refused because something the
+/// host never admitted holds the package name, typically a directory an
+/// interrupted install by an older build left half-written. `plugin remove`
+/// deletes such a directory when it is empty, or when it holds only what an
+/// install writes and admission rejects its own contents. A staged copy the
+/// install kept, and a namespace change, get their own messages; every other
+/// error passes through unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    // Install keeps its staged copy when it cannot publish it. A later
+    // `plugin remove` may sweep that copy, so the remedy is another install.
+    if let zeroclaw::plugins::error::PluginError::RecoveryRetained { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-install-retained",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Install could not publish the package and kept the staged copy at {path}: {reason}. Resolve the occupied name or filesystem error, then run the install again."
+            ),
+        ));
+    }
+    if matches!(
+        &error,
+        zeroclaw::plugins::error::PluginError::NamespaceChanged(_)
+    ) {
+        return with_remove_refusal_reason(error);
+    }
+    let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, .. } = &error else {
+        return error.into();
+    };
+    let remedy = ta(
+        "cli-plugin-install-unadmitted-package",
+        &[("name", name.as_str())],
+        format!(
+            "install failed: '{name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {name}`, then install again."
+        ),
+    );
+    anyhow::Error::from(error).context(remedy)
+}
+
+/// Say why `plugin remove` kept what occupies a name it did not load, with
+/// the host's reason, and what the operator can do instead. Every other error
+/// passes through unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn with_remove_refusal_reason(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    if let zeroclaw::plugins::error::PluginError::NamespaceChanged(reason) = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-namespace-changed",
+            &[("reason", reason.as_str())],
+            format!(
+                "Plugin operation refused because filesystem ownership changed: {reason}. Inspect the plugins directory before retrying."
+            ),
+        ));
+    }
+    if let zeroclaw::plugins::error::PluginError::RecoveryRetained { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-recovery-retained",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Recovery retained files at {path}: {reason}. Resolve the occupied destination or filesystem error, then retry plugin remove."
+            ),
+        ));
+    }
+    let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, reason } = &error else {
+        return error.into();
+    };
+    anyhow::Error::msg(ta(
+        "cli-plugin-remove-unadmitted-package",
+        &[("name", name.as_str()), ("reason", reason.as_str())],
+        format!(
+            "`zeroclaw plugin remove` left '{name}' in place: {reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{name}' by hand if it should go."
+        ),
+    ))
+}
+
 /// Publish a plugin and seed its config entries as one transaction.
 ///
 /// `host.install_admitted` either performs a *fresh publish* — copying the package into
 /// the plugins directory and inserting it into the loaded set — or, when the
-/// package is already loaded, fails with `AlreadyLoaded` *before* copying
-/// anything. So the only half-installed window is a fresh publish whose config
-/// seeding then fails: the package is on disk and in the loaded set, yet the
-/// command reports an error and a naive retry would hit `AlreadyLoaded`,
-/// forcing a manual removal.
+/// package is already loaded (`AlreadyLoaded`) or something unadmitted holds
+/// its name (`UnadmittedPackage`), fails *before* copying anything. So the only
+/// half-installed window is a fresh publish whose config seeding then fails: the
+/// package is on disk and in the loaded set, yet the command reports an error and
+/// a naive retry would hit `AlreadyLoaded`, forcing a manual removal.
 ///
 /// This closes that window. On any failure after a fresh publish the
 /// just-published package is rolled back with `host.remove` — the same removal
@@ -4496,7 +4570,9 @@ async fn publish_and_seed_plugin(
     // A fresh publish: the package is now on disk and in the loaded set. An
     // already-present package fails here, before any copy, so nothing past this
     // point ever runs against a package this call did not itself publish.
-    let name = host.install_admitted(admitted)?;
+    let name = host
+        .install_admitted(admitted)
+        .map_err(with_unadmitted_package_remedy)?;
 
     let seed_result: Result<()> = async {
         let config_entries = installed_plugin_config_entries(host, &name)?;
@@ -10984,7 +11060,22 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let instance_keys: Vec<String> = installed_plugin_config_entries(&host, &name)
                     .map(|entries| entries.into_iter().map(|(_, key)| key).collect())
                     .unwrap_or_default();
-                host.remove(&name)?;
+                let retained = host
+                    .remove_with_report(&name)
+                    .map_err(with_remove_refusal_reason)?;
+                for path in retained {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-staging-retained",
+                            &[("path", path.to_string_lossy().as_ref())],
+                            format!(
+                                "Retained staging at {} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.",
+                                path.display()
+                            )
+                        )
+                    );
+                }
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
@@ -20344,6 +20435,149 @@ type = "string"
                 .any(|e| e.name == instance_key),
             "the retry must seed the instance-key row"
         );
+    }
+
+    /// A package directory an older installer stranded half-written blocks the
+    /// next install of that name. The refusal names the recovery command,
+    /// announces nothing, and leaves the directory alone; running that command
+    /// and installing again succeeds.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn an_install_blocked_by_a_stranded_directory_names_plugin_remove() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = "name = \"stranded-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        // The manifest landed, the payload never did: discovery skips it.
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let stranded = plugins.path().join("stranded-probe");
+        std::fs::create_dir(&stranded).expect("stranded dir");
+        std::fs::write(stranded.join("manifest.toml"), manifest_toml).expect("stranded manifest");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        assert!(host.get_plugin("stranded-probe").is_none());
+
+        let dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(dir.path());
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("the stranded directory must refuse the install");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("`zeroclaw plugin remove stranded-probe`"),
+            "the refusal must name the recovery command: {rendered}"
+        );
+        assert!(!announced.get(), "a refused install must not announce");
+        assert!(
+            stranded.join("manifest.toml").is_file() && !stranded.join("plugin.wasm").exists(),
+            "the refused install must leave the stranded directory as it was"
+        );
+
+        host.remove("stranded-probe")
+            .expect("the named command must clear the stranded directory");
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect("the install must succeed once the directory is cleared");
+        assert!(announced.get());
+        assert_eq!(
+            std::fs::read(stranded.join("plugin.wasm")).expect("installed component"),
+            b"\0asm"
+        );
+    }
+
+    /// `plugin remove` keeps a complete package this host rejects for its
+    /// signature policy, and the refusal the operator reads carries the host's
+    /// reason instead of a bare "not admitted".
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_refused_plugin_remove_says_why_and_keeps_the_package() {
+        use zeroclaw::plugins::host::PluginHost;
+        use zeroclaw::plugins::signature::SignatureMode;
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let package = plugins.path().join("unsigned-probe");
+        std::fs::create_dir(&package).expect("package dir");
+        std::fs::write(
+            package.join("manifest.toml"),
+            "name = \"unsigned-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n",
+        )
+        .expect("write manifest");
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let mut host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .expect("strict host");
+
+        let err = host
+            .remove("unsigned-probe")
+            .map_err(with_remove_refusal_reason)
+            .expect_err("strict policy keeps a complete unsigned package");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("'unsigned-probe'")
+                && rendered.contains("unsigned and signature verification is required"),
+            "the refusal must name the package and the host's reason: {rendered}"
+        );
+        assert!(package.join("plugin.wasm").is_file(), "the package is kept");
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn retained_recovery_diagnostic_names_actual_claim_without_left_untouched() {
+        let error = zeroclaw::plugins::error::PluginError::RecoveryRetained {
+            path: "/synthetic/plugins/.probe.recovering-v1-test/package".into(),
+            reason: "destination occupied".into(),
+        };
+        let rendered = with_remove_refusal_reason(error).to_string();
+        assert!(
+            rendered.contains(".probe.recovering-v1-test/package"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("destination occupied"), "{rendered}");
+        assert!(!rendered.contains("left untouched"), "{rendered}");
+    }
+
+    /// An install that could not publish keeps its staged copy and says to run
+    /// the install again, not `plugin remove`, which may sweep that copy.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_retained_install_points_at_installing_again() {
+        let error = zeroclaw::plugins::error::PluginError::RecoveryRetained {
+            path: "/synthetic/plugins/.probe.installing-v1-test/package".into(),
+            reason: "File exists (os error 17)".into(),
+        };
+        let rendered = with_unadmitted_package_remedy(error).to_string();
+        assert!(
+            rendered.contains(".probe.installing-v1-test/package")
+                && rendered.contains("File exists (os error 17)")
+                && rendered.contains("run the install again"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("plugin remove"), "{rendered}");
     }
 
     /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves
