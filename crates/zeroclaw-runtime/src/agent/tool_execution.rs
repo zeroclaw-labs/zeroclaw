@@ -16,6 +16,30 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+tokio::task_local! {
+    /// The running turn's cancellation token, scoped around each tool's
+    /// `execute`. A tool that starts work its own future does not own (the
+    /// delegate fan-out spawns children) reads it to bind that work to the
+    /// turn, so aborting the turn reaches what the turn started.
+    static TURN_CANCELLATION: CancellationToken;
+}
+
+/// The cancellation token of the turn executing the current tool, when a
+/// turn is executing one. `None` outside a tool execution or when the turn
+/// runs without a token.
+pub(crate) fn current_turn_cancellation() -> Option<CancellationToken> {
+    TURN_CANCELLATION.try_with(Clone::clone).ok()
+}
+
+/// Scope `future` as running under `token`'s turn, so tools it executes see
+/// it through [`current_turn_cancellation`].
+pub(crate) async fn scope_turn_cancellation<F: std::future::Future>(
+    token: CancellationToken,
+    future: F,
+) -> F::Output {
+    TURN_CANCELLATION.scope(token, future).await
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -292,7 +316,7 @@ pub(crate) async fn execute_one_tool(
         if let Some(token) = cancellation_token {
             tokio::select! {
                 () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+                result = scope_turn_cancellation(token.clone(), tool_future) => Ok(result),
             }
         } else {
             Ok(tool_future.await)
@@ -2574,5 +2598,92 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() =
+                Some(super::current_turn_cancellation().is_some());
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            super::current_turn_cancellation().is_none(),
+            "the token must not leak past the tool execution"
+        );
     }
 }

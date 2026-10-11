@@ -243,6 +243,16 @@ them as Fluent keys.
 
 (Cron-launched agent jobs are a separate spawn site and use the explicit `subagent` span described above; `delegate` and cron are not the same path.)
 
+### `delegate`: what stopping the turn cancels
+
+Stopping the turn that called `delegate` (for example `POST /api/sessions/{id}/abort`, or a channel interruption) reaches the work that turn started, even though the children run in their own tasks and outlive the parent's dropped tool future:
+
+- **Agentic children** (bounded or independent) are bound to the launching turn's cancellation and stop with it.
+- **Parallel children** (`parallel: [...]`) that run their own tool loop are bound the same way, at every depth. A parallel child that makes a plain model call without a tool loop is not interrupted mid-call: it ends with that call's own timeout.
+- **Background tasks** (`background: true`) are not bound to the turn at any depth, including one launched by a child that was itself started in the foreground. They outlive the turn by design and stop only through `cancel_task`.
+
+`spawn_subagent` has none of this: it has no background or parallel mode, and its child is cancelled with the parent future.
+
 ### What's not in this page (intentionally)
 
 1. Example conversation transcripts. Anything I wrote here describing "what the bot will say" would be model-dependent. The bot's reply is downstream of the tool's output, model, system prompt, and current conversation state, none of which this page controls. The verifiable layer is what the tool returns (above) and what the log captures.
@@ -265,7 +275,7 @@ them as Fluent keys.
 
 1. **Recursion beyond depth 1.** A SubAgent cannot spawn its own SubAgent. The cap is a hard refusal at the tool, not a budget. Cron-launched runs start at depth 0 and may spawn one level; agent-loop-launched SubAgents are at depth 1 and refuse further spawning.
 2. **A separate identity for the child.** SubAgents share the parent's agent UUID. To run under a different identity, use `delegate` to hand off to a configured sibling agent.
-3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope.
+3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope (for `delegate`, see [what stopping the turn cancels](#delegate-what-stopping-the-turn-cancels)).
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
 6. **`delegate` targets with `always_ask`.** Independent delegation and bounded agentic delegation are blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools. This blocker remains until approval forwarding for child agent loops is supported by a future ZeroClaw version.
