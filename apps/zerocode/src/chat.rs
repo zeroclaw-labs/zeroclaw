@@ -5418,45 +5418,19 @@ impl Chat {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
-                        state.scrollbar_drag = Some(ScrollbarDrag {
-                            start_scroll: state.scroll_offset,
-                            start_row: row,
-                        });
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        if track.height > 0 {
-                            let rel = row.saturating_sub(track.y) as u32;
-                            let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
-                            state.scroll_offset = new_off.min(max);
-                            state.pinned_to_bottom = state.scroll_offset >= max;
-                            state.sync_transcript_selection_viewport();
-                        }
+                        state.scrollbar_drag = true;
+                        state.seek_scrollbar(row);
                         return;
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
-                    if let Some(drag) = state.scrollbar_drag {
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        let track_h = state
-                            .scrollbar_track_rect
-                            .map(|r| r.height)
-                            .unwrap_or(0)
-                            .max(1);
-                        let dy = row as i32 - drag.start_row as i32;
-                        let scroll_delta = dy * max as i32 / track_h as i32;
-                        let new_off =
-                            (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
-                        state.scroll_offset = new_off as u16;
-                        state.pinned_to_bottom = state.scroll_offset >= max;
-                        state.sync_transcript_selection_viewport();
+                    if state.scrollbar_drag {
+                        state.seek_scrollbar(row);
                         return;
                     }
                 }
-                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag.is_some() => {
-                    state.scrollbar_drag = None;
+                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag => {
+                    state.scrollbar_drag = false;
                     return;
                 }
                 _ => {}
@@ -8043,24 +8017,22 @@ fn render_conversation(
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
-    let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
-        .position(scroll as usize)
-        .viewport_content_length(inner_height as usize);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None),
-        area,
-        &mut scrollbar_state,
-    );
-    // Scrollbar paints in `area.right() - 1`; mirror that.
     if area.height > 2 {
-        state.scrollbar_track_rect = Some(Rect::new(
+        let track = Rect::new(
             area.x + area.width.saturating_sub(1),
             area.y + 1,
             1,
             area.height - 2,
-        ));
+        );
+        let mut scrollbar_state = state.scrollbar_state();
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            track,
+            &mut scrollbar_state,
+        );
+        state.scrollbar_track_rect = Some(track);
     } else {
         state.scrollbar_track_rect = None;
     }
@@ -9546,13 +9518,6 @@ impl ModelPickerOverlay {
 const MAX_RENDERED_ENTRIES: usize = 1_000;
 const RENDER_WINDOW_SHIFT_ENTRIES: usize = MAX_RENDERED_ENTRIES / 2;
 
-/// Scrollbar drag captured on mouse-down on the track.
-#[derive(Debug, Clone, Copy)]
-struct ScrollbarDrag {
-    start_scroll: u16,
-    start_row: u16,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptDragEdge {
     Top,
@@ -9776,8 +9741,8 @@ pub struct ChatState {
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
     scrollbar_track_rect: Option<ratatui::layout::Rect>,
-    /// Active scrollbar drag anchor.
-    scrollbar_drag: Option<ScrollbarDrag>,
+    /// Whether the scrollbar owns the current left-button drag.
+    scrollbar_drag: bool,
     session_overlay: SessionOverlay,
     scroll_offset: u16,
     pinned_to_bottom: bool,
@@ -9884,7 +9849,7 @@ impl ChatState {
             copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
-            scrollbar_drag: None,
+            scrollbar_drag: false,
             session_overlay: SessionOverlay::None,
             scroll_offset: 0,
             pinned_to_bottom: true,
@@ -11007,6 +10972,80 @@ impl ChatState {
                 .find(|(idx, _, _, _)| *idx == anchor_idx)
         {
             self.scroll_offset = lo.saturating_add(intra_entry_row);
+        }
+    }
+
+    fn scrollbar_state(&self) -> ScrollbarState {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        if self.entries.len() <= MAX_RENDERED_ENTRIES {
+            return ScrollbarState::new(usize::from(max) + 1)
+                .position(usize::from(self.scroll_offset.min(max)))
+                .viewport_content_length(usize::from(self.last_inner_height));
+        }
+
+        // Reuse the indexed viewport lookup without laying out older entries.
+        let visible = self.visible_cached_entry_range(self.scroll_offset, self.last_inner_height);
+        let position = if self.pinned_to_bottom {
+            self.entries.len().saturating_sub(1)
+        } else {
+            self.cached_screen_ranges
+                .get(visible.start)
+                .map_or(self.cached_render_start, |(idx, _, _, _)| *idx)
+        };
+        ScrollbarState::new(self.entries.len())
+            .position(position)
+            .viewport_content_length(visible.len().max(1))
+    }
+
+    fn seek_scrollbar(&mut self, row: u16) {
+        let Some(track) = self.scrollbar_track_rect.filter(|track| track.height > 0) else {
+            return;
+        };
+        let span = track.height.saturating_sub(1).max(1);
+        let position = row.saturating_sub(track.y).min(span);
+        // A stale browse cursor must not reclaim the newly sought window.
+        self.clear_browse_selection();
+        if position == 0 {
+            self.scroll_to_top();
+        } else if position == span {
+            self.scroll_to_bottom();
+        } else if self.entries.len() <= MAX_RENDERED_ENTRIES {
+            let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+            self.scroll_offset = (u32::from(position) * u32::from(max) / u32::from(span)) as u16;
+            self.pinned_to_bottom = self.scroll_offset >= max;
+            self.sync_transcript_selection_viewport();
+        } else {
+            let target =
+                self.entries.len().saturating_sub(1) * usize::from(position) / usize::from(span);
+            // Match zero-line entries in render_entry_into without full-history layout.
+            let is_visible = |idx: &usize| match &self.entries[*idx] {
+                ChatEntry::AgentThought(_) => self.show_thoughts,
+                ChatEntry::SystemMessage(text) => !text.is_empty(),
+                _ => true,
+            };
+            let target = (target..self.entries.len())
+                .find(is_visible)
+                .or_else(|| (0..target).rev().find(is_visible))
+                .unwrap_or(target);
+            self.pinned_to_bottom = false;
+            if !(self.cached_render_start..self.render_window_end()).contains(&target) {
+                self.cached_render_start =
+                    target.min(self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES));
+                self.mark_dirty_full();
+            }
+            if self.dirty != LinesDirty::Clean {
+                self.clear_transcript_selection_for_render_change();
+                self.transcript_snapshot = None;
+                self.rebuild_lines(self.cached_render_width);
+            }
+            self.last_total_rows = self.cached_total_rows;
+            let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+            self.scroll_offset = self
+                .cached_screen_ranges
+                .iter()
+                .find(|(idx, _, _, _)| *idx >= target)
+                .map_or(max, |(_, lo, _, _)| (*lo).min(max));
+            self.sync_transcript_selection_viewport();
         }
     }
 
@@ -14479,6 +14518,11 @@ mod tests {
         assert_eq!(state.transcript_selection, selection);
         assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 2);
 
+        state.scrollbar_track_rect = Some(Rect::new(5, 0, 1, 5));
+        state.seek_scrollbar(2);
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 1);
+
         state.enter_browse_mode();
         assert_eq!(state.transcript_selection, None);
 
@@ -14545,6 +14589,12 @@ mod tests {
         assert_eq!(state.transcript_layout.view().cached_render_start, 1_200);
         assert_eq!(state.transcript_selection, selection);
         assert!(state.transcript_snapshot.is_some());
+
+        state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
+        state.seek_scrollbar(6);
+        assert!(state.cached_render_start < 1_200);
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.transcript_snapshot, None);
     }
 
     #[test]
@@ -15253,9 +15303,11 @@ mod tests {
         state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        for (kind, row) in [
-            (MouseEventKind::Down(MouseButton::Left), 4),
-            (MouseEventKind::Drag(MouseButton::Left), 8),
+        for (kind, row, expected) in [
+            (MouseEventKind::Down(MouseButton::Left), 4, 17),
+            (MouseEventKind::Drag(MouseButton::Left), 4, 17),
+            (MouseEventKind::Drag(MouseButton::Left), 5, 26),
+            (MouseEventKind::Drag(MouseButton::Left), 11, 80),
         ] {
             chat.handle_mouse(
                 MouseEvent {
@@ -15267,13 +15319,17 @@ mod tests {
                 Rect::new(0, 0, 80, 20),
             )
             .await;
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert_eq!(state.scroll_offset, expected);
         }
 
         {
             let ChatPhase::Active(state) = &chat.phase else {
                 panic!("expected active chat");
             };
-            assert!(state.scrollbar_drag.is_some());
+            assert!(state.scrollbar_drag);
             assert!(state.scroll_offset > 0);
             assert_eq!(state.transcript_selection, None);
         }
@@ -15292,7 +15348,179 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.scrollbar_drag.is_none());
+        assert!(!state.scrollbar_drag);
+    }
+
+    #[tokio::test]
+    async fn scrollbar_seeks_complete_history_with_a_bounded_render_window() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let draw = |chat: &mut Chat, area: Rect| {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("expected active chat");
+            };
+            let mut terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    render_conversation(frame, state, area);
+                })
+                .expect("draw conversation");
+            assert!(state.cached_entry_count <= MAX_RENDERED_ENTRIES);
+            state.scrollbar_track_rect.expect("scrollbar track")
+        };
+
+        for (browse_mode, hidden_entries) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (mut chat, _rx) = test_chat();
+            let mut active = state();
+            active.entries = (0..2_200)
+                .map(|idx| {
+                    if hidden_entries && idx > 0 && idx < 2_199 {
+                        if idx % 2 == 0 {
+                            ChatEntry::AgentThought(Arc::<str>::from("hidden thought"))
+                        } else {
+                            ChatEntry::SystemMessage(Arc::<str>::from(""))
+                        }
+                    } else {
+                        ChatEntry::AgentMessage(Arc::<str>::from(format!("entry {idx}")))
+                    }
+                })
+                .collect();
+            active.show_thoughts = !hidden_entries;
+            if browse_mode {
+                active.enter_browse_mode();
+            }
+            active.mark_dirty_full();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut area = Rect::new(0, 0, 80, 20);
+            let mut track = draw(&mut chat, area);
+
+            for (step, kind) in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = match step {
+                    0 => track.y + track.height / 2,
+                    1 | 3 => track.y,
+                    _ => track.bottom() - 1,
+                };
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: track.x,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                )
+                .await;
+                track = draw(&mut chat, area);
+                let ChatPhase::Active(state) = &chat.phase else {
+                    panic!("expected active chat");
+                };
+                assert!(
+                    !state.in_browse_mode(),
+                    "old cursor must not reclaim the window"
+                );
+                match step {
+                    0 => {
+                        let expected = if hidden_entries {
+                            2_199
+                        } else {
+                            2_199 * usize::from(row - track.y) / usize::from(track.height - 1)
+                        };
+                        assert_eq!(state.scrollbar_state().get_position(), expected);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == expected));
+                    }
+                    1 | 3 => {
+                        assert_eq!(state.cached_render_start, 0);
+                        assert_eq!(state.scroll_offset, 0);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
+                    }
+                    _ => {
+                        assert!(state.pinned_to_bottom);
+                        assert_eq!(state.render_window_end(), 2_200);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 2_199));
+                    }
+                }
+                if step == 1 && !hidden_entries {
+                    let ChatPhase::Active(state) = &mut chat.phase else {
+                        panic!("expected active chat");
+                    };
+                    let rect = state.entry_rects[0].1;
+                    assert!(state.begin_transcript_drag(rect.x, rect.y));
+                    assert!(state.update_transcript_drag(rect.x + 1, rect.y));
+                    state.finish_transcript_drag();
+                    let selection = state.transcript_selection;
+                    let selected_text = state.current_selection_text();
+                    let cached_start = state.cached_render_start;
+                    let cached_count = state.cached_entry_count;
+                    chat.handle_mouse(
+                        MouseEvent {
+                            kind: MouseEventKind::Drag(MouseButton::Left),
+                            column: track.x,
+                            row: track.y + 1,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        area,
+                    )
+                    .await;
+                    track = draw(&mut chat, area);
+                    let ChatPhase::Active(state) = &chat.phase else {
+                        panic!("expected active chat");
+                    };
+                    assert_eq!(state.cached_render_start, cached_start);
+                    assert_eq!(state.cached_entry_count, cached_count);
+                    assert_eq!(state.transcript_selection, selection);
+                    assert_eq!(state.current_selection_text(), selected_text);
+                }
+                if step == 2 {
+                    area = Rect::new(0, 0, 60, 14);
+                    track = draw(&mut chat, area);
+                }
+            }
+        }
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.entries = (0..2_200)
+            .map(|idx| {
+                if idx == 0 {
+                    ChatEntry::AgentMessage(Arc::<str>::from("visible entry"))
+                } else {
+                    ChatEntry::AgentThought(Arc::<str>::from("hidden suffix"))
+                }
+            })
+            .collect();
+        active.show_thoughts = false;
+        active.mark_dirty_full();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let area = Rect::new(0, 0, 80, 20);
+        let track = draw(&mut chat, area);
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: track.x,
+                row: track.y + track.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        draw(&mut chat, area);
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.scrollbar_state().get_position(), 0);
+        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
     }
 
     #[test]
