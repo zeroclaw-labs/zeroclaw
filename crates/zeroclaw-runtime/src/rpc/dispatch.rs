@@ -894,6 +894,26 @@ fn memory_embeddings_use_provider(
             .any(|route| route.model_provider.trim() == model_provider_ref)
 }
 
+/// Whether `config/set` refuses to write `value` to `prop` because it would
+/// overwrite a secret with a placeholder: the masked display value a surface
+/// echoes back when nothing was edited (`MASKED_SECRET` or `****`), or the
+/// empty string. `info` is the field info the config reports for `prop`, when
+/// it reports one. A prop is a secret when that info marks it secret or
+/// derived from a secret, or when its path names a secret.
+///
+/// Public so a surface that decides whether the daemon would take a write
+/// applies the daemon's own rule.
+pub fn refuses_secret_placeholder(
+    info: Option<&zeroclaw_config::traits::PropFieldInfo>,
+    prop: &str,
+    value: &str,
+) -> bool {
+    let is_secret_prop = info.is_some_and(|info| info.is_secret || info.derived_from_secret)
+        || Config::prop_is_secret(prop);
+    is_secret_prop
+        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
+}
+
 fn rename_error_to_rpc(
     path: &str,
     from: &str,
@@ -9319,8 +9339,8 @@ impl RpcDispatcher {
     }
 
     /// Upper bound on entries in one `config/set-many` batch. See
-    /// [`Self::handle_config_set_many`] for why the bound exists.
-    const CONFIG_SET_MANY_MAX_ENTRIES: usize = 256;
+    /// `handle_config_set_many` for why the bound exists.
+    pub const CONFIG_SET_MANY_MAX_ENTRIES: usize = 256;
 
     /// `config/set-many`: stage an ordered batch of `config/set` entries on
     /// one working copy and commit it with a single `save_and_publish_config`,
@@ -9514,15 +9534,7 @@ impl RpcDispatcher {
         // masked display value back when no real edit happened, and
         // letting that through silently clobbers the live secret with
         // the literal masked string.
-        let is_secret_prop = info
-            .as_ref()
-            .is_some_and(|i| i.is_secret || i.derived_from_secret)
-            || Config::prop_is_secret(prop);
-        if is_secret_prop
-            && (value_str == zeroclaw_config::traits::MASKED_SECRET
-                || value_str == "****"
-                || value_str.is_empty())
-        {
+        if refuses_secret_placeholder(info.as_ref(), prop, &value_str) {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
@@ -14197,6 +14209,61 @@ mod tests {
         assert_eq!(reaction.len(), 2);
         assert!(reaction.contains_key("git.main"));
         assert!(reaction.contains_key("rpc"));
+    }
+
+    /// `config/set` refuses a placeholder only for a secret: a prop whose
+    /// field info marks it secret or derived from a secret, or whose path
+    /// names a secret. A real value always goes through.
+    #[test]
+    fn refuses_secret_placeholder_only_for_a_secret() {
+        use super::refuses_secret_placeholder;
+        use zeroclaw_config::traits::MASKED_SECRET;
+
+        let fields = zeroclaw_config::schema::Config::default().prop_fields();
+        let secret = fields
+            .iter()
+            .find(|field| field.is_secret)
+            .expect("the default config has a secret field");
+        let plain = fields
+            .iter()
+            .find(|field| field.name == "gateway.host")
+            .expect("gateway.host is a field");
+        let mut derived = plain.clone();
+        derived.derived_from_secret = true;
+        let placeholders = [MASKED_SECRET, "****", ""];
+
+        for (info, prop, what) in [
+            (Some(secret), secret.name.as_str(), "a field marked secret"),
+            (
+                Some(&derived),
+                "gateway.host",
+                "a field derived from a secret",
+            ),
+            (
+                None,
+                "providers.models.openrouter.default.api_key",
+                "a path that names a secret",
+            ),
+        ] {
+            for placeholder in placeholders {
+                assert!(
+                    refuses_secret_placeholder(info, prop, placeholder),
+                    "{what} refuses {placeholder:?}"
+                );
+            }
+            assert!(
+                !refuses_secret_placeholder(info, prop, "rotated"),
+                "{what} takes a real value"
+            );
+        }
+        for info in [Some(plain), None] {
+            for value in placeholders.into_iter().chain(["127.0.0.1"]) {
+                assert!(
+                    !refuses_secret_placeholder(info, "gateway.host", value),
+                    "a plain field takes {value:?}"
+                );
+            }
+        }
     }
 
     /// The personality filename allowlist constrains the name, not its target.

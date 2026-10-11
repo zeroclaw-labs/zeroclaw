@@ -62,14 +62,108 @@ importantly, what changes for existing remote connections.
    the session's queue, so a request queued before its principal was
    narrowed or its credential expired is refused when its turn comes.
 
-Authorization is **live** for edits made through the daemon's RPC config
-methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
-local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
-outside the daemon, directly in `config.toml`, through the web dashboard, or
-with `zeroclaw config set`, apply at the next daemon reload or restart.
+### When authorization edits take effect
+
+Authorization is **live** for edits the running daemon commits: the daemon's
+RPC config methods, which is what zerocode's config editor uses, the web
+dashboard's config API when the gateway runs under the daemon, and
+`zeroclaw config set` or `zeroclaw config patch` when the daemon accepts the
+edit from the CLI. Editing `[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid` that way re-compiles the policy at save time.
+Established native-token and local connections re-resolve at their next
+operation, with no reconnect or restart, and an OIDC connection must
+initialize again.
+
+For `zeroclaw config`, an authorization edit is one that writes or changes
+`[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid`. The CLI counts this configuration's daemon as
+running while its heartbeat file beside `config.toml`
+(`state/daemon_state.json`) is recent and, on Unix, names a live process.
+Without such a heartbeat, the CLI checks the configuration's ownership
+lock, which a daemon takes before it loads its configuration and holds
+while it runs. If another process holds the lock, typically a daemon still
+starting, before its first heartbeat, or a standalone `zeroclaw agent` or
+`zeroclaw gateway start`, the CLI sends nothing, saves the edit itself and
+reports it pending reload. Only when the lock is free does the CLI find no
+daemon: it then saves `config.toml` as before, prints nothing new, and
+contacts no endpoint, not even one an exported `ZEROCLAW_SOCKET` names; the
+edit applies when a daemon next starts.
+
+With the daemon running, `config set` and `config patch` first check that
+the endpoint is that daemon's (on Unix, the socket's peer must be this
+account or root, and its process the one the heartbeat names), then hand
+the edit to it as `config/set`, or `config/set-many` for a patch. The
+daemon validates and saves the edit, swaps it into its live configuration
+and publishes the policy before the CLI reports it applied. It commits a
+patch that also writes other paths as one batch. A patch the daemon would
+commit fails whole if it has a `test` op on an authorization path, before
+the daemon is contacted and with nothing saved: the CLI would check that
+`test` against its on-disk copy while the writes land on the daemon's live
+configuration. With no daemon, `test` ops keep their usual meaning.
+
+With the daemon running, the CLI instead saves `config.toml` itself and
+reports the edit as pending reload, naming the reason, when the daemon
+refuses the caller at the handshake, before binding a principal: a uid
+outside the roster, or any caller while the daemon is in the deny-all
+state. This lets the file's owner repair a lockout from the command line
+(see [Recovery](#recovery)). The CLI does the same when the daemon runs
+another release, fails the handshake, or cannot be reached; when the
+endpoint is not this configuration's daemon, or is a named pipe (the CLI
+does not verify a named pipe's server, so on Windows it never sends an
+authorization edit over one); and when the daemon's config methods do not
+take the write (clearing or masking a secret, a patch that creates a
+keyed-list row such as `plugins.entries`, a patch of more than 256
+writes). `config init` never commits an authorization entry through the
+daemon, so while the daemon runs it reports every one it writes as
+pending. Until a reload or restart picks up a pending edit, the running
+daemon enforces the previous policy.
+
+Before any pending save, the CLI checks that the resulting policy compiles.
+It refuses, saving nothing, only an edit that would turn a policy that
+compiles into one that does not, so with `config set` and `config init` a
+file whose policy already fails to compile can still be repaired one field
+at a time; `config patch` validates the whole resulting configuration
+first, as it always has. So while a daemon runs or another process holds
+the ownership lock, `config init users.<name>` and
+`config init oidc.<alias>` fail, since their entries cannot compile until
+filled in, and `config init permission_profiles.<name>` is saved and
+reported pending. The command fails with the daemon's reason, and nothing
+is saved, when the daemon rejects the edit, or identifies the caller and
+then refuses it because its principal lacks the config-write grant.
+Set fields that are only valid together, such as those of a new roster or
+OIDC entry, in one `zeroclaw config patch`. If the daemon is asked and does
+not answer, the command fails without saving and names the property to
+check with `zeroclaw config get`. A standalone `zeroclaw gateway start`
+publishes its own config-API edits but picks up CLI and hand edits only at
+its restart.
+
+Human output adds one notice on stderr for an applied or pending edit.
+With `--json` there is no notice; instead the envelope of `config set`,
+`config patch` and `config init` gains a `daemon` member for an
+authorization edit the daemon applied or the CLI reports pending:
+`{"applied": true}`, or
+`{"applied": false, "pending_reload": true, "reason": R}` with `R` one of
+these codes.
+
+| `reason` | Why the CLI saved the edit itself |
+|---|---|
+| `refused` | The daemon refused this caller at the handshake, before binding a principal: its uid is outside the roster, or the daemon is in the deny-all state. |
+| `version_mismatch` | The daemon runs another release than the CLI. |
+| `handshake` | The daemon answered, but the handshake failed. |
+| `unreachable` | The heartbeat names a running daemon, but its endpoint could not be reached. |
+| `other_daemon` | The endpoint is not this configuration's daemon, so it was not sent the edit. |
+| `unverified_endpoint` | The endpoint is a Windows named pipe, whose server the CLI does not verify, so it was not sent the edit. |
+| `owner_unconfirmed` | No recent heartbeat confirms a daemon, but another process holds the configuration's ownership lock, so the CLI sent nothing. |
+| `not_replayable` | The daemon's config methods do not take this write. |
+| `offline_command` | The command never commits this write through the daemon (`config init`). |
+
+A `config patch --json` that fails uses the command's JSON error envelope:
+`validation_failed` for an edit the daemon rejects as invalid, refuses for
+the principal it identified, or one that would break a compiling policy;
+`op_not_supported`, with `path` naming it, for a `test` op on an
+authorization path; and `internal_error` otherwise, with `path` naming the
+property to check when the outcome is unknown.
+
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
 Removing a token from `gateway.paired_tokens` by editing config, over RPC
@@ -155,19 +249,25 @@ local trusted path is intact on a Unix socket; on Windows, see the named
 pipe note above. Connect locally as the daemon's own uid:
 with `security.trust_daemon_uid = true` (the default) that account is the
 trusted shared operator whatever the roster says. Repair the offending
-entry over that local connection, for example in zerocode's config editor
-or with an RPC `config/set` of `users.alice.uid`, and the change is
-compiled and published at save time. Editing `config.toml` or running
-`zeroclaw config set` also repairs it, but only once the daemon reloads or
-restarts.
+entry over that local connection, for example in zerocode's config editor,
+with an RPC `config/set` of `users.alice.uid`, or with
+`zeroclaw config set` run as that account, which commits through the
+daemon; the change is compiled and published at save time. Editing
+`config.toml` by hand also repairs it, but only once the daemon reloads or
+restarts, and so does a `zeroclaw config set` that the CLI reports as
+pending. A roster principal without the config-write grant cannot repair
+it with `zeroclaw config set`: the daemon identifies it and refuses the
+edit, so the command fails and nothing is saved.
 
 **Locked out by a deny-all accepted state.** The policy did not compile,
 so the accepted state refuses every principal before resolution runs, the
 daemon's own uid and the shared operator included. No RPC repairs it:
 `config/set` and `config/reload` are refused along with everything else.
-Edit `config.toml` directly as its owner, then restart the daemon so the
-repaired sections are compiled and published. The daemon ignores `SIGHUP`,
-so a restart is the step that reloads it.
+Edit `config.toml` as its owner, by hand or with `zeroclaw config set`:
+the daemon refuses that command at the handshake, so the CLI saves the
+edit itself and reports it pending (`refused`). Then restart the daemon so
+the repaired sections are compiled and published. The daemon ignores
+`SIGHUP`, so a restart is the step that reloads it.
 
 If `security.trust_daemon_uid` is set to `false`, the trusted-uid route is
 gone. A policy that compiles can still be repaired live by a client that
@@ -504,9 +604,10 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. The
-daemon's own RPC surface holds a separate live configuration and
-reaches the same state through the reload the gateway write flags.
+settings, a roster or a profile takes effect on the next request. Under
+the daemon, the gateway and the RPC surface share one accepted policy
+and one live configuration, so a change persisted through either binds
+both before the writer returns. A standalone gateway holds its own.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups.
 
