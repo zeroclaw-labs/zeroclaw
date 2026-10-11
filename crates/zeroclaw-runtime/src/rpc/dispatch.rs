@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
@@ -7743,7 +7744,16 @@ impl RpcDispatcher {
                 crate::agent::SteeringInput::with_admission(req.content, admit)
             }
             None => crate::agent::SteeringInput::new(req.content),
-        };
+        }
+        .with_ingress(IngressContext {
+            message_id: None,
+            source_class: SourceClass::External,
+            sender: self.owner_principal_id(),
+            transport: Transport::Rpc,
+            trust: TrustClass::Untrusted,
+            origin: TurnOrigin::Interactive,
+            internal_principal: None,
+        });
         match self.ctx.sessions.steer_session_for_generation(
             &req.session_id,
             session_generation,
@@ -21866,6 +21876,71 @@ mod tests {
             .await
             .expect_err("still not bob's");
         assert_eq!(err.code, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_steer_stamps_the_acting_principal_not_the_session_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "a-steer",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her session");
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let session_generation = sessions.get_generation("a-steer").await.unwrap();
+        let turn_generation = sessions.register_cancel_token_for_generation_for_test(
+            "a-steer",
+            session_generation,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        sessions.register_steering("a-steer", turn_generation, sender);
+        let result = carol
+            .handle_session_steer(&json!({"session_id": "a-steer", "content": "admin correction"}))
+            .await
+            .expect("the administrator may steer another owner's session");
+        assert_eq!(result["accepted"], json!(true));
+
+        let message = receiver.try_recv().expect("RPC steering was queued");
+        let ingress = message
+            .ingress()
+            .expect("authorized RPC steering has provenance");
+        assert_eq!(message.text(), "admin correction");
+        assert_eq!(ingress.sender.as_deref(), Some("user:carol"));
+        assert_eq!(ingress.transport, Transport::Rpc);
+        assert_eq!(ingress.source_class, SourceClass::External);
+        assert_eq!(ingress.trust, TrustClass::Untrusted);
+        assert_eq!(
+            sessions.session_owner_principal("a-steer").await,
+            Some(Some("user:alice".into()))
+        );
     }
 
     /// Durable owner identity is separate from the administrator bypass: an

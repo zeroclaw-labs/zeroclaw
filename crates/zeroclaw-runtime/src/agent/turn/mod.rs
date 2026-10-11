@@ -84,7 +84,7 @@ use crate::agent::tool_execution::{
     should_execute_tools_in_parallel,
 };
 use crate::live_config_authority::AgentExecutionAdmission;
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
@@ -1356,7 +1356,30 @@ async fn emit_rejected_attempt_usage(
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// The Agent wrapper admits steering before history insertion. Admit only
+/// the original user message, or skip admission on subsequent rounds.
+pub(crate) enum InitialIngressSubject<'a> {
+    Original(&'a str),
+    AlreadyAdmitted,
+}
+
+pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
+    p: ToolLoop<'a>,
+    subject: InitialIngressSubject<'a>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, Some(subject))
+}
+
+pub fn run_tool_call_loop(
+    p: ToolLoop<'_>,
+) -> impl std::future::Future<Output = Result<String>> + '_ {
+    run_tool_call_loop_impl(p, None)
+}
+
+async fn run_tool_call_loop_impl<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1449,30 +1472,38 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
     }
 
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
-        // DEFAULT — the only arm reachable under the default policy. Proceed
-        // into the loop exactly as today.
-        IngressDecision::Loop => {}
-        // Phase 3: wrap the message as untrusted data before it enters history.
-        // Until framing exists, proceed as Loop (behavior-identical).
-        IngressDecision::Annotate { .. } => {}
-        // Phase 2: divert the turn into a managed SOP run instead of the loop.
-        // Not reachable under the default policy; proceed-as-loop for now.
-        IngressDecision::Gate { .. } => {
-            // TODO(PR C): hand this turn to the SOP run the gate names.
-        }
-        // Not reachable under the default policy; refuse the turn when it is.
-        IngressDecision::Drop { ref reason } => {
-            return Ok(crate::i18n::get_required_cli_string_with_args(
-                "turn-ingress-dropped",
-                &[("reason", reason.as_str())],
-            ));
+    let p1_text = match &initial_ingress {
+        Some(InitialIngressSubject::Original(text)) => Some(*text),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => Some(
+            turn_state
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map_or("", |m| m.content.as_str()),
+        ),
+    };
+    if let Some(p1_text) = p1_text {
+        match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+            // DEFAULT — the only arm reachable under the default policy. Proceed
+            // into the loop exactly as today.
+            IngressDecision::Loop => {}
+            // Phase 3: wrap the message as untrusted data before it enters history.
+            // Until framing exists, proceed as Loop (behavior-identical).
+            IngressDecision::Annotate { .. } => {}
+            // Phase 2: divert the turn into a managed SOP run instead of the loop.
+            // Not reachable under the default policy; proceed-as-loop for now.
+            IngressDecision::Gate { .. } => {
+                // TODO(PR C): hand this turn to the SOP run the gate names.
+            }
+            // Not reachable under the default policy; refuse the turn when it is.
+            IngressDecision::Drop { ref reason } => {
+                return Ok(crate::i18n::get_required_cli_string_with_args(
+                    "turn-ingress-dropped",
+                    &[("reason", reason.as_str())],
+                ));
+            }
         }
     }
 
@@ -1631,8 +1662,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
                 _ => continue,
             }
-            let steering_message = steering_input.into_text();
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
+            match steering_policy(
+                steering_input.text(),
+                steering_input.ingress(),
+                &ingress_policy_cfg,
+            ) {
                 // DEFAULT — append the injection to history exactly as today.
                 IngressDecision::Loop => {}
                 // Phase 3: frame as untrusted data; proceed as Loop until
@@ -1648,7 +1682,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // (do not append it) when it is.
                 IngressDecision::Drop { .. } => continue,
             }
-            let msg = ChatMessage::user(steering_message);
+            let msg = ChatMessage::user(steering_input.into_text());
             has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
             turn_state.push_dual(msg);
         }

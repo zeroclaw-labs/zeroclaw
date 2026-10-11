@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
@@ -44,6 +46,18 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// names in observability while interactive tools still route correctly —
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
+
+fn gateway_steering_input(content: String) -> SteeringInput {
+    SteeringInput::new(content).with_ingress(IngressContext {
+        message_id: None,
+        source_class: SourceClass::External,
+        sender: None,
+        transport: Transport::Gateway,
+        trust: TrustClass::Untrusted,
+        origin: TurnOrigin::Interactive,
+        internal_principal: None,
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -1934,7 +1948,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
-                                        match steering_tx.try_send(content.into()) {
+                                        match steering_tx.try_send(gateway_steering_input(content)) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({
