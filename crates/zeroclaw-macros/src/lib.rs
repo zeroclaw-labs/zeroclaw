@@ -75,6 +75,9 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[alias_source(Variant)]` on `Vec<String>` or `Option<Vec<String>>`
+///   declares its canonical `AliasSource` namespace. Typed reference vectors
+///   inherit metadata from their `HasPropKind` implementation.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
 ///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
@@ -149,12 +152,25 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         natural_key,
         tab,
         group,
-        multiline
+        multiline,
+        alias_source
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
+    if let Some(attr) = input
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("alias_source"))
+    {
+        return syn::Error::new_spanned(
+            attr,
+            "alias_source must be placed on a string-array field",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let prefix = extract_prefix(&input);
     let category = derive_category(&prefix);
@@ -241,6 +257,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
         let is_multiline = has_attr(field, "multiline");
+        let alias_source_variant = match extract_alias_source(field) {
+            Ok(variant) => variant,
+            Err(err) => return err.to_compile_error().into(),
+        };
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
@@ -1975,8 +1995,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             }
         };
 
-        let alias_source_expr = if is_vec {
-            quote! { None::<crate::config::AliasSource> }
+        let alias_source_expr = if let Some(variant) = alias_source_variant {
+            quote! { Some(crate::config::AliasSource::#variant) }
         } else {
             quote! { <#inner_ty as crate::config::HasPropKind>::ALIAS_SOURCE }
         };
@@ -2666,6 +2686,43 @@ fn extract_string_attr(attrs: &[syn::Attribute], name: &str) -> Option<String> {
     None
 }
 
+/// Validate an explicit source before fields can be skipped or delegated.
+/// Typed references carry their source on the type; annotations supply it only
+/// for otherwise untyped string arrays.
+fn extract_alias_source(field: &syn::Field) -> syn::Result<Option<syn::Ident>> {
+    let mut attrs = field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("alias_source"));
+    let Some(attr) = attrs.next() else {
+        return Ok(None);
+    };
+    if let Some(duplicate) = attrs.next() {
+        return Err(syn::Error::new_spanned(
+            duplicate,
+            "duplicate alias_source attribute",
+        ));
+    }
+    let variant = attr.parse_args::<syn::Ident>()?;
+    let shape_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
+    let is_string_array = extract_vec_inner(shape_ty).is_some_and(|inner| {
+        matches!(inner, syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "String"))
+    });
+    if !is_string_array
+        || has_attr(field, "nested")
+        || has_attr(field, "secret")
+        || has_attr(field, "derived_from_secret")
+        || has_serde_flatten(field)
+        || has_serde_skip(field)
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "alias_source requires an editable, non-secret Vec<String> or Option<Vec<String>> field",
+        ));
+    }
+    Ok(Some(variant))
+}
+
 fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2::TokenStream> {
     let Some(class) = extract_string_attr(attrs, "credential_class") else {
         return Ok(quote! { None });
@@ -2901,6 +2958,37 @@ fn extract_hashmap_value_type(ty: &syn::Type) -> Option<&syn::Type> {
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    #[test]
+    fn alias_source_accepts_plain_and_optional_string_arrays() {
+        for field in [
+            parse_quote! { #[alias_source(SkillBundles)] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(McpServers)] pub servers: Option<Vec<String>> },
+        ] {
+            assert!(extract_alias_source(&field).unwrap().is_some());
+        }
+        let plain: syn::Field = parse_quote! { pub names: Vec<String> };
+        assert!(extract_alias_source(&plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn alias_source_rejects_invalid_syntax_and_placement() {
+        for field in [
+            parse_quote! { #[alias_source] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source = "SkillBundles"] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles, McpBundles)] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] #[alias_source(McpBundles)] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] pub bundle: String },
+            parse_quote! { #[alias_source(SkillBundles)] pub bundles: Vec<AgentAlias> },
+            parse_quote! { #[alias_source(SkillBundles)] #[nested] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] #[secret] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] #[derived_from_secret] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] #[serde(flatten)] pub bundles: Vec<String> },
+            parse_quote! { #[alias_source(SkillBundles)] #[serde(skip)] pub bundles: Vec<String> },
+        ] {
+            assert!(extract_alias_source(&field).is_err(), "{field:?}");
+        }
+    }
 
     #[test]
     fn snake_to_kebab_is_identity_passthrough() {
