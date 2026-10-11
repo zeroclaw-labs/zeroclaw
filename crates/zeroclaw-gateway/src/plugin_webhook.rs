@@ -13,7 +13,9 @@ use axum::{
     routing::get,
 };
 
-use crate::{AppState, IdempotencyStore, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
+use zeroclaw_api::webhook::WebhookReservationStore;
+
+use crate::{AppState, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
 
 const PLUGIN_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 
@@ -29,23 +31,25 @@ fn plugin_webhook_idempotency_key(path: &str, message_id: &str) -> String {
 }
 
 fn plugin_webhook_idempotency(
-    store: Arc<IdempotencyStore>,
+    store: Arc<WebhookReservationStore>,
     path: &str,
 ) -> zeroclaw_api::webhook::WebhookIdempotency {
     let begin_store = Arc::clone(&store);
     let commit_store = Arc::clone(&store);
     let path = path.to_string();
     zeroclaw_api::webhook::WebhookIdempotency::new(
-        move |message_id| {
-            begin_store.begin_reservation(&plugin_webhook_idempotency_key(&path, message_id))
-        },
-        move |token| commit_store.commit_reservation(token),
-        move |token| store.rollback_reservation(token),
+        move |message_id| begin_store.begin(&plugin_webhook_idempotency_key(&path, message_id)),
+        move |token| commit_store.commit(token),
+        move |token| store.rollback(token),
     )
 }
 
+/// The `/plugin/{path}` routes, delivering to `registry`'s channels and
+/// deduplicating against `reservations`, the store the daemon created for
+/// this gateway run.
 pub(super) fn routes(
     registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    reservations: Arc<WebhookReservationStore>,
 ) -> Router<AppState> {
     Router::new()
         .route(
@@ -56,6 +60,7 @@ pub(super) fn routes(
                 .fallback(unsupported_method),
         )
         .layer(axum::Extension(registry))
+        .layer(axum::Extension(reservations))
 }
 
 async fn unsupported_method() -> impl IntoResponse {
@@ -71,6 +76,7 @@ async fn handle_plugin_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    axum::Extension(reservations): axum::Extension<Arc<WebhookReservationStore>>,
     Path(path): Path<String>,
     method: Method,
     RawQuery(query): RawQuery,
@@ -127,10 +133,7 @@ async fn handle_plugin_webhook(
         headers,
         body: body.to_vec(),
         cancellation,
-        idempotency: Some(plugin_webhook_idempotency(
-            Arc::clone(&state.idempotency_store),
-            &path,
-        )),
+        idempotency: Some(plugin_webhook_idempotency(reservations, &path)),
         reply,
     };
     match sink.try_send(request) {

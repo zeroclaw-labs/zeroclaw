@@ -7963,6 +7963,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let sop_driver_handles = sop_dh.clone();
                         let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                        // Created here, once per gateway run, so plugin webhook
+                        // deduplication resets when the gateway restarts within
+                        // this generation and when the daemon reloads.
+                        let plugin_webhook_reservations =
+                            zeroclaw_gateway::plugin_webhook_reservations(&config);
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
@@ -7978,6 +7983,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
+                                    plugin_webhook_reservations,
                                     authority,
                                     sop_driver_handles,
                                 ),
