@@ -9940,6 +9940,7 @@ mod tests {
     /// result, the number of approval requests and the number of executions.
     async fn run_repeated_prompt_required_shell_turn(
         approve: bool,
+        dedup_enabled: bool,
     ) -> (anyhow::Result<String>, usize, usize) {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let repeated_shell_call = r#"<tool_call>
@@ -9976,7 +9977,7 @@ mod tests {
         ];
         let observer = NoopObserver;
         let knobs = LoopKnobs {
-            dedup_enabled: false,
+            dedup_enabled,
             ..LoopKnobs::default()
         };
 
@@ -10046,7 +10047,7 @@ mod tests {
     #[tokio::test]
     async fn run_tool_call_loop_reprompts_identical_shell_rerun_after_approval() {
         let (result, approval_requests, invocations) =
-            run_repeated_prompt_required_shell_turn(true).await;
+            run_repeated_prompt_required_shell_turn(true, false).await;
 
         let reply = result.expect("an approved shell call may be rerun later in the same turn");
         assert_eq!(reply, "done");
@@ -10058,9 +10059,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_runs_approved_shell_rerun_with_dedup_enabled() {
+        // `LoopKnobs::default()` (what the CLI uses) keeps the turn-scoped
+        // duplicate check on. The second approval must not be wasted on a
+        // call that is then skipped as a duplicate.
+        let (result, approval_requests, invocations) =
+            run_repeated_prompt_required_shell_turn(true, true).await;
+
+        let reply = result.expect("an approved shell rerun must not be dropped as a duplicate");
+        assert_eq!(reply, "done");
+        assert_eq!(approval_requests, 2, "the rerun asks for a fresh approval");
+        assert_eq!(
+            invocations, 2,
+            "the approved rerun executes instead of being skipped as a duplicate"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_aborts_repeated_shell_call_after_denial() {
         let (result, approval_requests, invocations) =
-            run_repeated_prompt_required_shell_turn(false).await;
+            run_repeated_prompt_required_shell_turn(false, false).await;
 
         let err = result
             .expect_err("repeating a denied shell call should abort before another prompt")
