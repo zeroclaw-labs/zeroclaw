@@ -76,6 +76,45 @@ use std::sync::{Arc, OnceLock};
 /// from a separately-derived copy.
 pub(crate) type CallerCeiling = Arc<OnceLock<Vec<String>>>;
 
+/// The handle for a turn that is handed a per-run allowlist (`incoming`), created
+/// BEFORE the turn's tools are built and sealed by [`seal_to_registry`] once its
+/// registry exists. `None` when the turn has no allowlist, i.e. no bound.
+///
+/// Until it is sealed every holder fails closed (see [`sealed`]); nothing runs
+/// between building the tools and sealing, so that window is never observable.
+pub(crate) fn pending_for_turn(incoming: Option<&[String]>) -> Option<CallerCeiling> {
+    incoming.map(|_| Arc::new(OnceLock::new()))
+}
+
+/// Seal a turn's ceiling to what the turn ACTUALLY holds: the names of its
+/// assembled `registry` that the caller's `incoming` allowlist also names.
+///
+/// The incoming list is what the CALLER could use. The recipient's own policy
+/// (and anything else the assembly subtracts) removes tools from the turn after
+/// that list is fixed, so sealing the raw list hands every later job, child and
+/// relay of this turn names the turn itself never received - a
+/// `require_shell_within_ceiling` that finds `shell` in a list whose registry has
+/// no `shell`, for one. The ceiling must describe the turn, as the bounded
+/// delegate assembly already does (`tools/delegate.rs`, where the sealed set is
+/// built from the assembled registry). The intersection with `incoming` keeps the
+/// result a subset of the caller's bound even if the assembly adds a tool.
+pub(crate) fn seal_to_registry(
+    handle: Option<&CallerCeiling>,
+    incoming: Option<&[String]>,
+    registry: &[Box<dyn zeroclaw_api::tool::Tool>],
+) {
+    let (Some(handle), Some(incoming)) = (handle, incoming) else {
+        return;
+    };
+    let effective = registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| incoming.iter().any(|allowed| allowed == name))
+        .map(str::to_string)
+        .collect();
+    let _ = handle.set(effective);
+}
+
 /// Read a ceiling handle, distinguishing "no bound in force" from "bound in
 /// force but not sealed". The second case is an error everywhere.
 fn sealed<'a>(
@@ -288,6 +327,54 @@ mod tests {
 
     fn unsealed_ceiling() -> CallerCeiling {
         Arc::new(OnceLock::new())
+    }
+
+    // ── pending_for_turn / seal_to_registry ─────────────────────────────────
+
+    fn registry_of(
+        tools: Vec<Box<dyn zeroclaw_api::tool::Tool>>,
+    ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+        tools
+    }
+
+    /// Broken state this pins: a turn that sealed the RAW incoming list. The
+    /// recipient's registry has no `shell`, yet the sealed set still names it, so
+    /// a job stored from that turn passes `require_shell_within_ceiling`.
+    #[test]
+    fn a_name_the_turn_never_received_is_not_sealed() {
+        let incoming = vec!["calculator".to_string(), SHELL_TOOL_NAME.to_string()];
+        let handle = pending_for_turn(Some(&incoming)).expect("an allowlist yields a handle");
+        assert!(handle.get().is_none(), "the handle starts unsealed");
+
+        let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
+        seal_to_registry(Some(&handle), Some(&incoming), &registry);
+
+        assert_eq!(
+            handle.get().map(Vec::as_slice),
+            Some(&["calculator".to_string()][..])
+        );
+        let refusal = require_shell_within_ceiling("cron_add", Some(&handle))
+            .expect_err("shell was never in this turn's registry");
+        assert!(refusal.contains("outside the calling agent's bounded tool ceiling"));
+    }
+
+    /// The other half: sealing to the registry must not grow the set. A tool the
+    /// assembly added that the caller never named stays out.
+    #[test]
+    fn a_tool_the_caller_did_not_name_is_not_sealed_in() {
+        let incoming = vec!["shell".to_string()];
+        let handle = pending_for_turn(Some(&incoming)).unwrap();
+        let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
+        seal_to_registry(Some(&handle), Some(&incoming), &registry);
+        assert_eq!(handle.get().map(Vec::len), Some(0));
+    }
+
+    /// Control: without an allowlist there is no bound, and sealing is a no-op.
+    #[test]
+    fn a_turn_without_an_allowlist_has_no_handle() {
+        assert!(pending_for_turn(None).is_none());
+        let registry = registry_of(vec![Box::new(crate::tools::CalculatorTool::new())]);
+        seal_to_registry(None, None, &registry);
     }
 
     fn names(list: &Option<Vec<String>>) -> Vec<&str> {

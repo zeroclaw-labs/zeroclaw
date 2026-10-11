@@ -4982,6 +4982,16 @@ impl DelegateTool {
                 // the SAME per-tool factories `all_tools_with_runtime` calls
                 // (`crate::tools::git_operations_tool`, `backup_tool`, ...), so this can't
                 // drift from the real construction path either.
+                // The config every tool rebuilt below reads. It is the one this
+                // delegation was ADMITTED against when there is one; `self.root_config`
+                // is the snapshot the tool was constructed with, and reading it for
+                // the rebuild would hand the target tools configured from a
+                // generation the admission has already moved past (a provider or
+                // credential change, a switched-off feature). Same precedence as
+                // every other config read in this function (`target_config.or(..)`).
+                let rebuild_config: Option<Arc<Config>> = target_config
+                    .map(|config| Arc::new(config.clone()))
+                    .or_else(|| self.root_config.clone());
                 let needs_workspace_bound_tools = {
                     let parent_tools = self.parent_tools.read();
                     parent_tools.iter().any(|tool| {
@@ -5008,7 +5018,7 @@ impl DelegateTool {
                 let mut target_identity_bound_tools: HashMap<String, Box<dyn Tool>> =
                     HashMap::new();
                 if (needs_workspace_bound_tools || needs_identity_bound_tools)
-                    && let Some(root_config) = self.root_config.as_ref()
+                    && let Some(root_config) = rebuild_config.as_ref()
                 {
                     if let Some(tool) =
                         self.rebuild_target_git_operations_tool(Arc::clone(&target_policy))
@@ -5363,7 +5373,7 @@ impl DelegateTool {
                     })
                 };
                 let mut target_channel_tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
-                if needs_channel_tools && let Some(root_config) = self.root_config.as_ref() {
+                if needs_channel_tools && let Some(root_config) = rebuild_config.as_ref() {
                     let handles = &self.channel_handles;
                     let mut insert = |name: &str, tool: Arc<dyn Tool>| {
                         target_channel_tools.insert(
@@ -5455,7 +5465,7 @@ impl DelegateTool {
                     })
                 };
                 let mut target_autonomy_tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
-                if needs_autonomy_tools && let Some(root_config) = self.root_config.as_ref() {
+                if needs_autonomy_tools && let Some(root_config) = rebuild_config.as_ref() {
                     let mut insert = |tool: Option<Arc<dyn Tool>>| {
                         if let Some(tool) = tool {
                             target_autonomy_tools.insert(
@@ -5933,7 +5943,7 @@ impl DelegateTool {
                 // `skill_bundles` branch can join a directory onto the caller's
                 // workspace), and `sub_workspace` is what reaches
                 // `PromptContext`. Same source the independent path uses.
-                if let Some(root_config) = self.root_config.as_ref() {
+                if let Some(root_config) = rebuild_config.as_ref() {
                     // The EXECUTION policy's workspace, not the target's
                     // configured one: a same-profile hand-off deliberately keeps
                     // the caller's session workspace on that policy, and the
@@ -23658,6 +23668,104 @@ command = "rm independent-delegate-marker"
         assert!(result.success, "delegation failed: {:?}", result.error);
 
         seen.lock().unwrap().clone()
+    }
+
+    /// [`bounded_offered_tool_names`] for a delegation ADMITTED against `admitted`,
+    /// a different config generation than the `DelegateTool`'s own root config
+    /// (the snapshot it was built with).
+    async fn bounded_offered_tool_names_admitted(
+        snapshot: &Arc<zeroclaw_config::schema::Config>,
+        admitted: &zeroclaw_config::schema::Config,
+        target_alias: &str,
+        parent_tools: Vec<Arc<dyn Tool>>,
+    ) -> Vec<String> {
+        let caller_policy = Arc::new(
+            SecurityPolicy::for_agent(snapshot, "caller").expect("caller policy resolves"),
+        );
+        let tool = DelegateTool::new(snapshot.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(snapshot))
+            .with_caller_alias("caller")
+            .with_risk_profiles(snapshot.risk_profiles.clone())
+            .with_runtime_profiles(snapshot.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(parent_tools)));
+        let target_config = snapshot
+            .agents
+            .get(target_alias)
+            .expect("target agent exists")
+            .clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingToolNamesProvider {
+            seen: Arc::clone(&seen),
+        };
+        let result = tool
+            .execute_agentic_with_admission(
+                target_alias,
+                &target_config,
+                "ollama",
+                "test-model",
+                &provider,
+                "do the thing",
+                None,
+                DelegateAdmission::Required,
+                Some(admitted),
+            )
+            .await
+            .expect("bounded delegation runs");
+        assert!(result.success, "delegation failed: {:?}", result.error);
+        seen.lock().unwrap().clone()
+    }
+
+    /// The bounded rebuild must read the config the delegation was ADMITTED
+    /// against, not the snapshot the tool was built with. Broken state this pins:
+    /// a feature switched on in the admitted generation (here `linkedin`) was
+    /// invisible to the rebuild, which read the stale snapshot.
+    #[tokio::test]
+    async fn bounded_rebuild_sees_a_tool_the_admitted_config_enables() {
+        let tmp = TempDir::new().unwrap();
+        let snapshot = bounded_reuse_config(&["linkedin"], false, &tmp);
+        assert!(!snapshot.linkedin.enabled, "the snapshot has linkedin off");
+        let mut admitted = (*snapshot).clone();
+        admitted.linkedin.enabled = true;
+
+        let names = bounded_offered_tool_names_admitted(
+            &snapshot,
+            &admitted,
+            "target",
+            vec![Arc::new(NamedFixtureTool("linkedin"))],
+        )
+        .await;
+
+        assert!(
+            names.iter().any(|n| n == "linkedin"),
+            "a tool the admitted config enables must be rebuilt for the target, got {names:?}"
+        );
+    }
+
+    /// The converse, which is the one that matters for a revocation: a feature
+    /// the admitted generation switched OFF must not survive because the stale
+    /// snapshot still had it on.
+    #[tokio::test]
+    async fn bounded_rebuild_drops_a_tool_the_admitted_config_disables() {
+        let tmp = TempDir::new().unwrap();
+        let mut stale = (*bounded_reuse_config(&["linkedin"], false, &tmp)).clone();
+        stale.linkedin.enabled = true;
+        let snapshot = Arc::new(stale);
+        let mut admitted = (*snapshot).clone();
+        admitted.linkedin.enabled = false;
+
+        let names = bounded_offered_tool_names_admitted(
+            &snapshot,
+            &admitted,
+            "target",
+            vec![Arc::new(NamedFixtureTool("linkedin"))],
+        )
+        .await;
+
+        assert!(
+            !names.iter().any(|n| n == "linkedin"),
+            "a tool the admitted config disables must not be rebuilt from a stale \
+             snapshot, got {names:?}"
+        );
     }
 
     /// D1 core: a caller tool that is neither rebuilt against the target policy

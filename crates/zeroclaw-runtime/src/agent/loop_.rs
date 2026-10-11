@@ -1619,6 +1619,7 @@ pub async fn run(
             (None, None)
         };
 
+        let turn_ceiling = crate::tools::caller_ceiling::pending_for_turn(allowed_tools.as_deref());
         let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
@@ -1646,15 +1647,11 @@ pub async fn run(
             execution_capability.clone(),
             // `run` is the entry point that carries a per-run allowlist, so it is
             // also the one that can hand the scheduler tools the ceiling's value.
-            // Pre-sealed: unlike the bounded delegate assembly — which builds its
-            // tools before the sealed set exists — the list is already known
-            // here, so the handle is filled on construction.
-            allowed_tools.as_deref().map(|list| {
-                let handle: crate::tools::caller_ceiling::CallerCeiling =
-                    std::sync::Arc::new(std::sync::OnceLock::new());
-                let _ = handle.set(list.to_vec());
-                handle
-            }),
+            // Sealed after assembly, like the bounded delegate assembly: the
+            // incoming list is what the CALLER could use, and this turn's own
+            // policy removes tools from it, so the ceiling is sealed to the
+            // registry the turn ends up holding (`seal_to_registry`, below).
+            turn_ceiling.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -1705,6 +1702,11 @@ pub async fn run(
         // now takes `&ScopedToolRegistry`, so this local stays a scoped registry
         // (coerces to `&[Box<dyn Tool>]` at the leaf call sites via `Deref`).
         let tools_registry = registry;
+        crate::tools::caller_ceiling::seal_to_registry(
+            turn_ceiling.as_ref(),
+            allowed_tools.as_deref(),
+            &tools_registry,
+        );
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -3606,6 +3608,7 @@ async fn process_message_inner(
             (None, None)
         };
 
+        let turn_ceiling = crate::tools::caller_ceiling::pending_for_turn(allowed_tools.as_deref());
         let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
             Arc::clone(&config),
             &security,
@@ -3631,15 +3634,11 @@ async fn process_message_inner(
             sop_audit,
             live_config.clone(),
             execution_capability.clone(),
-            // `process_message` now carries a per-run allowlist when its
-            // caller has one (`send_message_to_peer`'s bounded relay), the
-            // same pre-sealed-handle shape `run()` already builds above.
-            allowed_tools.as_deref().map(|list| {
-                let handle: crate::tools::caller_ceiling::CallerCeiling =
-                    std::sync::Arc::new(std::sync::OnceLock::new());
-                let _ = handle.set(list.to_vec());
-                handle
-            }),
+            // `process_message` carries a per-run allowlist when its caller has
+            // one (`send_message_to_peer`'s bounded relay). Same shape as `run()`
+            // above: sealed to the registry this turn holds, not to the names
+            // the sender could use (`seal_to_registry`, below).
+            turn_ceiling.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3686,6 +3685,11 @@ async fn process_message_inner(
         // Stays sealed: `agent_turn_with_sop_reassembly` now takes
         // `&ScopedToolRegistry`; leaf uses coerce via `Deref`.
         let tools_registry = registry;
+        crate::tools::caller_ceiling::seal_to_registry(
+            turn_ceiling.as_ref(),
+            allowed_tools.as_deref(),
+            &tools_registry,
+        );
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -20277,6 +20281,150 @@ Let me check the result."#;
             "revoked private-host policy must fail before contacting the private endpoint"
         );
         download_server.verify().await;
+    }
+
+    /// A bounded sender relays a turn to a peer whose own policy has no `shell`.
+    /// The ceiling sealed for the peer's turn must describe what that turn holds,
+    /// so `cron_add` there cannot store a shell job on the strength of a `shell`
+    /// the peer never received. Broken state this pins: the raw incoming names
+    /// were sealed, `require_shell_within_ceiling` found `shell` in them, and the
+    /// job was written.
+    #[tokio::test]
+    async fn relayed_peer_turn_cannot_store_a_shell_job_when_its_own_registry_has_no_shell() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_shell_cron_add_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                let arguments = serde_json::json!({
+                    "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+                    "job_type": "shell",
+                    "command": "echo ok",
+                })
+                .to_string();
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-cron-add",
+                                "type": "function",
+                                "function": {"name": "cron_add", "arguments": arguments}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({"choices": [{"message": {"content": "done"}}]})
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_shell_cron_add_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "no-shell".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                // The peer can schedule, and has no `shell` of its own.
+                allowed_tools: vec!["cron_add".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "peer".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "no-shell".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("peer")).expect("peer workspace");
+
+        // The sender could run `shell` and `cron_add`, so both arrive as its ceiling.
+        let result = super::process_message_shared_with_live_config_and_admission_and_principal(
+            Arc::new(config),
+            None,
+            "peer",
+            "schedule the shell job",
+            Some("session"),
+            Some(vec!["shell".to_string(), "cron_add".to_string()]),
+            TurnOrigin::Channel,
+            None,
+            None,
+        )
+        .await
+        .expect("the relayed peer turn should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the cron_add result"
+        );
+        let requests = provider_state
+            .requests
+            .lock()
+            .expect("provider requests lock should be valid");
+        assert!(
+            requests.iter().any(|body| body
+                .to_string()
+                .contains("outside the calling agent's bounded tool ceiling")),
+            "cron_add must be refused: the peer's registry has no shell, got {requests:?}"
+        );
     }
 
     #[tokio::test]
