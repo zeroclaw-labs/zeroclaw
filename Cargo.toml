@@ -123,6 +123,9 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 directories = "6.0"
 toml = "1.0"
 
+# Version precedence for the `plugin update` notice about an older version
+semver = { version = "1.0", optional = true }
+
 # JSON Schema generation for config export
 schemars = { version = "1.2", optional = true }
 
@@ -361,6 +364,7 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
+    "dep:semver",
     "zeroclaw-runtime/plugins-wasm",
     "zeroclaw-gateway?/plugins-wasm",
 ]

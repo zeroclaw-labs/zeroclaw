@@ -1,5 +1,6 @@
 //! Plugin error types.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,6 +10,29 @@ pub enum PluginError {
 
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
+
+    /// Filesystem identity changed; never evidence of defective package contents.
+    #[error("plugin namespace changed: {0}")]
+    NamespaceChanged(String),
+
+    /// A package operation could not finish and kept the files it held at
+    /// `path`: for example a claimed package it could not restore without
+    /// replacing another occupant, or a staged package it could not publish.
+    /// `reason` says why.
+    #[error("plugin recovery retained bytes at {path}: {reason}")]
+    RecoveryRetained { path: String, reason: String },
+
+    /// An update claimed the installed package and could neither publish its
+    /// replacement nor put the claimed generation back. `preserved` holds that
+    /// generation, in a transaction whose lease is released on return, so
+    /// `PluginHost::recover_interrupted_update` can put it back, unless a
+    /// package of that name is installed by then.
+    #[error("plugin '{name}' was not replaced and its previous package could not be moved back ({cause}); it is preserved at {}", preserved.display())]
+    ReplacementInterrupted {
+        name: String,
+        preserved: PathBuf,
+        cause: String,
+    },
 
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),
@@ -30,6 +54,14 @@ pub enum PluginError {
 
     #[error("plugin '{0}' is already loaded")]
     AlreadyLoaded(String),
+
+    /// Something occupies a package name in the plugins directory that the host
+    /// has not admitted as that package, and it was left as found. Install
+    /// never overwrites it. `remove` deletes an unloaded directory only when it
+    /// is empty, or when admission rejects its own contents rather than its
+    /// signature. `reason` says why it was kept.
+    #[error("'{name}' in the plugins directory was left untouched: {reason}")]
+    UnadmittedPackage { name: String, reason: String },
 
     #[error("plugin capability not supported: {0}")]
     UnsupportedCapability(String),

@@ -218,6 +218,22 @@ zeroclaw plugin install ./my-plugin
 zeroclaw plugin install ./my-plugin/manifest.toml
 ```
 
+`zeroclaw plugin update` replaces an installed package through the same
+admission (`PluginHost::admit_update`) with the identity decided the other way
+round: the named package must be installed, and the source must carry its
+name. The CLI refuses authority the new manifest adds unless `--allow` accepts
+it, runs the same load check with no way to skip it, and
+`PluginHost::update_admitted` builds the replacement in a staging directory
+before renaming it into the installed package's place. The operator-facing
+contract is in [Updating a plugin](../plugins/index.md#updating-a-plugin).
+
+```bash
+zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
+```
+
 The default registry URL is:
 
 ```text
@@ -252,6 +268,15 @@ rejected before install. Downloads are capped while streaming, so a server
 without `Content-Length` cannot force ZeroClaw to buffer an oversized archive.
 Extraction is also capped, so a compressed archive cannot expand without bound
 in the temporary install area.
+
+Registry requests are bounded in time. Connecting to the registry or archive
+host may take at most 10 seconds, and a response may go at most 30 seconds
+without delivering data, both before its headers arrive and between reads of
+its body. Fetching the index must finish within 30 seconds, and downloading an
+archive within 30 minutes. A stalled registry or archive host therefore fails
+`zeroclaw plugin search` or `zeroclaw plugin install` instead of leaving it
+waiting, while a slow archive download that keeps delivering data is limited
+only by the 30-minute bound.
 
 Search is unauthenticated discovery. Install is the security boundary: registry
 installs use the configured plugin signature policy and trusted publisher keys,
@@ -766,9 +791,11 @@ plugin that declares its destinations works without the operator transcribing
 hosts, and the seeded values are printed. It never extends a row that already
 exists: an upgrade whose declaration grew prints the difference plus the exact
 `zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
-list` reports the same gap as a standing diagnostic. Declare the destinations
-your code actually contacts, and treat a growing declaration as something every
-operator has to approve on every upgrade.
+update` seeds nothing at all, not even into a row it creates, and prints the
+same difference. `zeroclaw plugin list` reports the same gap as a standing
+diagnostic. Declare the destinations your code actually contacts, and treat a
+growing declaration as something every operator has to approve on every
+upgrade.
 
 If reinstall finds an unsupported pre-typed-config row keyed by the package
 name, install refuses before creating the derived `zpi1_…` row and prints the
@@ -999,3 +1026,42 @@ These delegate to the `zeroclaw-plugins` crate features
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. Only install, update, remove, and listing what an interrupted
+update displaced open that root and its lock, so a host that only discovers
+plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
+its ancestors against rename until its host drops. A process that cannot take
+the lock within 60 seconds gives up and names the lock file. Any account that
+can read that file can hold the lock, and where the operating system or
+filesystem offers no file locking, install, update and remove refuse. New
+staging directories use unique generations and an OS-held lease, rather than a
+PID as ownership evidence. Recovery cleans an abandoned protocol stage only
+while recovering an actual final package, or while finishing the delete of one
+an earlier remove had judged. Legacy PID-only stages without proof of
+abandonment are retained and their paths are printed; they do not prevent a new
+install from using fresh staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Where the platform or filesystem
+has no rename that refuses an existing destination (FreeBSD, an NFS mount,
+Linux before 3.15), a package directory moves with a plain rename, which can
+replace only an empty directory, and nothing but a directory moves that way.

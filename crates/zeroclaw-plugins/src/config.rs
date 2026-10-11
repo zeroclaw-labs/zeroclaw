@@ -506,8 +506,18 @@ fn validate_config_instance(
     config: &Value,
 ) -> Result<(), PluginError> {
     if let Err(error) = validator.validate(config) {
+        // A missing required property is named, since the name is the
+        // schema's own. Configured values, and configured keys the schema does
+        // not declare, are never repeated: either could hold a secret.
+        let missing = match error.kind() {
+            jsonschema::error::ValidationErrorKind::Required { property } => property
+                .as_str()
+                .map(|property| format!(": missing required property '{property}'"))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         return Err(PluginError::InvalidConfig(format!(
-            "plugin '{}' config violates config_schema at '{}'",
+            "plugin '{}' config violates config_schema at '{}'{missing}",
             manifest.name,
             error.schema_path()
         )));
@@ -1308,6 +1318,27 @@ x-secret = true
         ] {
             assert!(resolve_plugin_config(&manifest, &scope, Some(&values)).is_err());
         }
+    }
+
+    /// A missing required property is named, since the name is the schema's
+    /// own; the values configured beside it are not repeated.
+    #[test]
+    fn a_missing_required_property_is_named_and_no_value_is_repeated() {
+        let mut schema = object_schema(json!({
+            "retries": {"type": "integer"},
+            "label": {"type": "string"}
+        }));
+        schema["required"] = json!(["retries"]);
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+
+        let values = configured(&[("label", "sekrit-value")]);
+        let missing = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .err()
+            .expect("a missing required property is rejected")
+            .to_string();
+        assert!(missing.contains("'retries'"), "{missing}");
+        assert!(!missing.contains("sekrit-value"), "{missing}");
     }
 
     #[test]

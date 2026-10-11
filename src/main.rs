@@ -3375,6 +3375,27 @@ enum PluginCommands {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Replace installed plugins with another version from the registry, or
+    /// with a local package directory
+    Update {
+        /// Installed plugin names, each optionally pinned as name@version
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        plugins: Vec<String>,
+        /// Update every installed plugin
+        #[arg(long)]
+        all: bool,
+        /// Registry JSON URL to take versions from
+        #[arg(long, conflicts_with = "from")]
+        registry: Option<String>,
+        /// Replace the plugin with this local package directory instead
+        #[arg(long, value_name = "DIR", conflicts_with = "all")]
+        from: Option<String>,
+        /// Accept authority the new version adds (comma-separated):
+        /// permission:<name>, capability:<name>, provides:<id>,
+        /// publisher:<key>
+        #[arg(long, value_delimiter = ',', conflicts_with = "all")]
+        allow: Vec<String>,
+    },
     /// Remove an installed plugin
     Remove {
         /// Plugin name
@@ -3436,6 +3457,32 @@ async fn verify_plugin_loads_or_bail(
             ))
         }
     }
+}
+
+/// Point an install refused because the package is already installed at
+/// the `plugin update` command that replaces it from the same source: the
+/// local directory, or the registry entry, pinned when the install was. A
+/// pointer at the registry after a local install would offer to replace a
+/// local build with a same-named registry package. The refusal still fails
+/// the command, and every other error passes through unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn with_update_pointer(
+    error: zeroclaw::plugins::error::PluginError,
+    config_dir: &std::path::Path,
+    source: crate::plugins::update::UpdateSource<'_>,
+) -> anyhow::Error {
+    let zeroclaw::plugins::error::PluginError::AlreadyLoaded(name) = &error else {
+        return error.into();
+    };
+    let command = crate::plugins::update::update_command(config_dir, name, source, &[]);
+    let pointer = ta(
+        "cli-plugin-install-already-installed",
+        &[("name", name.as_str()), ("command", command.as_str())],
+        format!(
+            "install failed: '{name}' is already installed, and install never replaces a package. Update it with: {command}"
+        ),
+    );
+    anyhow::Error::from(error).context(pointer)
 }
 
 /// The load verdict for one *installed* plugin.
@@ -3734,12 +3781,22 @@ fn declared_egress_hosts(
     plugin_name: &str,
 ) -> Vec<String> {
     host.manifest(plugin_name)
-        .filter(|m| {
-            m.permissions
-                .contains(&zeroclaw::plugins::PluginPermission::HttpClient)
-        })
-        .map(|m| m.egress.hosts.clone())
+        .map(manifest_declared_egress)
         .unwrap_or_default()
+}
+
+/// [`declared_egress_hosts`] for a manifest that is not installed yet, such as
+/// the replacement `plugin update` is about to install.
+#[cfg(feature = "plugins-wasm")]
+fn manifest_declared_egress(manifest: &zeroclaw::plugins::PluginManifest) -> Vec<String> {
+    if manifest
+        .permissions
+        .contains(&zeroclaw::plugins::PluginPermission::HttpClient)
+    {
+        manifest.egress.hosts.clone()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Print the destinations a freshly seeded instance row was granted, one line
@@ -4314,29 +4371,55 @@ fn render_egress_gap_plan(
     lines
 }
 
-/// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
-/// default instance keys, carrying the manifest's declared egress destinations
-/// into each row this call creates. `config set
-/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
-/// resolution, which only matches entries already present in live config.
-/// Idempotent: existing entries and operator values remain untouched — an
-/// existing row's `egress_hosts` is reported against, never rewritten.
-/// A pre-typed-config row keyed by the package name is unsupported beta state:
-/// refuse before creating a canonical row and print the same ordered update
-/// guidance as `plugin list` — including its rule that a deployment-wide
-/// refusal is reported once, on its own, with no row steps that could not
-/// take effect. The operator's old row remains untouched.
+/// The `[[plugins.entries]]` rows of a package's instances, as
+/// [`ensure_plugin_config_entries`] left them: the rows it created and the rows
+/// that already existed.
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entries(
+struct PluginConfigRows<'a> {
+    created: Vec<&'a String>,
+    existing: Vec<&'a String>,
+}
+
+/// [`ensure_plugin_config_entries`] refusing a package whose config row still
+/// uses the pre-1.0 key: the guidance for that row, rendered the way
+/// `plugin list` renders a stranded row ([`render_egress_gap_plan`]). The lines
+/// stay apart so `plugin update` prints each on its own line; the error text
+/// is the lines joined, which is what `plugin install` prints.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+struct LegacyConfigRow(Vec<String>);
+
+#[cfg(feature = "plugins-wasm")]
+impl std::fmt::Display for LegacyConfigRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("\n"))
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl std::error::Error for LegacyConfigRow {}
+
+/// Find or create the `[[plugins.entries]]` rows of a package's instance keys,
+/// without granting, saving, or printing anything about them.
+///
+/// `config set plugins.entries.<instance-key>.config.<key>` routes through
+/// natural-key path resolution, which only matches entries already present in
+/// live config, so every instance needs its row. Existing rows and operator
+/// values remain untouched. A pre-typed-config row keyed by the package name
+/// is unsupported beta state: refuse before creating a canonical row and print
+/// the same ordered update guidance as `plugin list`, including its rule that
+/// a deployment-wide refusal is reported once, on its own, with no row steps
+/// that could not take effect. The operator's old row remains untouched.
+///
+/// Returns `None`, after a warning per instance, when the `[plugins]` section
+/// on disk is malformed and no row could be saved.
+#[cfg(feature = "plugins-wasm")]
+fn ensure_plugin_config_entries<'a>(
     config: &mut crate::config::schema::Config,
     package: &str,
-    entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    entries: &'a [(zeroclaw::plugins::PluginCapability, String)],
     declared_egress: &[String],
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
+) -> Result<Option<PluginConfigRows<'a>>> {
     let whole_config_degraded = config
         .degraded_security
         .iter()
@@ -4355,7 +4438,7 @@ async fn seed_plugin_config_entries(
                 )
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let mut created = Vec::new();
@@ -4384,7 +4467,7 @@ async fn seed_plugin_config_entries(
             // rename-then-grant steps wait until it is fixed. The install is
             // still refused: the stranded row is unsupported state either way.
             if let Some(line) = egress_deployment_gap_line(config) {
-                anyhow::bail!("{line}");
+                return Err(LegacyConfigRow(vec![line]).into());
             }
             let plan = crate::plugins::egress_ceremony::plan_egress_gap(
                 egress_command_config_dir(config),
@@ -4394,7 +4477,7 @@ async fn seed_plugin_config_entries(
                 &egress_runtime_inputs(config),
             );
             let guidance = render_egress_gap_plan(package, instance_key, &plan);
-            anyhow::bail!("{}", guidance.join("\n"));
+            return Err(LegacyConfigRow(guidance).into());
         }
         if config
             .create_map_key("plugins.entries", instance_key)
@@ -4406,6 +4489,30 @@ async fn seed_plugin_config_entries(
             existing.push(instance_key);
         }
     }
+    Ok(Some(PluginConfigRows { created, existing }))
+}
+
+/// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
+/// default instance keys, carrying the manifest's declared egress destinations
+/// into each row this call creates. Rows are found or created by
+/// [`ensure_plugin_config_entries`]. Idempotent: existing entries and operator
+/// values remain untouched — an existing row's `egress_hosts` is reported
+/// against, never rewritten.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    package: &str,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    declared_egress: &[String],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let Some(PluginConfigRows { created, existing }) =
+        ensure_plugin_config_entries(config, package, entries, declared_egress)?
+    else {
+        return Ok(());
+    };
 
     // Seed the declaration into the rows just created, before the save, so the
     // grant lands through the same dirty-path persistence the entry itself
@@ -4464,15 +4571,89 @@ async fn seed_plugin_config_entries(
     Ok(())
 }
 
+/// Name the recovery command when install is refused because something the
+/// host never admitted holds the package name, typically a directory an
+/// interrupted install by an older build left half-written. `plugin remove`
+/// deletes such a directory when it is empty, or when it holds only what an
+/// install writes and admission rejects its own contents. A staged copy the
+/// install kept, and a namespace change, get their own messages; every other
+/// error passes through unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn with_unadmitted_package_remedy(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    // Install keeps its staged copy when it cannot publish it. A later
+    // `plugin remove` may sweep that copy, so the remedy is another install.
+    if let zeroclaw::plugins::error::PluginError::RecoveryRetained { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-install-retained",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Install could not publish the package and kept the staged copy at {path}: {reason}. Resolve the occupied name or filesystem error, then run the install again."
+            ),
+        ));
+    }
+    if matches!(
+        &error,
+        zeroclaw::plugins::error::PluginError::NamespaceChanged(_)
+    ) {
+        return with_remove_refusal_reason(error);
+    }
+    let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, .. } = &error else {
+        return error.into();
+    };
+    let remedy = ta(
+        "cli-plugin-install-unadmitted-package",
+        &[("name", name.as_str())],
+        format!(
+            "install failed: '{name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {name}`, then install again."
+        ),
+    );
+    anyhow::Error::from(error).context(remedy)
+}
+
+/// Say why `plugin remove` kept what occupies a name it did not load, with
+/// the host's reason, and what the operator can do instead. Every other error
+/// passes through unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn with_remove_refusal_reason(error: zeroclaw::plugins::error::PluginError) -> anyhow::Error {
+    if let zeroclaw::plugins::error::PluginError::NamespaceChanged(reason) = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-namespace-changed",
+            &[("reason", reason.as_str())],
+            format!(
+                "Plugin operation refused because filesystem ownership changed: {reason}. Inspect the plugins directory before retrying."
+            ),
+        ));
+    }
+    if let zeroclaw::plugins::error::PluginError::RecoveryRetained { path, reason } = &error {
+        return anyhow::Error::msg(ta(
+            "cli-plugin-recovery-retained",
+            &[("path", path.as_str()), ("reason", reason.as_str())],
+            format!(
+                "Recovery retained files at {path}: {reason}. Resolve the occupied destination or filesystem error, then retry plugin remove."
+            ),
+        ));
+    }
+    let zeroclaw::plugins::error::PluginError::UnadmittedPackage { name, reason } = &error else {
+        return error.into();
+    };
+    anyhow::Error::msg(ta(
+        "cli-plugin-remove-unadmitted-package",
+        &[("name", name.as_str()), ("reason", reason.as_str())],
+        format!(
+            "`zeroclaw plugin remove` left '{name}' in place: {reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{name}' by hand if it should go."
+        ),
+    ))
+}
+
 /// Publish a plugin and seed its config entries as one transaction.
 ///
 /// `host.install_admitted` either performs a *fresh publish* — copying the package into
 /// the plugins directory and inserting it into the loaded set — or, when the
-/// package is already loaded, fails with `AlreadyLoaded` *before* copying
-/// anything. So the only half-installed window is a fresh publish whose config
-/// seeding then fails: the package is on disk and in the loaded set, yet the
-/// command reports an error and a naive retry would hit `AlreadyLoaded`,
-/// forcing a manual removal.
+/// package is already loaded (`AlreadyLoaded`) or something unadmitted holds
+/// its name (`UnadmittedPackage`), fails *before* copying anything. So the only
+/// half-installed window is a fresh publish whose config seeding then fails: the
+/// package is on disk and in the loaded set, yet the command reports an error and
+/// a naive retry would hit `AlreadyLoaded`, forcing a manual removal.
 ///
 /// This closes that window. On any failure after a fresh publish the
 /// just-published package is rolled back with `host.remove` — the same removal
@@ -4496,7 +4677,9 @@ async fn publish_and_seed_plugin(
     // A fresh publish: the package is now on disk and in the loaded set. An
     // already-present package fails here, before any copy, so nothing past this
     // point ever runs against a package this call did not itself publish.
-    let name = host.install_admitted(admitted)?;
+    let name = host
+        .install_admitted(admitted)
+        .map_err(with_unadmitted_package_remedy)?;
 
     let seed_result: Result<()> = async {
         let config_entries = installed_plugin_config_entries(host, &name)?;
@@ -4532,6 +4715,842 @@ async fn publish_and_seed_plugin(
              ALSO failed ({rollback_err}); the package is still installed — remove \
              it with `zeroclaw plugin remove {name}` before retrying"
         ))),
+    }
+}
+
+/// Where `zeroclaw plugin update` takes replacements from.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone, Copy)]
+enum UpdateFrom<'a> {
+    /// The registry index, fetched once for the whole command, and the
+    /// `--registry` URL the operator passed, if any.
+    Registry {
+        index: &'a zeroclaw::plugins::registry::PluginRegistryIndex,
+        registry: Option<&'a str>,
+    },
+    /// A local package directory, as an absolute path.
+    Local(&'a std::path::Path),
+}
+
+/// What every plugin in one `zeroclaw plugin update` shares.
+#[cfg(feature = "plugins-wasm")]
+struct PluginUpdatePolicy<'a> {
+    from: UpdateFrom<'a>,
+    /// The `--allow` items: authority the operator accepts for the one plugin
+    /// they apply to.
+    allow: &'a [String],
+    limits: zeroclaw::plugins::component::PluginLimits,
+    /// Whether `--all` chose the plugins, so a package the registry does not
+    /// list is skipped rather than reported as a failure.
+    all: bool,
+}
+
+/// How one plugin's update ended.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+enum PluginUpdateOutcome {
+    /// The package was replaced. `from` equals `to` when a local package was
+    /// reinstalled at the same version.
+    Updated { from: String, to: String },
+    /// The version the registry selects is the installed one.
+    UpToDate { version: String },
+    /// `--all` only: the registry does not list the package.
+    NotListed,
+    /// The replacement requests authority the installed version lacks and the
+    /// operator has not accepted. Nothing was changed.
+    NeedsApproval {
+        version: String,
+        items: Vec<String>,
+        command: String,
+    },
+    /// No package of that name is installed. `install` is the command that
+    /// installs it from the source the update named.
+    NotInstalled { install: String },
+    /// The installed package was not replaced. `kept` is its version, when
+    /// one is installed. Config rows created for the replacement, and a
+    /// displaced copy recovery put back, stay as they are.
+    Failed { error: String, kept: Option<String> },
+    /// The installed package, version `kept`, was not replaced because a
+    /// config row of it still uses the pre-1.0 key. `guidance` is what
+    /// `plugin install` prints for that row, one line each: its rename steps,
+    /// or a deployment-wide egress refusal reported in their place. Nothing
+    /// was changed.
+    LegacyRow { guidance: Vec<String>, kept: String },
+    /// The replacement failed and the previous package could not be moved
+    /// back: it is preserved at `preserved`. `command` puts it back and tries
+    /// the same update again, from the same source; authority the update adds
+    /// is asked for again.
+    Interrupted {
+        error: String,
+        preserved: std::path::PathBuf,
+        command: String,
+    },
+}
+
+/// `zeroclaw plugin update`: replace installed plugins one at a time, report
+/// each, and fail the command when any was not updated.
+#[cfg(feature = "plugins-wasm")]
+async fn run_plugin_update(
+    config: &mut crate::config::schema::Config,
+    plugins: Vec<String>,
+    all: bool,
+    registry: Option<String>,
+    from: Option<String>,
+    allow: Vec<String>,
+) -> Result<()> {
+    // The combinations clap cannot express. A local package and accepted
+    // authority each belong to one plugin, so they cannot apply to another,
+    // and authority accepted for a registry update is pinned to the version
+    // the operator reviewed, not whatever the registry selects later.
+    if from.is_some() && (plugins.len() != 1 || plugins.iter().any(|spec| spec.contains('@'))) {
+        bail!(t(
+            "cli-plugin-update-usage-from",
+            "--from takes exactly one plugin name, without a version: the package directory decides the version."
+        ));
+    }
+    if !allow.is_empty()
+        && (plugins.len() != 1
+            || (from.is_none() && !plugins.iter().all(|spec| spec.contains('@'))))
+    {
+        bail!(t(
+            "cli-plugin-update-usage-allow",
+            "--allow applies to exactly one plugin: name that plugin alone, pinned to the version you approve."
+        ));
+    }
+    if let Some(item) = crate::plugins::update::malformed_allow_item(&allow) {
+        bail!(ta(
+            "cli-plugin-update-usage-allow-item",
+            &[("item", item)],
+            format!(
+                "'{item}' is not an --allow item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>."
+            ),
+        ));
+    }
+
+    let mut host = plugin_host_with_configured_security(config)?;
+    let mut noted_displaced = false;
+    let targets: Vec<(String, Option<String>)> = if all {
+        // A package an interrupted update displaced is not put back by
+        // `--all`: only naming it does, so a copy is never restored unasked.
+        // Point at that command, as `plugin list` does.
+        for name in host.displaced_packages()? {
+            eprintln!(
+                "{}",
+                plugin_displaced_note(config, &name, registry.as_deref())
+            );
+            noted_displaced = true;
+        }
+        host.list_plugins()
+            .into_iter()
+            .map(|info| (info.name, None))
+            .collect()
+    } else {
+        plugins
+            .iter()
+            .map(|spec| {
+                zeroclaw::plugins::registry::parse_plugin_spec(spec)
+                    .map(|spec| (spec.name, spec.version))
+            })
+            .collect::<Result<_>>()?
+    };
+    if targets.is_empty() {
+        // When packages are displaced, the notes above already say what to do.
+        if !noted_displaced {
+            println!("{}", t("cli-plugins-none", "No plugins installed."));
+        }
+        return Ok(());
+    }
+
+    // Interrupted updates are put back first, and names that are not
+    // installed are answered, before the registry is consulted: recovery then
+    // works offline, and an unreachable registry cannot hide either answer.
+    let local = from
+        .as_deref()
+        .map(|dir| std::path::absolute(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir)));
+    let mut tally = PluginUpdateTally::default();
+    let mut pending = Vec::with_capacity(targets.len());
+    for (name, pin) in &targets {
+        if let Some(outcome) = recover_before_update(&mut host, name) {
+            tally.report(name, &outcome);
+        } else if host.manifest(name).is_none() {
+            // Point at installing it from the source the update named, never
+            // at the registry for a local package.
+            let source = match &local {
+                Some(dir) => crate::plugins::update::UpdateSource::Local(dir),
+                None => crate::plugins::update::UpdateSource::Registry {
+                    version: pin.as_deref(),
+                    registry: registry.as_deref(),
+                },
+            };
+            let install = crate::plugins::update::install_command(
+                egress_command_config_dir(config),
+                name,
+                source,
+            );
+            tally.report(name, &PluginUpdateOutcome::NotInstalled { install });
+        } else {
+            pending.push((name.as_str(), pin.as_deref()));
+        }
+    }
+
+    if !pending.is_empty() {
+        let fetched;
+        let from = if let Some(dir) = &local {
+            UpdateFrom::Local(dir)
+        } else {
+            let registry_url = plugin_registry::registry_url(registry.as_deref());
+            println!(
+                "{}",
+                t(
+                    "cli-plugin-update-checking",
+                    "Checking the plugin registry for updates..."
+                )
+            );
+            fetched = plugin_registry::fetch_registry_index(&registry_url).await?;
+            zeroclaw::plugins::registry::write_cached_registry_index(
+                &config.data_dir,
+                &registry_url,
+                &fetched,
+            )?;
+            UpdateFrom::Registry {
+                index: &fetched,
+                registry: registry.as_deref(),
+            }
+        };
+        let policy = PluginUpdatePolicy {
+            from,
+            allow: &allow,
+            limits: zeroclaw_runtime::plugin_runtime::plugin_limits(config),
+            all,
+        };
+        for (name, pin) in pending {
+            let outcome = Box::pin(update_one_plugin(&mut host, config, name, pin, &policy)).await;
+            tally.report(name, &outcome);
+        }
+    }
+
+    let PluginUpdateTally {
+        updated,
+        current,
+        skipped,
+        not_updated,
+    } = tally;
+    if targets.len() > 1 {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-update-summary",
+                &[
+                    ("updated", &updated.to_string()),
+                    ("current", &current.to_string()),
+                    ("skipped", &skipped.to_string()),
+                    ("failed", &not_updated.to_string()),
+                ],
+                format!(
+                    "Updated: {updated}. Up to date: {current}. Skipped: {skipped}. Not updated: {not_updated}."
+                ),
+            )
+        );
+    }
+    if updated > 0 {
+        println!(
+            "{}",
+            t(
+                "cli-plugin-update-restart",
+                "Restart the daemon so plugin instances it has already started use the new version."
+            )
+        );
+    }
+    if not_updated > 0 {
+        bail!(ta(
+            "cli-plugin-update-failed-exit",
+            &[("count", &not_updated.to_string())],
+            format!("{not_updated} plugin(s) not updated."),
+        ));
+    }
+    Ok(())
+}
+
+/// How many plugins one `zeroclaw plugin update` updated, found up to date,
+/// skipped, and did not update: the summary line and the exit status.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Default)]
+struct PluginUpdateTally {
+    updated: usize,
+    current: usize,
+    skipped: usize,
+    not_updated: usize,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginUpdateTally {
+    /// Print one plugin's outcome and count it.
+    fn report(&mut self, name: &str, outcome: &PluginUpdateOutcome) {
+        for line in plugin_update_outcome_lines(name, outcome) {
+            println!("{line}");
+        }
+        match outcome {
+            PluginUpdateOutcome::Updated { .. } => self.updated += 1,
+            PluginUpdateOutcome::UpToDate { .. } => self.current += 1,
+            PluginUpdateOutcome::NotListed => self.skipped += 1,
+            PluginUpdateOutcome::NeedsApproval { .. }
+            | PluginUpdateOutcome::NotInstalled { .. }
+            | PluginUpdateOutcome::Failed { .. }
+            | PluginUpdateOutcome::LegacyRow { .. }
+            | PluginUpdateOutcome::Interrupted { .. } => self.not_updated += 1,
+        }
+    }
+}
+
+/// Put back what an interrupted update of `name` left, before anything else
+/// about its update is decided and without the registry, so the recovery the
+/// operator is pointed at works offline. Returns the outcome to report when
+/// the plugin cannot be updated at all, or `None` to go on.
+#[cfg(feature = "plugins-wasm")]
+fn recover_before_update(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    name: &str,
+) -> Option<PluginUpdateOutcome> {
+    use zeroclaw::plugins::host::UpdateRecovery;
+
+    let failed = |error: String| Some(PluginUpdateOutcome::Failed { error, kept: None });
+    match host.recover_interrupted_update(name) {
+        Ok(UpdateRecovery::Nothing) => None,
+        Ok(UpdateRecovery::Swept { kept, .. }) => {
+            for (path, error) in &kept {
+                print_update_line(&plugin_update_leftover_line(name, path, error));
+            }
+            None
+        }
+        Ok(UpdateRecovery::Restored) => {
+            if let Some(info) = host.get_plugin(name) {
+                let version = &info.version;
+                print_update_line(&ta(
+                    "cli-plugin-update-restored",
+                    &[("name", name), ("version", version)],
+                    format!(
+                        "Restored '{name}' {version}, which an interrupted update had left displaced."
+                    ),
+                ));
+                return None;
+            }
+            // Put back, but the configured policy does not admit it, so there
+            // is nothing to update and `plugin install` would be refused too.
+            let path = host.plugins_dir().join(name).display().to_string();
+            failed(ta(
+                "cli-plugin-update-restored-not-admitted",
+                &[("path", &path)],
+                format!(
+                    "the copy an interrupted update left was put back at {path}, but this host does not admit it; run `zeroclaw plugin list --verbose` to see why"
+                ),
+            ))
+        }
+        Ok(UpdateRecovery::Ambiguous { displaced }) => {
+            let paths = displaced
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            failed(ta(
+                "cli-plugin-update-displaced-ambiguous",
+                &[("name", name), ("paths", &paths)],
+                format!(
+                    "an interrupted update left several copies of '{name}' ({paths}), and which one was installed last is not known. Rename the one to keep to '{name}' in the plugins directory, then run this command again"
+                ),
+            ))
+        }
+        Ok(UpdateRecovery::Occupied {
+            displaced,
+            occupant,
+        }) => {
+            let displaced = displaced.display().to_string();
+            let occupant = occupant.display().to_string();
+            failed(ta(
+                "cli-plugin-update-displaced-occupied",
+                &[("displaced", &displaced), ("occupant", &occupant)],
+                format!(
+                    "an interrupted update left it at {displaced}, but {occupant} is in the way. Move that aside, then run this command again"
+                ),
+            ))
+        }
+        Err(error) => failed(error.to_string()),
+    }
+}
+
+/// The note `plugin list` and `plugin update --all` print for a package an
+/// interrupted update left displaced, with both commands from
+/// [`plugin_displaced_commands`].
+#[cfg(feature = "plugins-wasm")]
+fn plugin_displaced_note(
+    config: &crate::config::schema::Config,
+    name: &str,
+    registry: Option<&str>,
+) -> String {
+    let (command, local) =
+        plugin_displaced_commands(egress_command_config_dir(config), name, registry);
+    let name = crate::plugins::update::printable(name);
+    ta(
+        "cli-plugin-list-displaced",
+        &[("name", &name), ("command", &command), ("local", &local)],
+        format!(
+            "Note: an interrupted update left '{name}' displaced, so it is not loaded. Run `{command}` to put it back and update it from the registry, or `{local}` to put it back and update it from a package directory instead."
+        ),
+    )
+}
+
+/// The two commands that put back a package an interrupted update displaced,
+/// for the selected configuration. Whoever prints them does not know where the
+/// package came from, so one updates it from the registry (`registry`, when
+/// the run named one) and the other from a package directory, left as the
+/// `<dir>` placeholder. Each is a complete command: `--from` and `--registry`
+/// never appear together, because `plugin update` refuses that pair.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_displaced_commands(
+    config_dir: &std::path::Path,
+    name: &str,
+    registry: Option<&str>,
+) -> (String, String) {
+    use crate::plugins::update::{UpdateSource, update_command};
+
+    (
+        update_command(
+            config_dir,
+            name,
+            UpdateSource::Registry {
+                version: None,
+                registry,
+            },
+            &[],
+        ),
+        update_command(
+            config_dir,
+            name,
+            UpdateSource::Local(std::path::Path::new("<dir>")),
+            &[],
+        ),
+    )
+}
+
+/// The warning for a replaced package that could not be deleted.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_update_leftover_line(name: &str, path: &std::path::Path, error: &str) -> String {
+    let path = path.display().to_string();
+    ta(
+        "cli-plugin-update-leftover",
+        &[("name", name), ("path", &path), ("error", error)],
+        format!(
+            "warning: the replaced version of '{name}' could not be deleted from {path} ({error}). It is not loaded; delete it by hand, or the next update of '{name}' tries to delete it again."
+        ),
+    )
+}
+
+/// Print one line of `zeroclaw plugin update` output. Lines carry manifest
+/// text, such as versions and schema locations, so every one goes through
+/// [`crate::plugins::update::printable`]: nothing a package declares can
+/// rewrite or rearrange what the operator reads, including an approval block
+/// a batch printed earlier.
+#[cfg(feature = "plugins-wasm")]
+fn print_update_line(line: &str) {
+    println!("{}", crate::plugins::update::printable(line));
+}
+
+/// Update one installed plugin: select and admit the replacement, require
+/// approval for authority it adds, check that it loads, create its missing
+/// config rows, and replace the package. Nothing before the replacement
+/// changes the installed package. Recovery of an interrupted update already
+/// ran, in [`recover_before_update`].
+#[cfg(feature = "plugins-wasm")]
+async fn update_one_plugin(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    name: &str,
+    pin: Option<&str>,
+    policy: &PluginUpdatePolicy<'_>,
+) -> PluginUpdateOutcome {
+    use crate::plugins::update::{
+        AuthorityItem, UpdateSource, accepts_all, authority_increase, update_command,
+    };
+
+    let Some(installed) = host.manifest(name).cloned() else {
+        // The caller answers names that are not installed before this runs,
+        // so the package went away in between.
+        return PluginUpdateOutcome::Failed {
+            error: zeroclaw::plugins::error::PluginError::NotFound(name.to_string()).to_string(),
+            kept: None,
+        };
+    };
+    let failed = |error: String| PluginUpdateOutcome::Failed {
+        error,
+        kept: Some(installed.version.clone()),
+    };
+
+    // The replacement: a local package, or the registry entry the rule install
+    // uses selects, where the installed version is up to date.
+    let downloaded;
+    let (source_dir, source) = match policy.from {
+        UpdateFrom::Local(dir) => (dir.to_path_buf(), UpdateSource::Local(dir)),
+        UpdateFrom::Registry { index, registry } => {
+            let spec = zeroclaw::plugins::registry::PluginSpec {
+                name: name.to_string(),
+                version: pin.map(str::to_string),
+            };
+            let Ok(entry) = zeroclaw::plugins::registry::resolve_entry(index, &spec) else {
+                if policy.all {
+                    return PluginUpdateOutcome::NotListed;
+                }
+                let spec =
+                    pin.map_or_else(|| name.to_string(), |version| format!("{name}@{version}"));
+                return failed(ta(
+                    "cli-plugin-update-not-in-registry",
+                    &[("spec", &spec)],
+                    format!("the registry does not list '{spec}'"),
+                ));
+            };
+            if entry.version == installed.version {
+                return PluginUpdateOutcome::UpToDate {
+                    version: installed.version.clone(),
+                };
+            }
+            downloaded = match plugin_registry::download_registry_entry(entry).await {
+                Ok(downloaded) => downloaded,
+                Err(error) => return failed(format!("{error:#}")),
+            };
+            (
+                downloaded.plugin_dir().to_path_buf(),
+                UpdateSource::Registry {
+                    version: Some(&entry.version),
+                    registry,
+                },
+            )
+        }
+    };
+
+    let admitted = match host.admit_update(name, &source_dir.to_string_lossy()) {
+        Ok(admitted) => admitted,
+        Err(error) => return failed(error.to_string()),
+    };
+    let candidate = admitted.manifest().clone();
+
+    // Authority the replacement adds needs the operator's say-so, decided
+    // before its component is compiled.
+    let increase = authority_increase(&installed, &candidate);
+    if !accepts_all(&increase, policy.allow) {
+        return PluginUpdateOutcome::NeedsApproval {
+            version: candidate.version.clone(),
+            items: increase.iter().map(AuthorityItem::token).collect(),
+            command: update_command(egress_command_config_dir(config), name, source, &increase),
+        };
+    }
+
+    // The load check install runs, against the operator's limits. An update
+    // cannot skip it.
+    if let Some(component) = admitted.component()
+        && let Err(error) = zeroclaw::plugins::validate::verify_component_loads(
+            component,
+            &candidate,
+            policy.limits,
+        )
+        .await
+    {
+        let detail = format!("{error:#}");
+        return failed(ta(
+            "cli-plugin-update-does-not-load",
+            &[("error", &detail)],
+            format!("it does not load against this host: {detail}"),
+        ));
+    }
+
+    // Rows the replacement's instances need are created without a grant and
+    // saved before the package changes, so nothing after the replacement can
+    // fail and leave it half done.
+    let entries = match manifest_config_entries(&candidate) {
+        Ok(entries) => entries,
+        Err(error) => return failed(format!("{error:#}")),
+    };
+    let declared = manifest_declared_egress(&candidate);
+    let rows = match ensure_plugin_config_entries(config, name, &entries, &declared) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return match error.downcast::<LegacyConfigRow>() {
+                Ok(LegacyConfigRow(guidance)) => PluginUpdateOutcome::LegacyRow {
+                    guidance,
+                    kept: installed.version.clone(),
+                },
+                Err(error) => failed(format!("{error:#}")),
+            };
+        }
+    };
+    if rows.as_ref().is_some_and(|rows| !rows.created.is_empty())
+        && let Err(error) = Box::pin(config.save_dirty()).await
+    {
+        return failed(format!("{error:#}"));
+    }
+    let rejected = plugin_config_rejections(config, &candidate);
+
+    let replaced = match host.update_admitted(admitted) {
+        Ok(replaced) => replaced,
+        Err(zeroclaw::plugins::error::PluginError::ReplacementInterrupted {
+            preserved,
+            cause,
+            ..
+        }) => {
+            return PluginUpdateOutcome::Interrupted {
+                error: cause,
+                preserved,
+                command: update_command(egress_command_config_dir(config), name, source, &[]),
+            };
+        }
+        Err(error) => return failed(error.to_string()),
+    };
+
+    if let Some(rows) = &rows {
+        report_updated_plugin_config_entries(config, name, rows, &declared);
+    }
+    for (key, reason) in &rejected {
+        print_update_line(&ta(
+            "cli-plugin-update-config-rejected",
+            &[
+                ("name", name),
+                ("version", &candidate.version),
+                ("key", key),
+                ("error", reason),
+            ],
+            format!(
+                "warning: '{name}' {} rejects the configuration of its instance {key} ({reason}). That instance will not load until its configuration fits the new version.",
+                candidate.version
+            ),
+        ));
+    }
+    if let Some((path, error)) = &replaced.leftover {
+        print_update_line(&plugin_update_leftover_line(name, path, &error.to_string()));
+    }
+    PluginUpdateOutcome::Updated {
+        from: replaced.previous_version,
+        to: candidate.version,
+    }
+}
+
+/// What `plugin update` prints about the replaced package's config rows after
+/// the replacement: each row it created, then for every row the difference
+/// between the new version's egress declaration and the row's grant, the same
+/// report install prints for a row that already exists. Nothing is granted:
+/// an update never extends an allowlist, not even in a row it created.
+#[cfg(feature = "plugins-wasm")]
+fn report_updated_plugin_config_entries(
+    config: &crate::config::schema::Config,
+    package: &str,
+    rows: &PluginConfigRows<'_>,
+    declared_egress: &[String],
+) {
+    for instance_key in &rows.created {
+        print_update_line(&ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", instance_key)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<instance-key>.config.<key>`.",
+        ));
+    }
+    let reported: Vec<&String> = rows.created.iter().chain(&rows.existing).copied().collect();
+    if !reported.is_empty()
+        && let Some(line) = egress_deployment_gap_line(config)
+    {
+        print_update_line(&line);
+    }
+    for instance_key in reported {
+        for line in existing_egress_grant_lines(config, package, instance_key, declared_egress) {
+            print_update_line(&line);
+        }
+    }
+}
+
+/// The instances whose preserved configuration `manifest` rejects, as
+/// `(instance key, reason)`: the package's default tool binding and every
+/// `[channels.plugin.<alias>]` declared for it, resolved the way the runtime
+/// materializes config, with the manifest's requested permissions granted.
+/// The reasons name the schema's own properties and locations, such as a
+/// missing required property, never a configured value, nor a configured key
+/// the schema does not declare.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_rejections(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Vec<(String, String)> {
+    use zeroclaw::plugins::PluginCapability;
+    use zeroclaw::plugins::instance::PluginInstanceScope;
+
+    let grants = || manifest.permissions.iter().copied();
+    let mut scopes = Vec::new();
+    if manifest.capabilities.contains(&PluginCapability::Tool) {
+        scopes.push(PluginInstanceScope::for_package_binding(
+            manifest,
+            PluginCapability::Tool,
+            grants(),
+        ));
+    }
+    if manifest.capabilities.contains(&PluginCapability::Channel) {
+        for (alias, declaration) in &config.channels.plugin {
+            if declaration.package == manifest.name {
+                scopes.push(PluginInstanceScope::from_manifest(
+                    manifest,
+                    PluginCapability::Channel,
+                    alias.clone(),
+                    grants(),
+                ));
+            }
+        }
+    }
+
+    let mut rejected = Vec::new();
+    for scope in scopes.into_iter().flatten() {
+        let Ok(key) = scope.id().config_entry_key() else {
+            continue;
+        };
+        let resolved = match config.plugins.entry_config(&key) {
+            Ok(configured) => {
+                zeroclaw::plugins::config::resolve_plugin_config(manifest, &scope, configured)
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            }
+            Err(duplicate) => Err(duplicate.to_string()),
+        };
+        if let Err(reason) = resolved {
+            rejected.push((key, reason));
+        }
+    }
+    rejected.sort();
+    rejected
+}
+
+/// The lines `zeroclaw plugin update` prints for one plugin's outcome.
+///
+/// Versions, `provides` ids and publisher keys are manifest text, so every
+/// line is passed through [`crate::plugins::update::printable`]: an escape
+/// sequence in them cannot rewrite what the operator reads, least of all at
+/// the approval prompt. Lines break only where this host puts them apart. An
+/// error that spans lines, such as a parse error quoting the manifest, stays
+/// on one line with its breaks escaped, so manifest text never prints a line
+/// of its own.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_update_outcome_lines(name: &str, outcome: &PluginUpdateOutcome) -> Vec<String> {
+    plugin_update_outcome_text(name, outcome)
+        .iter()
+        .map(|line| crate::plugins::update::printable(line))
+        .collect()
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<String> {
+    match outcome {
+        PluginUpdateOutcome::Updated { from, to } if from == to => vec![ta(
+            "cli-plugin-update-reinstalled",
+            &[("name", name), ("version", to)],
+            format!("Reinstalled '{name}' {to}."),
+        )],
+        PluginUpdateOutcome::Updated { from, to }
+            if crate::plugins::update::is_older_version(to, from) =>
+        {
+            vec![ta(
+                "cli-plugin-update-downgraded",
+                &[("name", name), ("from", from), ("to", to)],
+                format!(
+                    "Replaced '{name}' {from} with {to}, an older version than the one installed."
+                ),
+            )]
+        }
+        PluginUpdateOutcome::Updated { from, to } => vec![ta(
+            "cli-plugin-update-updated",
+            &[("name", name), ("from", from), ("to", to)],
+            format!("Updated '{name}' from {from} to {to}."),
+        )],
+        PluginUpdateOutcome::UpToDate { version } => vec![ta(
+            "cli-plugin-update-up-to-date",
+            &[("name", name), ("version", version)],
+            format!("'{name}' is up to date ({version})."),
+        )],
+        PluginUpdateOutcome::NotListed => vec![ta(
+            "cli-plugin-update-not-listed",
+            &[("name", name)],
+            format!("Skipped '{name}': the registry does not list it."),
+        )],
+        PluginUpdateOutcome::NeedsApproval {
+            version,
+            items,
+            command,
+        } => {
+            let mut lines = vec![ta(
+                "cli-plugin-update-needs-approval",
+                &[("name", name), ("version", version)],
+                format!(
+                    "'{name}' {version} requests authority the installed version does not have:"
+                ),
+            )];
+            // The row is indented in code, not in Fluent: Fluent trims the
+            // leading whitespace of a single-line value.
+            for item in items {
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-update-approval-item",
+                        &[("item", item)],
+                        format!("+ {item}")
+                    )
+                ));
+            }
+            lines.push(ta(
+                "cli-plugin-update-approval-command",
+                &[("command", command)],
+                format!("Nothing was changed. To accept it and update, run: {command}"),
+            ));
+            lines
+        }
+        PluginUpdateOutcome::NotInstalled { install } => vec![ta(
+            "cli-plugin-update-not-installed",
+            &[("name", name), ("command", install)],
+            format!("Could not update '{name}': it is not installed. Install it with: {install}"),
+        )],
+        PluginUpdateOutcome::Failed {
+            error,
+            kept: Some(version),
+        } => vec![ta(
+            "cli-plugin-update-failed-kept",
+            &[("name", name), ("error", error), ("version", version)],
+            format!("Could not update '{name}': {error}. Version {version} is still installed."),
+        )],
+        PluginUpdateOutcome::Failed { error, kept: None } => vec![ta(
+            "cli-plugin-update-failed",
+            &[("name", name), ("error", error)],
+            format!("Could not update '{name}': {error}"),
+        )],
+        PluginUpdateOutcome::LegacyRow { guidance, kept } => {
+            let mut lines = vec![ta(
+                "cli-plugin-update-legacy-row",
+                &[("name", name), ("version", kept)],
+                format!(
+                    "Could not update '{name}': its config row still uses the pre-1.0 key format. Version {kept} is still installed."
+                ),
+            )];
+            lines.extend(guidance.iter().cloned());
+            lines
+        }
+        PluginUpdateOutcome::Interrupted {
+            error,
+            preserved,
+            command,
+        } => {
+            let preserved = preserved.display().to_string();
+            vec![ta(
+                "cli-plugin-update-interrupted",
+                &[
+                    ("name", name),
+                    ("error", error),
+                    ("preserved", &preserved),
+                    ("command", command),
+                ],
+                format!(
+                    "Could not update '{name}': {error}. Its previous version was not moved back and is preserved at {preserved}. Run `{command}` to put it back and try the update again, unless a package named '{name}' is installed by then."
+                ),
+            )]
+        }
     }
 }
 
@@ -10852,6 +11871,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                         )
                     );
                 }
+                // The note is advisory. A plugins directory this process cannot
+                // lock, such as a read-only one, has nothing it could recover.
+                for name in host.displaced_packages().unwrap_or_default() {
+                    eprintln!("{}", plugin_displaced_note(&config, &name, None));
+                }
                 Ok(())
             }
             PluginCommands::Search { query, registry } => {
@@ -10919,7 +11943,15 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let mut host = plugin_host_with_configured_security(&config)?;
                 let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 if plugin_registry::is_local_plugin_source(&source) {
-                    let admitted = host.admit_source(&source)?;
+                    let local = std::path::absolute(&source)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&source));
+                    let admitted = host.admit_source(&source).map_err(|error| {
+                        with_update_pointer(
+                            error,
+                            egress_command_config_dir(&config),
+                            crate::plugins::update::UpdateSource::Local(&local),
+                        )
+                    })?;
                     verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
                     Box::pin(publish_and_seed_plugin(
                         &mut host,
@@ -10954,7 +11986,19 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let admitted = host.admit_source(&plugin_dir)?;
+                    let pinned = zeroclaw::plugins::registry::parse_plugin_spec(&source)
+                        .ok()
+                        .and_then(|spec| spec.version);
+                    let admitted = host.admit_source(&plugin_dir).map_err(|error| {
+                        with_update_pointer(
+                            error,
+                            egress_command_config_dir(&config),
+                            crate::plugins::update::UpdateSource::Registry {
+                                version: pinned.as_deref(),
+                                registry: registry.as_deref(),
+                            },
+                        )
+                    })?;
                     verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
                     Box::pin(publish_and_seed_plugin(
                         &mut host,
@@ -10984,7 +12028,22 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let instance_keys: Vec<String> = installed_plugin_config_entries(&host, &name)
                     .map(|entries| entries.into_iter().map(|(_, key)| key).collect())
                     .unwrap_or_default();
-                host.remove(&name)?;
+                let retained = host
+                    .remove_with_report(&name)
+                    .map_err(with_remove_refusal_reason)?;
+                for path in retained {
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-plugin-staging-retained",
+                            &[("path", path.to_string_lossy().as_ref())],
+                            format!(
+                                "Retained staging at {} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.",
+                                path.display()
+                            )
+                        )
+                    );
+                }
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
@@ -11056,6 +12115,23 @@ Add pricing to the active provider profile or supply a catalog entry."
                     println!("{}", t("cli-plugin-migrate-none", "Nothing to migrate."));
                 }
                 Ok(())
+            }
+            PluginCommands::Update {
+                plugins,
+                all,
+                registry,
+                from,
+                allow,
+            } => {
+                Box::pin(run_plugin_update(
+                    &mut config,
+                    plugins,
+                    all,
+                    registry,
+                    from,
+                    allow,
+                ))
+                .await
             }
         },
     }
@@ -20346,6 +21422,149 @@ type = "string"
         );
     }
 
+    /// A package directory an older installer stranded half-written blocks the
+    /// next install of that name. The refusal names the recovery command,
+    /// announces nothing, and leaves the directory alone; running that command
+    /// and installing again succeeds.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn an_install_blocked_by_a_stranded_directory_names_plugin_remove() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = "name = \"stranded-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        // The manifest landed, the payload never did: discovery skips it.
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let stranded = plugins.path().join("stranded-probe");
+        std::fs::create_dir(&stranded).expect("stranded dir");
+        std::fs::write(stranded.join("manifest.toml"), manifest_toml).expect("stranded manifest");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        assert!(host.get_plugin("stranded-probe").is_none());
+
+        let dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(dir.path());
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("the stranded directory must refuse the install");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("`zeroclaw plugin remove stranded-probe`"),
+            "the refusal must name the recovery command: {rendered}"
+        );
+        assert!(!announced.get(), "a refused install must not announce");
+        assert!(
+            stranded.join("manifest.toml").is_file() && !stranded.join("plugin.wasm").exists(),
+            "the refused install must leave the stranded directory as it was"
+        );
+
+        host.remove("stranded-probe")
+            .expect("the named command must clear the stranded directory");
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect("the install must succeed once the directory is cleared");
+        assert!(announced.get());
+        assert_eq!(
+            std::fs::read(stranded.join("plugin.wasm")).expect("installed component"),
+            b"\0asm"
+        );
+    }
+
+    /// `plugin remove` keeps a complete package this host rejects for its
+    /// signature policy, and the refusal the operator reads carries the host's
+    /// reason instead of a bare "not admitted".
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_refused_plugin_remove_says_why_and_keeps_the_package() {
+        use zeroclaw::plugins::host::PluginHost;
+        use zeroclaw::plugins::signature::SignatureMode;
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let package = plugins.path().join("unsigned-probe");
+        std::fs::create_dir(&package).expect("package dir");
+        std::fs::write(
+            package.join("manifest.toml"),
+            "name = \"unsigned-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n",
+        )
+        .expect("write manifest");
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let mut host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .expect("strict host");
+
+        let err = host
+            .remove("unsigned-probe")
+            .map_err(with_remove_refusal_reason)
+            .expect_err("strict policy keeps a complete unsigned package");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("'unsigned-probe'")
+                && rendered.contains("unsigned and signature verification is required"),
+            "the refusal must name the package and the host's reason: {rendered}"
+        );
+        assert!(package.join("plugin.wasm").is_file(), "the package is kept");
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn retained_recovery_diagnostic_names_actual_claim_without_left_untouched() {
+        let error = zeroclaw::plugins::error::PluginError::RecoveryRetained {
+            path: "/synthetic/plugins/.probe.recovering-v1-test/package".into(),
+            reason: "destination occupied".into(),
+        };
+        let rendered = with_remove_refusal_reason(error).to_string();
+        assert!(
+            rendered.contains(".probe.recovering-v1-test/package"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("destination occupied"), "{rendered}");
+        assert!(!rendered.contains("left untouched"), "{rendered}");
+    }
+
+    /// An install that could not publish keeps its staged copy and says to run
+    /// the install again, not `plugin remove`, which may sweep that copy.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_retained_install_points_at_installing_again() {
+        let error = zeroclaw::plugins::error::PluginError::RecoveryRetained {
+            path: "/synthetic/plugins/.probe.installing-v1-test/package".into(),
+            reason: "File exists (os error 17)".into(),
+        };
+        let rendered = with_unadmitted_package_remedy(error).to_string();
+        assert!(
+            rendered.contains(".probe.installing-v1-test/package")
+                && rendered.contains("File exists (os error 17)")
+                && rendered.contains("run the install again"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("plugin remove"), "{rendered}");
+    }
+
     /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves
     /// its package-name config row behind. Reinstall must refuse before it
     /// creates a second, canonical row, print the same ordered update guidance
@@ -20728,5 +21947,771 @@ hosts = ["api.example.com", "api2.example.com"]
             b_after.contains("gitea.b.example.net"),
             "premise: profile B's operator-only grant is on disk: {b_after}"
         );
+    }
+
+    /// A tool package source whose component is a stub that does not load;
+    /// `extra` is appended to the manifest.
+    #[cfg(feature = "plugins-wasm")]
+    fn write_tool_update_source(dir: &std::path::Path, name: &str, version: &str, extra: &str) {
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"{version}\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n{extra}"
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(dir.join("plugin.wasm"), b"\0asm stub").expect("write component");
+    }
+
+    /// A host over `plugins` with `name` 1.0.0 installed.
+    #[cfg(feature = "plugins-wasm")]
+    fn host_with_installed_tool(
+        plugins: &std::path::Path,
+        name: &str,
+    ) -> zeroclaw::plugins::host::PluginHost {
+        let source = tempfile::tempdir().expect("source dir");
+        write_tool_update_source(source.path(), name, "1.0.0", "");
+        let mut host =
+            zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins).expect("host");
+        host.install(source.path().to_str().expect("utf-8 temp path"))
+            .expect("install 1.0.0");
+        host
+    }
+
+    /// A one-entry registry index whose archive nothing may fetch: its URL
+    /// refuses connections, so an update that downloads it fails.
+    #[cfg(feature = "plugins-wasm")]
+    fn unfetchable_index(
+        name: &str,
+        version: &str,
+    ) -> zeroclaw::plugins::registry::PluginRegistryIndex {
+        zeroclaw::plugins::registry::PluginRegistryIndex {
+            plugins: vec![zeroclaw::plugins::registry::PluginRegistryEntry {
+                name: name.to_string(),
+                version: version.to_string(),
+                description: None,
+                author: None,
+                capabilities: Vec::new(),
+                url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
+                sha256: None,
+            }],
+            registry_url: None,
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn update_policy<'a>(
+        from: UpdateFrom<'a>,
+        allow: &'a [String],
+        all: bool,
+    ) -> PluginUpdatePolicy<'a> {
+        PluginUpdatePolicy {
+            from,
+            allow,
+            limits: zeroclaw_runtime::plugin_runtime::plugin_limits(
+                &crate::config::schema::Config::default(),
+            ),
+            all,
+        }
+    }
+
+    /// REGRESSION (plugin update authority): a replacement that requests a
+    /// permission the installed version lacks is refused before its component
+    /// is compiled (the stub here would fail the load check), nothing changes,
+    /// and the refusal carries the command that accepts exactly that increase.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_refuses_added_authority_before_the_load_check_and_changes_nothing() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let source = tempfile::tempdir().expect("source dir");
+        write_tool_update_source(
+            source.path(),
+            "weather",
+            "2.0.0",
+            "permissions = [\"http_client\"]\n[egress]\nhosts = [\"api.example.com\"]\n",
+        );
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+
+        let policy = update_policy(UpdateFrom::Local(source.path()), &[], false);
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+
+        let PluginUpdateOutcome::NeedsApproval {
+            version,
+            items,
+            command,
+        } = outcome
+        else {
+            panic!("expected NeedsApproval, got {outcome:?}");
+        };
+        assert_eq!(version, "2.0.0");
+        assert_eq!(items, ["permission:http_client"]);
+        for part in [
+            "plugin update",
+            "--from",
+            "--allow",
+            "permission:http_client",
+        ] {
+            assert!(command.contains(part), "{part:?} missing from {command}");
+        }
+        assert_eq!(
+            host.get_plugin("weather").expect("installed").version,
+            "1.0.0"
+        );
+        assert!(
+            config.plugins.entries.is_empty(),
+            "a refused update creates no config row"
+        );
+    }
+
+    /// Accepting the added authority does not skip the load check: an update
+    /// cannot install a component that does not load, and the installed
+    /// version stays in place.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_with_the_authority_accepted_still_refuses_a_component_that_does_not_load() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let source = tempfile::tempdir().expect("source dir");
+        write_tool_update_source(
+            source.path(),
+            "weather",
+            "2.0.0",
+            "permissions = [\"http_client\"]\n",
+        );
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+
+        let allow = ["permission:http_client".to_string()];
+        let policy = update_policy(UpdateFrom::Local(source.path()), &allow, false);
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+
+        let PluginUpdateOutcome::Failed { error, kept } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert_eq!(kept.as_deref(), Some("1.0.0"));
+        assert!(error.contains("failed to load WASM component"), "{error}");
+        assert_eq!(
+            host.get_plugin("weather").expect("installed").version,
+            "1.0.0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plugins.path().join("weather/manifest.toml"))
+                .expect("installed manifest")
+                .lines()
+                .nth(1),
+            Some("version = \"1.0.0\"")
+        );
+        assert!(config.plugins.entries.is_empty());
+    }
+
+    /// The version the registry selects being the installed one is up to date,
+    /// decided without a download: the entry's archive refuses connections.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_to_the_installed_version_is_up_to_date_without_a_download() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let index = unfetchable_index("weather", "1.0.0");
+        let policy = update_policy(
+            UpdateFrom::Registry {
+                index: &index,
+                registry: None,
+            },
+            &[],
+            false,
+        );
+
+        for pin in [None, Some("1.0.0")] {
+            let outcome = Box::pin(update_one_plugin(
+                &mut host,
+                &mut config,
+                "weather",
+                pin,
+                &policy,
+            ))
+            .await;
+            assert!(
+                matches!(&outcome, PluginUpdateOutcome::UpToDate { version } if version == "1.0.0"),
+                "pin {pin:?}: {outcome:?}"
+            );
+        }
+    }
+
+    /// A package the registry does not list is skipped when `--all` chose it,
+    /// and is a failure when the operator named it, pinned or not.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_package_the_registry_does_not_list_is_skipped_with_all_and_failed_by_name() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let index = unfetchable_index("weather", "1.0.0");
+        let from = UpdateFrom::Registry {
+            index: &index,
+            registry: None,
+        };
+
+        let all = update_policy(from, &[], true);
+        let named = update_policy(from, &[], false);
+        let other = unfetchable_index("calendar", "1.0.0");
+        let unlisted = update_policy(
+            UpdateFrom::Registry {
+                index: &other,
+                registry: None,
+            },
+            &[],
+            true,
+        );
+
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &unlisted,
+        ))
+        .await;
+        assert!(
+            matches!(outcome, PluginUpdateOutcome::NotListed),
+            "{outcome:?}"
+        );
+
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            Some("9.9.9"),
+            &named,
+        ))
+        .await;
+        let PluginUpdateOutcome::Failed { error, kept } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(error.contains("weather@9.9.9"), "{error}");
+        assert_eq!(kept.as_deref(), Some("1.0.0"));
+
+        // `--all` never pins, so the installed version is simply up to date.
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &all,
+        ))
+        .await;
+        assert!(
+            matches!(outcome, PluginUpdateOutcome::UpToDate { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_package_that_goes_away_before_its_update_is_a_failure() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host =
+            zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let index = unfetchable_index("weather", "2.0.0");
+        let policy = update_policy(
+            UpdateFrom::Registry {
+                index: &index,
+                registry: None,
+            },
+            &[],
+            false,
+        );
+
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+        // The command answers names that are not installed before it gets
+        // here; reaching it means the package went away in between, which is
+        // a failure with nothing kept.
+        assert!(
+            matches!(&outcome, PluginUpdateOutcome::Failed { kept: None, error } if error.contains("weather")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The transaction an update that stopped between claiming the installed
+    /// `name` and publishing its replacement leaves in `plugins`: a hidden
+    /// `replacing` directory whose lease no process holds. Returns where its
+    /// claimed package goes.
+    #[cfg(feature = "plugins-wasm")]
+    fn abandoned_claim(plugins: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let claim = plugins.join(format!(".{name}.replacing-v1-{}", "0".repeat(32)));
+        std::fs::create_dir(&claim).expect("claim directory");
+        std::fs::write(claim.join("lease"), b"").expect("lease");
+        claim.join("package")
+    }
+
+    /// A package an interrupted update left displaced is put back before the
+    /// update is decided, so the operator's retry recovers it and the update
+    /// then proceeds against the restored version.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn update_puts_back_a_package_an_interrupted_update_displaced() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        drop(host_with_installed_tool(plugins.path(), "weather"));
+        let claimed = abandoned_claim(plugins.path(), "weather");
+        std::fs::rename(plugins.path().join("weather"), &claimed)
+            .expect("claim the package the way a stopped update leaves it");
+        let mut host =
+            zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        assert!(host.get_plugin("weather").is_none());
+
+        assert!(
+            recover_before_update(&mut host, "weather").is_none(),
+            "a restored package goes on to its update"
+        );
+        assert!(plugins.path().join("weather/manifest.toml").is_file());
+        assert!(!claimed.exists());
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let index = unfetchable_index("weather", "1.0.0");
+        let policy = update_policy(
+            UpdateFrom::Registry {
+                index: &index,
+                registry: None,
+            },
+            &[],
+            false,
+        );
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+
+        assert!(
+            matches!(outcome, PluginUpdateOutcome::UpToDate { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A displaced copy the configured policy no longer admits is still put
+    /// back, but reported as not updated, naming where it is, rather than as
+    /// "not installed", whose install pointer would be refused because the
+    /// name is occupied.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_restored_copy_the_policy_rejects_is_reported_where_it_is() {
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let displaced = abandoned_claim(plugins.path(), "weather");
+        std::fs::create_dir(&displaced).expect("claimed package");
+        write_tool_update_source(&displaced, "weather", "1.0.0", "");
+        let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            zeroclaw::plugins::signature::SignatureMode::Strict,
+            Vec::new(),
+        )
+        .expect("host");
+
+        let outcome = recover_before_update(&mut host, "weather");
+
+        let Some(PluginUpdateOutcome::Failed { error, kept }) = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert_eq!(kept, None);
+        let restored = plugins.path().join("weather");
+        assert!(
+            error.contains(&restored.display().to_string()),
+            "the report names where the copy is: {error}"
+        );
+        assert!(restored.join("manifest.toml").is_file());
+        assert!(host.get_plugin("weather").is_none());
+    }
+
+    /// The preserved-config report names the instance and what the new schema
+    /// rejects, never the configured value.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn config_rejections_name_the_instance_and_never_the_value() {
+        let manifest = manifest_from_toml(
+            r#"name = "weather"
+version = "2.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["retries"]
+
+[config_schema.properties.retries]
+type = "integer"
+"#,
+        );
+        let key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+
+        let rejected = plugin_config_rejections(&config, &manifest);
+        assert_eq!(
+            rejected.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            [key.as_str()],
+            "a newly required property with no row is reported"
+        );
+        assert!(
+            rejected[0].1.contains("'retries'"),
+            "the reason names the missing property: {:?}",
+            rejected[0]
+        );
+
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: key.clone(),
+                config: std::collections::HashMap::from([(
+                    "retries".to_string(),
+                    "sekrit-not-a-number".to_string(),
+                )]),
+                ..Default::default()
+            });
+        let rejected = plugin_config_rejections(&config, &manifest);
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].1.contains("retries"), "{:?}", rejected[0]);
+        assert!(!rejected[0].1.contains("sekrit"), "{:?}", rejected[0]);
+
+        config.plugins.entries[0]
+            .config
+            .insert("retries".to_string(), "3".to_string());
+        assert!(plugin_config_rejections(&config, &manifest).is_empty());
+    }
+
+    /// An update to a lower version says so instead of reading as a normal
+    /// update, and one to a higher version is still reported as updated.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn an_update_to_an_older_version_says_so() {
+        let older = plugin_update_outcome_text(
+            "weather",
+            &PluginUpdateOutcome::Updated {
+                from: "2.0.0".to_string(),
+                to: "1.2.5".to_string(),
+            },
+        );
+        let newer = plugin_update_outcome_text(
+            "weather",
+            &PluginUpdateOutcome::Updated {
+                from: "1.2.5".to_string(),
+                to: "2.0.0".to_string(),
+            },
+        );
+        let down = [("name", "weather"), ("from", "2.0.0"), ("to", "1.2.5")];
+        let up = [("name", "weather"), ("from", "1.2.5"), ("to", "2.0.0")];
+        assert_eq!(
+            older,
+            [ta("cli-plugin-update-downgraded", &down, String::new())]
+        );
+        assert_eq!(newer, [ta("cli-plugin-update-updated", &up, String::new())]);
+        assert_ne!(
+            older[0],
+            ta("cli-plugin-update-updated", &down, String::new())
+        );
+    }
+
+    /// Manifest text reaches the terminal escaped: a control sequence in a
+    /// version, a `provides` id or the printed command cannot rewrite what the
+    /// operator reads at the approval prompt.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn update_lines_print_manifest_control_characters_as_escapes() {
+        let lines = plugin_update_outcome_lines(
+            "weather",
+            &PluginUpdateOutcome::NeedsApproval {
+                version: "2.0.0\u{1b}[2K".to_string(),
+                items: vec!["provides:tele\u{1b}[8mgram".to_string()],
+                command: "zeroclaw plugin update 'weather@2.0.0\u{1b}[2K'".to_string(),
+            },
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{1b}')),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("\\u{1b}[8m")),
+            "the sequence is shown, escaped: {lines:#?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_refused_update_prints_each_item_indented_and_then_the_command() {
+        let command = "zeroclaw plugin update 'weather@2.0.0' --allow 'permission:http_client,capability:channel'";
+        let lines = plugin_update_outcome_lines(
+            "weather",
+            &PluginUpdateOutcome::NeedsApproval {
+                version: "2.0.0".to_string(),
+                items: vec![
+                    "permission:http_client".to_string(),
+                    "capability:channel".to_string(),
+                ],
+                command: command.to_string(),
+            },
+        );
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(
+            lines[0].contains("weather") && lines[0].contains("2.0.0"),
+            "{lines:#?}"
+        );
+        assert!(lines[1].starts_with("  ") && lines[1].contains("permission:http_client"));
+        assert!(lines[2].starts_with("  ") && lines[2].contains("capability:channel"));
+        assert!(lines[3].contains(command), "{lines:#?}");
+    }
+
+    /// A refusal over a pre-1.0 config row prints each step of its guidance on
+    /// its own line, indented under the result. A line break inside one line
+    /// is manifest text, so it is escaped rather than starting a line.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_legacy_row_refusal_prints_each_step_on_its_own_line() {
+        let lines = plugin_update_outcome_lines(
+            "weather",
+            &PluginUpdateOutcome::LegacyRow {
+                guidance: vec![
+                    "  weather: declares api.example.com\nUpdated 'weather'".to_string(),
+                    "    1) migrate the row".to_string(),
+                    "    2) grant: zeroclaw config set".to_string(),
+                ],
+                kept: "1.0.0".to_string(),
+            },
+        );
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert!(
+            lines[0].contains("weather") && lines[0].contains("1.0.0"),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[1],
+            "  weather: declares api.example.com\\u{a}Updated 'weather'"
+        );
+        assert_eq!(lines[2], "    1) migrate the row");
+        assert_eq!(lines[3], "    2) grant: zeroclaw config set");
+    }
+
+    /// The displaced-package note cannot know where the package came from, so
+    /// it offers two complete commands for the selected configuration: one
+    /// from the run's registry, one from a package directory. Each parses as
+    /// printed; `--from` never joins `--registry`, which `plugin update`
+    /// refuses.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn the_displaced_note_offers_two_commands_for_the_selected_configuration() {
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let config = config_in_dir(config_dir.path());
+        let registry = "https://registry.example/i.json";
+        let (command, local) =
+            plugin_displaced_commands(config_dir.path(), "weather", Some(registry));
+
+        assert!(
+            command.contains("--registry") && !command.contains("--from"),
+            "{command}"
+        );
+        assert!(
+            local.contains("--from") && !local.contains("--registry"),
+            "{local}"
+        );
+        let note = plugin_displaced_note(&config, "weather", Some(registry));
+        assert!(note.contains(&command) && note.contains(&local), "{note}");
+
+        // The exact form, and parsing it back, follow the host shell's quoting.
+        if matches!(ShellDialect::host(), ShellDialect::Posix) {
+            let dir = config_dir.path().display();
+            assert!(
+                command.ends_with(&format!(
+                    "--config-dir '{dir}' plugin update 'weather' --registry '{registry}'"
+                )),
+                "{command}"
+            );
+            assert!(
+                local.ends_with(&format!(
+                    "--config-dir '{dir}' plugin update 'weather' --from '<dir>'"
+                )),
+                "{local}"
+            );
+            for printed in [&command, &local] {
+                assert!(
+                    Cli::try_parse_from(posix_words(printed)).is_ok(),
+                    "the printed command must parse: {printed}"
+                );
+            }
+            assert!(
+                Cli::try_parse_from(posix_words(&format!("{command} --from '<dir>'"))).is_err(),
+                "premise: `plugin update` refuses --from with --registry"
+            );
+        }
+    }
+
+    /// Split a command the way a POSIX shell would, for the quoting this crate
+    /// prints: bare words and single-quoted strings, with `'\''` for a quote
+    /// inside one.
+    #[cfg(feature = "plugins-wasm")]
+    fn posix_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => {
+                    in_word = true;
+                    for quoted in chars.by_ref() {
+                        if quoted == '\'' {
+                            break;
+                        }
+                        word.push(quoted);
+                    }
+                }
+                '\\' => {
+                    in_word = true;
+                    word.extend(chars.next());
+                }
+                ' ' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                other => {
+                    in_word = true;
+                    word.push(other);
+                }
+            }
+        }
+        if in_word {
+            words.push(word);
+        }
+        words
+    }
+
+    /// An interrupted update points at the command that puts the previous
+    /// version back and tries again from the same source: a local package
+    /// directory stays the source, never the registry.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn an_interrupted_update_points_back_at_its_own_source() {
+        use crate::plugins::update::{UpdateSource, update_command};
+
+        let command = update_command(
+            std::path::Path::new("/cfg"),
+            "weather",
+            UpdateSource::Local(std::path::Path::new("/work/weather-plugin")),
+            &[],
+        );
+        let lines = plugin_update_outcome_lines(
+            "weather",
+            &PluginUpdateOutcome::Interrupted {
+                error: "rename failed".to_string(),
+                preserved: std::path::PathBuf::from(
+                    "/plugins/.weather.replacing-v1-0123456789abcdef0123456789abcdef/package",
+                ),
+                command: command.clone(),
+            },
+        );
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains(
+                "/plugins/.weather.replacing-v1-0123456789abcdef0123456789abcdef/package"
+            ) && lines[0].contains(&command),
+            "{lines:#?}"
+        );
+        assert!(
+            command.contains("--config-dir '/cfg'")
+                && command.contains("--from '/work/weather-plugin'"),
+            "{command}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn installing_an_installed_package_points_at_plugin_update() {
+        use crate::plugins::update::UpdateSource;
+        use zeroclaw::plugins::error::PluginError;
+
+        let config_dir = std::path::Path::new("/cfg");
+        let already = || PluginError::AlreadyLoaded("weather".to_string());
+
+        // A local install points at an update from the same directory, never
+        // at the registry, which could replace a local build with a
+        // same-named registry package.
+        let local = format!(
+            "{:#}",
+            with_update_pointer(
+                already(),
+                config_dir,
+                UpdateSource::Local(std::path::Path::new("/work/weather-plugin")),
+            )
+        );
+        assert!(
+            local.contains("plugin update") && local.contains("--from"),
+            "{local}"
+        );
+        assert!(local.contains("/work/weather-plugin"), "{local}");
+        assert!(local.contains("already loaded"), "{local}");
+
+        // A pinned registry install keeps its pin.
+        let pinned = format!(
+            "{:#}",
+            with_update_pointer(
+                already(),
+                config_dir,
+                UpdateSource::Registry {
+                    version: Some("1.2.0"),
+                    registry: None,
+                },
+            )
+        );
+        assert!(pinned.contains("weather@1.2.0"), "{pinned}");
+        assert!(!pinned.contains("--from"), "{pinned}");
+
+        let other = format!(
+            "{:#}",
+            with_update_pointer(
+                PluginError::NotFound("weather".to_string()),
+                config_dir,
+                UpdateSource::Registry {
+                    version: None,
+                    registry: None,
+                },
+            )
+        );
+        assert!(!other.contains("plugin update"), "{other}");
     }
 }

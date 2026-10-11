@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 use zeroclaw::plugins::PluginManifest;
 pub(crate) use zeroclaw::plugins::registry::search_entries;
@@ -16,6 +17,20 @@ pub(crate) const DEFAULT_REGISTRY_URL: &str =
 pub(crate) const MAX_PLUGIN_ZIP_BYTES: usize = 50 * 1024 * 1024;
 pub(crate) const MAX_PLUGIN_EXTRACTED_BYTES: u64 = 50 * 1024 * 1024;
 const REGISTRY_URL_ENV: &str = "ZEROCLAW_PLUGIN_REGISTRY_URL";
+/// How long a registry request may spend connecting. An unreachable or
+/// black-holed host fails here instead of hanging the command.
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a registry response may deliver nothing: from the request until
+/// its headers arrive, then between reads of its body. A stalled server fails
+/// here, while a slow download that keeps delivering data does not.
+const REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request bound on fetching the registry index, body included.
+const REGISTRY_INDEX_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request ceiling on downloading one plugin archive, body included.
+/// Stalls end at [`REGISTRY_READ_TIMEOUT`], so this only bounds a download
+/// that keeps trickling in: it gives a link of about 30 KB/s the time to fetch
+/// an archive at the size cap.
+const REGISTRY_ARCHIVE_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub(crate) struct DownloadedPlugin {
     _temp_dir: TempDir,
@@ -56,22 +71,9 @@ pub(crate) fn looks_like_url(source: &str) -> bool {
 }
 
 pub(crate) async fn fetch_registry_index(registry_url: &str) -> Result<PluginRegistryIndex> {
-    let response = reqwest::get(registry_url)
+    RegistryClient::new(RegistryTimeouts::default())?
+        .fetch_index(registry_url)
         .await
-        .with_context(|| format!("fetching plugin registry {registry_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        if status == reqwest::StatusCode::NOT_FOUND && registry_url == DEFAULT_REGISTRY_URL {
-            bail!(
-                "the public plugin registry is not populated yet; use --registry <url> to point at a custom registry"
-            );
-        }
-        bail!("plugin registry returned HTTP {status} for {registry_url}");
-    }
-    response
-        .json::<PluginRegistryIndex>()
-        .await
-        .context("parsing plugin registry JSON")
 }
 
 pub(crate) async fn download_registry_plugin(
@@ -84,47 +86,136 @@ pub(crate) async fn download_registry_plugin(
         write_cached_registry_index(data_dir, registry_url, &index)?;
     }
     let spec = parse_plugin_spec(source)?;
-    let entry = resolve_entry(&index, &spec)?.clone();
-    let bytes = download_archive_bytes(&entry.url).await?;
-    verify_sha256_if_present(&bytes, entry.sha256.as_deref())?;
-
-    let temp_dir = tempfile::tempdir().context("creating temporary plugin extraction directory")?;
-    let extract_dir = temp_dir.path().join("plugin");
-    extract_zip_safe(std::io::Cursor::new(bytes), &extract_dir)?;
-    let plugin_dir = find_manifest_dir(&extract_dir)?;
-    let manifest = load_plugin_manifest(&plugin_dir)?;
-    verify_manifest_matches_registry(&entry, &manifest)?;
-
-    Ok(DownloadedPlugin {
-        _temp_dir: temp_dir,
-        plugin_dir,
-        manifest,
-    })
+    let entry = resolve_entry(&index, &spec)?;
+    download_registry_entry(entry).await
 }
 
-async fn download_archive_bytes(url: &str) -> Result<Vec<u8>> {
-    let mut response = reqwest::get(url)
+/// Download one resolved registry entry and unpack it for admission.
+///
+/// Covers everything after entry resolution: the archive fetch, the digest
+/// check when the entry carries one, confined extraction, manifest discovery,
+/// and the check that the archive holds the package the entry names. The
+/// result is only a candidate; the caller still admits it through the plugin
+/// host before anything is installed.
+pub(crate) async fn download_registry_entry(
+    entry: &PluginRegistryEntry,
+) -> Result<DownloadedPlugin> {
+    RegistryClient::new(RegistryTimeouts::default())?
+        .download_entry(entry)
         .await
-        .with_context(|| format!("downloading plugin archive {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("plugin archive returned HTTP {status} for {url}");
+}
+
+/// Request bounds for registry traffic.
+///
+/// `Default` is the production policy. Tests inject shorter bounds so a
+/// stalled server fails in milliseconds rather than after the real bound.
+#[derive(Clone, Copy, Debug)]
+struct RegistryTimeouts {
+    connect: Duration,
+    /// The longest silence on any request; see [`REGISTRY_READ_TIMEOUT`].
+    read: Duration,
+    index: Duration,
+    archive: Duration,
+}
+
+impl Default for RegistryTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: REGISTRY_CONNECT_TIMEOUT,
+            read: REGISTRY_READ_TIMEOUT,
+            index: REGISTRY_INDEX_TIMEOUT,
+            archive: REGISTRY_ARCHIVE_TIMEOUT,
+        }
     }
-    if let Some(len) = response.content_length()
-        && len > MAX_PLUGIN_ZIP_BYTES as u64
-    {
-        bail!("plugin archive exceeds maximum size of {MAX_PLUGIN_ZIP_BYTES} bytes");
+}
+
+/// Every registry request goes through this client, so none of them can run
+/// unbounded.
+struct RegistryClient {
+    http: reqwest::Client,
+    timeouts: RegistryTimeouts,
+}
+
+impl RegistryClient {
+    fn new(timeouts: RegistryTimeouts) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.read)
+            .build()
+            .context("building the plugin registry HTTP client")?;
+        Ok(Self { http, timeouts })
     }
 
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("reading plugin archive response body")?
-    {
-        append_chunk_capped(&mut bytes, &chunk, MAX_PLUGIN_ZIP_BYTES)?;
+    async fn fetch_index(&self, registry_url: &str) -> Result<PluginRegistryIndex> {
+        let response = self
+            .http
+            .get(registry_url)
+            .timeout(self.timeouts.index)
+            .send()
+            .await
+            .with_context(|| format!("fetching plugin registry {registry_url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND && registry_url == DEFAULT_REGISTRY_URL {
+                bail!(
+                    "the public plugin registry is not populated yet; use --registry <url> to point at a custom registry"
+                );
+            }
+            bail!("plugin registry returned HTTP {status} for {registry_url}");
+        }
+        response
+            .json::<PluginRegistryIndex>()
+            .await
+            .context("parsing plugin registry JSON")
     }
-    Ok(bytes)
+
+    async fn download_entry(&self, entry: &PluginRegistryEntry) -> Result<DownloadedPlugin> {
+        let bytes = self.download_archive_bytes(&entry.url).await?;
+        verify_sha256_if_present(&bytes, entry.sha256.as_deref())?;
+
+        let temp_dir =
+            tempfile::tempdir().context("creating temporary plugin extraction directory")?;
+        let extract_dir = temp_dir.path().join("plugin");
+        extract_zip_safe(std::io::Cursor::new(bytes), &extract_dir)?;
+        let plugin_dir = find_manifest_dir(&extract_dir)?;
+        let manifest = load_plugin_manifest(&plugin_dir)?;
+        verify_manifest_matches_registry(entry, &manifest)?;
+
+        Ok(DownloadedPlugin {
+            _temp_dir: temp_dir,
+            plugin_dir,
+            manifest,
+        })
+    }
+
+    async fn download_archive_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(self.timeouts.archive)
+            .send()
+            .await
+            .with_context(|| format!("downloading plugin archive {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("plugin archive returned HTTP {status} for {url}");
+        }
+        if let Some(len) = response.content_length()
+            && len > MAX_PLUGIN_ZIP_BYTES as u64
+        {
+            bail!("plugin archive exceeds maximum size of {MAX_PLUGIN_ZIP_BYTES} bytes");
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("reading plugin archive response body")?
+        {
+            append_chunk_capped(&mut bytes, &chunk, MAX_PLUGIN_ZIP_BYTES)?;
+        }
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +406,20 @@ mod tests {
     use std::cell::Cell;
     use std::io::{Cursor, Write};
     use std::rc::Rc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     use zip::write::SimpleFileOptions;
+
+    /// Injected bound for the stalled-request tests.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(200);
+    /// Far past `TEST_TIMEOUT`, so only the client's own bound can end the
+    /// request before the server answers.
+    const STALLED_RESPONSE_DELAY: Duration = Duration::from_secs(10);
+    const SAMPLE_ARCHIVE_PATH: &str = "/sample-0.1.0.zip";
+    const SAMPLE_MANIFEST: &[u8] = br#"name = "sample"
+version = "0.1.0"
+capabilities = ["tool"]
+"#;
 
     struct CountingChunks {
         chunks: Vec<Vec<u8>>,
@@ -463,6 +567,336 @@ capabilities = ["tool"]
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("manifest.toml"), "").unwrap();
         assert_eq!(find_manifest_dir(nested_root.path()).unwrap(), nested);
+    }
+
+    #[tokio::test]
+    async fn registry_index_parses_a_successful_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plugins": [{
+                    "name": "sample",
+                    "version": "0.1.0",
+                    "url": "https://example.invalid/sample.zip",
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let index = fetch_registry_index(&format!("{}/registry.json", server.uri()))
+            .await
+            .unwrap();
+
+        assert_eq!(index.plugins.len(), 1);
+        assert_eq!(index.plugins[0].name, "sample");
+        assert_eq!(index.plugins[0].version, "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn registry_index_not_found_on_a_custom_registry_reports_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let registry_url = format!("{}/registry.json", server.uri());
+
+        let err = fetch_registry_index(&registry_url)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("HTTP 404"), "unexpected error: {err}");
+        assert!(err.contains(&registry_url), "unexpected error: {err}");
+        assert!(
+            !err.contains("not populated"),
+            "only the default registry gets the unpopulated hint: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_index_server_error_reports_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let registry_url = format!("{}/registry.json", server.uri());
+
+        let err = fetch_registry_index(&registry_url)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("HTTP 500"), "unexpected error: {err}");
+        assert!(err.contains(&registry_url), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn registry_entry_download_unpacks_the_named_package() {
+        let server = MockServer::start().await;
+        let archive = sample_archive();
+        let digest = hex::encode(Sha256::digest(&archive));
+        serve_sample_archive(&server, ResponseTemplate::new(200).set_body_bytes(archive)).await;
+
+        let downloaded =
+            download_registry_entry(&sample_entry(&server, Some(format!("sha256:{digest}"))))
+                .await
+                .unwrap();
+
+        assert_eq!(downloaded.manifest().name, "sample");
+        assert_eq!(downloaded.manifest().version, "0.1.0");
+        assert!(downloaded.plugin_dir().join("manifest.toml").is_file());
+    }
+
+    #[tokio::test]
+    async fn registry_entry_download_refuses_a_digest_mismatch() {
+        let server = MockServer::start().await;
+        serve_sample_archive(
+            &server,
+            ResponseTemplate::new(200).set_body_bytes(sample_archive()),
+        )
+        .await;
+
+        let Err(err) = download_registry_entry(&sample_entry(&server, Some("0".repeat(64)))).await
+        else {
+            panic!("an archive that does not match the registry digest must be refused");
+        };
+
+        assert!(
+            err.to_string().contains("sha256 mismatch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_plugin_download_resolves_caches_and_unpacks_the_entry() {
+        let server = MockServer::start().await;
+        let archive = sample_archive();
+        let entry = sample_entry(&server, Some(hex::encode(Sha256::digest(&archive))));
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "plugins": [entry] })),
+            )
+            .mount(&server)
+            .await;
+        serve_sample_archive(&server, ResponseTemplate::new(200).set_body_bytes(archive)).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let registry_url = format!("{}/registry.json", server.uri());
+
+        let downloaded =
+            download_registry_plugin(&registry_url, "sample@0.1.0", Some(data_dir.path()))
+                .await
+                .unwrap();
+
+        assert_eq!(downloaded.manifest().name, "sample");
+        let cached = zeroclaw::plugins::registry::read_cached_registry_index(data_dir.path())
+            .unwrap()
+            .expect("the fetched index is cached");
+        assert_eq!(cached.registry_url.as_deref(), Some(registry_url.as_str()));
+        assert_eq!(cached.plugins, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_registry_index_fails_at_the_index_bound() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "plugins": [] }))
+                    .set_delay(STALLED_RESPONSE_DELAY),
+            )
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new(RegistryTimeouts {
+            index: TEST_TIMEOUT,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        let err = client
+            .fetch_index(&format!("{}/registry.json", server.uri()))
+            .await
+            .unwrap_err();
+
+        assert!(is_timeout(&err), "expected a timeout, got {err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_registry_index_fails_at_the_read_bound() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/registry.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "plugins": [] }))
+                    .set_delay(STALLED_RESPONSE_DELAY),
+            )
+            .mount(&server)
+            .await;
+        // The index bound stays at its production value, so only the read
+        // bound can end the request before the server answers.
+        let client = RegistryClient::new(RegistryTimeouts {
+            read: TEST_TIMEOUT,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        let err = client
+            .fetch_index(&format!("{}/registry.json", server.uri()))
+            .await
+            .unwrap_err();
+
+        assert!(is_timeout(&err), "expected a timeout, got {err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_archive_download_fails_at_the_read_bound() {
+        let server = MockServer::start().await;
+        serve_sample_archive(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_bytes(sample_archive())
+                .set_delay(STALLED_RESPONSE_DELAY),
+        )
+        .await;
+        // The whole-request ceiling stays at its production value, so only
+        // the read bound can end the request before the server answers.
+        let client = RegistryClient::new(RegistryTimeouts {
+            read: TEST_TIMEOUT,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        let Err(err) = client.download_entry(&sample_entry(&server, None)).await else {
+            panic!("a stalled archive download must fail");
+        };
+
+        assert!(is_timeout(&err), "expected a timeout, got {err:#}");
+    }
+
+    #[tokio::test]
+    async fn the_archive_ceiling_still_bounds_the_whole_download() {
+        let server = MockServer::start().await;
+        serve_sample_archive(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_bytes(sample_archive())
+                .set_delay(STALLED_RESPONSE_DELAY),
+        )
+        .await;
+        let client = RegistryClient::new(RegistryTimeouts {
+            archive: TEST_TIMEOUT,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        let Err(err) = client.download_entry(&sample_entry(&server, None)).await else {
+            panic!("a download past the ceiling must fail");
+        };
+
+        assert!(is_timeout(&err), "expected a timeout, got {err:#}");
+    }
+
+    /// The read bound ends a stall, not a slow download: an archive that
+    /// keeps arriving in pieces, each well inside the bound, completes even
+    /// though the whole transfer takes longer than the bound.
+    #[tokio::test]
+    async fn a_slow_archive_download_that_keeps_delivering_completes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const READ_BOUND: Duration = Duration::from_secs(1);
+        const GAP: Duration = Duration::from_millis(200);
+        const PIECES: usize = 8;
+
+        let archive = sample_archive();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let entry = PluginRegistryEntry {
+            name: "sample".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".to_string()],
+            url: format!("http://{address}{SAMPLE_ARCHIVE_PATH}"),
+            sha256: Some(hex::encode(Sha256::digest(&archive))),
+        };
+        let client = RegistryClient::new(RegistryTimeouts {
+            read: READ_BOUND,
+            ..RegistryTimeouts::default()
+        })
+        .unwrap();
+
+        // A server that sends the headers at once and then the body in
+        // pieces, pausing before each one.
+        let trickle = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "the client closed before sending its request");
+                head.extend_from_slice(&buffer[..read]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                archive.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            for piece in archive.chunks(archive.len().div_ceil(PIECES)) {
+                tokio::time::sleep(GAP).await;
+                socket.write_all(piece).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+        };
+        let started = std::time::Instant::now();
+
+        let (downloaded, ()) = tokio::join!(client.download_entry(&entry), trickle);
+
+        let downloaded = downloaded.expect("a download that keeps delivering completes");
+        assert_eq!(downloaded.manifest().name, "sample");
+        assert!(
+            started.elapsed() > READ_BOUND,
+            "the transfer outlasted the read bound, so only the pauses were bounded"
+        );
+    }
+
+    fn sample_archive() -> Vec<u8> {
+        zip_with_entry("sample/manifest.toml", SAMPLE_MANIFEST)
+    }
+
+    fn sample_entry(server: &MockServer, sha256: Option<String>) -> PluginRegistryEntry {
+        PluginRegistryEntry {
+            name: "sample".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".to_string()],
+            url: format!("{}{SAMPLE_ARCHIVE_PATH}", server.uri()),
+            sha256,
+        }
+    }
+
+    async fn serve_sample_archive(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(SAMPLE_ARCHIVE_PATH))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn is_timeout(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        })
     }
 
     fn zip_with_entry(name: &str, body: &[u8]) -> Vec<u8> {
