@@ -453,7 +453,7 @@ impl EgressPolicy {
 
 /// The two operator-authored lists an instance's grant is made of, as the
 /// canonical config currently resolves them.
-// Gated like its only consumer, the `wasi_http` denial path.
+// Gated like its only consumer, the egress refusal records.
 #[cfg(feature = "plugins-wasmtime")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GrantLists {

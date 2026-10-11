@@ -652,6 +652,21 @@ never blocks, and once the terminal `closed` or `failed` event has been
 drained it returns the `closed` error rather than `none`. Dropping the resource closes the socket and releases the
 connection lease.
 
+A refused `sockets` or `websocket` connect reaches the guest only as its typed
+error. The host also logs the same WARN record a refused `wasi:http` request
+produces, with `error_key` `plugin_egress_denied`: it names the instance
+(`plugin`, `capability`, `binding`), the `transport` (`http`, `socket`, or
+`websocket`), the requested host, and the reason. When the fix is a grant in
+`egress_hosts` or a private-address carve-out in `egress_allow_private`,
+`remedy` holds the exact `zeroclaw config set` command, carrying every entry
+the instance's grant already has; other refusals, such as a name that did not
+resolve, carry none. A connect refused because the instance's connection
+budget is spent logs `plugin_egress_connection_limit` instead. A TLS failure
+after the destination was authorized, such as a missing profile secret, is not
+an egress refusal and is not recorded this way. Every refused attempt is
+logged, so a plugin that retries should back off rather than reconnect in a
+tight loop.
+
 ### TLS profiles
 
 A `sockets` or `websocket` request may name a TLS profile the operator
