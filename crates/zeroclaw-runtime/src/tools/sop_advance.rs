@@ -36,6 +36,11 @@ impl SopAdvanceTool {
 
 #[async_trait]
 impl Tool for SopAdvanceTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Advancing can enqueue another step without the caller's ceilings.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_advance"
     }
