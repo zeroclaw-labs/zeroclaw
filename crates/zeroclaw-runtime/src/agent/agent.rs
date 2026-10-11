@@ -3436,6 +3436,7 @@ impl Agent {
             &no_tools
         };
         let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let hidden_builtin_names = self.tools.hidden_builtin_names();
         // Prompt policy facts come from the same ApprovalManager the
         // execution gate consults (borrowed, render-time). A builder without
         // a manager retains its legacy autonomy fallback but cannot name
@@ -3449,6 +3450,7 @@ impl Agent {
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
             tools: prompt_tools,
+            hidden_builtin_names: Some(&hidden_builtin_names),
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
@@ -8614,6 +8616,7 @@ mod tests {
             responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
             supports_native: bool,
             captured_messages: CapturedTranscripts,
+            captured_tool_specs: Option<Arc<Mutex<Vec<Vec<crate::tools::ToolSpec>>>>>,
         }
 
         #[async_trait]
@@ -8637,6 +8640,11 @@ mod tests {
                 self.captured_messages
                     .lock()
                     .push(request.messages.to_vec());
+                if let Some(specs) = &self.captured_tool_specs {
+                    specs
+                        .lock()
+                        .push(request.tools.unwrap_or_default().to_vec());
+                }
                 let mut guard = self.responses.lock();
                 if guard.is_empty() {
                     return Ok(zeroclaw_providers::ChatResponse {
@@ -8676,9 +8684,316 @@ mod tests {
                     responses: Mutex::new(vec![]),
                     supports_native,
                     captured_messages: Arc::clone(&captured),
+                    captured_tool_specs: None,
                 }),
                 captured,
             )
+        }
+
+        struct DeferredSchemaProbeTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        zeroclaw_api::mock_tool_attribution!(DeferredSchemaProbeTool);
+
+        #[async_trait]
+        impl Tool for DeferredSchemaProbeTool {
+            fn name(&self) -> &str {
+                "builtin_probe"
+            }
+
+            fn description(&self) -> &str {
+                "Probe an admitted built-in.\nFull deferred description sentinel."
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"probe_argument": {"type": "string"}},
+                    "required": ["probe_argument"]
+                })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                assert_eq!(args["probe_argument"], "selected value");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "deferred probe executed".into(),
+                    error: None,
+                })
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum DeferredBuiltinRequestFlow {
+            SearchFirst,
+            Direct,
+            SearchAndExecute,
+        }
+
+        async fn prove_deferred_builtin_provider_requests(
+            supports_native: bool,
+            flow: DeferredBuiltinRequestFlow,
+        ) {
+            use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+            use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+            let workspace = tempfile::TempDir::new().expect("temp workspace");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = DeferredSchemaProbeTool {
+                calls: Arc::clone(&calls),
+            };
+            let probe_spec = probe.spec();
+            let eager_names = [
+                "shell",
+                "file_read",
+                "file_write",
+                "file_edit",
+                "memory_recall",
+                "memory_store",
+            ];
+            let mut raw_tools: Vec<Box<dyn Tool>> = eager_names
+                .iter()
+                .map(|name| Box::new(NamedMockTool::new(name)) as Box<dyn Tool>)
+                .collect();
+            raw_tools.push(Box::new(probe));
+            raw_tools.push(Box::new(NamedMockTool::new("unselected_builtin")));
+
+            let mut config = Config::default();
+            config.runtime_profiles.insert(
+                "deferred-test".into(),
+                RuntimeProfileConfig {
+                    deferred_builtin_tools: true,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                "default".into(),
+                AliasedAgentConfig {
+                    runtime_profile: "deferred-test".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            let security = Arc::new(crate::security::SecurityPolicy::default());
+            let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+                config: &config,
+                agent_alias: "default",
+                security: &security,
+                built: crate::tools::AllToolsResult::from_prebuilt_tools(raw_tools),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            })
+            .await;
+            let activated = assembled
+                .activated_handle
+                .clone()
+                .expect("schema selection state");
+            let search = assembled.tool_search_handle.clone();
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            let captured_specs = Arc::new(Mutex::new(Vec::new()));
+            let tool_response = |name: &str, arguments: serde_json::Value| {
+                zeroclaw_providers::ChatResponse {
+                    text: (!supports_native).then(|| {
+                        format!("<tool_call>{{\"name\":\"{name}\",\"arguments\":{arguments}}}</tool_call>")
+                    }),
+                    tool_calls: if supports_native {
+                        vec![zeroclaw_providers::ToolCall {
+                            id: format!("call-{name}"),
+                            name: name.into(),
+                            arguments: arguments.to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    usage: None,
+                    reasoning_content: None,
+                }
+            };
+            let search_response = tool_response(
+                "tool_search",
+                serde_json::json!({"query": "select:builtin_probe"}),
+            );
+            let execute_response = tool_response(
+                "builtin_probe",
+                serde_json::json!({"probe_argument": "selected value"}),
+            );
+            let responses = match flow {
+                DeferredBuiltinRequestFlow::SearchFirst => {
+                    vec![search_response, execute_response]
+                }
+                DeferredBuiltinRequestFlow::Direct => vec![execute_response],
+                DeferredBuiltinRequestFlow::SearchAndExecute => {
+                    assert!(!supports_native, "mixed batch exercises text parsing");
+                    let mut response = search_response;
+                    response.text = Some(format!(
+                        "{}\n{}",
+                        response.text.as_deref().unwrap(),
+                        execute_response.text.as_deref().unwrap()
+                    ));
+                    vec![response]
+                }
+            };
+            let provider = Box::new(CapturingModelProvider {
+                responses: Mutex::new(responses),
+                supports_native,
+                captured_messages: Arc::clone(&captured),
+                captured_tool_specs: Some(Arc::clone(&captured_specs)),
+            });
+            let mut agent = blank_input_agent(provider);
+            agent.workspace_dir = workspace.path().to_path_buf();
+            agent.agent_workspace_dir = workspace.path().to_path_buf();
+            agent.tools = assembled.registry;
+            agent.activated_tools = Some(Arc::clone(&activated));
+            agent.tool_search = search;
+            assert!(agent.tools.hidden_builtin_names().contains("builtin_probe"));
+
+            assert_eq!(
+                agent
+                    .turn("select and run the built-in probe")
+                    .await
+                    .unwrap(),
+                "done"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let requests = captured.lock();
+            let specs = captured_specs.lock();
+            let search_first = matches!(flow, DeferredBuiltinRequestFlow::SearchFirst);
+            let selected = !matches!(flow, DeferredBuiltinRequestFlow::Direct);
+            assert_eq!(
+                agent.tools.hidden_builtin_names().contains("builtin_probe"),
+                !selected
+            );
+            let expected_requests = if search_first { 3 } else { 2 };
+            assert_eq!(requests.len(), expected_requests);
+            assert_eq!(specs.len(), expected_requests);
+            let initial_prompt = &requests[0]
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("provider receives system prompt")
+                .content;
+            assert!(initial_prompt.contains("builtin_probe - Probe an admitted built-in."));
+            assert!(initial_prompt.contains("unselected_builtin - mock"));
+            assert!(!initial_prompt.contains("probe_argument"));
+            assert!(!initial_prompt.contains("Full deferred description sentinel."));
+
+            if supports_native {
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        specs[0].iter().any(|spec| spec.name == name),
+                        "eager schema {name}"
+                    );
+                }
+                assert!(specs[0].iter().all(|spec| spec.name != "builtin_probe"));
+                for request_specs in &specs[1..] {
+                    if selected {
+                        let selected = request_specs
+                            .iter()
+                            .find(|spec| spec.name == "builtin_probe")
+                            .expect(
+                                "selection exposes the complete native schema on the next request",
+                            );
+                        assert_eq!(selected.parameters, probe_spec.parameters);
+                        assert_eq!(selected.description, probe_spec.description);
+                    } else {
+                        assert!(
+                            request_specs
+                                .iter()
+                                .all(|spec| spec.name != "builtin_probe")
+                        );
+                    }
+                    assert!(
+                        request_specs
+                            .iter()
+                            .all(|spec| spec.name != "unselected_builtin")
+                    );
+                }
+            } else {
+                assert!(
+                    specs.iter().all(Vec::is_empty),
+                    "text providers receive no native specs"
+                );
+                for name in eager_names.into_iter().chain(["tool_search"]) {
+                    assert!(
+                        initial_prompt.contains(&format!("**{name}**")),
+                        "eager text schema {name}"
+                    );
+                }
+                assert!(!initial_prompt.contains("**builtin_probe**"));
+            }
+
+            let after_first_response = requests[1]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(after_first_response.contains("<functions>"), selected);
+            assert_eq!(
+                after_first_response.contains("Full deferred description sentinel."),
+                selected
+            );
+            if selected {
+                assert!(after_first_response.contains("probe_argument"));
+            }
+            assert_eq!(
+                after_first_response.contains("deferred probe executed"),
+                !search_first
+            );
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.content.contains("deferred probe executed"))
+            );
+            assert!(
+                activated.lock().unwrap().get("builtin_probe").is_none(),
+                "built-in selection must not create a second executable owner"
+            );
+        }
+
+        #[tokio::test]
+        async fn native_agent_requests_expose_builtin_schema_only_after_selection() {
+            prove_deferred_builtin_provider_requests(true, DeferredBuiltinRequestFlow::SearchFirst)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn text_agent_requests_receive_selected_builtin_schema_before_execution() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchFirst,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn admitted_hidden_builtin_executes_before_schema_selection() {
+            for supports_native in [true, false] {
+                prove_deferred_builtin_provider_requests(
+                    supports_native,
+                    DeferredBuiltinRequestFlow::Direct,
+                )
+                .await;
+            }
+        }
+
+        #[tokio::test]
+        async fn text_agent_executes_hidden_builtin_in_tool_search_batch() {
+            prove_deferred_builtin_provider_requests(
+                false,
+                DeferredBuiltinRequestFlow::SearchAndExecute,
+            )
+            .await;
         }
 
         #[test]

@@ -1,12 +1,12 @@
-//! Built-in `tool_search` tool for on-demand MCP tool schema loading.
+//! `tool_search` discovery for built-in and MCP tool schemas.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet, deferred_search_score};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
@@ -72,11 +72,11 @@ impl ToolAccessPolicy {
     }
 }
 
-/// Built-in tool that fetches full schemas for deferred MCP tools.
+/// Fetches full schemas for admitted deferred built-ins and MCP tools.
 pub struct ToolSearchTool {
     // This is the executable deferred registry, not a cached grants record.
     // Session admission may only remove entries from it.
-    deferred: Mutex<DeferredMcpToolSet>,
+    deferred: Mutex<Option<DeferredMcpToolSet>>,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
     activation_hook: Option<ActivationHook>,
@@ -85,7 +85,17 @@ pub struct ToolSearchTool {
 impl ToolSearchTool {
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
         Self {
-            deferred: Mutex::new(deferred),
+            deferred: Mutex::new(Some(deferred)),
+            activated,
+            access_policy: None,
+            activation_hook: None,
+        }
+    }
+
+    /// Built-in schema discovery requires no MCP registry or executable wrapper.
+    pub fn for_builtin_schemas(activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
+        Self {
+            deferred: Mutex::new(None),
             activated,
             access_policy: None,
             activation_hook: None,
@@ -107,9 +117,11 @@ impl ToolSearchTool {
     /// against the current ceiling before execution can resume.
     pub fn narrow_to_caller(&self, allowed: &[String]) {
         let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        deferred
-            .stubs
-            .retain(|stub| allowed.contains(&stub.prefixed_name));
+        if let Some(deferred) = deferred.as_mut() {
+            deferred
+                .stubs
+                .retain(|stub| allowed.contains(&stub.prefixed_name));
+        }
         self.activated
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -126,11 +138,22 @@ impl ToolSearchTool {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        crate::mcp_deferred::build_deferred_tools_section_excluding(
-            &deferred,
-            self.access_policy.as_ref(),
-            &names,
-        )
+        let mut section = match self.access_policy.as_ref() {
+            Some(policy) => {
+                crate::mcp_deferred::build_deferred_builtin_tools_section(&activated, Some(policy))
+            }
+            None => activated.deferred_builtin_prompt_section(),
+        };
+        if let Some(deferred) = deferred.as_ref() {
+            section.push_str(
+                &crate::mcp_deferred::build_deferred_tools_section_excluding(
+                    deferred,
+                    self.access_policy.as_ref(),
+                    &names,
+                ),
+            );
+        }
+        section
     }
 
     fn is_allowed(&self, tool_name: &str) -> bool {
@@ -155,7 +178,7 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch full schema definitions for deferred MCP tools so they can be called. \
+        "Fetch full schema definitions for deferred built-in and MCP tools. \
          Use \"select:name1,name2\" for exact match or keywords to search."
     }
 
@@ -205,29 +228,36 @@ impl Tool for ToolSearchTool {
             return self.select_tools(&names);
         }
 
-        // Keyword search mode.
-        // When a policy is active, fetch all matches so denied tools don't
-        // consume result slots. The max_results cap is applied after filtering.
-        let search_limit = if self.access_policy.is_some() {
-            usize::MAX
-        } else {
-            max_results
-        };
-        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
-        let results = deferred.search(query, search_limit);
-        if results.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: "No matching deferred tools found.".into(),
-                error: None,
-            });
-        }
+        self.search_tools(query, max_results)
+    }
+}
 
-        // Activate and return full specs (policy-filtered, then capped)
-        let mut output = String::from("<functions>\n");
-        let mut activated_count = 0;
-        let mut returned_count = 0;
-        let mut newly_activated = Vec::new();
+impl ToolSearchTool {
+    /// Select built-in metadata or activate an MCP wrapper. Only MCP tools
+    /// enter the executable set and the activation hook's notification list.
+    fn load_schema(
+        deferred: Option<&DeferredMcpToolSet>,
+        activated: &mut ActivatedToolSet,
+        name: &str,
+        newly_activated: &mut Vec<Arc<dyn Tool>>,
+    ) -> Option<ToolSpec> {
+        if let Some(spec) = activated.select_builtin_schema(name) {
+            return Some(spec);
+        }
+        let deferred = deferred?;
+        let spec = deferred.tool_spec(name)?;
+        if !activated.is_activated(name)
+            && let Some(tool) = deferred.activate(name)
+        {
+            let tool: Arc<dyn Tool> = Arc::from(tool);
+            activated.activate(name.to_string(), Arc::clone(&tool));
+            newly_activated.push(tool);
+        }
+        Some(spec)
+    }
+
+    fn search_tools(&self, query: &str, max_results: usize) -> anyhow::Result<ToolResult> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = match self.activated.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -244,44 +274,58 @@ impl Tool for ToolSearchTool {
                 poisoned.into_inner()
             }
         };
-
-        for stub in &results {
-            if returned_count >= max_results {
-                break;
-            }
-            if !self.is_allowed(&stub.prefixed_name) {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    &format!(
-                        "tool_search: '{}' matched query but denied by access policy",
-                        stub.prefixed_name
-                    )
-                );
-                continue;
-            }
-            if let Some(spec) = deferred.tool_spec(&stub.prefixed_name) {
-                if !guard.is_activated(&stub.prefixed_name)
-                    && let Some(tool) = deferred.activate(&stub.prefixed_name)
-                {
-                    let tool: Arc<dyn Tool> = Arc::from(tool);
-                    guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
-                    newly_activated.push(tool);
-                    activated_count += 1;
+        let terms: Vec<_> = query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        // Rank the combined catalog before capping. Denied names never occupy
+        // a result slot. MCP ties preserve the registry's existing order.
+        let mut results = Vec::new();
+        if let Some(deferred) = deferred.as_ref() {
+            for stub in &deferred.stubs {
+                let hits = deferred_search_score(&stub.prefixed_name, &stub.description, &terms);
+                if hits > 0 && self.is_allowed(&stub.prefixed_name) {
+                    results.push((stub.prefixed_name.clone(), hits));
                 }
-                let _ = writeln!(
-                    output,
-                    "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                    spec.name,
-                    spec.description.replace('"', "\\\""),
-                    spec.parameters
-                );
-                returned_count += 1;
             }
         }
-
+        let mut builtin_specs: Vec<_> = guard.deferred_builtin_specs().collect();
+        builtin_specs.sort_by(|a, b| a.name.cmp(&b.name));
+        for spec in builtin_specs {
+            let hits = deferred_search_score(&spec.name, &spec.description, &terms);
+            if hits > 0 && self.is_allowed(&spec.name) {
+                results.push((spec.name.clone(), hits));
+            }
+        }
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        if results.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: "No matching deferred tools found.".into(),
+                error: None,
+            });
+        }
+        let mut output = String::from("<functions>\n");
+        let mut newly_activated = Vec::new();
+        let mut returned_names = std::collections::HashSet::new();
+        for (name, _) in &results {
+            if returned_names.len() >= max_results {
+                break;
+            }
+            if returned_names.contains(name) {
+                continue;
+            }
+            if let Some(spec) =
+                Self::load_schema(deferred.as_ref(), &mut guard, name, &mut newly_activated)
+            {
+                write_schema(&mut output, &spec)?;
+                returned_names.insert(name.clone());
+            }
+        }
         output.push_str("</functions>\n");
         drop(guard);
+        drop(deferred);
+        let activated_count = newly_activated.len();
         self.notify_activated(newly_activated);
 
         ::zeroclaw_log::record!(
@@ -299,15 +343,13 @@ impl Tool for ToolSearchTool {
             error: None,
         })
     }
-}
 
-impl ToolSearchTool {
     fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
         let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
-        let mut activated_count = 0;
         let mut newly_activated = Vec::new();
+        let mut returned_names = std::collections::HashSet::new();
         let mut guard = match self.activated.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -326,7 +368,7 @@ impl ToolSearchTool {
         };
 
         for name in names {
-            if name.is_empty() {
+            if name.is_empty() || returned_names.contains(*name) {
                 continue;
             }
             if !self.is_allowed(name) {
@@ -338,23 +380,10 @@ impl ToolSearchTool {
                 not_found.push(*name);
                 continue;
             }
-            match deferred.tool_spec(name) {
+            match Self::load_schema(deferred.as_ref(), &mut guard, name, &mut newly_activated) {
                 Some(spec) => {
-                    if !guard.is_activated(name)
-                        && let Some(tool) = deferred.activate(name)
-                    {
-                        let tool: Arc<dyn Tool> = Arc::from(tool);
-                        guard.activate(String::from(*name), Arc::clone(&tool));
-                        newly_activated.push(tool);
-                        activated_count += 1;
-                    }
-                    let _ = writeln!(
-                        output,
-                        "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                        spec.name,
-                        spec.description.replace('"', "\\\""),
-                        spec.parameters
-                    );
+                    write_schema(&mut output, &spec)?;
+                    returned_names.insert(*name);
                 }
                 None => {
                     not_found.push(*name);
@@ -364,6 +393,8 @@ impl ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        drop(deferred);
+        let activated_count = newly_activated.len();
         self.notify_activated(newly_activated);
 
         if !not_found.is_empty() {
@@ -386,6 +417,30 @@ impl ToolSearchTool {
             error: None,
         })
     }
+}
+
+/// Keep the existing function envelope while escaping descriptions as JSON
+/// and retaining any declared structured-output schema and parameter domains.
+fn write_schema(output: &mut String, spec: &ToolSpec) -> serde_json::Result<()> {
+    let _ = write!(
+        output,
+        "<function>{{\"name\": {}, \"description\": {}, \"parameters\": {}",
+        serde_json::to_string(&spec.name)?,
+        serde_json::to_string(&spec.description)?,
+        spec.parameters
+    );
+    if let Some(schema) = &spec.output {
+        let _ = write!(output, ", \"output\": {schema}");
+    }
+    if !spec.param_domains.is_empty() {
+        let _ = write!(
+            output,
+            ", \"param_domains\": {}",
+            serde_json::to_string(&spec.param_domains)?
+        );
+    }
+    output.push_str("}</function>\n");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -423,6 +478,229 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(guard.is_activated(tool_name));
+    }
+
+    fn builtin_spec(name: &str, description: &str) -> ToolSpec {
+        ToolSpec::new(
+            name,
+            description,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"event_date": {"type": "string", "format": "date"}},
+                "required": ["event_date"]
+            }),
+        )
+    }
+
+    fn returned_schemas(result: &ToolResult) -> Vec<serde_json::Value> {
+        result
+            .output
+            .lines()
+            .filter_map(|line| line.strip_prefix("<function>")?.strip_suffix("</function>"))
+            .map(|schema| serde_json::from_str(schema).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn builtin_only_search_returns_full_schema_without_executable_activation() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let mut spec = builtin_spec(
+            "calendar",
+            "Manage events.\nUse the \"calendar\" path C:\\events.",
+        );
+        spec.output = Some(serde_json::json!({
+            "type": "object", "properties": {"event_id": {"type": "string"}}
+        }));
+        activated
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![spec.clone()]);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated))
+            .with_activation_hook(Arc::new(move |tool| {
+                seen_hook.lock().unwrap().push(tool.name().to_string());
+            }));
+        assert!(tool.deferred.lock().unwrap().is_none());
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar - Manage events."));
+        assert!(!prompt.contains("event_date"));
+
+        // The full description remains searchable even though the compact
+        // prompt advertises only its first line.
+        let result = tool
+            .execute(serde_json::json!({"query": "C:\\events"}))
+            .await
+            .unwrap();
+        let schemas = returned_schemas(&result);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0], serde_json::to_value(&spec).unwrap());
+        let guard = activated.lock().unwrap();
+        assert!(guard.is_builtin_schema_exposed("calendar"));
+        assert!(!guard.is_activated("calendar"));
+        assert!(guard.get("calendar").is_none());
+        assert!(guard.get_resolved("calendar").is_none());
+        assert!(guard.tool_names().is_empty());
+        assert!(guard.tool_specs().is_empty());
+        drop(guard);
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_exact_selection_preserves_explicit_names_and_recovers_poisoned_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar events"),
+            builtin_spec("weather", "Weather forecast"),
+        ]);
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({
+                "query": "select:calendar,calendar,weather", "max_results": 1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 2);
+        {
+            let guard = activated.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.tool_specs().is_empty());
+        }
+        assert!(tool.deferred_prompt_section().is_empty());
+        let result = tool
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result)[0]["name"], "weather");
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_search_and_selection_share_result_limit_and_only_activate_mcp() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar events search"),
+            builtin_spec("weather", "Weather search"),
+        ]);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("remote__calendar", "Calendar search")]).await,
+            Arc::clone(&activated),
+        )
+        .with_activation_hook(Arc::new(move |tool| {
+            seen_hook.lock().unwrap().push(tool.name().to_string());
+        }));
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar - Calendar events search"));
+        assert!(prompt.contains("remote__calendar - Calendar search"));
+        let result = tool
+            .execute(serde_json::json!({"query": "calendar events search", "max_results": 2}))
+            .await
+            .unwrap();
+        let schemas = returned_schemas(&result);
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(schemas[0]["name"], "calendar");
+        assert_eq!(schemas[1]["name"], "remote__calendar");
+        {
+            let guard = activated.lock().unwrap();
+            assert!(guard.is_builtin_schema_exposed("calendar"));
+            assert!(!guard.is_builtin_schema_exposed("weather"));
+            assert!(guard.is_activated("remote__calendar"));
+            assert_eq!(guard.tool_names(), vec!["remote__calendar"]);
+        }
+        assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "query": "select:weather,remote__calendar,calendar", "max_results": 1
+            }))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 3);
+        assert_eq!(returned_schemas(&result)[0]["name"], "weather");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
+        assert!(tool.deferred_prompt_section().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_policy_and_principal_narrowing_remove_discovery_and_selection() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().set_deferred_builtin_specs(vec![
+            builtin_spec("calendar", "Calendar tool"),
+            builtin_spec("weather", "Weather tool"),
+            builtin_spec("blocked", "Blocked tool"),
+            builtin_spec("outside", "Outside caller tool"),
+            builtin_spec("risk_blocked", "Outside risk tool"),
+        ]);
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "calendar".into(),
+                "weather".into(),
+                "blocked".into(),
+                "outside".into(),
+            ]),
+            caller_allowed: Some(vec![
+                "calendar".into(),
+                "weather".into(),
+                "blocked".into(),
+                "risk_blocked".into(),
+            ]),
+            denied: Some(vec!["blocked".into()]),
+        };
+        let tool =
+            ToolSearchTool::for_builtin_schemas(Arc::clone(&activated)).with_access_policy(policy);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("calendar"));
+        for denied in ["blocked", "outside", "risk_blocked"] {
+            assert!(!prompt.contains(denied));
+        }
+        let result = tool
+            .execute(serde_json::json!({"query": "tool", "max_results": 1}))
+            .await
+            .unwrap();
+        assert_eq!(returned_schemas(&result).len(), 1);
+        assert_eq!(returned_schemas(&result)[0]["name"], "calendar");
+        let denied = tool
+            .execute(serde_json::json!({"query": "select:blocked,outside,risk_blocked"}))
+            .await
+            .unwrap();
+        assert!(returned_schemas(&denied).is_empty());
+        assert!(
+            !activated
+                .lock()
+                .unwrap()
+                .is_builtin_schema_exposed("blocked")
+        );
+
+        tool.narrow_to_caller(&["weather".to_string()]);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("weather"));
+        assert!(!prompt.contains("calendar"));
+        for query in ["calendar", "select:calendar"] {
+            let result = tool
+                .execute(serde_json::json!({"query": query}))
+                .await
+                .unwrap();
+            assert!(returned_schemas(&result).is_empty());
+        }
+        let guard = activated.lock().unwrap();
+        assert_eq!(
+            guard.hidden_builtin_names(),
+            std::collections::HashSet::from(["weather".to_string()])
+        );
+        assert!(guard.tool_specs().is_empty());
     }
 
     #[tokio::test]

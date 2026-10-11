@@ -2875,6 +2875,7 @@ impl DelegateTool {
             agent_config,
             &model,
             &[],
+            None,
             prompt_workspace,
             false,
             None,
@@ -4423,6 +4424,7 @@ impl DelegateTool {
             agent_config,
             model_name,
             sub_tools,
+            None,
             workspace_dir,
             sends_native_tool_specs,
             skills_override,
@@ -4430,6 +4432,7 @@ impl DelegateTool {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_enriched_system_prompt_from_config(
         &self,
         config: Option<&Config>,
@@ -4437,6 +4440,7 @@ impl DelegateTool {
         agent_config: &AliasedAgentConfig,
         model_name: &str,
         sub_tools: &[Box<dyn Tool>],
+        hidden_builtin_names: Option<&HashSet<String>>,
         workspace_dir: &Path,
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
@@ -4503,6 +4507,7 @@ impl DelegateTool {
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
+            hidden_builtin_names,
             skills,
             skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
@@ -4935,12 +4940,26 @@ impl DelegateTool {
         // the skill prompt content matches the target's skill tools; bounded delegation
         // keeps the caller's `self.workspace_dir`.
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
+        let hidden_builtin_names = sub_tools.hidden_builtin_names();
+        if let Some(state) = &sub_activated {
+            let section = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deferred_builtin_prompt_section();
+            if !section.is_empty() {
+                if !sub_deferred_section.is_empty() {
+                    sub_deferred_section.push_str("\n\n");
+                }
+                sub_deferred_section.push_str(&section);
+            }
+        }
         let enriched_system_prompt = self.build_enriched_system_prompt_from_config(
             target_config,
             agent_name,
             agent_config,
             model,
             &sub_tools,
+            Some(&hidden_builtin_names),
             prompt_workspace,
             native_tools,
             sub_skills.as_deref(),
@@ -15822,6 +15841,8 @@ command = "echo hi"
     struct FullTargetProbeProvider {
         system_prompts: std::sync::Mutex<Vec<String>>,
         tool_messages: std::sync::Mutex<Vec<String>>,
+        native_tools: bool,
+        request_tool_names: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[cfg(unix)]
@@ -15843,6 +15864,10 @@ command = "echo hi"
     #[cfg(unix)]
     #[async_trait]
     impl ModelProvider for FullTargetProbeProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -15869,6 +15894,14 @@ command = "echo hi"
                     .unwrap()
                     .push(system.content.clone());
             }
+            self.request_tool_names.lock().unwrap().push(
+                request
+                    .tools
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect(),
+            );
             let tool_messages: Vec<String> = request
                 .messages
                 .iter()
@@ -15947,7 +15980,11 @@ command = "echo hi"
             "target".to_string(),
             RiskProfileConfig {
                 level: zeroclaw_config::autonomy::AutonomyLevel::Full,
-                allowed_tools: vec!["shell".to_string()],
+                allowed_tools: vec![
+                    "shell".to_string(),
+                    "memory_forget".to_string(),
+                    "tool_search".to_string(),
+                ],
                 ..RiskProfileConfig::default()
             },
         );
@@ -15956,6 +15993,8 @@ command = "echo hi"
             RuntimeProfileConfig {
                 agentic: true,
                 max_tool_iterations: 2,
+                deferred_builtin_tools: true,
+                strict_tool_parsing: false,
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -15996,58 +16035,82 @@ command = "echo hi"
             .with_runtime_profiles(config.runtime_profiles.clone())
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
         let target = config.agents.get("target").unwrap();
-        let provider = FullTargetProbeProvider::default();
+        for native_tools in [false, true] {
+            let provider = FullTargetProbeProvider {
+                native_tools,
+                ..Default::default()
+            };
 
-        let result = delegate
-            .execute_agentic(
-                "target",
-                target,
-                "test",
-                "test-model",
-                &provider,
-                "echo the marker phrase",
-                None,
-            )
-            .await
-            .unwrap();
+            let result = delegate
+                .execute_agentic(
+                    "target",
+                    target,
+                    "test",
+                    "test-model",
+                    &provider,
+                    "echo the marker phrase",
+                    None,
+                )
+                .await
+                .unwrap();
 
-        assert!(
-            result.success,
-            "independent Full target must complete: {result:?}"
-        );
+            assert!(
+                result.success,
+                "independent Full target must complete: {result:?}"
+            );
 
-        // Prompt side: the enriched prompt states the target manager's exact
-        // Full + empty-always_ask contract, not generic Supervised guidance.
-        let prompt = provider.system_prompt();
-        assert!(
-            prompt
-                .contains("Full autonomy auto-approves tools that are not listed in `always_ask`"),
-            "Full target prompt must state the Full contract, got: {prompt}"
-        );
-        assert!(
-            prompt.contains("No tools are listed in `always_ask`"),
-            "Full target with no always_ask must see the empty-list contract, got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("Ask for approval when the runtime policy requires it"),
-            "Full target must not receive generic Supervised guidance, got: {prompt}"
-        );
+            // Prompt side: the enriched prompt states the target manager's exact
+            // Full + empty-always_ask contract, not generic Supervised guidance.
+            let prompt = provider.system_prompt();
+            assert!(
+                prompt.contains("memory_forget - "),
+                "target must discover its deferred built-in: {prompt}"
+            );
+            assert!(
+                !prompt.contains("**memory_forget**"),
+                "text prompts must omit the deferred definition: {prompt}"
+            );
+            assert!(
+                !prompt.contains("delegate - "),
+                "removed recursion must not enter discovery"
+            );
+            if native_tools {
+                let requests = provider.request_tool_names.lock().unwrap();
+                assert!(requests[0].iter().any(|name| name == "tool_search"));
+                assert!(requests[0].iter().any(|name| name == "shell"));
+                assert!(!requests[0].iter().any(|name| name == "memory_forget"));
+            }
+            assert!(
+                prompt.contains(
+                    "Full autonomy auto-approves tools that are not listed in `always_ask`"
+                ),
+                "Full target prompt must state the Full contract, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("No tools are listed in `always_ask`"),
+                "Full target with no always_ask must see the empty-list contract, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("Ask for approval when the runtime policy requires it"),
+                "Full target must not receive generic Supervised guidance, got: {prompt}"
+            );
 
-        // Enforcement side: the uncovered tool executed directly — the tool
-        // result carries the real command output, not an approval denial.
-        let tool_messages = provider.tool_messages();
-        assert!(
-            tool_messages
-                .iter()
-                .any(|message| message.contains("delegate-full-ran")),
-            "uncovered Full tool must execute and report real output: {tool_messages:?}"
-        );
-        assert!(
-            !tool_messages
-                .iter()
-                .any(|message| message.contains("requires approval")),
-            "uncovered Full tool must not be gated: {tool_messages:?}"
-        );
+            // Enforcement side: the uncovered tool executed directly — the tool
+            // result carries the real command output, not an approval denial.
+            let tool_messages = provider.tool_messages();
+            assert!(
+                tool_messages
+                    .iter()
+                    .any(|message| message.contains("delegate-full-ran")),
+                "uncovered Full tool must execute and report real output: {tool_messages:?}"
+            );
+            assert!(
+                !tool_messages
+                    .iter()
+                    .any(|message| message.contains("requires approval")),
+                "uncovered Full tool must not be gated: {tool_messages:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
