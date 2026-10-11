@@ -1366,6 +1366,7 @@ sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: exe
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Procedure execution requires an administrator until headless steps preserve the caller's principal restrictions.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
@@ -1455,5 +1456,8 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
 
 skill-http-request-timeout = HTTP request timed out
