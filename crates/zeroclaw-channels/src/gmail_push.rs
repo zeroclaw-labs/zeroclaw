@@ -1084,6 +1084,42 @@ mod tests {
     }
 
     #[test]
+    fn extract_body_text_walks_nested_multipart_parts() {
+        let plain_b64 = BASE64
+            .encode(b"Nested plain text")
+            .replace('+', "-")
+            .replace('/', "_")
+            .replace('=', "");
+        let msg = GmailMessage {
+            id: "msg-nested".into(),
+            thread_id: String::new(),
+            snippet: "fallback".into(),
+            payload: Some(MessagePayload {
+                headers: Vec::new(),
+                body: None,
+                parts: vec![MessagePart {
+                    mime_type: "multipart/alternative".into(),
+                    body: None,
+                    parts: vec![MessagePart {
+                        mime_type: "text/plain".into(),
+                        body: Some(MessageBody {
+                            data: Some(plain_b64),
+                            size: 17,
+                        }),
+                        parts: Vec::new(),
+                        filename: String::new(),
+                    }],
+                    filename: String::new(),
+                }],
+                mime_type: "multipart/mixed".into(),
+            }),
+            internal_date: "0".into(),
+        };
+
+        assert_eq!(extract_body_text(&msg), "Nested plain text");
+    }
+
+    #[test]
     fn extract_body_text_fallback_to_snippet() {
         let msg = GmailMessage {
             id: "msg-5".into(),
