@@ -958,6 +958,7 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
     /// Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination.
@@ -5813,12 +5814,14 @@ pub struct McpServerConfig {
     /// Optional environment variables for stdio transport.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
     /// Optional HTTP headers for HTTP/SSE transports. Treated as secret:
     /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
     /// Optional per-call timeout in seconds (hard capped in validation).
@@ -9641,6 +9644,7 @@ pub struct PluginEntryConfig {
     pub name: String,
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
     /// Destinations this plugin instance may reach. Default: empty,
@@ -10269,6 +10273,7 @@ pub struct FileUploadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10354,6 +10359,7 @@ pub struct FileUploadBundleConfig {
     /// Static HTTP headers attached to every upload request.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10446,6 +10452,7 @@ pub struct FileDownloadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -13464,6 +13471,7 @@ pub struct ObservabilityConfig {
     /// ```
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
@@ -43358,7 +43366,173 @@ stream_tool_arguments = [
             "mcp.servers.acme.headers.Authorization"
         ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
-        assert!(!Config::prop_is_secret("file_download.headers"));
+        // The bare map path is the `PropKind::SecretMap` container row: it is
+        // secret-classified (it fronts encrypted values) even though its
+        // display carries only key names.
+        assert!(Config::prop_is_secret("file_download.headers"));
+    }
+
+    fn mcp_server_fixture(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: an empty `#[secret] HashMap<String, String>` (MCP `env`)
+    /// used to emit no property rows at all, so neither Zerocode nor the
+    /// dashboard could add the first key. The container row must exist on
+    /// an empty map and advertise itself as `SecretMap`.
+    #[test]
+    async fn empty_secret_map_emits_container_row() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        let fields = config.prop_fields();
+        for leaf in ["env", "headers"] {
+            let path = format!("mcp.servers.acme.{leaf}");
+            let row = fields
+                .iter()
+                .find(|f| f.name == path)
+                .unwrap_or_else(|| panic!("missing container row `{path}`"));
+            assert_eq!(row.kind, crate::traits::PropKind::SecretMap);
+            assert!(row.is_secret);
+            assert_eq!(row.display_value, crate::traits::UNSET_DISPLAY);
+            assert_eq!(
+                row.credential_class,
+                Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+            );
+            assert_eq!(
+                config.get_prop(&path).unwrap(),
+                crate::traits::UNSET_DISPLAY
+            );
+            assert!(Config::prop_is_secret(&path));
+        }
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f.name.starts_with("mcp.servers.acme.env.")),
+            "an empty map has no entry rows"
+        );
+    }
+
+    #[test]
+    async fn secret_map_entries_add_list_and_remove_without_leaking_values() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "zed-plaintext")
+            .unwrap();
+        config
+            .set_prop("mcp.servers.acme.env.API_KEY", "api-plaintext")
+            .unwrap();
+        assert_eq!(
+            config.mcp.servers[0].env.get("API_KEY").map(String::as_str),
+            Some("api-plaintext")
+        );
+
+        let fields = config.prop_fields();
+        let env_rows: Vec<&str> = fields
+            .iter()
+            .filter(|f| f.name.starts_with("mcp.servers.acme.env"))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            env_rows,
+            vec![
+                "mcp.servers.acme.env",
+                "mcp.servers.acme.env.API_KEY",
+                "mcp.servers.acme.env.ZED_TOKEN",
+            ],
+            "container first, then entries in sorted key order"
+        );
+        // Container display lists key names only.
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            "API_KEY, ZED_TOKEN"
+        );
+        for field in &fields {
+            assert!(
+                !field.display_value.contains("plaintext"),
+                "`{}` leaked a secret value: {}",
+                field.name,
+                field.display_value
+            );
+        }
+
+        // Writing the container itself is rejected with guidance.
+        let err = config
+            .set_prop("mcp.servers.acme.env", "{\"X\":\"y\"}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`env` is a key/value map") && err.contains("<this path>.<KEY>"),
+            "{err}"
+        );
+
+        // An empty value (what `config delete` sends) removes the entry.
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "")
+            .unwrap();
+        assert!(!config.mcp.servers[0].env.contains_key("ZED_TOKEN"));
+        assert_eq!(config.get_prop("mcp.servers.acme.env").unwrap(), "API_KEY");
+        config.set_prop("mcp.servers.acme.env.API_KEY", "").unwrap();
+        assert!(config.mcp.servers[0].env.is_empty());
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            crate::traits::UNSET_DISPLAY
+        );
+    }
+
+    /// Same call sites the dashboard / Zerocode use (`set_prop_persistent`
+    /// then `save_dirty`): an added env entry lands on disk encrypted, and
+    /// removing it drops the key from disk rather than leaving `KEY = ""`.
+    #[test]
+    async fn save_dirty_persists_secret_map_entry_add_and_remove() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(mcp_server_fixture("fs"));
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "mailbox-plaintext")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("GBR_MAILBOX_KEY"),
+            "added env key must be written; got:\n{written}"
+        );
+        assert!(
+            !written.contains("mailbox-plaintext"),
+            "env values must be encrypted at rest; got:\n{written}"
+        );
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("GBR_MAILBOX_KEY"),
+            "removed env key must be dropped from disk; got:\n{written}"
+        );
+        assert!(written.contains("name = \"fs\""), "{written}");
     }
 
     #[test]
@@ -49766,7 +49940,8 @@ model_provider = \"ollama.default\"
             PropKind::AliasRef
             | PropKind::StringArray
             | PropKind::ObjectArray
-            | PropKind::Object => None,
+            | PropKind::Object
+            | PropKind::SecretMap => None,
         }
     }
 

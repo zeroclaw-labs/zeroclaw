@@ -573,6 +573,16 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 anyhow::Error::msg("JSON object contained only nulls, nothing to write")
             })
         }
+        // Secret-map container rows are intercepted by the Configurable
+        // derive (entries are set per `<path>.<KEY>`); reaching the generic
+        // parser means a caller bypassed that routing.
+        PropKind::SecretMap => {
+            reject(
+                "secret_map",
+                ::serde_json::json!({"kind": "secret_map", "reason": "container-not-settable"}),
+            );
+            anyhow::bail!("key/value map fields are set per entry as `<path>.<KEY>`")
+        }
     }
 }
 

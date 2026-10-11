@@ -611,6 +611,15 @@ zc-config-field-type-prefix = Type:
 zc-config-field-type-secret-suffix = (secret — input hidden)
 zc-config-field-type-string-array-suffix = (one entry per line; { $newline_chord }=new line, { $save_chord }=save)
 
+# Secret key/value maps (MCP env/headers, provider extra_headers, …)
+zc-config-secret-map-add = [+ Add entry]
+zc-config-secret-map-key-prompt = New entry name (e.g. API_TOKEN), then Enter
+zc-config-secret-map-value-prompt = Value for { $key } (secret — input hidden), then Enter
+zc-config-secret-map-key-empty = Entry name cannot be empty
+zc-config-secret-map-key-invalid = Entry name cannot contain spaces, control characters, or "="
+zc-config-secret-map-value-empty = Value cannot be empty — to remove an entry, select its row and delete it
+zc-config-secret-map-delete-hint = Select an entry row below to delete it; this row only adds entries
+
 zc-config-help-navigate = Navigate
 zc-config-help-switch-section = Switch config section
 zc-config-help-open-section = Open section

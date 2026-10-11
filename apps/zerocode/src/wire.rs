@@ -182,9 +182,9 @@ pub enum MemoryBackendKind {
 // ── Config explorer wire shapes ────────────────────────────────
 
 /// Schema field-kind tag mirroring `zeroclaw_config::traits::PropKind`.
-/// Carries the canonical eight variants — adding one in the schema
-/// must mirror here too; `wire_drift::prop_kind_variants_round_trip`
-/// fails when they diverge.
+/// zerocode does not depend on `zeroclaw-config`, so adding a variant in
+/// the schema must be mirrored here by hand: an unknown tag fails to
+/// deserialize the whole `config/list` response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PropKind {
@@ -197,6 +197,9 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a secret key/value map (MCP `env`, `headers`, …).
+    /// Entries are the sibling `<path>.<KEY>` rows.
+    SecretMap,
 }
 
 impl PropKind {
@@ -214,6 +217,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }

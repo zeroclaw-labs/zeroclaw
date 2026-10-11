@@ -96,7 +96,15 @@ Three surfaces edit the same `[[mcp.servers]]` table:
 
 - **`config.toml`**: hand-edit the keys documented below. The full table is round-tripped on save.
 - **zerocode TUI** (`/config` -> `mcp.servers`): first-class per-field editor. The section shows one row per server, labeled with the server's `name`; enter a row to edit `transport`, `command` / `url`, `headers`, `env`, and `tool_timeout_secs` as individual fields. `+ Add` creates a new entry seeded with the name you supply; deleting from the alias list removes the entry. The `name` field is not edited inline because renaming the natural key mid-edit would invalidate in-flight references; use the dashboard or hand-edit `config.toml` to rename for now.
-- **Web dashboard**: currently renders `mcp.servers` through a JSON-array editor. A migration to the same per-field surface the TUI uses is planned; until then the dashboard remains a usable but coarser editor.
+- **Web dashboard** (Config -> MCP servers -> a server): the same per-field surface as the TUI, one form per server.
+
+`env` and `headers` are key/value maps, so both UIs show them as a container row followed by one row per entry (`env.GITHUB_TOKEN`, `headers.Authorization`, …):
+
+- **Add an entry**: in zerocode, select the `env` (or `headers`) row showing `[+ Add entry]`, press Enter, type the name, press Enter, then type the value (input hidden) and press Enter. In the dashboard, use the name/value inputs and **Add entry** under the map. The entry is saved immediately and encrypted at rest.
+- **Change a value**: edit the entry's own row like any other secret.
+- **Remove an entry**: delete the entry's row (zerocode's delete-row key, or the dashboard trash button and then Save).
+
+Values are never displayed; the container row lists only entry names. From the CLI, `zeroclaw config set mcp.servers.<name>.env.<KEY>` adds or replaces an entry, and setting it to an empty value removes it. The bare map path (`mcp.servers.<name>.env`) cannot be set directly. The same editor applies to every secret key/value map in the config (for example provider `extra_headers`).
 
 ## Server fields
 

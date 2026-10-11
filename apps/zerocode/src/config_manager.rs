@@ -236,6 +236,23 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
     }
 }
 
+/// Validate a new secret-map entry key (env var name, header name, …).
+/// Returns the Fluent key of the rejection message, or `None` when valid.
+/// Kept deliberately loose: the same row type fronts env vars, HTTP headers,
+/// and plugin settings, so only what can never be a valid key is refused.
+fn secret_map_key_validation_key(key: &str) -> Option<&'static str> {
+    if key.is_empty() {
+        Some("zc-config-secret-map-key-empty")
+    } else if key
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+    {
+        Some("zc-config-secret-map-key-invalid")
+    } else {
+        None
+    }
+}
+
 fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<String> {
     scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
 }
@@ -430,6 +447,9 @@ pub(crate) struct App {
     // Edit state
     edit_buf: String,
     edit_cursor: usize,
+    /// Two-step add on a `PropKind::SecretMap` row: `None` while the user
+    /// types the entry key, `Some(key)` while they type its (masked) value.
+    secret_map_entry_key: Option<String>,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -503,6 +523,7 @@ impl App {
             field_cursor: 0,
             edit_buf: String::new(),
             edit_cursor: 0,
+            secret_map_entry_key: None,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -2494,6 +2515,16 @@ impl App {
             Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
                 self.enter_field_edit(self.field_cursor, term).await;
             }
+            Some(ConfigTabAction::DeleteRow)
+                if self
+                    .fields
+                    .get(self.field_cursor)
+                    .is_some_and(|field| field.kind == PropKind::SecretMap) =>
+            {
+                // The container row is not itself a value; entries are
+                // removed from their own `<path>.<KEY>` rows.
+                self.status_msg = Some(crate::i18n::t("zc-config-secret-map-delete-hint"));
+            }
             Some(ConfigTabAction::DeleteRow) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
                     let prop = field.path.clone();
@@ -3146,6 +3177,7 @@ impl App {
 
     fn prepare_edit_at(&mut self, idx: usize) {
         let kind = self.fields[idx].kind;
+        self.secret_map_entry_key = None;
         let value = if self.fields[idx].populated {
             self.fields[idx]
                 .value
@@ -3315,6 +3347,50 @@ impl App {
         };
     }
 
+    /// Advance the two-step "add entry" flow on a `PropKind::SecretMap`
+    /// row. Step 1 takes the entry key; step 2 takes its value and writes
+    /// `<map_path>.<key>`. An existing key is simply replaced. Empty values
+    /// are refused here because the daemon treats "" as "remove entry".
+    async fn confirm_secret_map_step(&mut self, map_path: &str) -> Result<()> {
+        let Some(key) = self.secret_map_entry_key.clone() else {
+            let key = self.edit_buf.trim().to_string();
+            if let Some(status_key) = secret_map_key_validation_key(&key) {
+                self.status_msg = Some(crate::i18n::t(status_key));
+                return Ok(());
+            }
+            self.secret_map_entry_key = Some(key);
+            self.edit_buf.clear();
+            self.edit_cursor = 0;
+            self.status_msg = None;
+            return Ok(());
+        };
+        if self.edit_buf.is_empty() {
+            self.status_msg = Some(crate::i18n::t("zc-config-secret-map-value-empty"));
+            return Ok(());
+        }
+        let prop = format!("{map_path}.{key}");
+        let value = serde_json::Value::String(self.edit_buf.clone());
+        match self.rpc.config_set(&prop, value).await {
+            Ok(()) => {
+                self.secret_map_entry_key = None;
+                self.edit_buf.clear();
+                self.edit_cursor = 0;
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-field-set",
+                    &[("prop", &prop)],
+                ));
+                self.pop_to_field_list_keep_cursor().await?;
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-set-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn is_scalar_field_edit(&self) -> bool {
         matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
             if !self.is_select_edit()
@@ -3390,6 +3466,12 @@ impl App {
                 self.pop_to_field_list().await?;
             }
             Some(ConfigEditorAction::Confirm) => {
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen
+                    && self.fields[*field_idx].kind == PropKind::SecretMap
+                {
+                    let map_path = self.fields[*field_idx].path.clone();
+                    return self.confirm_secret_map_step(&map_path).await;
+                }
                 if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
                     if let Some(status) =
@@ -4042,7 +4124,11 @@ impl App {
                 let f = &self.fields[i];
                 let short_name =
                     &tab_names[tab_indices.iter().position(|&ti| ti == i).unwrap_or(0)];
-                let val_display = if f.is_secret {
+                let val_display = if f.kind == PropKind::SecretMap {
+                    // Entries are listed as their own `<path>.<KEY>` rows;
+                    // the container row is the add affordance.
+                    crate::i18n::t("zc-config-secret-map-add")
+                } else if f.is_secret {
                     "••••••".to_string()
                 } else {
                     f.value
@@ -4393,6 +4479,34 @@ impl App {
                     ))),
                     r.main,
                 );
+                self.draw_status(frame, r);
+                return;
+            }
+
+            if field.kind == PropKind::SecretMap {
+                // Two-step add: key in clear text, then its value masked.
+                let (hint, masked, title) = match &self.secret_map_entry_key {
+                    None => (
+                        crate::i18n::t("zc-config-secret-map-key-prompt"),
+                        false,
+                        format!(" {short_name} \u{203a} + "),
+                    ),
+                    Some(key) => (
+                        crate::i18n::t_args(
+                            "zc-config-secret-map-value-prompt",
+                            &[("key", key.as_str())],
+                        ),
+                        true,
+                        format!(" {short_name} \u{203a} {key} "),
+                    ),
+                };
+                let input_display = scalar_edit_display(&self.edit_buf, self.edit_cursor, masked);
+                let input = Paragraph::new(vec![
+                    Line::from(Span::styled(hint, theme::dim_style())),
+                    Line::from(Span::styled(input_display, theme::input_style())),
+                ])
+                .block(theme::panel_block(&title));
+                frame.render_widget(input, r.main);
                 self.draw_status(frame, r);
                 return;
             }
@@ -5250,6 +5364,137 @@ mod tests {
             tab: ConfigTab::None,
             alias_source: None,
         }
+    }
+
+    fn secret_map_field(path: &str) -> ConfigFieldEntry {
+        let mut f = field(path);
+        f.kind = PropKind::SecretMap;
+        f.is_secret = true;
+        f
+    }
+
+    /// Manager whose RPC is answered by a scripted fake daemon: every
+    /// outbound request is recorded and acknowledged (`config/list` gets an
+    /// empty entry list, everything else `{}`).
+    fn test_manager_with_recording_rpc() -> (App, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder = Arc::clone(&outbound);
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&frame) else {
+                    continue;
+                };
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if req["method"] == "config/list" {
+                    serde_json::json!({ "entries": [] })
+                } else {
+                    serde_json::json!({})
+                };
+                recorder.lock().unwrap().push(req);
+                responder.dispatch_response(&id, Some(result), None);
+            }
+        });
+        let rpc = Arc::new(RpcClient::with_rpc(outbound));
+        (App::new(rpc, std::path::Path::new("/tmp")), seen)
+    }
+
+    async fn type_text(manager: &mut App, text: &str) {
+        for c in text.chars() {
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn press_enter(manager: &mut App) {
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn secret_map_entry_kind_deserializes_from_daemon_wire_tag() {
+        let entry: ConfigFieldEntry = serde_json::from_value(serde_json::json!({
+            "path": "mcp.servers.acme.env",
+            "category": "Mcp",
+            "kind": "secret_map",
+            "type_hint": "HashMap<String,String>",
+            "populated": false,
+            "is_secret": true,
+            "description": "Optional environment variables for stdio transport.",
+        }))
+        .unwrap();
+        assert_eq!(entry.kind, PropKind::SecretMap);
+        assert_eq!(entry.kind.wire_name(), "secret_map");
+    }
+
+    #[test]
+    fn secret_map_key_validation_rejects_unusable_names() {
+        assert_eq!(
+            secret_map_key_validation_key(""),
+            Some("zc-config-secret-map-key-empty")
+        );
+        for bad in ["HAS SPACE", "A=B", "TAB\tKEY", "NL\nKEY"] {
+            assert_eq!(
+                secret_map_key_validation_key(bad),
+                Some("zc-config-secret-map-key-invalid"),
+                "{bad:?}"
+            );
+        }
+        for good in ["GITHUB_TOKEN", "Authorization", "X-Api-Key", "x.dotted"] {
+            assert_eq!(secret_map_key_validation_key(good), None, "{good:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_map_row_adds_entry_in_two_steps() {
+        let (mut manager, seen) = test_manager_with_recording_rpc();
+        manager.fields = vec![secret_map_field("mcp.servers.acme.env")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "mcp.servers.acme".into(),
+            breadcrumb: vec!["mcp.servers".into(), "acme".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+
+        // Step 1: an invalid key is refused without any RPC.
+        type_text(&mut manager, "BAD KEY").await;
+        press_enter(&mut manager).await;
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(manager.status_msg.is_some());
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+
+        type_text(&mut manager, "API_TOKEN").await;
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(manager.edit_buf.is_empty(), "value step starts blank");
+
+        // Step 2: an empty value is refused (it would remove the entry).
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(seen.lock().unwrap().is_empty(), "no RPC before a value");
+
+        type_text(&mut manager, "s3cr3t").await;
+        press_enter(&mut manager).await;
+
+        let requests = seen.lock().unwrap().clone();
+        let set = requests
+            .iter()
+            .find(|r| r["method"] == "config/set")
+            .expect("config/set must be sent");
+        assert_eq!(set["params"]["prop"], "mcp.servers.acme.env.API_TOKEN");
+        assert_eq!(set["params"]["value"], "s3cr3t");
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
     }
 
     #[tokio::test]
