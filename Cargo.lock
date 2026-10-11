@@ -14787,6 +14787,7 @@ dependencies = [
  "brotli",
  "cap-fs-ext",
  "cap-std",
+ "chacha20poly1305 0.10.1",
  "chrono",
  "directories",
  "fantoccini",
@@ -14795,6 +14796,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "hmac 0.12.1",
  "infer",
  "libc",
  "mail-parser",
@@ -14835,6 +14837,7 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-providers",
  "zeroclaw-spawn",
+ "zeroize",
 ]
 
 [[package]]

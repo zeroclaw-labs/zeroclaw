@@ -123,6 +123,10 @@ tool-backup-error-is-directory = Backup file destination is a directory: '{ $pat
 tool-backup-error-special-file = Refusing to traverse a special file in backup data: '{ $path }'
 tool-backup-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
 tool-backup-error-write-blocked = Backup destination is not writable under the security policy: '{ $path }'
+tool-backup-error-encrypt-unavailable = Backup encryption is enabled but the secret store key is unavailable, so no backup was written: { $reason }
+tool-backup-error-key-unavailable = This backup is encrypted and the secret store key that opens it is unavailable: { $reason }
+tool-backup-error-payload = Backup file failed authentication or decompression, so nothing was restored: '{ $path }'
+tool-backup-error-format = Backup format is unreadable or unsupported: '{ $name }'
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.

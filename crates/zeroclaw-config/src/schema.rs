@@ -9258,7 +9258,9 @@ pub struct BackupConfig {
     /// Subdirectories of the shared data directory to include in backups.
     #[serde(default = "default_backup_include_dirs")]
     pub include_dirs: Vec<String>,
-    /// Output directory for backup archives (relative to the shared data directory).
+    /// Output directory for backups, relative to the shared data directory.
+    /// Backups already in the earlier `backups` directory stay listable,
+    /// verifiable, and restorable after this changes.
     #[serde(default = "default_backup_destination_dir")]
     pub destination_dir: String,
     /// Optional cron expression for scheduled automatic backups.
@@ -9267,10 +9269,16 @@ pub struct BackupConfig {
     /// IANA timezone for `schedule_cron`.
     #[serde(default)]
     pub schedule_timezone: Option<String>,
-    /// Compress backup archives.
+    /// Gzip each file stored in a backup. A backup stays a directory tree;
+    /// `restore` decompresses.
     #[serde(default = "default_true")]
     pub compress: bool,
-    /// Encrypt backup archives (requires a configured secret store key).
+    /// Encrypt each file stored in a backup with ChaCha20-Poly1305, under a key
+    /// derived from the install's `.secret_key` beside the config file. File
+    /// names and the directory layout are not encrypted. Restoring needs the
+    /// same `.secret_key`, which is not inside the backup: keep a copy of it
+    /// elsewhere or an encrypted backup cannot be restored. When the key
+    /// cannot be loaded, `backup create` refuses instead of writing plaintext.
     #[serde(default)]
     pub encrypt: bool,
 }
