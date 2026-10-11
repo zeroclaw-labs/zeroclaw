@@ -421,6 +421,8 @@ channel-wecom-ws-stop-ack = Stopped the current message.
 channel-wecom-ws-voice-unavailable = I can't process voice messages right now {$emoji}
 channel-wecom-ws-unsupported-message = This message type is not supported yet.
 channel-wecom-ws-welcome = Hi, welcome to chat with me {$emoji}
+channel-wecom-ws-media-failed =
+    {"["}Media not sent] {$detail}
 channel-wecom-ws-supplemental-message =
     {"["}Supplemental message]
     {$extra}
