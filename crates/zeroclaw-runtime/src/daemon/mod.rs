@@ -811,7 +811,14 @@ pub async fn run_with_authority(
         )?,
     );
 
+    let mut gateway_sessions = None;
     if let Some(gateway_start) = registry.take_gateway_start() {
+        // RPC deletion and every supervised gateway restart use the same
+        // queue/cancellation authority for this daemon generation. Reload
+        // constructs a new handle together with the new RPC context.
+        let gateway_coordination =
+            zeroclaw_infra::gateway_session::GatewaySessionCoordination::for_gateway();
+        gateway_sessions = Some(gateway_coordination.clone());
         gateway_required = true;
         let gateway_cfg = config.clone();
         let gateway_authority = DaemonInboundAuthority {
@@ -850,6 +857,7 @@ pub async fn run_with_authority(
                 let start = gateway_start.clone();
                 let live_config_authority = gateway_live_config_authority.clone();
                 let authority = gateway_authority.clone();
+                let session_coordination = gateway_coordination.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 let readiness_reporter = gateway_start_hook_reporter(
@@ -868,6 +876,7 @@ pub async fn run_with_authority(
                         Some(reload_controls),
                         Some(tui_reg),
                         Some(authority),
+                        Some(session_coordination),
                         readiness_reporter,
                     )
                     .await
@@ -1089,6 +1098,7 @@ pub async fn run_with_authority(
         let rpc_auth = std::sync::Arc::clone(&inbound_auth);
 
         Some(std::sync::Arc::new(RpcContext {
+            gateway_sessions: gateway_sessions.clone(),
             #[cfg(test)]
             config_commit_pause: None,
             config: live_config_authority.live_handle(),
@@ -3236,7 +3246,16 @@ mod tests {
             })
         }));
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _authority, _events, controls, _tui, _pairing, _ready| {
+            move |_host,
+                  _port,
+                  _config,
+                  _authority,
+                  _events,
+                  controls,
+                  _tui,
+                  _pairing,
+                  _gateway_sessions,
+                  _ready| {
                 let reload_rx = reload_rx.lock().take().unwrap();
                 Box::pin(async move {
                     reload_rx.await.unwrap();
@@ -4483,6 +4502,89 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
+    async fn gateway_session_coordination_is_shared_across_restart_and_fresh_on_reload() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut previous: Option<zeroclaw_infra::gateway_session::GatewaySessionCoordination> =
+            None;
+        for _ in 0..2 {
+            let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (rpc_tx, mut rpc_rx) = tokio::sync::mpsc::unbounded_channel();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let mut registry = DaemonRegistry::new();
+            registry.register_gateway(Box::new(
+                move |_, _, _, _, _, reload, _, _, coordination, _| {
+                    let gateway_tx = gateway_tx.clone();
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        gateway_tx
+                            .send((
+                                coordination.expect("supervised gateway coordination"),
+                                reload.expect("supervised reload controls"),
+                            ))
+                            .unwrap();
+                        if attempt == 0 {
+                            anyhow::bail!("injected supervised gateway restart");
+                        }
+                        std::future::pending::<Result<()>>().await
+                    })
+                },
+            ));
+            registry.register_socket(Box::new(move |ctx, cancel, _, _| {
+                let rpc_tx = rpc_tx.clone();
+                Box::pin(async move {
+                    rpc_tx
+                        .send(
+                            ctx.gateway_sessions
+                                .clone()
+                                .expect("RPC shares gateway coordination"),
+                        )
+                        .unwrap();
+                    cancel.cancelled().await;
+                    Ok(())
+                })
+            }));
+            let (exit, current) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
+                tokio::join!(
+                    run(
+                        config.clone(),
+                        "127.0.0.1".into(),
+                        0,
+                        registry,
+                        false,
+                        false
+                    ),
+                    async {
+                        let (first, _) = gateway_rx.recv().await.unwrap();
+                        let rpc = rpc_rx.recv().await.unwrap();
+                        let (second, reload) = gateway_rx.recv().await.unwrap();
+                        assert!(Arc::ptr_eq(first.queue(), second.queue()));
+                        assert!(Arc::ptr_eq(first.cancellations(), second.cancellations()));
+                        assert!(Arc::ptr_eq(first.queue(), rpc.queue()));
+                        assert!(Arc::ptr_eq(first.cancellations(), rpc.cancellations()));
+                        reload.send(true).unwrap();
+                        first
+                    }
+                )
+            })
+            .await
+            .expect("supervised restart and reload must complete");
+            assert_eq!(exit.unwrap(), DaemonExit::Reload);
+            if let Some(old) = previous {
+                assert!(!Arc::ptr_eq(old.queue(), current.queue()));
+                assert!(!Arc::ptr_eq(old.cancellations(), current.cancellations()));
+            }
+            previous = Some(current);
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
         let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
@@ -4500,6 +4602,7 @@ mod tests {
                   reload_controls,
                   tui_registry,
                   _pairing,
+                  _gateway_sessions,
                   _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
@@ -4585,6 +4688,7 @@ mod tests {
                   reload_controls,
                   _tui_registry,
                   _pairing,
+                  _gateway_sessions,
                   _ready_tx| {
                 let signalled_tx = signalled_tx.clone();
                 Box::pin(async move {
@@ -4886,7 +4990,16 @@ mod tests {
             })
         }));
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _authority, _events, controls, _tui, _pairing, _ready| {
+            move |_host,
+                  _port,
+                  _config,
+                  _authority,
+                  _events,
+                  controls,
+                  _tui,
+                  _pairing,
+                  _gateway_sessions,
+                  _ready| {
                 let reload_sent = reload_sent.clone();
                 let session_ready = session_ready.clone();
                 Box::pin(async move {
@@ -5012,6 +5125,7 @@ mod tests {
                   reload_controls,
                   _tui_reg,
                   _pairing,
+                  _gateway_sessions,
                   _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
@@ -7273,6 +7387,7 @@ mod tests {
                   reload_controls,
                   _tui_reg,
                   _pairing,
+                  _gateway_sessions,
                   _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
@@ -7502,6 +7617,7 @@ mod tests {
                           _reload,
                           _tui,
                           _pairing,
+                          _gateway_sessions,
                           readiness| {
                         received.store(if readiness.is_some() { 2 } else { 1 }, Ordering::SeqCst);
                         Box::pin(std::future::pending::<Result<()>>())
@@ -7568,6 +7684,7 @@ mod tests {
                       _reload,
                       _tui,
                       authority,
+                      _gateway_sessions,
                       _ready| {
                     *handed.lock().unwrap() = authority.map(|_| _live_config_authority.clone());
                     Box::pin(std::future::pending::<Result<()>>())

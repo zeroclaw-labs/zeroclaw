@@ -1376,6 +1376,7 @@ mod tests {
         let cases = [
             ("cli-approval-request", &["shell"][..]),
             ("cli-approval-prompt", &["shell", "[Y]", "[N]", "[A]"][..]),
+            ("cli-approval-prompt-yesno", &["[Y]", "[N]"][..]),
         ];
 
         for (source, locale) in [
@@ -1394,7 +1395,7 @@ mod tests {
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
                     );
                 }
-                if key == "cli-approval-prompt" {
+                if matches!(key, "cli-approval-prompt" | "cli-approval-prompt-yesno") {
                     assert!(
                         value.ends_with(' ') && !value.ends_with("  "),
                         "{key} in {locale} should end with exactly one space; got: {value:?}"
@@ -1412,6 +1413,60 @@ mod tests {
             format_ftl_message(english, "en", "cli-approval-prompt", &[("tool", tool)]).as_deref(),
             Some("   [Y]es / [N]o / [A]lways for shell: ")
         );
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-prompt-yesno", &[]).as_deref(),
+            Some("   [Y]es / [N]o: ")
+        );
+    }
+
+    #[test]
+    fn session_prompt_approval_domain_has_a_translation_in_every_builtin_locale() {
+        let english = include_str!("../locales/en/cli.ftl");
+        let key = "session-prompt-approval-domain";
+        let english_domain = format_ftl_message(english, "en", key, &[]).unwrap();
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                english
+            } else {
+                builtin_cli_ftl_source(&locale.code).unwrap()
+            };
+            // Query the locale's own embedded catalogue, not the fallback
+            // loader: an English fallback must not conceal a missing entry.
+            let text = format_ftl_message(source, &locale.code, key, &[])
+                .unwrap_or_else(|| panic!("{key} missing in {}", locale.code));
+            assert!(!text.trim().is_empty());
+            if locale.code != "en" {
+                assert_ne!(text, english_domain);
+            }
+        }
+    }
+
+    #[test]
+    fn session_prompt_approval_messages_format_in_every_locale() {
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
+            for key in [
+                "session-prompt-approval-description",
+                "session-prompt-approval-domain",
+                "session-prompt-approval-binding-failed",
+                "session-prompt-approval-manager-unavailable",
+                "session-prompt-approval-channel-unavailable",
+                "session-prompt-approval-runtime-denial",
+                "session-prompt-approval-not-granted",
+            ] {
+                let text = format_cli_string_with_args(&sources, key, &[])
+                    .unwrap_or_else(|| panic!("{key} missing in {}", locale.code));
+                assert!(!text.trim().is_empty());
+            }
+            let reason = "synthetic-denial-reason";
+            let output = format_cli_string_with_args(
+                &sources,
+                "session-prompt-approval-denied",
+                &[("reason", reason)],
+            )
+            .unwrap();
+            assert!(output.contains(reason));
+        }
     }
 
     #[test]
@@ -2481,6 +2536,40 @@ mod tests {
                     "{locale}: reply-instruction-approve-deny should preserve {expected:?} verbatim; got {approve_deny:?}"
                 );
             }
+
+            let yesno_once = format_ftl_message(
+                source,
+                locale,
+                "channel-approval-reply-instruction-yesno-once",
+                &[("yes_command", "abc123 yes"), ("no_command", "abc123 no")],
+            )
+            .unwrap_or_else(|| {
+                panic!("{locale}: channel-approval-reply-instruction-yesno-once should be defined")
+            });
+            for expected in ["abc123 yes", "abc123 no"] {
+                assert!(
+                    yesno_once.contains(expected),
+                    "{locale}: reply-instruction-yesno-once should preserve {expected:?} verbatim; got {yesno_once:?}"
+                );
+            }
+
+            let approve_deny_once = format_ftl_message(
+                source,
+                locale,
+                "channel-approval-reply-instruction-approve-deny-once",
+                &[("approve_command", "abc123 approve"), ("deny_command", "abc123 deny")],
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "{locale}: channel-approval-reply-instruction-approve-deny-once should be defined"
+                )
+            });
+            for expected in ["abc123 approve", "abc123 deny"] {
+                assert!(
+                    approve_deny_once.contains(expected),
+                    "{locale}: reply-instruction-approve-deny-once should preserve {expected:?} verbatim; got {approve_deny_once:?}"
+                );
+            }
         }
     }
 
@@ -2523,6 +2612,19 @@ mod tests {
                     ("always_command", "abc123 always"),
                 ],
                 "Reply `abc123 approve` / `abc123 deny` / `abc123 always`.",
+            ),
+            (
+                "channel-approval-reply-instruction-yesno-once",
+                &[("yes_command", "abc123 yes"), ("no_command", "abc123 no")],
+                "Reply: \"abc123 yes\" or \"abc123 no\"",
+            ),
+            (
+                "channel-approval-reply-instruction-approve-deny-once",
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                ],
+                "Reply `abc123 approve` / `abc123 deny`.",
             ),
             ("channel-telegram-approval-ack-approved", &[], "Approved"),
             (
@@ -2601,6 +2703,17 @@ mod tests {
                     ("approve_command", "abc123 approve"),
                     ("deny_command", "abc123 deny"),
                     ("always_command", "abc123 always"),
+                ][..],
+            ),
+            (
+                "channel-approval-reply-instruction-yesno-once",
+                &[("yes_command", "abc123 yes"), ("no_command", "abc123 no")][..],
+            ),
+            (
+                "channel-approval-reply-instruction-approve-deny-once",
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
                 ][..],
             ),
         ] {

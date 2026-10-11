@@ -45,6 +45,13 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
+fn current_tool_loop_session_id() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_ID
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
 fn invalid_semantic_completion_error(agent_name: &str) -> String {
     crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
 }
@@ -63,11 +70,22 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
-async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
+// Detached delegates do not inherit task locals. Carry both identities because
+// the storage key can include an RPC namespace absent from the shell session ID.
+async fn scope_delegate_session_context<F>(
+    session_key: Option<String>,
+    session_id: Option<String>,
+    future: F,
+) -> F::Output
 where
     F: std::future::Future,
 {
-    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+    TOOL_LOOP_SESSION_KEY
+        .scope(
+            session_key,
+            zeroclaw_api::TOOL_LOOP_SESSION_ID.scope(session_id, future),
+        )
+        .await
 }
 
 /// Run `inner` under the delegate target's cost-tracking task-locals so the
@@ -3267,6 +3285,7 @@ impl DelegateTool {
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_session_id = current_tool_loop_session_id();
         // Receipt continuity for detached work: capture the launching turn's
         // generator so the background sub-loop signs with the same key. The
         // wrapper below pairs it with a fresh collector, never the parent's
@@ -3320,8 +3339,9 @@ impl DelegateTool {
         zeroclaw_spawn::spawn!(
             TOOL_LOOP_THREAD_ID.scope(
                 parent_thread_id,
-                scope_delegate_session_key(
+                scope_delegate_session_context(
                     parent_session_key,
+                    parent_session_id,
                     crate::sop::active_scope::with_inherited_headless_step_scope(
                         parent_step_scope,
                         // Detached receipt scope: the launching turn's generator with a
@@ -3608,6 +3628,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_session_id = current_tool_loop_session_id();
         let parent_budget = ExecutionTreeBudget::current();
         // Captured once here and restored inside every worker: each fan-out
         // target runs on its own spawned task, which does not inherit the SOP
@@ -3665,6 +3686,7 @@ impl DelegateTool {
             // verbatim rather than extending it.
             let originator_chain = self.originator_chain.clone();
             let session_key = parent_session_key.clone();
+            let session_id = parent_session_id.clone();
             let inherited_budget = parent_budget.clone();
             let thread_scope = parent_thread_id.clone();
             let step_scope = parent_step_scope.clone();
@@ -3729,27 +3751,39 @@ impl DelegateTool {
                             thread_scope,
                             crate::sop::active_scope::with_inherited_headless_step_scope(
                                 step_scope,
-                                scope_delegate_session_key(session_key, async move {
-                                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                                        .scope(receipt_scope, async move {
-                                            let worker: std::pin::Pin<
-                                                Box<
-                                                    dyn std::future::Future<
-                                                            Output = anyhow::Result<ToolResult>,
-                                                        > + Send
-                                                        + '_,
-                                                >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
-                                            ));
-                                            worker.await
-                                        })
-                                        .await
-                                }),
+                                scope_delegate_session_context(
+                                    session_key,
+                                    session_id,
+                                    async move {
+                                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                            .scope(receipt_scope, async move {
+                                                // Erase the worker future's type, as
+                                                // `#[async_trait]` does on the `Tool::execute`
+                                                // path: the spawn's `Send` proof otherwise
+                                                // walks every layer of the delegated loop and
+                                                // overflows the trait-solver recursion limit
+                                                // (E0275). A plain `Box::pin` does not stop it.
+                                                let worker: std::pin::Pin<
+                                                    Box<
+                                                        dyn std::future::Future<
+                                                                Output = anyhow::Result<ToolResult>,
+                                                            > + Send
+                                                            + '_,
+                                                    >,
+                                                > = Box::pin(
+                                                    inner.execute_sync_with_target_admission(
+                                                        &agent_name,
+                                                        &prompt,
+                                                        &args_clone,
+                                                        DelegateAdmission::Required,
+                                                        target_execution_admission,
+                                                    ),
+                                                );
+                                                worker.await
+                                            })
+                                            .await
+                                    },
+                                ),
                             ),
                         ),
                     )
@@ -5109,12 +5143,19 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        // Nested delegations compose several scoped futures; keep the turn
+        // future off the test/runtime thread stack before adding this scope.
+        // Keep the session-prompt task-local scope behind a future boundary
+        // before composing the execution-tree budget and optional thinking
+        // scopes.
+        let delegated_turn =
+            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(false, Box::pin(execution));
         let execution =
-            ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
+            ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(delegated_turn));
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .scope(params.native_thinking, execution)
+                    .scope(params.native_thinking, Box::pin(execution))
                     .await
             }
             None => execution.await,
@@ -10672,22 +10713,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_spawn_helper_forwards_session_key() {
+    async fn delegate_spawn_helper_forwards_storage_key_and_caller_session_id() {
         let seen = TOOL_LOOP_SESSION_KEY
-            .scope(Some("channel_session".to_string()), async {
-                let session_key = current_tool_loop_session_key();
-                zeroclaw_spawn::spawn!(async move {
-                    scope_delegate_session_key(session_key, async {
-                        current_tool_loop_session_key()
-                    })
-                    .await
-                })
-                .await
-                .unwrap()
-            })
+            .scope(
+                Some("rpc_channel_session".to_string()),
+                zeroclaw_api::TOOL_LOOP_SESSION_ID.scope(
+                    Some("channel_session".to_string()),
+                    async {
+                        let session_key = current_tool_loop_session_key();
+                        let session_id = current_tool_loop_session_id();
+                        zeroclaw_spawn::spawn!(async move {
+                            scope_delegate_session_context(session_key, session_id, async {
+                                (
+                                    current_tool_loop_session_key(),
+                                    current_tool_loop_session_id(),
+                                )
+                            })
+                            .await
+                        })
+                        .await
+                        .unwrap()
+                    },
+                ),
+            )
             .await;
 
-        assert_eq!(seen.as_deref(), Some("channel_session"));
+        assert_eq!(seen.0.as_deref(), Some("rpc_channel_session"));
+        assert_eq!(seen.1.as_deref(), Some("channel_session"));
     }
 
     #[tokio::test]

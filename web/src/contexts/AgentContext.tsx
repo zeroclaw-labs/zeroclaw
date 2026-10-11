@@ -622,6 +622,9 @@ export function AgentProvider({
           toolName: msg.tool ?? 'unknown',
           argumentsSummary: msg.arguments_summary ?? '',
           timeoutSecs: msg.timeout_secs ?? 120,
+          // Older daemons did not send the policy marker; preserve the
+          // ordinary approval affordance for those compatibility frames.
+          allowAlways: msg.allow_always ?? true,
           receivedAt: Date.now(),
         });
         break;

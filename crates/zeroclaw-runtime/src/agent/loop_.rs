@@ -466,6 +466,9 @@ pub fn register_eager_mcp_tool_if_allowed(
     delegate_handle: Option<&tools::DelegateParentToolsHandle>,
     policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
 ) -> bool {
+    if crate::tools::SESSION_PROMPT_TOOL_NAMES.contains(&wrapper.name()) {
+        return false;
+    }
     if !eager_mcp_tool_allowed(wrapper.name(), policy) {
         return false;
     }
@@ -723,8 +726,15 @@ fn elide_image_data(content: &str) -> String {
 }
 
 pub(crate) fn scrub_for_export(content: &str) -> String {
+    // Remove the host-owned attachment tail before classifying invocations:
+    // opaque attachment text must not erase the preceding host instructions.
+    let without_attachments =
+        crate::agent::prompt::redact_session_prompt_attachments_for_export(content);
+    if crate::agent::prompt::session_prompt_tool_call_envelope_mentioned(&without_attachments) {
+        return "[Session-prompt tool exchange omitted from export]".to_string();
+    }
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
-        &elide_image_data(content),
+        &elide_image_data(&without_attachments),
     ))
 }
 
@@ -741,12 +751,15 @@ pub(crate) fn capture_llm_messages(
         LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot,
     };
 
-    let system_instructions = messages
+    let export_messages =
+        crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(messages);
+
+    let system_instructions = export_messages
         .iter()
         .find(|m| m.role == "system")
         .map(|m| scrub_for_export(&m.content));
 
-    let input = messages
+    let input = export_messages
         .iter()
         .filter(|m| m.role != "system")
         .map(|m| MessageSnapshot {
@@ -762,7 +775,13 @@ pub(crate) fn capture_llm_messages(
         .map(|tc| ToolCallSnapshot {
             id: tc.id.clone(),
             name: tc.name.clone(),
-            arguments_json: scrub_for_export(&tc.arguments),
+            arguments_json: if crate::agent::tool_execution::is_sensitive_session_prompt_tool(
+                &tc.name,
+            ) {
+                "[Session-prompt tool arguments omitted from export]".to_string()
+            } else {
+                scrub_for_export(&tc.arguments)
+            },
         })
         .collect();
 
@@ -3222,9 +3241,18 @@ pub async fn run(
 
         Ok(final_output)
     };
-    __zc_body
-        .instrument(__zc_scope_span)
-        .instrument(__zc_attribution_span)
+    // This CLI/cron/subturn entry does not own a durable primary Chat turn.
+    // Inline callers (notably cron_run) can inherit the parent task's session
+    // locals, so deny attachment access here rather than relying on spawning.
+    // Forwarding access would also require deliberately propagating exact child
+    // approval and privacy guarantees; that is outside the bounded proposal.
+    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        .scope(
+            false,
+            __zc_body
+                .instrument(__zc_scope_span)
+                .instrument(__zc_attribution_span),
+        )
         .await
 }
 
@@ -10719,11 +10747,19 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_tool_call_loop_retries_malformed_tool_protocol_without_leaking_json() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let marker = "turn-debug-private-canary";
         let provider = ScriptedModelProvider::from_text_responses(vec![
             r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+            r#"<invoke>{"name":" tools.session_prompt_set ","arguments":{"content":"turn-debug-private-canary"}</invoke>"#,
             "Recovered answer.",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
@@ -10737,7 +10773,8 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(ToolLoop {
+        let result = zeroclaw_log::scope!(trace_id: turn_id.as_str(), => async {
+            run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10792,6 +10829,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+        }).await
         })
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -10809,6 +10847,20 @@ mod tests {
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
             "history should include internal parser feedback for the model"
         );
+        let mut feedback_events = 0;
+        while let Ok(event) = log_rx.try_recv() {
+            if event["trace_id"] == turn_id {
+                assert!(!event.to_string().contains(marker), "{event}");
+                if event["message"] == "tool_call_parse_feedback_details" {
+                    feedback_events += 1;
+                }
+            }
+        }
+        assert_eq!(
+            feedback_events, 2,
+            "DEBUG branch must be observed, not filtered out"
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]
@@ -16203,7 +16255,7 @@ Let me check the result."#;
             "Native prompt with effective native specs must not deny tool availability"
         );
         assert!(
-            system_prompt.contains("Use tools when the request requires action"),
+            system_prompt.contains("Use tools when this request needs it"),
             "Native prompt with effective native specs should authorize action tool use"
         );
     }
@@ -19220,6 +19272,108 @@ Let me check the result."#;
 
     #[cfg(feature = "observability-otel")]
     #[test]
+    fn capture_llm_messages_redacts_supported_session_prompt_envelopes_and_results() {
+        const MARKER: &str = "session-prompt-private-marker";
+        const RESULT_PREFIX: &str = zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX;
+        const RESULT_MARKER: &str = crate::agent::prompt::SESSION_PROMPT_TEXT_RESULT_MARKER;
+        // Text results use the runtime's reserved carrier. Unmarked user
+        // messages are ordinary input, even when they mention a tool result.
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{MARKER}\"}}}}]}}"#
+            )),
+            ChatMessage::tool(format!("native tool result: {MARKER}")),
+            ChatMessage::assistant(format!(
+                r#"{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}"#
+            )),
+            ChatMessage::user(format!(
+                "{RESULT_PREFIX}{RESULT_MARKER}bare JSON result: {MARKER}"
+            )),
+            ChatMessage::assistant(format!(
+                r#"<toolcall>{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}</toolcall>"#
+            )),
+            ChatMessage::user(format!("{RESULT_PREFIX}\ntext tool result: {MARKER}")),
+            ChatMessage::assistant(
+                r#"<tool_calls>{"name":"session_prompt_list","arguments":{}}</tool_calls>"#,
+            ),
+            ChatMessage::user(format!(
+                "{RESULT_PREFIX}{RESULT_MARKER}plural wrapper result: {MARKER}"
+            )),
+            ChatMessage::assistant(
+                r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            ),
+            ChatMessage::tool(format!("call-id-only list result: {MARKER}")),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let malformed_outputs = [
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"default_api.session_prompt_set"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":" tools.session_prompt_se"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"type": "function_call", "name": "session_prompt_set", "arguments": "{{\"content\":\"{MARKER}\"}}""#
+            ),
+            format!(
+                r#"{{"tool_\u0063alls":[{{"na\u006de":"session_prompt_\u0073et","argu\u006dents":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}}"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}} Done"#
+            ),
+            format!(
+                r#"{{"name":"session_prompt_set","arguments":"{{\"content\":\"{MARKER}\"}}","type":"function_call"#
+            ),
+            format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{MARKER}\"}}}}]"#
+            ),
+        ];
+        let snap =
+            super::capture_llm_messages(&messages, Some(&malformed_outputs[0]), &[]).expect("Some");
+
+        assert!(
+            snap.input
+                .iter()
+                .all(|message| !message.content.contains(MARKER)),
+            "snapshot input must not expose session-prompt content: {:#?}",
+            snap.input
+        );
+        assert_eq!(
+            snap.input.last().map(|message| message.content.as_str()),
+            Some("ordinary next-turn input"),
+            "the redaction boundary must not remove later ordinary input"
+        );
+        for malformed_output in malformed_outputs {
+            let snap =
+                super::capture_llm_messages(&messages, Some(&malformed_output), &[]).expect("Some");
+            assert!(
+                !snap
+                    .output_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(MARKER),
+                "malformed-tool parse-rejection output must not expose session-prompt content"
+            );
+        }
+
+        let ordinary_input = format!("bare JSON result: {MARKER}");
+        let snap = super::capture_llm_messages(&[ChatMessage::user(&ordinary_input)], None, &[])
+            .expect("Some");
+        assert_eq!(snap.input[0].content, ordinary_input);
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
     fn capture_llm_messages_empty_output_and_no_system() {
         let messages = vec![ChatMessage::user("hi")];
         let snap = super::capture_llm_messages(&messages, Some(""), &[]).expect("Some");
@@ -19415,6 +19569,12 @@ Let me check the result."#;
         // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("session_prompt_set"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),
@@ -22582,6 +22742,176 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_cron_rejects_inherited_session_prompt_capability() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+            SessionPromptApproval,
+        };
+        use zeroclaw_infra::session_backend::{
+            ScopedSessionBackend, SessionBackend, SessionPromptBudget, TOOL_LOOP_SESSION_BACKEND,
+            TOOL_LOOP_SESSION_PROMPT_BUDGET, TOOL_LOOP_SESSION_PROMPT_OWNER,
+        };
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = requests.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().unwrap();
+                    requests.push(request);
+                    if requests.len() == 1 {
+                        // Force the calls even when absent from the advertised catalog:
+                        // omission alone must not authorize guessed tool names.
+                        Json(serde_json::json!({"choices": [{"message": {
+                            "content": null,
+                            "tool_calls": [
+                                {"id":"list", "type":"function", "function": {
+                                    "name":"session_prompt_list", "arguments":"{}"}},
+                                {"id":"set", "type":"function", "function": {
+                                    "name":"session_prompt_set", "arguments":
+                                    "{\"id\":\"indirect\",\"content\":\"unexpected write\"}"}},
+                                {"id":"delete", "type":"function", "function": {
+                                    "name":"session_prompt_delete", "arguments":"{\"id\":\"task\"}"}}
+                            ]
+                        }}]}))
+                    } else {
+                        Json(serde_json::json!({"choices": [{"message": {"content":"done"}}]}))
+                    }
+                }
+            }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (tmp, mut config) = isolated_run_test_config();
+        config.channels.session_prompts_enabled = true;
+        // This must be a capability refusal, not an incidental approval refusal.
+        config.session_prompt_approval = SessionPromptApproval::Disabled;
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-scope-test".into()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "cron-scope-test".into(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..Default::default()
+            },
+        );
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let canary = "parent-private-prompt-canary";
+        backend
+            .set_session_prompt("parent", "task", canary)
+            .unwrap();
+        let owner = backend.admit_session_prompt_owner("parent").unwrap();
+        let before = backend.list_session_prompts("parent").unwrap();
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                    Some("parent".into()),
+                    TOOL_LOOP_SESSION_BACKEND.scope(
+                        Some(ScopedSessionBackend(backend.clone())),
+                        TOOL_LOOP_SESSION_PROMPT_OWNER.scope(
+                            Some(owner),
+                            TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                                Some(SessionPromptBudget::new(100, 100_000)),
+                                async {
+                                    // This is the same inline run entry used by cron_run's scheduler.
+                                    let result = Box::pin(super::run(
+                                        config,
+                                        "cron-scope-test",
+                                        Some("run job".into()),
+                                        None,
+                                        None,
+                                        None,
+                                        Vec::new(),
+                                        false,
+                                        Some(tmp.path().join("cron-state.json")),
+                                        None,
+                                        TurnOrigin::Cron,
+                                        super::AgentRunOverrides::default(),
+                                    ))
+                                    .await;
+                                    assert!(
+                                        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                            .with(|allowed| *allowed),
+                                        "nested refusal must restore the parent chat capability"
+                                    );
+                                    result
+                                },
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        server.abort();
+        assert_eq!(result.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "forced calls must complete a result round"
+        );
+        let advertised = requests[0]["tools"].as_array().unwrap();
+        for name in zeroclaw_api::SESSION_PROMPT_TOOL_NAMES {
+            assert!(
+                !advertised
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name),
+                "cron must not advertise {name}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(&*requests).unwrap().contains(canary),
+            "the cron provider must never receive the parent attachment"
+        );
+        let results: Vec<_> = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(results.len(), 3, "all guessed calls must produce refusals");
+        assert!(
+            results
+                .iter()
+                .all(|message| message["content"].as_str().unwrap().contains("Error")),
+            "each forced session-prompt call must fail: {results:?}"
+        );
+        assert_eq!(
+            backend.list_session_prompts("parent").unwrap(),
+            before,
+            "cron must neither set nor delete parent attachments"
+        );
     }
 
     #[tokio::test]

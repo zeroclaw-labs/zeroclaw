@@ -31,6 +31,26 @@ pub mod turn_stop;
 pub mod vad;
 pub mod webhook;
 
+/// Reserved names for tools that manage durable session-prompt attachments.
+/// Every policy and presentation boundary must use this single vocabulary.
+pub const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
+    "session_prompt_list",
+    "session_prompt_set",
+    "session_prompt_delete",
+];
+
+/// Content-mutating subset of [`SESSION_PROMPT_TOOL_NAMES`]. Approval and
+/// redaction boundaries use this vocabulary to keep list operations read-only.
+pub const SESSION_PROMPT_MUTATION_TOOL_NAMES: [&str; 2] =
+    ["session_prompt_set", "session_prompt_delete"];
+
+/// Whether an approval request is the dedicated one-time confirmation for a
+/// session-prompt mutation. The producer sets this marker explicitly; the
+/// approval adapters must not infer policy from unrelated payload fields.
+pub fn is_strict_session_prompt_approval(request: &crate::channel::ChannelApprovalRequest) -> bool {
+    request.strict_session_prompt_approval
+}
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.
@@ -40,9 +60,21 @@ tokio::task_local! {
     /// Read by model_providers that support native tool calling.
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
 
-    /// Session key for the currently active session.
-    /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
+    /// Canonical storage key for the currently active session. It may include
+    /// a storage-domain prefix not present in the caller-visible session ID.
+    /// Scoped by gateway and channel turns, read by session-scoped tools.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// Caller-visible session ID for child-process environment forwarding,
+    /// external conversation attribution, and provider session affinity.
+    /// This remains distinct from `TOOL_LOOP_SESSION_KEY` when a storage
+    /// backend namespaces its keys.
+    pub static TOOL_LOOP_SESSION_ID: Option<String>;
+
+    /// Capability marker for primary durable chat turns. It is deliberately
+    /// absent from ACP, one-shot, delegate, cron, and auxiliary executions so
+    /// session prompt tools cannot create unsupported attachment records.
+    pub static TOOL_LOOP_SESSION_PROMPTS_ALLOWED: bool;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.

@@ -1943,13 +1943,21 @@ pub async fn handle_api_session_message_post(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    if !backend.session_exists(&session_key) {
+    // Bind the durable existence observation and queue incarnation together
+    // before waiting. DELETE publishes invalidation through this same queue
+    // authority only after durable removal, so a queued request cannot adopt a
+    // successor generation after it observed the predecessor.
+    let Some((expected_generation, _session_lifecycle_lease)) = state
+        .session_queue
+        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
+        .await
+    else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
+    };
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1968,6 +1976,18 @@ pub async fn handle_api_session_message_post(
                 .into_response();
         }
     };
+
+    // Deletion shares this queue. Re-check after waiting so a queued POST
+    // cannot recreate metadata that DELETE removed while it was pending.
+    if !backend.session_exists(&session_key)
+        || state.session_queue.lifecycle_generation(&session_key).await != expected_generation
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
     if let Err(e) = backend.append(&session_key, &message) {
@@ -2024,32 +2044,39 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-
-    let cancellation = {
-        let mut tokens = state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned");
-        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
-            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
+    let Some((expected_generation, _session_lifecycle_lease)) = state
+        .session_queue
+        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
+        .await
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
     };
-    if let Some((cancel_key, token)) = cancellation {
-        token.cancel();
+
+    // Do not remove the token before finalization: the active turn owns that
+    // registration and will clean it up. Cancellation is bound to the queue
+    // incarnation captured above, so a stale DELETE cannot affect a same-ID
+    // successor that has registered its own token.
+    let deletion_cancellation =
+        signal_gateway_deletion_at_generation(&state, &session_key, expected_generation);
+    if deletion_cancellation.cancelled_active_turn {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
                     "session_key": session_key,
-                    "cancel_key": cancel_key,
                 })
             ),
             "cancelled in-flight turn for deleted session"
         );
     }
 
-    // Take the same permit turns hold. The cancel above makes a running turn
-    // unwind; waiting here means neither a turn nor a reconnecting socket's
-    // history refresh can straddle the delete.
+    // Wait for the cancelled turn's finalization path before deleting durable
+    // state. Reconnecting sockets' history refreshes use the same permit, so
+    // neither a turn nor a refresh can straddle the deletion.
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
         Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
@@ -2068,8 +2095,22 @@ pub async fn handle_api_session_delete(
         }
     };
 
+    if !backend.session_exists(&session_key)
+        || state.session_queue.lifecycle_generation(&session_key).await != expected_generation
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
     match backend.delete_session(&session_key) {
         Ok(true) => {
+            // Invalidate every already-connected holder only after durable
+            // deletion succeeds. A successor that later reuses this ID gets
+            // the new incarnation.
+            state.session_queue.invalidate(&session_key).await;
             // A connection still holding the deleted conversation must not
             // mistake a recreation under the same key for its own history.
             state.session_queue.advance_generation(&session_key);
@@ -2086,6 +2127,19 @@ pub async fn handle_api_session_delete(
         )
             .into_response(),
     }
+}
+
+/// Signal deletion through the shared gateway lifecycle authority.
+pub(crate) fn signal_gateway_deletion_at_generation(
+    state: &AppState,
+    session_key: &str,
+    expected_generation: u64,
+) -> zeroclaw_infra::gateway_session::GatewayDeletionCancellation {
+    zeroclaw_infra::gateway_session::signal_deletion_at_generation(
+        &state.cancel_tokens,
+        session_key,
+        expected_generation,
+    )
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -2236,9 +2290,11 @@ pub async fn handle_api_session_abort(
             .lock()
             .expect("cancel_tokens lock poisoned");
         let cancel_key = resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key));
-        let token = cancel_key
-            .as_deref()
-            .and_then(|key| tokens.get(key).cloned());
+        let token = cancel_key.as_deref().and_then(|key| {
+            tokens
+                .get(key)
+                .map(|(_, token)| std::sync::Arc::clone(token))
+        });
         (cancel_key, token)
     };
 
@@ -2513,7 +2569,9 @@ pub(crate) mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(
+                crate::GatewayCancellationRegistry::default(),
+            )),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -3528,7 +3586,7 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
+    pub(crate) fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
     ) -> AppState {
@@ -3714,6 +3772,275 @@ pub(crate) mod tests {
         assert_eq!(messages[1].content, "queued notification");
     }
 
+    #[tokio::test]
+    async fn session_message_post_does_not_recreate_a_session_deleted_while_queued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let response_fut = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "stale queued notification"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should be queued before deletion"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!backend.session_exists("gw_operator-1"));
+        assert!(backend.load("gw_operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_does_not_append_to_a_same_id_successor_after_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let response_fut = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "stale queued notification"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should be queued before the lifecycle changes"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        state.session_queue.invalidate("gw_operator-1").await;
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 1, "the successor must remain untouched");
+        assert_eq!(messages[0].content, "successor");
+    }
+
+    #[tokio::test]
+    async fn session_delete_does_not_remove_a_same_id_successor_after_queue_wait() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let delete_fut = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        );
+        tokio::pin!(delete_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete_fut)
+                .await
+                .is_err(),
+            "DELETE should be queued behind the lifecycle guard"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        state.session_queue.invalidate("gw_operator-1").await;
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), delete_fut)
+            .await
+            .expect("queued DELETE should finish")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 1, "the successor must remain intact");
+        assert_eq!(messages[0].content, "successor");
+    }
+
+    #[tokio::test]
+    async fn stale_session_delete_cannot_cancel_a_same_id_successor_turn() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1";
+        let predecessor_generation = 4;
+        let successor_generation = predecessor_generation + 1;
+        let successor_token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                session_key.to_string(),
+                (successor_generation, Arc::new(successor_token.clone())),
+            );
+
+        let stale =
+            signal_gateway_deletion_at_generation(&state, session_key, predecessor_generation);
+        assert!(
+            !stale.cancelled_active_turn,
+            "a stale DELETE must not find the successor token"
+        );
+        drop(stale);
+        assert!(
+            !successor_token.is_cancelled(),
+            "a stale DELETE must not cancel the same-ID successor"
+        );
+
+        let active =
+            signal_gateway_deletion_at_generation(&state, session_key, successor_generation);
+        assert!(active.cancelled_active_turn);
+        assert!(successor_token.is_cancelled());
+    }
+
+    #[test]
+    fn session_delete_retains_generation_latches_out_of_order() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1";
+        let predecessor_generation = 4;
+        let successor_generation = predecessor_generation + 1;
+
+        let predecessor =
+            signal_gateway_deletion_at_generation(&state, session_key, predecessor_generation);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions()
+                .get(session_key)
+                .is_some_and(|generations| generations.contains(&predecessor_generation))
+        );
+
+        let successor =
+            signal_gateway_deletion_at_generation(&state, session_key, successor_generation);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions()
+                .get(session_key)
+                .is_some_and(|generations| {
+                    generations.contains(&predecessor_generation)
+                        && generations.contains(&successor_generation)
+                }),
+            "a successor DELETE must retain a stale predecessor latch"
+        );
+
+        drop(predecessor);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions()
+                .get(session_key)
+                .is_some_and(|generations| generations.contains(&successor_generation)),
+            "the predecessor guard must not clear the successor latch"
+        );
+
+        let late_predecessor =
+            signal_gateway_deletion_at_generation(&state, session_key, predecessor_generation);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions()
+                .get(session_key)
+                .is_some_and(|generations| {
+                    generations.contains(&predecessor_generation)
+                        && generations.contains(&successor_generation)
+                }),
+            "an out-of-order stale DELETE must not overwrite the successor latch"
+        );
+        drop(late_predecessor);
+
+        drop(successor);
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .pending_deletions()
+                .contains_key(session_key)
+        );
+    }
+
     #[test]
     fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
         let none = |_key: &str| false;
@@ -3812,7 +4139,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(session_key.clone(), std::sync::Arc::new(token.clone()));
+            .insert(session_key.clone(), (0, std::sync::Arc::new(token.clone())));
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -3838,7 +4165,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_operator-1".to_string(),
-                std::sync::Arc::new(token.clone()),
+                (0, std::sync::Arc::new(token.clone())),
             );
 
         let response = handle_api_session_abort(
@@ -3865,7 +4192,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team_alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
+                (0, std::sync::Arc::new(token.clone())),
             );
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
@@ -3897,7 +4224,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
+                (0, std::sync::Arc::new(token.clone())),
             );
 
         let response = handle_api_session_abort(
@@ -3924,7 +4251,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
+                (0, std::sync::Arc::new(token.clone())),
             );
 
         let response = handle_api_session_abort(
@@ -3952,7 +4279,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                std::sync::Arc::new(dotted_token.clone()),
+                (0, std::sync::Arc::new(dotted_token.clone())),
             );
         state
             .cancel_tokens
@@ -3960,7 +4287,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team_alpha".to_string(),
-                std::sync::Arc::new(underscored_token.clone()),
+                (0, std::sync::Arc::new(underscored_token.clone())),
             );
 
         let dotted_response = handle_api_session_abort(
@@ -4016,7 +4343,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+            .insert("gw_team.alpha".to_string(), (0, Arc::new(token.clone())));
 
         let response = handle_api_session_delete(
             State(state),
@@ -4060,7 +4387,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+            .insert("gw_team.alpha".to_string(), (0, Arc::new(token.clone())));
 
         let response = handle_api_session_delete(
             State(state),

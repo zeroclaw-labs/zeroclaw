@@ -215,6 +215,15 @@ fn has_arguments_signal(value: &serde_json::Value) -> bool {
     value.get("arguments").is_some() || value.get("parameters").is_some()
 }
 
+fn has_responses_function_call_shape(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|ty| ty == "function_call")
+        && has_non_empty_string(value, "name")
+        && (has_arguments_signal(value) || has_non_empty_string(value, "call_id"))
+}
+
 fn looks_like_tool_call_object(value: &serde_json::Value) -> bool {
     if let Some(function) = value.get("function").and_then(serde_json::Value::as_object) {
         let function = serde_json::Value::Object(function.clone());
@@ -259,13 +268,7 @@ fn tool_call_array_has_malformed_protocol_signal(value: &serde_json::Value, key:
 fn classify_tool_protocol_json_value(
     value: &serde_json::Value,
 ) -> Option<ToolProtocolEnvelopeKind> {
-    if value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|ty| ty == "function_call")
-        && has_non_empty_string(value, "name")
-        && (has_arguments_signal(value) || has_non_empty_string(value, "call_id"))
-    {
+    if has_responses_function_call_shape(value) {
         return Some(ToolProtocolEnvelopeKind::ResponsesFunctionCall);
     }
 
@@ -298,6 +301,7 @@ fn classify_tool_protocol_json_value(
 fn json_value_mentions_known_tool(
     value: &serde_json::Value,
     known_tool_names: &HashSet<String>,
+    require_invocation_shape: bool,
 ) -> bool {
     if known_tool_names.is_empty() {
         return false;
@@ -305,9 +309,9 @@ fn json_value_mentions_known_tool(
 
     let Some(object) = value.as_object() else {
         return value.as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+            items.iter().any(|item| {
+                json_value_mentions_known_tool(item, known_tool_names, require_invocation_shape)
+            })
         });
     };
 
@@ -319,7 +323,11 @@ fn json_value_mentions_known_tool(
             .is_some_and(|name| known_tool_names.contains(&name.to_ascii_lowercase()))
     };
 
-    if name_matches(object.get("name")) {
+    if name_matches(object.get("name"))
+        && (!require_invocation_shape
+            || has_arguments_signal(value)
+            || has_responses_function_call_shape(value))
+    {
         return true;
     }
 
@@ -328,13 +336,13 @@ fn json_value_mentions_known_tool(
         .and_then(serde_json::Value::as_object)
     {
         let function = serde_json::Value::Object(function.clone());
-        if json_value_mentions_known_tool(&function, known_tool_names) {
+        if json_value_mentions_known_tool(&function, known_tool_names, require_invocation_shape) {
             return true;
         }
     }
 
     if let Some(function_call) = object.get("function_call")
-        && json_value_mentions_known_tool(function_call, known_tool_names)
+        && json_value_mentions_known_tool(function_call, known_tool_names, require_invocation_shape)
     {
         return true;
     }
@@ -344,9 +352,9 @@ fn json_value_mentions_known_tool(
             .get(*key)
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+                items.iter().any(|item| {
+                    json_value_mentions_known_tool(item, known_tool_names, require_invocation_shape)
+                })
             })
     })
 }
@@ -354,6 +362,26 @@ fn json_value_mentions_known_tool(
 pub fn tool_protocol_envelope_mentions_known_tool(
     text: &str,
     known_tool_names: &HashSet<String>,
+) -> bool {
+    known_tool_envelope_matches(text, known_tool_names, false)
+}
+
+/// Recognize invocation-shaped envelopes for export-only redaction.
+///
+/// Unlike the shared protocol guard, this preserves business JSON with only a
+/// known `name`. Do not use this stricter predicate for streaming suppression:
+/// the parser accepts argument-less calls inside mixed protocol arrays.
+pub fn tool_invocation_envelope_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    known_tool_envelope_matches(text, known_tool_names, true)
+}
+
+fn known_tool_envelope_matches(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+    require_invocation_shape: bool,
 ) -> bool {
     if known_tool_names.is_empty() {
         return false;
@@ -365,7 +393,7 @@ pub fn tool_protocol_envelope_mentions_known_tool(
     }
 
     if let Some(body) = json_fence_body(trimmed) {
-        return tool_protocol_envelope_mentions_known_tool(body, known_tool_names);
+        return known_tool_envelope_matches(body, known_tool_names, require_invocation_shape);
     }
 
     if starts_with_tool_protocol_tag_or_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed)
@@ -379,8 +407,30 @@ pub fn tool_protocol_envelope_mentions_known_tool(
         }
     }
 
-    serde_json::from_str::<serde_json::Value>(trimmed)
-        .is_ok_and(|value| json_value_mentions_known_tool(&value, known_tool_names))
+    serde_json::from_str::<serde_json::Value>(trimmed).is_ok_and(|value| {
+        json_value_mentions_known_tool(&value, known_tool_names, require_invocation_shape)
+    })
+}
+
+/// Return whether the runtime would accept any call to one of `known_tool_names`.
+///
+/// This deliberately follows [`parse_tool_calls`] for legacy text formats
+/// rather than maintaining a second list of provider spellings. Complete JSON
+/// stays with [`tool_invocation_envelope_mentions_known_tool`], whose structural
+/// discriminator distinguishes an invocation from business JSON that happens
+/// to carry a `name` field. Callers at export-only boundaries use both helpers
+/// to preserve accepted-call identity without changing parsing or model-visible
+/// history.
+pub fn parsed_tool_protocol_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    !known_tool_names.is_empty()
+        && serde_json::from_str::<serde_json::Value>(text.trim()).is_err()
+        && parse_tool_calls(text)
+            .1
+            .iter()
+            .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
 }
 
 fn has_malformed_tool_protocol_json_signal(value: &serde_json::Value) -> bool {
@@ -660,11 +710,242 @@ pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
     tool_protocol_json_identifying_keys().any(|key| trimmed.contains(key))
 }
 
+fn malformed_json_string_fields(text: &str) -> Vec<(String, String)> {
+    // Match keys independently of values. In broken JSON an unterminated
+    // earlier value can appear to close at a later key's opening quote;
+    // consuming that quote as part of a field pair would hide the later name.
+    malformed_json_field_key_regex()
+        .captures_iter(text)
+        .filter_map(|cap| {
+            let key = serde_json::from_str::<String>(cap.get(1)?.as_str()).ok()?;
+            let value = serde_json::Deserializer::from_str(&text[cap.get(0)?.end()..])
+                .into_iter::<String>()
+                .next()?
+                .ok()?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn malformed_json_field_key_regex() -> &'static Regex {
+    static JSON_FIELD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"("(?:\\.|[^"\\])*")\s*:"#).expect("JSON_FIELD_KEY_RE regex must compile")
+    });
+    &JSON_FIELD_KEY_RE
+}
+
+fn malformed_json_field_names(text: &str) -> HashSet<String> {
+    malformed_json_field_key_regex()
+        .captures_iter(text)
+        .filter_map(|cap| serde_json::from_str::<String>(cap.get(1)?.as_str()).ok())
+        .collect()
+}
+
+/// Recognize an incomplete JSON invocation of a known sensitive tool.
+///
+/// This is for export-only privacy boundaries, not parsing or provider-visible
+/// history. It requires both an arguments-like field and a recovered sensitive
+/// tool name. An unterminated name value may end partway through the name, so a
+/// non-empty prefix of a known sensitive name is sufficient only when that
+/// JSON string is itself unterminated. That preserves ordinary malformed-tool
+/// diagnostics while withholding opaque arguments from a truncated sensitive
+/// invocation. If truncation occurs before a sensitive name can be recovered,
+/// the envelope remains classified as a generic malformed diagnostic and is
+/// not parsed or executed; failing closed there would also redact
+/// indistinguishable malformed calls to ordinary tools.
+pub fn looks_like_malformed_json_tool_invocation(
+    text: &str,
+    known_sensitive_tool_names: &HashSet<String>,
+) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_malformed_json_tool_invocation(body, known_sensitive_tool_names);
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    let field_names = malformed_json_field_names(trimmed);
+    let string_fields = malformed_json_string_fields(trimmed);
+    let has_arguments = ["arguments", "parameters"]
+        .iter()
+        .any(|key| field_names.contains(*key));
+    let has_known_sensitive_name =
+        string_fields.iter().any(|(key, value)| {
+            key == "name"
+                && known_sensitive_tool_names
+                    .contains(&map_tool_name_alias(value.trim()).to_ascii_lowercase())
+        }) || has_unterminated_sensitive_name_prefix(&lower, known_sensitive_tool_names);
+    // This helper is used for sensitive-export redaction. A malformed generic
+    // tool envelope must retain its diagnostic and provider history; only a
+    // recovered sensitive name establishes that opaque prompt content is present.
+    has_arguments && has_known_sensitive_name
+}
+
+/// Recover a sensitive identity from a rejected tagged call for export only.
+/// Uses the execution parser's tag vocabulary without accepting or executing
+/// the damaged call. An ordinary outer tool name takes precedence over names
+/// mentioned inside its arguments.
+pub fn malformed_tagged_invocation_mentions_known_tool(
+    content: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    struct CallName<'a> {
+        recovered: &'a mut Option<bool>,
+        known: &'a HashSet<String>,
+    }
+    impl<'de> serde::de::Visitor<'de> for CallName<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a tool-call object with a top-level name")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "name" {
+                    let name = map.next_value::<String>()?;
+                    // Rejected envelopes retain the execution parser's name
+                    // identity, without becoming accepted or executable calls.
+                    *self.recovered = Some(
+                        self.known
+                            .contains(&map_tool_name_alias(name.trim()).to_ascii_lowercase()),
+                    );
+                    return Ok(());
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let lower = content.to_ascii_lowercase();
+    TOOL_CALL_OPEN_TAGS.iter().any(|tag| {
+        let prefix = tag.trim_end_matches('>');
+        lower.match_indices(prefix).any(|(start, _)| {
+            // MiniMax encodes identity in the opening tag, not a JSON body.
+            // Recover only that identity; a missing close must not admit a call.
+            if let Some(name) = minimax_invocation_identity(&content[start..]) {
+                return known_tool_names.contains(&name.to_ascii_lowercase());
+            }
+            let rest = &content[start + prefix.len()..];
+            let body = rest
+                .trim_start()
+                .strip_prefix('>')
+                .unwrap_or(rest)
+                .trim_start();
+            if let Some(name) = minimax_invocation_identity(body) {
+                return known_tool_names.contains(&name.to_ascii_lowercase());
+            }
+            if body.starts_with('<') {
+                // XML's outer element owns the tool identity even when its
+                // closing element is damaged. Do not search argument elements.
+                return XML_OPEN_TAG_RE.captures(body).is_some_and(|capture| {
+                    capture.get(0).is_some_and(|matched| matched.start() == 0)
+                        && capture.get(1).is_some_and(|name| {
+                            known_tool_names.contains(&name.as_str().to_ascii_lowercase())
+                        })
+                });
+            }
+            if body.starts_with('[') {
+                return looks_like_malformed_json_tool_invocation(body, known_tool_names);
+            }
+            if !body.starts_with('{') {
+                return false;
+            }
+            let mut recovered = None;
+            let mut decoder = serde_json::Deserializer::from_str(body);
+            // Keep a recovered identity even if checking the remaining map fails.
+            let _ = serde::Deserializer::deserialize_map(
+                &mut decoder,
+                CallName {
+                    recovered: &mut recovered,
+                    known: known_tool_names,
+                },
+            );
+            recovered.unwrap_or_else(|| {
+                looks_like_malformed_json_tool_invocation(body, known_tool_names)
+            })
+        })
+    })
+}
+
+fn has_unterminated_sensitive_name_prefix(
+    lower_text: &str,
+    known_sensitive_tool_names: &HashSet<String>,
+) -> bool {
+    let mut search_start = 0;
+    while let Some(relative_name_key) = lower_text[search_start..].find("\"name\"") {
+        let name_key_start = search_start + relative_name_key;
+        let after_key = &lower_text[name_key_start + "\"name\"".len()..];
+        let after_colon = after_key.trim_start().strip_prefix(':');
+        let Some(after_open_quote) = after_colon
+            .map(str::trim_start)
+            .and_then(|value| value.strip_prefix('"'))
+        else {
+            search_start = name_key_start + "\"name\"".len();
+            continue;
+        };
+        // Export-only recovery must normalize incomplete identities too;
+        // execution's complete-name parser trims whitespace and resolves aliases.
+        let after_open_quote = after_open_quote.trim_start();
+
+        let mut prefix_end = 0;
+        let mut escaped = false;
+        let mut terminated = false;
+        for (offset, character) in after_open_quote.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '"' => {
+                    terminated = true;
+                    break;
+                }
+                character
+                    if character.is_ascii_alphanumeric()
+                        || matches!(character, '_' | '.' | '-') =>
+                {
+                    prefix_end = offset + character.len_utf8();
+                }
+                _ => break,
+            }
+        }
+
+        if !terminated {
+            let prefix = map_tool_name_alias(&after_open_quote[..prefix_end]);
+            if !prefix.is_empty()
+                && known_sensitive_tool_names
+                    .iter()
+                    .any(|known_name| known_name.starts_with(prefix))
+            {
+                return true;
+            }
+        }
+
+        search_start = name_key_start + "\"name\"".len();
+    }
+    false
+}
+
 fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
     if known_tool_names.is_empty() {
         return false;
     }
 
+    // Shared suppression retains upstream's direct name-field search: an
+    // earlier unterminated argument string must not consume a later name.
+    // Decoded field-pair matching is confined to export redaction behind its
+    // own admission boundary, not used to redefine streaming detection.
     static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
     });
@@ -840,6 +1121,21 @@ static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</invoke>"#)
         .expect("MINIMAX_INVOKE_RE regex must compile")
 });
+
+// Export-only identity recovery mirrors the MiniMax opening-tag grammar.
+// No closing tag or arguments are required: this never accepts a tool call.
+static MINIMAX_INVOKE_IDENTITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)^<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
+        .expect("MINIMAX_INVOKE_IDENTITY_RE regex must compile")
+});
+
+fn minimax_invocation_identity(content: &str) -> Option<&str> {
+    let capture = MINIMAX_INVOKE_IDENTITY_RE.captures(content)?;
+    capture
+        .get(1)
+        .or_else(|| capture.get(2))
+        .map(|name| map_tool_name_alias(name.as_str().trim()))
+}
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -3346,6 +3642,173 @@ mod tests {
             "The \"tool_call_id\" field identifies the call."
         ));
         assert!(!looks_like_incomplete_tool_protocol_json(""));
+    }
+
+    #[test]
+    fn malformed_json_tool_invocation_detection_requires_sensitive_name() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"type": "function_call", "name": "session_prompt_set", "arguments": "{"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"tool_\u0063alls":[{"arguments":{"content":"secret"},"name":"session_prompt_set}]} Done"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"arguments":{"content":"secret"},"name":"session_prompt_se"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"arguments":{"content":"secret"},"name":"session_prompt_setter"}]"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"name":"session_prompt_set","arguments":"{\"content\":\"secret\"}","type":"function_call"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"retries": 3, "timeout_ms":"#,
+            &known,
+        ));
+    }
+
+    #[test]
+    fn arguments_first_export_detection_recovers_names_after_broken_values() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"arguments":{"content":"secret},"name":"session_prompt_set"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"content":"C:\workspace\"},"name":"session_prompt_set"}]}"#,
+            r#"{"tool_calls":[{"parameters":{"content":"secret},"na\u006de":"session_prompt_\u0073et"}]}"#,
+            r#"{"tool_calls":[{"arguments":"secret},"name":"session_prompt_set"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(envelope).is_err());
+            assert!(
+                looks_like_malformed_json_tool_invocation(envelope, &known),
+                "a broken earlier value must not consume a later sensitive name"
+            );
+            assert!(looks_like_malformed_json_tool_invocation(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+            assert!(!looks_like_malformed_json_tool_invocation(
+                &envelope
+                    .replace("session_prompt_set", "shell")
+                    .replace("session_prompt_\\u0073et", "shell"),
+                &known,
+            ));
+        }
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"content":"secret},"name":"session_prompt_set"}"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"arguments":{},"name":"session_prompt_set"}"#,
+            &known,
+        ));
+    }
+
+    #[test]
+    fn shared_malformed_detector_preserves_arguments_first_idless_calls() {
+        let known = HashSet::from(["shell".to_owned(), "file_read".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"path":"C:\temp\"},"name":"file_read"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<serde_json::Value>(envelope).is_err());
+            assert!(!looks_like_malformed_tool_protocol_envelope(envelope));
+            assert!(looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                envelope, &known,
+            ));
+            assert!(looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+        }
+        assert!(
+            !looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                r#"{"tool_calls":[{"name":"sh\u0065ll","arguments":"{"#,
+                &known,
+            )
+        );
+        assert!(
+            !looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"unknown"}]}"#,
+                &known,
+            )
+        );
+    }
+
+    #[test]
+    fn shared_detector_preserves_argumentless_calls_in_mixed_envelopes() {
+        let known = HashSet::from(["shell".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"name":"unknown","arguments":{}},{"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"name":"unknown","parameters":{}},{"function":{"name":"shell"}}]}"#,
+        ] {
+            assert!(classify_tool_protocol_envelope(envelope).is_some());
+            assert!(
+                parse_tool_calls(envelope)
+                    .1
+                    .iter()
+                    .any(|call| call.name == "shell")
+            );
+            assert!(tool_protocol_envelope_mentions_known_tool(envelope, &known));
+            assert!(!tool_invocation_envelope_mentions_known_tool(
+                envelope, &known
+            ));
+            assert!(tool_protocol_envelope_mentions_known_tool(
+                &format!("```json\n{envelope}\n```"),
+                &known,
+            ));
+        }
+    }
+
+    #[test]
+    fn known_tool_detection_requires_complete_invocation_shape() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        assert!(!tool_invocation_envelope_mentions_known_tool(
+            r#"{"name":"session_prompt_set","description":"Document this identifier"}"#,
+            &known,
+        ));
+        assert!(tool_invocation_envelope_mentions_known_tool(
+            r#"{"name":"session_prompt_set","arguments":{"content":"opaque"}}"#,
+            &known,
+        ));
+        assert!(tool_invocation_envelope_mentions_known_tool(
+            r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            &HashSet::from(["session_prompt_list".to_owned()]),
+        ));
+    }
+
+    #[test]
+    fn parsed_known_tool_detection_tracks_accepted_legacy_text_formats() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        for response in [
+            r#"<minimax:tool_call>{"name":"session_prompt_set","arguments":{"content":"opaque"}}</minimax:tool_call>"#,
+            r#"<invoke name="session_prompt_set"><parameter name="content">opaque</parameter></invoke>"#,
+            r#"TOOL_CALL
+{tool => "session_prompt_set", args => { --content "opaque" }}}
+/TOOL_CALL"#,
+            "session_prompt_set/content>opaque",
+        ] {
+            assert!(
+                parsed_tool_protocol_mentions_known_tool(response, &known),
+                "accepted parser representation must retain known-tool identity: {response}"
+            );
+        }
+
+        assert!(!parsed_tool_protocol_mentions_known_tool(
+            r#"{"name":"session_prompt_set","description":"A documented identifier"}"#,
+            &known,
+        ));
     }
 
     #[test]

@@ -3,8 +3,10 @@
 
 pub mod acp_session_store;
 pub mod debounce;
+pub mod gateway_session;
 pub mod net_guard;
 pub mod session_backend;
+pub mod session_prompts;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;

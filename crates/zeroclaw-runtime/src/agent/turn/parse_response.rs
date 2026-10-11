@@ -10,7 +10,9 @@ use super::protocol_detect::{
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
 use crate::agent::cost::record_tool_loop_cost_usage;
-use crate::agent::loop_::capture_llm_messages;
+use crate::agent::{
+    loop_::capture_llm_messages, prompt::redact_session_prompt_text_protocol_for_export,
+};
 use crate::observability::ObserverEvent;
 use std::time::Instant;
 use zeroclaw_api::agent::TurnEvent;
@@ -292,7 +294,9 @@ pub(crate) async fn interpret_chat_response(
                     "model": model,
                     "iteration": iteration + 1,
                     "issue": issue.as_str(),
-                    "response": scrub_credentials(&response_text),
+                    "response": scrub_credentials(
+                        &redact_session_prompt_text_protocol_for_export(&response_text),
+                    ),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_parse_issue"
@@ -430,7 +434,9 @@ pub(crate) async fn record_accepted_chat_response(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost_usd,
-                "raw_response": scrub_credentials(response_text),
+                "raw_response": scrub_credentials(
+                    &redact_session_prompt_text_protocol_for_export(response_text),
+                ),
                 "native_tool_calls": native_tool_calls.len(),
                 "parsed_tool_calls": parsed_tool_calls,
                 "trace_id": ctx.turn_id,
@@ -443,6 +449,54 @@ pub(crate) async fn record_accepted_chat_response(
 mod tests {
     use super::{build_native_assistant_history, unforwarded_narration};
     use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn shared_protocol_detection_withholds_idless_and_mixed_envelopes() {
+        use super::super::{protocol_detect, stream_guard::StreamTextGuard};
+        let known = std::collections::HashSet::from(["shell".to_owned()]);
+        for envelope in [
+            r#"{"tool_calls":[{"name":"unknown","arguments":{}},{"name":"shell"}]}"#,
+            r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#,
+        ] {
+            for chunks in [vec![envelope], vec![&envelope[..35], &envelope[35..]]] {
+                let mut guard = StreamTextGuard::new(Some(&[crate::tools::ToolSpec::new(
+                    "shell",
+                    "run a command",
+                    serde_json::json!({"type": "object"}),
+                )]));
+                let mut forwarded = String::new();
+                for chunk in chunks {
+                    if let Some(text) = guard.push(chunk) {
+                        forwarded.push_str(&text);
+                    }
+                }
+                if let Some(tail) = guard.finish() {
+                    forwarded.push_str(&tail);
+                }
+                assert_eq!(forwarded, "");
+                assert!(guard.suppressed_protocol);
+            }
+        }
+        let malformed = r#"{"tool_calls":[{"arguments":{"command":"ls},"name":"shell"}]}"#;
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(malformed);
+        assert!(calls.is_empty());
+        assert!(
+            protocol_detect::detect_tool_call_parse_issue_for_known_tools(
+                malformed, &calls, &known
+            )
+            .is_some()
+        );
+        let ordinary = r#"{"retries":3,"timeout_ms":1000}"#;
+        let mut guard = StreamTextGuard::new(Some(&[crate::tools::ToolSpec::new(
+            "shell",
+            "run a command",
+            serde_json::json!({"type": "object"}),
+        )]));
+        let mut forwarded = guard.push(ordinary).unwrap_or_default();
+        forwarded.push_str(&guard.finish().unwrap_or_default());
+        assert_eq!(forwarded, ordinary);
+        assert!(!guard.suppressed_protocol);
+    }
 
     #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {
@@ -564,6 +618,7 @@ mod argument_preservation_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "",
             channel_reply_target: None,
             cancellation_token: None,
@@ -621,6 +676,179 @@ mod argument_preservation_tests {
             false,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn arguments_first_export_omits_attachment_from_emitted_parse_issue() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            session_prompt_approval_required: true,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "arguments-first-export-log",
+            serving_provider_name: None,
+            serving_model: None,
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: vec![ToolSpec::new(
+                "session_prompt_set",
+                "attach session context",
+                json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["session_prompt_set".to_owned()]),
+            use_native_tools: false,
+        };
+
+        // Protect the real log broadcast hook from parallel writer tests.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        let marker = "session-prompt-private-marker";
+        let mut cases: Vec<String> = [marker.to_string(), format!("C:\\workspace\\{marker}\\")]
+            .into_iter()
+            .map(|value| format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{value}}},"name":"session_prompt_set"}}]}}"#
+            ))
+            .collect();
+        cases.push(format!(
+            r#"<invoke>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}</invoke>"#
+        ));
+        for name in [
+            "default_api.session_prompt_set",
+            " tools.session_prompt_set ",
+        ] {
+            cases.push(format!(
+                r#"<invoke>{{"name":"{name}","arguments":{{"content":"{marker}"}}</invoke>"#
+            ));
+        }
+        cases.push(format!(r#"Saving that. {{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}"#));
+        cases.push(format!(
+            "<tool_call><session_prompt_set><id>task</id><content>{marker}</content></tool_call>"
+        ));
+        let truncated_cases =
+            ["default_api.session_prompt_set", " tools.session_prompt_se"].map(|name| {
+                format!(r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"{name}"#)
+            });
+        for (malformed, expect_parse_issue) in cases
+            .into_iter()
+            .map(|text| (text, true))
+            .chain(truncated_cases.into_iter().map(|text| (text, false)))
+        {
+            let mut guard =
+                super::super::stream_guard::StreamTextGuard::new(Some(&specs.tool_specs));
+            let mut forwarded = guard.push(&malformed).unwrap_or_default();
+            forwarded.push_str(&guard.finish().unwrap_or_default());
+            // The arguments-first broken-string cases exercise log masking
+            // independently; the preamble case also proves upstream stream
+            // suppression and downstream export agree on the same raw text.
+            if malformed.starts_with("Saving that.") {
+                assert!(guard.suppressed_protocol);
+                assert!(!forwarded.contains(marker));
+            }
+            let interpreted = interpret_chat_response(
+                &ctx,
+                "test.provider",
+                "test-model",
+                ChatResponse {
+                    text: Some(malformed.clone()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                &[],
+                &specs,
+                guard.suppressed_protocol,
+                0,
+                false,
+            )
+            .await;
+            assert_eq!(
+                interpreted.parse_issue_detected, expect_parse_issue,
+                "{malformed}: {:?}",
+                interpreted.tool_calls
+            );
+            assert!(interpreted.tool_calls.is_empty());
+            assert_eq!(interpreted.assistant_history_content, malformed);
+
+            // Truncated names are export-sensitive without changing upstream
+            // parse-issue classification; only existing rejected shapes emit WARN.
+            if expect_parse_issue {
+                let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let event = log_rx
+                            .recv()
+                            .await
+                            .expect("log broadcast remains installed");
+                        if event["message"] == "tool_call_parse_issue"
+                            && event["trace_id"] == ctx.turn_id
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .expect("the production parser must emit its parse-issue event");
+                assert_eq!(
+                    logged["attributes"]["response"],
+                    redact_session_prompt_text_protocol_for_export(&malformed).as_ref()
+                );
+                assert!(!logged.to_string().contains(marker));
+            }
+
+            record_accepted_chat_response(
+                &ctx,
+                "test.provider",
+                "test-model",
+                &malformed,
+                &[],
+                0,
+                None,
+                &[],
+                std::time::Instant::now(),
+                0,
+                None,
+            )
+            .await;
+            let response_logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = log_rx
+                        .recv()
+                        .await
+                        .expect("log broadcast remains installed");
+                    if event["message"] == "llm_response" && event["trace_id"] == ctx.turn_id {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("the production response recorder must emit its INFO event");
+            assert_eq!(
+                response_logged["attributes"]["raw_response"],
+                redact_session_prompt_text_protocol_for_export(&malformed).as_ref()
+            );
+            assert!(!response_logged.to_string().contains(marker));
+        }
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]
@@ -849,6 +1077,7 @@ mod cost_usd_regression_tests {
             },
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "",
             channel_reply_target: None,
             cancellation_token: None,
@@ -994,6 +1223,7 @@ mod cost_usd_regression_tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "",
             channel_reply_target: None,
             cancellation_token: None,

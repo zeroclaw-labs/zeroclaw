@@ -24,6 +24,7 @@ pub(crate) enum ComponentIntent {
     Approval {
         token: String,
         decision: super::approval::ApprovalDecision,
+        strict_session_prompt_approval: bool,
     },
 }
 

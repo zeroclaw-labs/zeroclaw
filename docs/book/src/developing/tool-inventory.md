@@ -52,7 +52,7 @@ product integrations.
 | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule` | Scheduling affects autonomous execution, ownership, and run history; keep it policy-visible in core. |
 | `spawn_subagent`, `delegate`, `send_message_to_peer` | Delegation is part of the agent execution model and must share risk profiles, tools, memory, and parent/child constraints. |
 | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room` | These are channel-bridging operator interaction primitives with late-bound channel handles and receipts. |
-| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session visibility and history access share the daemon/gateway session backend and agent ownership boundaries. `sessions_send` is a deprecated legacy Chat-history append: it does not notify or run a session. Use `send_message_to_peer` for agent-to-agent messaging. |
+| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send`, `session_prompt_list`, `session_prompt_set`, `session_prompt_delete` | Session visibility, history access, and persistent prompt management share the daemon/gateway session backend and agent ownership boundaries. `sessions_send` is a deprecated legacy Chat-history append: it does not notify or run a session. Use `send_message_to_peer` for agent-to-agent messaging. |
 | `model_routing_config`, `model_switch`, `proxy_config` | These expose the current model/proxy routing control plane and should not drift from config-source behavior. |
 | `TodoWrite` | Maintains the agent's structured task list inside the runtime tool surface; keep its stable tool name and lifecycle behavior in core. |
 | `read_skill` and skill-defined tools with `kind = "shell"`, `kind = "http"`, or `kind = "builtin"` | Skills are an intended extension surface, but the runtime bridge that turns installed skills into tools is core. |
@@ -193,6 +193,7 @@ keeps constructing them.
 | Control plane | `model_switch`, `model_routing_config`, `proxy_config` | The turn-scoped model-switch state that the runtime tool loop installs. The last two mutate config: both rewrite the config file, and `proxy_config` also sets the process-wide runtime proxy that the HTTP request and web fetch tools read. They can be built from the tier-test inputs, so keeping them runtime-owned is a judgment call recorded here. |
 | Channel bridging | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room`, `send_via`, `git_forge` | Late-bound channel maps that assembly returns to its caller, which fills them afterwards; `reaction` and `git_forge` share one map, `ask_user` and `send_via` share another. |
 | Sessions | `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | The ACP session read view, which only the ACP agent path passes; the session backend itself is opened from config. |
+| Session prompts | `session_prompt_list`, `session_prompt_set`, `session_prompt_delete` | Opt-in SQLite Chat-session attachments. The runtime binds their access to the admitted session owner and applies name-keyed exact mutation approval, hook exclusion and sensitive-result handling; unsupported turn types cannot acquire that capability. |
 | SOP | `sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`, `sop_workshop` | The SOP engine and audit logger. |
 | Skills | `read_skill` | The skills loader, and the channel prompt path selects the skills prompt mode by whether `read_skill` is available. |
 | Task list | `TodoWrite` | The runtime emits plan events only for this name, and that is the sole feed of the ZeroCode task tracker. |
@@ -239,7 +240,7 @@ any later gating must first migrate them.
 ### Deviation from the FND-001 baseline
 
 FND-001 D5 names eleven kernel tools and says "Everything else is registered by
-installed plugins." This classification deviates from that: 51 tools stay
+installed plugins." This classification deviates from that: 54 tools stay
 runtime-constructed beyond the eleven. Most need a runtime handle that
 `ToolRequest` does not carry, or have runtime behavior keyed on their names.
 The rest pass the tier test and are kept by judgment: `cron_list` and

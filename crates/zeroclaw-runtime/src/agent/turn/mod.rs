@@ -565,6 +565,11 @@ async fn streamed_prefix_relays_only_unforwarded_native_narration_suffix() {
 pub(crate) struct ToolProtocolPrompts {
     text_tools_section: String,
     max_chars: usize,
+    /// Caller-validated complete variants for attachment-bearing turns. This
+    /// is rendered per-turn input, not a durable session or policy cache.
+    /// Selecting the canonical variant avoids separator growth from repeated
+    /// section removal/insertion and never truncates a required attachment.
+    required_pair: Option<(String, String)>,
     /// The capped native request prompt, built from the complete native
     /// prompt. Only set when a cap applies: a history prompt that was capped
     /// for the text transport can have lost `## Safety` and later sections
@@ -574,6 +579,29 @@ pub(crate) struct ToolProtocolPrompts {
 }
 
 impl ToolProtocolPrompts {
+    /// Both complete prompts must already satisfy the caller's finite budget.
+    pub(crate) fn with_required_prompts(native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self {
+            text_tools_section,
+            max_chars: 0,
+            native_request: None,
+            required_pair: Some((native, text)),
+        }
+    }
+
+    fn required_prompt(&self, use_native_tools: bool) -> Option<&str> {
+        self.required_pair.as_ref().map(|(native, text)| {
+            if use_native_tools {
+                native.as_str()
+            } else {
+                text.as_str()
+            }
+        })
+    }
+
     /// Uncapped prompts for tests that exercise only the protocol swap.
     #[cfg(test)]
     pub(crate) fn new(native: String, text: String) -> Self {
@@ -595,6 +623,7 @@ impl ToolProtocolPrompts {
             text_tools_section,
             max_chars,
             native_request,
+            required_pair: None,
         }
     }
 }
@@ -624,11 +653,16 @@ fn refresh_scoped_tool_protocol_prompt(
         let mut history_prompts = None;
         if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
             let before = system.content.clone();
-            replace_tool_protocol_section(
-                &mut system.content,
-                &prompts.text_tools_section,
-                use_native_tools,
-            );
+            if let Some(required) = prompts.required_prompt(use_native_tools) {
+                system.content = required.to_owned();
+                refresh_prompt_anchor(std::slice::from_mut(system), use_native_tools);
+            } else {
+                replace_tool_protocol_section(
+                    &mut system.content,
+                    &prompts.text_tools_section,
+                    use_native_tools,
+                );
+            }
             history_prompts = Some((before, system.content.clone()));
         }
         if let Some(system) = request_messages
@@ -640,12 +674,17 @@ fn refresh_scoped_tool_protocol_prompt(
             // hook text reaches the model as it does on the CLI path. The
             // request may already be finalized (the post-trim rebuild).
             let rebuilt = history_prompts.and_then(|(before, swapped)| {
-                let base = match (&prompts.native_request, use_native_tools) {
-                    (Some(native), true) => {
-                        let mut native = [ChatMessage::system(native.clone())];
-                        refresh_prompt_anchor(&mut native, true);
-                        let [native] = native;
-                        native.content
+                let canonical = prompts.required_prompt(use_native_tools).or_else(|| {
+                    use_native_tools
+                        .then_some(prompts.native_request.as_deref())
+                        .flatten()
+                });
+                let base = match canonical {
+                    Some(canonical) => {
+                        let mut selected = [ChatMessage::system(canonical.to_owned())];
+                        refresh_prompt_anchor(&mut selected, use_native_tools);
+                        let [selected] = selected;
+                        selected.content
                     }
                     _ => swapped,
                 };
@@ -1496,6 +1535,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
+    // A missing config is a test/degraded path. Preserve the production
+    // fail-closed default rather than accidentally treating it as disabled.
+    let session_prompt_approval_required = config
+        .map(|config| {
+            config.session_prompt_approval_for_agent(agent_alias)
+                == zeroclaw_config::schema::SessionPromptApproval::Required
+        })
+        .unwrap_or(true);
+
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
@@ -1629,6 +1677,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         context_limits,
         temperature,
         approval,
+        session_prompt_approval_required,
         channel_name,
         channel_reply_target,
         cancellation_token: cancellation_token.as_ref(),
@@ -2637,7 +2686,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     "retry": malformed_tool_protocol_retries,
                     "max_retries": MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
                     "response_excerpt": truncate_with_ellipsis(
-                        &scrub_credentials(&response_text),
+                        &scrub_credentials(
+                            &crate::agent::prompt::redact_session_prompt_text_protocol_for_export(
+                                &response_text,
+                            ),
+                        ),
                         600
                     ),
                     })),
@@ -2915,6 +2968,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            hook_contexts,
             stream_calls,
         } = prepare_tool_calls(
             &ctx,
@@ -2990,9 +3044,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // the turn aborts.
                 call_prep::abandon_unexecuted_prepared_contexts(
                     &ctx,
-                    iteration,
                     &executable_indices,
                     &executable_calls,
+                    &hook_contexts,
                     &[],
                 )
                 .await;
@@ -3004,18 +3058,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_hook_contexts = Vec::new();
         let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
-            executable_indices
-                .iter()
-                .copied()
-                .zip(executable_calls.iter())
-                .zip(stream_calls),
-        ) {
+        for (slot, (((call_idx, call), stream_call), hook_context)) in
+            executed_slots.into_iter().zip(
+                executable_indices
+                    .iter()
+                    .copied()
+                    .zip(executable_calls.iter())
+                    .zip(stream_calls)
+                    .zip(hook_contexts.iter()),
+            )
+        {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_hook_contexts.push(hook_context.clone());
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
@@ -3025,6 +3084,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_hook_contexts,
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
@@ -3037,9 +3097,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // post-execution handling and gets exactly one abandonment.
             call_prep::abandon_unexecuted_prepared_contexts(
                 &ctx,
-                iteration,
                 &executable_indices,
                 &executable_calls,
+                &hook_contexts,
                 &executed_completed_indices,
             )
             .await;
@@ -4080,7 +4140,7 @@ async fn drive_live_sop_actions(
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
                             let mut nested_memory_preamble: Option<MemoryPreamble> = None;
-                            let step_result = ::zeroclaw_log::scope!(
+                            let nested_step = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
@@ -4194,8 +4254,10 @@ async fn drive_live_sop_actions(
                                     sop_reassembly: sop_reassembly.clone(),
                                     })),
                                 )
-                            )
-                            .await;
+                            );
+                            let step_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step)
+                                .await;
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()
@@ -4418,6 +4480,51 @@ mod surface3_tests {
     }
 
     #[tokio::test]
+    async fn scoped_complete_session_prompt_protocol_switch_keeps_finite_budget() {
+        let host = format!(
+            "Identity\n\n## Safety\n\nIMMUTABLE_POLICY\n\nMCP_CONTROL{}",
+            crate::agent::prompt::TIMESTAMP_ORIENTATION
+        );
+        let mut native = host.clone();
+        let mut text = host.replace("## Safety", "## Tools\n\nXML_GUIDANCE\n\n## Safety");
+        let attachment = "## Session Prompts\n- id: \"task\"; content: \"retain task\"\n";
+        let cap = text.chars().count() + 2 + attachment.chars().count();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut native,
+            attachment,
+            cap,
+        )
+        .unwrap();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut text, attachment, cap,
+        )
+        .unwrap();
+        // Attachment-bearing Agent pairs have already passed the finite cap;
+        // they must never be head-truncated during a later protocol swap.
+        let prompts = Arc::new(ToolProtocolPrompts::with_required_prompts(
+            native.clone(),
+            text,
+        ));
+        let mut history = vec![ChatMessage::system(native)];
+        scope_tool_protocol_prompts(prompts, async {
+            for native_tools in [false, true, false, true] {
+                let mut request = history.clone();
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native_tools);
+                let system = &request[0].content;
+                assert!(system.ends_with(attachment));
+                assert!(system.contains("IMMUTABLE_POLICY"));
+                assert!(system.contains("MCP_CONTROL"));
+                assert!(
+                    system.chars().count() <= cap,
+                    "protocol switching grew a validated prompt past its cap: {} > {cap}",
+                    system.chars().count()
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn scoped_protocol_switch_caps_request_and_keeps_history_lossless() {
         let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
         let native = format!(
@@ -4604,6 +4711,15 @@ mod surface3_tests {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn tool_protocol_framings_have_equal_char_length() {
+        assert_eq!(
+            NATIVE_TOOLS_TASK_FRAMING.chars().count(),
+            NO_TOOLS_TASK_FRAMING.chars().count(),
+            "post-budget anchor refresh must not change prompt character count"
+        );
     }
 
     #[test]
@@ -5952,6 +6068,7 @@ mod active_route_context_tests {
             context_limits: text_limits,
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
