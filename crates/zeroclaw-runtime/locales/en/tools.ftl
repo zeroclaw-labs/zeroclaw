@@ -62,6 +62,22 @@ tool-delegate = Delegate a subtask to a specialized agent. Use when: a task bene
 
 tool-file-edit = Edit a file by replacing an exact string match with new content
 
+tool-agy-cli = Delegate a coding task to Google's Antigravity CLI (agy --print). Supports file editing and command execution within the permissions allowed in agy's own settings. Use for complex coding work that benefits from Antigravity's full agent loop.
+tool-agy-cli-param-prompt = The coding task to delegate to Antigravity CLI
+tool-agy-cli-param-working-directory = Working directory within the workspace (must be inside workspace_dir)
+tool-agy-cli-error-missing-prompt = Missing 'prompt' parameter
+tool-agy-cli-error-not-json = Antigravity CLI did not return a JSON result; treating the run as failed
+tool-agy-cli-error-status = Antigravity CLI reported status { $status }{ $detail }
+tool-agy-cli-error-denied = Antigravity CLI auto-denied tool permissions in headless mode ({ $denied }). To let the task proceed, allow them under permissions.allow in agy's settings.json, or have the ZeroClaw operator adjust agy_cli.extra_args in the ZeroClaw config (remove --sandbox, which denies every shell command, or add --dangerously-skip-permissions to auto-approve all tools).
+tool-agy-cli-error-exit = Antigravity CLI exited with a failure status
+tool-agy-cli-error-working-directory-missing = working_directory '{ $path }' does not exist or is not accessible
+tool-agy-cli-error-workspace-missing = workspace directory '{ $path }' does not exist or is not accessible
+tool-agy-cli-error-outside-workspace = working_directory '{ $path }' is outside the workspace '{ $workspace }'
+tool-agy-cli-error-not-installed = Antigravity CLI ('agy') not found in PATH. Install with: curl -fsSL https://antigravity.google/cli/install.sh | bash
+tool-agy-cli-error-execute = Failed to execute agy: { $err }
+tool-agy-cli-error-timeout = Antigravity CLI timed out after { $secs }s and was killed
+tool-agy-cli-error-prepare = Failed to prepare agy execution: { $err }
+
 tool-file-download = Download a file from the configured remote endpoint and write it to the agent's workspace. Supply the identifier of the document to fetch and a workspace-relative destination path; the endpoint URL is fixed by host config and is never model-controlled. Bytes are streamed straight to disk and are not loaded into model context. Returns the HTTP status, the number of bytes written, and the destination path.
 tool-file-download-param-document-id = Identifier of the document to fetch from the configured endpoint.
 tool-file-download-param-dest-path = Workspace-relative path to write the file to. The parent directory must already exist.

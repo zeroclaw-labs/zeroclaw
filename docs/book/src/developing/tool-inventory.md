@@ -89,7 +89,7 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 | Tool(s) | Likely long-term home | Why |
 |---|---|---|
 | `notion`, `jira`, `microsoft365`, `google_workspace`, `linkedin`, `composio` | Plugin, MCP server, or CLI-backed integration. | These mostly wrap third-party products and authentication models that can evolve independently from the core runtime. |
-| `claude_code`, `claude_code_runner`, `codex_cli`, `gemini_cli`, `opencode_cli` | CLI-backed integration or skill package. | The external CLI already owns authentication, command behavior, and release cadence; ZeroClaw should preserve receipts and policy if it invokes them. |
+| `claude_code`, `claude_code_runner`, `codex_cli`, `gemini_cli`, `agy_cli`, `opencode_cli` | CLI-backed integration or skill package. | The external CLI already owns authentication, command behavior, and release cadence; ZeroClaw should preserve receipts and policy if it invokes them. |
 | `email_search`, `email_read` | Channel companion plugin or MCP server. | Email search/read is useful but tied to external account auth and channel setup rather than the baseline agent contract. |
 | `discord_search` | Channel companion plugin or archive-query skill. | It depends on a Discord archive database produced by the channel; keep it close to that channel until the archive API is explicit. |
 | `image_gen`, `cloud_ops`, `cloud_patterns`, `project_intel`, `report_template` | Skill package, plugin, or MCP server. | These are optional workflows or vendor/data-service wrappers rather than core execution primitives. |
@@ -100,7 +100,7 @@ replacement surface exists. Until then, keep them compatible and policy-visible.
 `git_operations` is [tier 1](#tier-1-core) because FND-001 D5 lists it as core.
 The row above records a possible later home, which would first need D5 amended.
 
-`claude_code`, `codex_cli`, `gemini_cli`, and `opencode_cli` are
+`claude_code`, `codex_cli`, `gemini_cli`, `agy_cli`, and `opencode_cli` are
 [tier 2](#tier-2-host-coupled) because they run through the runtime's shared
 sandbox; externalization remains a later candidate.
 
@@ -199,7 +199,7 @@ keeps constructing them.
 | Canvas | `canvas` | The canvas store shared with the gateway. |
 | ACP delivery | `deliver_file` | Admitted only on ACP turns; its helpers are used by the ACP server. |
 | Provider-bound | `llm_task` | Builds a provider from the agent's credential outside the provider source. |
-| Sandbox-bound coding CLIs | `claude_code`, `codex_cli`, `gemini_cli`, `opencode_cli` | The coding-CLI executor wraps the runtime adapter and the shared sandbox. Opt-in by config, but runtime-constructed. |
+| Sandbox-bound coding CLIs | `claude_code`, `codex_cli`, `gemini_cli`, `agy_cli`, `opencode_cli` | The coding-CLI executor wraps the runtime adapter and the shared sandbox. Opt-in by config, but runtime-constructed. |
 | Live config | `a2a_discover`, `a2a_send`, `a2a_get_task`, `a2a_cancel`, `file_download` | They hold the live config handle; the A2A client also uses a process-wide route cache. |
 | Runtime-defined | `security_ops` | Lives in the runtime crate and uses its security playbook and vulnerability modules. |
 | Built outside the factory | `execute_pipeline`, `tool_search`, `mcp_resources`, `mcp_prompts` | Minted by the scoped registry assembly from the registry itself or from the MCP registry. |

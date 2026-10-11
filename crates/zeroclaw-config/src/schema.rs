@@ -723,6 +723,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub gemini_cli: GeminiCliConfig,
 
+    /// Antigravity CLI tool configuration (`[agy_cli]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub agy_cli: AgyCliConfig,
+
     /// OpenCode CLI tool configuration (`[opencode_cli]`).
     #[serde(default)]
     #[nested]
@@ -10942,6 +10948,176 @@ impl Default for GeminiCliConfig {
             timeout_secs: default_gemini_cli_timeout_secs(),
             max_output_bytes: default_gemini_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Antigravity CLI ─────────────────────────────────────────────
+
+/// Antigravity CLI tool configuration (`[agy_cli]` section).
+///
+/// Delegates coding tasks to Google's Antigravity CLI (`agy --print`), the
+/// successor of Gemini CLI for Google AI subscription accounts.
+/// Authentication uses the binary's own session (OS keyring / browser
+/// sign-in), so no API key is needed.
+///
+/// What the delegated agent may do is decided by agy's own permission
+/// settings (`permissions.allow` in its `settings.json`), not by ZeroClaw.
+/// ZeroClaw validates the directory agy starts in; it does not contain where
+/// agy's tools write.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agy_cli"]
+pub struct AgyCliConfig {
+    /// Enable the `agy_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_agy_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_agy_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the agy subprocess
+    #[serde(default)]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Model passed as `agy --model` (for example `gemini-3.8-flash-high`).
+    /// When unset, agy uses its own configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Extra CLI arguments passed to `agy` before ZeroClaw's own flags.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and remain allowed without blocking. Config
+    /// validation warns when a recognized argument can auto-approve agy's
+    /// tool permissions or widen its workspace. This is a warning inventory,
+    /// not an allowlist; ordinary and unknown arguments remain allowed and
+    /// silent.
+    ///
+    /// ZeroClaw's output-format, slash-command, timeout, model, and prompt
+    /// flags follow these arguments, so they cannot be overridden here. A bare
+    /// `--` entry is dropped (validation warns), because it would turn those
+    /// flags into positional arguments. Use the attached `--flag=value` form
+    /// for value-taking flags: a trailing `--flag` would consume ZeroClaw's
+    /// next flag as its value.
+    ///
+    /// `--sandbox` restricts agy's terminal access. In print mode agy cannot
+    /// prompt, so every shell command is then auto-denied and most coding
+    /// tasks fail; the tool reports those denials as failures.
+    ///
+    /// Example: `["--sandbox"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+impl AgyCliConfig {
+    /// Returns the configured arguments exactly as ZeroClaw forwards them to
+    /// `agy`, paired with their original config indices.
+    ///
+    /// Shared by subprocess construction and security-boundary diagnostics
+    /// so both interpret the same argv sequence. Blank entries and bare `--`
+    /// terminators are dropped: a terminator would make ZeroClaw's own flags,
+    /// which follow these arguments, positional.
+    pub fn effective_extra_args(&self) -> impl Iterator<Item = (usize, &str)> {
+        effective_agy_cli_extra_args(&self.extra_args)
+    }
+}
+
+fn effective_agy_cli_extra_args(extra_args: &[String]) -> impl Iterator<Item = (usize, &str)> {
+    effective_codex_cli_extra_args(extra_args).filter(|(_, arg)| *arg != "--")
+}
+
+/// Recognized agy arguments that widen what the delegated agent may do.
+///
+/// Deliberately finite, like the Codex inventory: unknown arguments remain
+/// allowed and silent for forward compatibility.
+const RISKY_AGY_CLI_FLAGS: &[RiskyCodexCliFlag] = &[
+    RiskyCodexCliFlag {
+        spellings: &["--dangerously-skip-permissions"],
+        display: "--dangerously-skip-permissions",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "auto-approve every agy tool permission request without prompting",
+    },
+    RiskyCodexCliFlag {
+        spellings: &["--add-dir"],
+        display: "--add-dir",
+        value: RiskyCodexCliArgValue::AnyValue,
+        effect: "add directories to agy's workspace alongside the validated working directory",
+    },
+];
+
+const AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING: &str = "agy_cli_extra_args_security_boundary";
+
+const AGY_CLI_EXTRA_ARGS_TERMINATOR_DROPPED_WARNING: &str = "agy_cli_extra_args_terminator_dropped";
+
+/// Matches risky flags in the argv ZeroClaw actually forwards to agy.
+///
+/// Bare `--` entries are dropped from that argv, so arguments after one are
+/// still parsed as flags and are matched here too.
+fn risky_agy_cli_arg_matches(extra_args: &[String]) -> Vec<RiskyCodexCliArgMatch> {
+    let mut matches = Vec::new();
+    let effective_args = effective_agy_cli_extra_args(extra_args).collect::<Vec<_>>();
+
+    for (effective_index, (original_index, arg)) in effective_args.iter().copied().enumerate() {
+        for flag in RISKY_AGY_CLI_FLAGS {
+            if flag.spellings.iter().any(|spelling| {
+                codex_cli_flag_matches(&effective_args, effective_index, arg, spelling, flag.value)
+                    || agy_cli_presence_flag_has_attached_value(arg, spelling, flag.value)
+            }) {
+                matches.push(RiskyCodexCliArgMatch {
+                    index: original_index,
+                    flag,
+                });
+                break;
+            }
+        }
+    }
+
+    matches
+}
+
+/// agy also accepts a presence flag in the attached form `--flag=<value>`
+/// (for example `--dangerously-skip-permissions=true`), so agy's warning
+/// inventory treats that spelling as present whatever the value. The shared
+/// Codex matcher keeps its clap semantics, where presence flags take no value.
+fn agy_cli_presence_flag_has_attached_value(
+    arg: &str,
+    spelling: &str,
+    value_rule: RiskyCodexCliArgValue,
+) -> bool {
+    matches!(value_rule, RiskyCodexCliArgValue::Presence)
+        && arg
+            .strip_prefix(spelling)
+            .is_some_and(|remainder| remainder.starts_with('='))
+}
+
+/// Original config indices of bare `--` entries, which ZeroClaw drops from
+/// agy's argv.
+fn agy_cli_dropped_terminator_indices(extra_args: &[String]) -> Vec<usize> {
+    effective_codex_cli_extra_args(extra_args)
+        .filter(|(_, arg)| *arg == "--")
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn default_agy_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_agy_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for AgyCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_agy_cli_timeout_secs(),
+            max_output_bytes: default_agy_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+            model: None,
+            extra_args: Vec::new(),
         }
     }
 }
@@ -21194,6 +21370,7 @@ impl Default for Config {
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            agy_cli: AgyCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
@@ -23153,6 +23330,7 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
+        self.collect_agy_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
         self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
@@ -23291,6 +23469,33 @@ impl Config {
                     risky_match.flag.display, risky_match.flag.effect
                 ),
                 format!("codex_cli.extra_args[{}]", risky_match.index),
+            ));
+        }
+    }
+
+    fn collect_agy_cli_extra_arg_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for risky_match in risky_agy_cli_arg_matches(&self.agy_cli.extra_args) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
+                format!(
+                    "Antigravity CLI argument `{}` can {}. ZeroClaw allows this operator-controlled \
+                     argument without blocking; verify that the resulting trust boundary is \
+                     intentional.",
+                    risky_match.flag.display, risky_match.flag.effect
+                ),
+                format!("agy_cli.extra_args[{}]", risky_match.index),
+            ));
+        }
+        for index in agy_cli_dropped_terminator_indices(&self.agy_cli.extra_args) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                AGY_CLI_EXTRA_ARGS_TERMINATOR_DROPPED_WARNING,
+                "Antigravity CLI argument `--` is dropped. It would make ZeroClaw's own \
+                 output-format, timeout, model, and prompt flags positional; arguments after \
+                 it are still passed to agy as flags.",
+                format!("agy_cli.extra_args[{index}]"),
             ));
         }
     }
@@ -33086,6 +33291,7 @@ auto_save = true
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            agy_cli: AgyCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
@@ -34285,6 +34491,7 @@ default_temperature = 0.7
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            agy_cli: AgyCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
@@ -48705,6 +48912,178 @@ group_policy = "all"
                 assert!(matches.is_empty(), "unexpected match for {case:?}");
             }
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_risky_extra_args_warn_without_blocking_and_redact_values() {
+        let private_dir = "/srv/sensitive-private-dir";
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.agy_cli.extra_args = vec![
+            "  ".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--add-dir".to_string(),
+            private_dir.to_string(),
+            format!("--add-dir={private_dir}"),
+            "--sandbox".to_string(),
+            "--effort=high".to_string(),
+        ];
+
+        config
+            .validate()
+            .expect("risky agy arguments must remain allowed");
+        let warnings = warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(warnings[0].path, "agy_cli.extra_args[1]");
+        assert_eq!(warnings[1].path, "agy_cli.extra_args[2]");
+        assert_eq!(warnings[2].path, "agy_cli.extra_args[4]");
+        assert!(
+            warnings[0]
+                .message
+                .contains("--dangerously-skip-permissions")
+        );
+        assert!(warnings[1].message.contains("--add-dir"));
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains(private_dir)),
+            "warning messages must not disclose the added directory"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_restrictive_and_unknown_extra_args_stay_silent() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.agy_cli.extra_args = vec![
+            "--sandbox".to_string(),
+            "--effort".to_string(),
+            "low".to_string(),
+            "--future-flag".to_string(),
+            "--dangerously-skip-permissionsX".to_string(),
+        ];
+
+        assert!(
+            warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING).is_empty(),
+            "restrictive and unknown arguments must not warn"
+        );
+        assert!(
+            warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_TERMINATOR_DROPPED_WARNING).is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_attached_skip_permissions_form_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.agy_cli.extra_args = vec![
+            "--dangerously-skip-permissions=true".to_string(),
+            "--dangerously-skip-permissions=".to_string(),
+            "--dangerously-skip-permissions=false".to_string(),
+        ];
+
+        let warnings = warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for (index, warning) in warnings.iter().enumerate() {
+            assert_eq!(warning.path, format!("agy_cli.extra_args[{index}]"));
+            assert!(
+                warning.message.contains("--dangerously-skip-permissions"),
+                "{warning:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_presence_flags_keep_rejecting_attached_values() {
+        // The agy-only attached-form match must not change Codex semantics.
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args =
+            vec!["--dangerously-bypass-approvals-and-sandbox=true".to_string()];
+
+        assert!(
+            warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING).is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_bare_terminator_warns_and_does_not_hide_later_flags() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.agy_cli.extra_args = vec![
+            "--sandbox".to_string(),
+            "--".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            " -- ".to_string(),
+        ];
+
+        config
+            .validate()
+            .expect("a bare terminator must remain allowed");
+        let dropped = warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_TERMINATOR_DROPPED_WARNING);
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert_eq!(dropped[0].path, "agy_cli.extra_args[1]");
+        assert_eq!(dropped[1].path, "agy_cli.extra_args[3]");
+
+        let risky = warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(risky.len(), 1, "{risky:?}");
+        assert_eq!(risky[0].path, "agy_cli.extra_args[2]");
+
+        assert_eq!(
+            config.agy_cli.effective_extra_args().collect::<Vec<_>>(),
+            vec![(0, "--sandbox"), (2, "--dangerously-skip-permissions")],
+            "the forwarded argv must not contain the terminator"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_extra_args_do_not_trigger_codex_warnings() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.agy_cli.extra_args = vec!["--add-dir=/srv/x".to_string()];
+        config.codex_cli.extra_args = vec!["--dangerously-skip-permissions".to_string()];
+
+        assert_eq!(
+            warnings_with_code(&config, AGY_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING).len(),
+            1
+        );
+        assert!(
+            warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING).is_empty(),
+            "agy's flag inventory must not leak into codex_cli diagnostics"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn agy_cli_config_round_trips_through_toml() {
+        let parsed: Config = toml::from_str(
+            r#"
+[agy_cli]
+enabled = true
+model = "gemini-3.8-flash-high"
+timeout_secs = 900
+extra_args = ["--sandbox"]
+"#,
+        )
+        .expect("agy_cli section should parse");
+        assert!(parsed.agy_cli.enabled);
+        assert_eq!(
+            parsed.agy_cli.model.as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
+        assert_eq!(parsed.agy_cli.timeout_secs, 900);
+        assert_eq!(parsed.agy_cli.max_output_bytes, 2_097_152);
+        assert_eq!(parsed.agy_cli.extra_args, vec!["--sandbox".to_string()]);
+
+        let defaults = Config::default();
+        assert!(
+            !defaults.agy_cli.enabled,
+            "agy_cli must be disabled by default"
+        );
+        let serialized = toml::to_string(&defaults.agy_cli).expect("serialize defaults");
+        assert!(
+            !serialized.contains("model"),
+            "an unset model must not serialize: {serialized}"
+        );
     }
 
     #[::core::prelude::v1::test]
