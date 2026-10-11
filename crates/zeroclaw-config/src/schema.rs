@@ -1094,10 +1094,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
-    /// Enable or disable chain-of-thought thinking for models that support it
-    /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
-    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
-    /// in the request body; mirrors the Ollama provider's `think` field.
+    /// Request thinking on or off on Ollama and llama.cpp. Overrides
+    /// `runtime.reasoning_enabled` for this alias; unset inherits that switch
+    /// or the backend default. Ollama uses `reasoning_effort` on its compatible
+    /// API. llama.cpp additionally uses `chat_template_kwargs.enable_thinking`
+    /// on the chat-completions wire. Explicit on/off controls override
+    /// conflicting manual reasoning fields. Models/templates without an off
+    /// mode may still generate reasoning. Other provider families do not use
+    /// this field to enable thinking.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
@@ -14960,6 +14964,9 @@ pub struct RuntimeConfig {
     pub shell: Option<String>,
 
     /// Global reasoning override for model_providers that expose explicit controls.
+    /// On Ollama and llama.cpp, an alias's `think` field takes precedence.
+    /// This requests a backend mode; actual suppression depends on the model
+    /// and chat template supporting it.
     /// - `None`: model_provider default behavior
     /// - `Some(true)`: request reasoning/thinking when supported
     /// - `Some(false)`: disable reasoning/thinking when supported
