@@ -1302,6 +1302,7 @@ pub async fn handle_api_cost(
                 "monthly_cost_usd": 0.0,
                 "total_tokens": 0,
                 "request_count": 0,
+                "rejected_records": 0,
                 "by_model": {},
                 "by_agent": {},
             }
