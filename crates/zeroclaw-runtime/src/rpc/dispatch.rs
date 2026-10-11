@@ -9528,9 +9528,17 @@ impl RpcDispatcher {
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
             ));
         }
-        config
-            .set_prop_persistent(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        config.set_prop_persistent(prop, &value_str).map_err(|e| {
+            // A masked placeholder that no stored value can resolve is the
+            // caller's to fix, as the HTTP routes answer it.
+            if e.downcast_ref::<zeroclaw_config::url_credentials::UnresolvedMask>()
+                .is_some()
+            {
+                rpc_err(INVALID_PARAMS, e.to_string())
+            } else {
+                rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}"))
+            }
+        })
     }
 
     fn refresh_memory_embedder_for_model_provider(
@@ -14825,6 +14833,95 @@ mod tests {
                 MethodAuthz::Requires(_, _) => {}
             }
         }
+    }
+
+    /// The core's `config/get` answers with a provider URI's password and
+    /// query credential masked, for the whole config and for the property
+    /// alone, so neither reaches an RPC client.
+    #[tokio::test]
+    async fn config_get_withholds_a_provider_uris_embedded_credentials() {
+        const PASSWORD: &str = "uri-password-654738";
+        const QUERY: &str = "uri-query-938472";
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            "[providers.models.custom.credential_url]\nuri = \"http://review-user:{PASSWORD}@127.0.0.1:9/v1?credential={QUERY}\"\n"
+        ))
+        .unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let whole = rpc(&mut operator, &mut rx, 1, "config/get", json!({})).await;
+        assert!(whole.get("result").is_some(), "{whole}");
+        let prop = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "config/get",
+            json!({"prop": "providers.models.custom.credential_url.uri"}),
+        )
+        .await;
+        let (whole, prop) = (whole.to_string(), prop.to_string());
+        assert_eq!(
+            [
+                whole.contains(PASSWORD),
+                whole.contains(QUERY),
+                prop.contains(PASSWORD),
+                prop.contains(QUERY),
+            ],
+            [false; 4],
+            "userinfo and query secrets must be withheld by the core: {whole}\n{prop}"
+        );
+        assert!(
+            whole.contains("127.0.0.1:9/v1"),
+            "the endpoint stays readable: {whole}"
+        );
+    }
+
+    /// `config/set` writing a provider URI back as `config/get` shows it keeps
+    /// the stored credentials. A placeholder that no stored value can resolve
+    /// is refused as invalid params, the caller's error, and stores nothing.
+    #[tokio::test]
+    async fn config_set_restores_a_masked_uri_and_refuses_an_unresolvable_one() {
+        const PATH: &str = "providers.models.custom.credential_url.uri";
+        let stored =
+            "http://review-user:uri-password-654738@127.0.0.1:9/v1?credential=uri-query-938472";
+        let tmp = tempfile::tempdir().unwrap();
+        let source = format!("[providers.models.custom.credential_url]\nuri = \"{stored}\"\n");
+        std::fs::write(tmp.path().join("config.toml"), &source).unwrap();
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&source).unwrap();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().to_path_buf();
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let uri = || {
+            ctx.config
+                .read()
+                .providers
+                .models
+                .find("custom", "credential_url")
+                .and_then(|provider| provider.uri.clone())
+        };
+
+        let echoed = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/set",
+            json!({"prop": PATH, "value": "http://***MASKED***@127.0.0.1:9/v1?***MASKED***"}),
+        )
+        .await;
+        assert!(echoed.get("error").is_none(), "{echoed}");
+        assert_eq!(uri().as_deref(), Some(stored));
+
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "config/set",
+            json!({"prop": PATH, "value": "http://***MASKED***.example/v1"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+        assert_eq!(uri().as_deref(), Some(stored));
     }
 
     fn enforcement_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {

@@ -99,6 +99,13 @@ pub trait HasPropKind {
     fn display_secret_terminals() -> Vec<&'static str> {
         Vec::new()
     }
+
+    /// Terminal field names whose string values are URLs that may carry a
+    /// credential in their userinfo, query or fragment. An object or
+    /// object-array display masks those components and keeps the rest.
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -205,6 +212,10 @@ impl HasPropKind
 
 impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
     const PROP_KIND: PropKind = PropKind::Object;
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        crate::scattered_types::EmailOAuth2Config::CREDENTIAL_URL_FIELDS.to_vec()
+    }
 }
 
 impl HasPropKind for Vec<crate::schema::ClassificationRule> {
@@ -216,6 +227,10 @@ impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
     fn display_secret_terminals() -> Vec<&'static str> {
         crate::schema::EmbeddingRouteConfig::secret_field_terminals()
     }
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        crate::schema::EmbeddingRouteConfig::credential_url_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -226,6 +241,10 @@ impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     fn display_secret_terminals() -> Vec<&'static str> {
         crate::schema::McpServerConfig::secret_field_terminals()
     }
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::credential_url_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -233,9 +252,17 @@ impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     fn display_secret_terminals() -> Vec<&'static str> {
         crate::schema::ModelRouteConfig::secret_field_terminals()
     }
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        crate::schema::ModelRouteConfig::credential_url_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_credential_url_terminals() -> Vec<&'static str> {
+        vec!["url"]
+    }
 }
 impl HasPropKind for crate::schema::DelegateExecutionMode {
     const PROP_KIND: PropKind = PropKind::Enum;
@@ -429,6 +456,9 @@ impl std::fmt::Debug for PropFieldInfo {
 
 pub trait MaskSecrets {
     fn mask_secrets(&mut self);
+    /// Best-effort restoration for a masked projection. Unresolvable URL
+    /// placeholders remain masked; this is not a persistence validator.
+    /// Writes must use `Config::set_prop_persistent`, which rejects them.
     fn restore_secrets_from(&mut self, current: &Self);
 }
 
@@ -464,6 +494,59 @@ pub const MASKED_SECRET: &str = "***MASKED***";
 
 pub fn is_masked_secret(value: &str) -> bool {
     value == MASKED_SECRET
+}
+
+/// A URL-valued field whose userinfo, query or fragment may hold a
+/// credential (`#[credential_url]`). Masking shows those components as
+/// [`MASKED_SECRET`] and keeps the endpoint readable; restoring puts back
+/// each component a client echoed masked. See [`crate::url_credentials`].
+pub trait CredentialUrlField {
+    fn mask_url_credentials(&mut self);
+    fn restore_url_credentials(&mut self, current: &Self);
+}
+
+impl CredentialUrlField for String {
+    fn mask_url_credentials(&mut self) {
+        *self = crate::url_credentials::mask(self);
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        // This only fills in what it can: a placeholder that cannot be
+        // resolved stays as it is. `set_prop`, the write path, refuses one.
+        if let Ok(restored) = crate::url_credentials::restore(self, Some(current)) {
+            *self = restored;
+        }
+    }
+}
+
+impl CredentialUrlField for Vec<String> {
+    fn mask_url_credentials(&mut self) {
+        for value in self {
+            value.mask_url_credentials();
+        }
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        // Preserve the original projection if any list entry is ambiguous.
+        let mut restored = self.clone();
+        if crate::url_credentials::restore_list(&mut restored, current).is_ok() {
+            *self = restored;
+        }
+    }
+}
+
+impl<T: CredentialUrlField> CredentialUrlField for Option<T> {
+    fn mask_url_credentials(&mut self) {
+        if let Some(inner) = self {
+            inner.mask_url_credentials();
+        }
+    }
+
+    fn restore_url_credentials(&mut self, current: &Self) {
+        if let (Some(inner), Some(cur)) = (self.as_mut(), current.as_ref()) {
+            inner.restore_url_credentials(cur);
+        }
+    }
 }
 
 pub trait SecretField {
