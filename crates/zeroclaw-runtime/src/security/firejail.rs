@@ -14,16 +14,95 @@ struct FirejailHardeningSupport {
     noroot: bool,
 }
 
+/// Firejail options that would undo what the wrapper itself relies on: its
+/// own profile and home handling (`--noprofile`, `--private=home`), an
+/// option-filter that can drop the wrapper's flags, a debugger escape from
+/// seccomp, or joining another sandbox instead of starting this one.
+const CONFLICTING_EXTRA_ARGS: &[&str] = &[
+    "--profile",
+    "--include",
+    "--ignore",
+    "--private",
+    "--allow-debuggers",
+    "--join",
+    "--join-or-start",
+    "--join-network",
+    "--join-filesystem",
+];
+
 /// Firejail sandbox backend for Linux
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FirejailSandbox;
+#[derive(Debug, Clone, Default)]
+pub struct FirejailSandbox {
+    /// Validated `firejail_args`, passed after the wrapper's own flags and
+    /// before the wrapped invocation.
+    extra_args: Vec<OsString>,
+}
 
 impl FirejailSandbox {
     /// Create a new Firejail sandbox
     pub fn new() -> std::io::Result<Self> {
-        let sandbox = Self;
+        Self::with_args(&[])
+    }
+
+    /// Create a Firejail sandbox that also passes the configured
+    /// `firejail_args`. An argument that is not a single `--option[=value]`
+    /// Firejail option, or that conflicts with the wrapper, is an
+    /// `InvalidInput` error rather than being dropped.
+    pub fn with_args(args: &[String]) -> std::io::Result<Self> {
+        let sandbox = Self {
+            extra_args: Self::validate_extra_args(args)?,
+        };
         sandbox.version_launcher()?;
         Ok(sandbox)
+    }
+
+    /// Check configured `firejail_args` without probing for Firejail.
+    pub fn validate_extra_args(args: &[String]) -> std::io::Result<Vec<OsString>> {
+        let invalid = |key: &str, extra: &[(&str, &str)]| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                crate::i18n::get_required_cli_string_with_args(key, extra),
+            )
+        };
+        args.iter()
+            .map(|arg| {
+                if arg.trim().is_empty() {
+                    return Err(invalid("cli-security-firejail-args-error-empty", &[]));
+                }
+                let quoted = format!("{arg:?}");
+                if arg != arg.trim() {
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-whitespace",
+                        &[("arg", &quoted)],
+                    ));
+                }
+                let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+                if !Self::is_option_name(name) {
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-not-option",
+                        &[("arg", &quoted)],
+                    ));
+                }
+                if CONFLICTING_EXTRA_ARGS.contains(&name) {
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-conflict",
+                        &[("name", name)],
+                    ));
+                }
+                Ok(OsString::from(arg))
+            })
+            .collect()
+    }
+
+    /// `--name` where `name` is non-empty and made of the characters Firejail
+    /// option names use; a value may only follow after `=`.
+    fn is_option_name(name: &str) -> bool {
+        name.strip_prefix("--").is_some_and(|rest| {
+            rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
     }
 
     /// Probe if Firejail is available (for auto-detection)
@@ -83,7 +162,7 @@ impl FirejailSandbox {
 
     #[cfg(test)]
     fn for_test() -> Self {
-        Self
+        Self::default()
     }
 
     fn support_from_help(stdout: &str, stderr: &str) -> FirejailHardeningSupport {
@@ -171,6 +250,9 @@ impl FirejailSandbox {
             "--quiet",        // Suppress warnings
         ]);
         Self::append_hardening_flags(&mut firejail_cmd, support);
+        // Configured firejail_args: options for Firejail, so they go before
+        // the wrapped command rather than becoming its arguments.
+        firejail_cmd.args(&self.extra_args);
 
         // Add the original command
         firejail_cmd.args(invocation);
@@ -228,7 +310,7 @@ mod tests {
                 Ok(PathBuf::from("/usr/bin/env"))
             })
             .unwrap();
-        FirejailSandbox
+        FirejailSandbox::for_test()
             .wrap_invocation(
                 &mut cmd,
                 FirejailHardeningSupport::default(),
@@ -320,7 +402,7 @@ mod tests {
         std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         let launcher = launcher.canonicalize().unwrap();
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         assert!(
             Command::new(&launcher)
                 .arg("--version")
@@ -473,5 +555,118 @@ mod tests {
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"
         );
+    }
+
+    // ── firejail_args ──────────────────────────────────────────
+
+    #[test]
+    fn firejail_wrap_passes_configured_args_before_the_wrapped_command() {
+        let sandbox = FirejailSandbox {
+            extra_args: FirejailSandbox::validate_extra_args(&[
+                "--net=none".to_string(),
+                "--private-tmp".to_string(),
+            ])
+            .unwrap(),
+        };
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("payload");
+        sandbox
+            .wrap_command_with_support(&mut cmd, FirejailHardeningSupport::default())
+            .unwrap();
+
+        let args = args(&cmd);
+        let at = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from {args:?}"))
+        };
+        assert!(
+            at("--quiet") < at("--net=none"),
+            "after the wrapper's flags: {args:?}"
+        );
+        assert_eq!(
+            at("--net=none") + 1,
+            at("--private-tmp"),
+            "in configured order: {args:?}"
+        );
+        assert!(
+            at("--private-tmp") < at("payload"),
+            "Firejail options, not arguments of the wrapped command: {args:?}"
+        );
+    }
+
+    #[test]
+    fn firejail_wrap_without_configured_args_is_unchanged() {
+        let mut plain = Command::new("/bin/echo");
+        FirejailSandbox::for_test()
+            .wrap_command_with_support(&mut plain, FirejailHardeningSupport::default())
+            .unwrap();
+        let mut empty = Command::new("/bin/echo");
+        FirejailSandbox {
+            extra_args: FirejailSandbox::validate_extra_args(&[]).unwrap(),
+        }
+        .wrap_command_with_support(&mut empty, FirejailHardeningSupport::default())
+        .unwrap();
+        assert_eq!(args(&plain), args(&empty));
+    }
+
+    #[test]
+    fn firejail_accepts_single_options_with_and_without_values() {
+        let accepted = FirejailSandbox::validate_extra_args(&[
+            "--net=none".to_string(),
+            "--private-tmp".to_string(),
+            "--rlimit-as=1g".to_string(),
+            "--env=GREETING=hello world".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            accepted,
+            [
+                "--net=none",
+                "--private-tmp",
+                "--rlimit-as=1g",
+                "--env=GREETING=hello world"
+            ]
+        );
+    }
+
+    #[test]
+    fn firejail_rejects_args_that_are_not_options_or_undo_the_wrapper() {
+        for bad in [
+            "",
+            "  ",
+            "--",
+            "none",
+            "-q",
+            " --net=none",
+            "--net=none ",
+            "--private",
+            "--private=/home/user",
+            "--profile=/etc/firejail/default.profile",
+            "--include=/tmp/x.inc",
+            "--ignore=noroot",
+            "--allow-debuggers",
+            "--join=1234",
+            "--join-or-start=work",
+            "--net none",
+            "--=x",
+            "---net=none",
+            "--net\tnone",
+        ] {
+            let error =
+                FirejailSandbox::validate_extra_args(&["--net=none".to_string(), bad.to_string()])
+                    .expect_err(bad);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+            assert!(
+                error.to_string().contains("firejail_args"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_with_args_reports_rejected_args_before_probing() {
+        let error = FirejailSandbox::with_args(&["--profile=x".to_string()]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
