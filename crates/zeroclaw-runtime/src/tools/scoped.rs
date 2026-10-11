@@ -67,42 +67,72 @@ impl ScopedToolRegistry {
     /// at the routed handle, or an owned session would keep issuing shared-plane
     /// recall/store/export/delete while the agent reports its memory as private.
     ///
-    /// This replaces the SAME named memory tools in place with fresh instances
-    /// over `memory`; it never introduces a new tool name, so the surface the
-    /// seal admitted is unchanged. Any memory tool already withdrawn by policy
+    /// This replaces canonical memory tools and captured skill-alias targets
+    /// with fresh instances over `memory`, preserving alias restrictions. It
+    /// never introduces a new tool name, so the admitted surface is unchanged. Any memory tool already withdrawn by policy
     /// narrowing stays withdrawn (only tools currently present are rebound).
     pub(crate) fn rebind_memory_tools(
         &mut self,
         memory: Arc<dyn zeroclaw_memory::Memory>,
         security: Arc<SecurityPolicy>,
-    ) {
+    ) -> anyhow::Result<()> {
         use zeroclaw_tools::{
             memory_export::MemoryExportTool, memory_forget::MemoryForgetTool,
             memory_purge::MemoryPurgeTool, memory_recall::MemoryRecallTool,
             memory_store::MemoryStoreTool,
         };
-        for tool in self.0.iter_mut() {
-            let replacement: Option<Box<dyn Tool>> = match tool.name() {
-                "memory_store" => Some(Box::new(MemoryStoreTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                "memory_recall" => Some(Box::new(MemoryRecallTool::new(Arc::clone(&memory)))),
-                "memory_forget" => Some(Box::new(MemoryForgetTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                "memory_export" => Some(Box::new(MemoryExportTool::new(Arc::clone(&memory)))),
-                "memory_purge" => Some(Box::new(MemoryPurgeTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                _ => None,
-            };
+        let mut replacements = Vec::new();
+        for (index, tool) in self.0.iter().enumerate() {
+            let replacement: Option<Box<dyn Tool>> =
+                match tool.builtin_target_name().unwrap_or_else(|| tool.name()) {
+                    "memory_store" => Some(Box::new(MemoryStoreTool::new(
+                        Arc::clone(&memory),
+                        Arc::clone(&security),
+                    ))),
+                    "memory_recall" => Some(Box::new(MemoryRecallTool::new(Arc::clone(&memory)))),
+                    "memory_forget" => Some(Box::new(MemoryForgetTool::new(
+                        Arc::clone(&memory),
+                        Arc::clone(&security),
+                    ))),
+                    "memory_export" => Some(Box::new(MemoryExportTool::new(Arc::clone(&memory)))),
+                    "memory_purge" => Some(Box::new(MemoryPurgeTool::new(
+                        Arc::clone(&memory),
+                        Arc::clone(&security),
+                    ))),
+                    _ => None,
+                };
             if let Some(replacement) = replacement {
-                *tool = replacement;
+                if tool.builtin_target_name().is_some() {
+                    let rebound = tool
+                        .with_builtin_target(Arc::from(replacement))
+                        .ok_or_else(|| {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"tool": tool.name()})),
+                                "Memory alias cannot rebind its builtin target"
+                            );
+                            anyhow::Error::msg(format!(
+                                "memory alias '{}' cannot rebind its builtin target",
+                                tool.name()
+                            ))
+                        })?;
+                    replacements
+                        .push((index, Box::new(tools::ArcToolRef(rebound)) as Box<dyn Tool>));
+                } else {
+                    replacements.push((index, replacement));
+                }
             }
         }
+        for (index, replacement) in replacements {
+            self.0[index] = replacement;
+        }
+        Ok(())
     }
 
     /// Test-only constructor that mints a registry directly from raw tools,
@@ -278,11 +308,8 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             unfiltered_tool_arcs,
-            // Test-only capture of the concrete delegate instance; `assemble`
-            // has no use for it and must keep destructuring exhaustively so a
-            // new field cannot be silently dropped here.
-            #[cfg(test)]
-                delegate_tool: _,
+            // The Agent captures this before assembly for owner binding.
+            delegate_tool: _,
         } = built;
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
