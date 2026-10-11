@@ -58,6 +58,7 @@ libc = "0.2"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 zeroclaw-spawn.workspace = true

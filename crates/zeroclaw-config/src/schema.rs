@@ -12171,12 +12171,36 @@ fn resolve_ws_proxy_url(
     preferred.or_else(|| normalize_proxy_url_option(cfg.all_proxy.as_deref()))
 }
 
+// Resolve the operator-owned bundle on each connection so reconnects pick up
+// certificate rotation. Explicitly configured but unusable bundles fail closed.
+#[cfg(feature = "ws-transport")]
+fn websocket_root_cert_store() -> anyhow::Result<rustls::RootCertStore> {
+    use rustls_pki_types::pem::PemObject;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
+        let certificates = rustls_pki_types::CertificateDer::pem_file_iter(path)
+            .with_context(|| "Failed to read WebSocket CA bundle from SSL_CERT_FILE")?;
+        let mut count = 0;
+        for certificate in certificates {
+            let certificate =
+                certificate.with_context(|| "Invalid PEM certificate in WebSocket CA bundle")?;
+            roots
+                .add(certificate)
+                .with_context(|| "Invalid trust anchor in WebSocket CA bundle")?;
+            count += 1;
+        }
+        anyhow::ensure!(count > 0, "WebSocket CA bundle contains no certificates");
+    }
+    Ok(roots)
+}
+
 /// Connect a WebSocket through the configured proxy (if any).
 ///
-/// When no proxy applies, this is a thin wrapper around
-/// `tokio_tungstenite::connect_async`. When a proxy is active the
-/// function tunnels the TCP connection through the proxy before
-/// performing the WebSocket upgrade.
+/// Establishes TCP directly or through the configured proxy before TLS and the
+/// WebSocket upgrade. Secure connections retain the bundled WebPKI roots and
+/// additionally trust certificates from a non-empty `SSL_CERT_FILE` PEM bundle.
 ///
 /// `service_key` is the proxy-service selector (e.g. `"channel.discord"`).
 /// `channel_proxy_url` is the optional per-channel proxy override.
@@ -12229,8 +12253,7 @@ pub async fn ws_connect_with_proxy(
 
             let is_secure = target.scheme() == "wss";
             let stream: BoxedIo = if is_secure {
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let root_store = websocket_root_cert_store()?;
                 let tls_config = std::sync::Arc::new(
                     rustls::ClientConfig::builder()
                         .with_root_certificates(root_store)
@@ -12392,8 +12415,7 @@ async fn ws_connect_via_proxy(
     // If the target is wss://, wrap in TLS.
     let is_secure = target.scheme() == "wss";
     let stream: BoxedIo = if is_secure {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let root_store = websocket_root_cert_store()?;
         let tls_config = std::sync::Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
