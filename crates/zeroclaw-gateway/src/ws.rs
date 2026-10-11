@@ -4071,9 +4071,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[cfg(unix)]
-    async fn rpc_deleted_websocket_is_fenced(
+    async fn rpc_delete_websocket_fixture(
         session_prompts_enabled: bool,
         http_first: Option<bool>,
+        storage_failure: bool,
     ) {
         use zeroclaw_infra::session_backend::SessionBackend;
         use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
@@ -4202,6 +4203,80 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             .expect("session_start transport");
 
         let delete_params = serde_json::json!({"session_id": "delete-race"});
+        if storage_failure {
+            let key = "gw_delete-race";
+            let generation = coordination.queue().lifecycle_generation(key).await;
+            let transcript_generation = coordination.queue().transcript_generation(key);
+            for alias in ["delete-race", "rpc_delete-race", key] {
+                backend
+                    .set_session_prompt(alias, "task", "retain this task")
+                    .unwrap();
+            }
+            let db = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+            db.execute_batch(
+                "CREATE TRIGGER reject_gateway_delete BEFORE DELETE ON session_metadata
+                 WHEN OLD.session_key = 'gw_delete-race'
+                 BEGIN SELECT RAISE(ABORT, 'injected gateway delete failure'); END;",
+            )
+            .unwrap();
+            let error =
+                zeroclaw_runtime::rpc::local::call_local(&config, "session/delete", delete_params)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to delete persistent session"),
+                "deletion must fail at the injected storage boundary: {error}"
+            );
+            for alias in ["delete-race", "rpc_delete-race", key] {
+                assert!(backend.session_exists(alias));
+                let prompts = backend.list_session_prompts(alias).unwrap();
+                assert_eq!(prompts.len(), 1);
+                assert_eq!(prompts[0].content, "retain this task");
+            }
+            assert_eq!(
+                coordination.queue().lifecycle_generation(key).await,
+                generation
+            );
+            assert_eq!(
+                coordination.queue().transcript_generation(key),
+                transcript_generation
+            );
+            assert!(
+                coordination
+                    .cancellations()
+                    .lock()
+                    .unwrap()
+                    .pending_deletions()
+                    .is_empty()
+            );
+            socket
+                .send(ClientMessage::Text(
+                    serde_json::json!({"type": "message", "content": "turn after rollback"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let frame = socket.next().await.unwrap().unwrap();
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+                    if frame["type"] == "error" {
+                        assert_eq!(frame["code"], "PROVIDER_ERROR");
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the existing socket must reach execution after rollback");
+            server.abort();
+            rpc_cancel.cancel();
+            rpc_server.await.unwrap().unwrap();
+            return;
+        }
         if let Some(http_first) = http_first {
             use axum::{
                 extract::{Path, State},
@@ -4352,25 +4427,31 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[cfg(unix)]
     #[tokio::test]
     async fn rpc_delete_fences_idle_websocket_with_session_prompts() {
-        rpc_deleted_websocket_is_fenced(true, None).await;
+        rpc_delete_websocket_fixture(true, None, false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn rpc_delete_fences_idle_websocket_without_session_prompts() {
-        rpc_deleted_websocket_is_fenced(false, None).await;
+        rpc_delete_websocket_fixture(false, None, false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn rpc_delete_concurrent_http_first_is_fenced_without_deadlock() {
-        rpc_deleted_websocket_is_fenced(true, Some(true)).await;
+        rpc_delete_websocket_fixture(true, Some(true), false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn rpc_delete_concurrent_rpc_first_is_fenced_without_deadlock() {
-        rpc_deleted_websocket_is_fenced(true, Some(false)).await;
+        rpc_delete_websocket_fixture(true, Some(false), false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_delete_storage_rollback_keeps_existing_websocket_usable() {
+        rpc_delete_websocket_fixture(true, None, true).await;
     }
 
     #[tokio::test]
