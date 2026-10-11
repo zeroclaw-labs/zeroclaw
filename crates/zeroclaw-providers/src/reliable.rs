@@ -823,6 +823,8 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "context window of this model",
         "maximum context length",
         "context length exceeded",
+        // snake_case form used by local OpenAI-compatible servers.
+        "context_length_exceeded",
         "too many tokens",
         "token limit exceeded",
         "prompt is too long",
@@ -9843,6 +9845,20 @@ mod tests {
         assert!(is_context_window_exceeded(&anyhow::Error::msg(
             "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
         )));
+    }
+
+    #[test]
+    fn is_context_window_exceeded_detects_snake_case_error_code() {
+        // The reply arrives nested under the fallback wrapper, so the detector
+        // must look through the cause chain; a spaced-prose-only list misses it
+        // and the turn fails instead of trimming the oldest turns and retrying.
+        let err = anyhow::Error::msg(
+            "Custom API error (400 Bad Request): {\"error\":{\"message\":\"context_length_exceeded: prompt is 32866 tokens, over the configured 32768-token prompt-plus-reply window.\",\"code\":\"context_length_exceeded\"}}",
+        )
+        .context("All model providers/models failed after 1 failure event(s)");
+
+        assert!(!err.to_string().contains("context_length_exceeded"));
+        assert!(is_context_window_exceeded(&err));
     }
 
     #[test]
