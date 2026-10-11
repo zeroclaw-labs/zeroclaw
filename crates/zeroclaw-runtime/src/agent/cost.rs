@@ -25,6 +25,25 @@ pub struct TurnUsage {
     pub output_tokens: u64,
     pub cost_usd: f64,
     pub last_input_tokens: u64,
+    /// Token subset that could not be priced. When non-zero, `cost_usd` is
+    /// an incomplete total and must not be published as a complete cost.
+    pub unpriced_tokens: u64,
+}
+
+impl TurnUsage {
+    /// True when no tokens were billed and no cost was recorded. Used to
+    /// skip emitting empty `AgentEnd` annotations when the turn produced
+    /// no observable usage (e.g. a turn that returned early on error).
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cost_usd == 0.0
+    }
+
+    /// The turn's cost, or `None` when any token-bearing usage could not be
+    /// priced and `cost_usd` is therefore an incomplete total. Preserves
+    /// `Some(0.0)` for fully priced, genuinely free usage.
+    pub fn complete_cost(&self) -> Option<f64> {
+        (self.unpriced_tokens == 0).then_some(self.cost_usd)
+    }
 }
 
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
@@ -545,6 +564,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cost_usd += cost_usage.cost_usd;
+            usage.unpriced_tokens = usage.unpriced_tokens.saturating_add(unpriced.tokens);
             if updates_context_window_fill {
                 // Replace (not accumulate) last_input_tokens with the absolute
                 // accepted provider-reported prompt size — this is the accurate
@@ -561,6 +581,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
         turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
         turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
         turn_usage.cost_usd += cost_usage.cost_usd;
+        turn_usage.unpriced_tokens = turn_usage.unpriced_tokens.saturating_add(unpriced.tokens);
         if updates_context_window_fill {
             // Replace (not accumulate) last_input_tokens with the absolute
             // accepted provider-reported prompt size.
@@ -657,6 +678,169 @@ mod tests {
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
     use zeroclaw_providers::ProviderDispatch;
     use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+
+    #[test]
+    fn turn_usage_is_zero_skips_empty_usage() {
+        assert!(TurnUsage::default().is_zero());
+
+        let token_only = TurnUsage {
+            input_tokens: 1,
+            ..TurnUsage::default()
+        };
+        assert!(!token_only.is_zero());
+
+        let cost_only = TurnUsage {
+            cost_usd: 0.001,
+            ..TurnUsage::default()
+        };
+        assert!(!cost_only.is_zero());
+    }
+
+    #[test]
+    fn turn_usage_complete_cost_preserves_pricing_completeness() {
+        // Fully priced, known non-zero cost.
+        let known = TurnUsage {
+            cost_usd: 0.042,
+            ..TurnUsage::default()
+        };
+        assert_eq!(known.complete_cost(), Some(0.042));
+
+        // Fully priced but genuinely free usage stays Some(0.0).
+        let free = TurnUsage::default();
+        assert_eq!(free.complete_cost(), Some(0.0));
+
+        // Missing pricing: tokens recorded but no price → None, not Some(0.0).
+        let missing = TurnUsage {
+            input_tokens: 100,
+            unpriced_tokens: 100,
+            ..TurnUsage::default()
+        };
+        assert_eq!(missing.complete_cost(), None);
+
+        // Mixed/partial pricing: some tokens priced, some not → None.
+        let partial = TurnUsage {
+            input_tokens: 200,
+            cost_usd: 0.01,
+            unpriced_tokens: 100,
+            ..TurnUsage::default()
+        };
+        assert_eq!(partial.complete_cost(), None);
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>,
+    }
+
+    impl zeroclaw_api::observability_traits::Observer for CapturingObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn agent_end_cost_reflects_pricing_completeness() {
+        // Drive usage through the production recorder, then emit AgentEnd the
+        // way the runtime/channel call sites do, and assert the emitted cost.
+        // Known pricing → Some(cost); fully priced free → Some(0.0); missing
+        // or partial pricing → None.
+        type Case = (
+            &'static str,
+            &'static str,
+            HashMap<String, f64>,
+            Option<f64>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "known",
+                "known-model",
+                pricing_with_cache("known-model", 2.0, 0.0, 5.0),
+                Some((100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0),
+            ),
+            (
+                "free",
+                "free-model",
+                pricing_with_cache("free-model", 0.0, 0.0, 0.0),
+                Some(0.0),
+            ),
+            ("missing", "missing-model", HashMap::new(), None),
+            (
+                "partial",
+                "partial-model",
+                HashMap::from([("partial-model.input".to_string(), 2.0)]),
+                None,
+            ),
+        ];
+
+        for (provider, model, pricing, expected_cost) in cases {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let ctx = ToolLoopCostTrackingContext::new(
+                Arc::clone(&tracker),
+                Arc::new(HashMap::from([(provider.to_string(), pricing)])),
+            );
+            let usage = zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
+            };
+
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx.clone()), async {
+                        record_tool_loop_cost_usage(provider, model, &usage)
+                    }),
+                )
+                .expect("usage recorded");
+
+            // Emit AgentEnd exactly as the runtime/channel call sites do.
+            let observer = CapturingObserver::default();
+            let turn_usage = ctx.snapshot_turn_usage();
+            let tokens_used = (!turn_usage.is_zero()).then_some({
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: turn_usage.input_tokens,
+                    output_tokens: turn_usage.output_tokens,
+                }
+            });
+            let mut guard = crate::observability::AgentTurnGuard::start(
+                &observer, provider, model, None, None, None,
+            );
+            guard.set_usage(tokens_used, turn_usage.complete_cost());
+            guard.finish();
+
+            let cost = observer.events.lock().iter().find_map(|event| match event {
+                zeroclaw_api::observability_traits::ObserverEvent::AgentEnd {
+                    cost_usd, ..
+                } => *cost_usd,
+                _ => None,
+            });
+            match (cost, expected_cost) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "{provider}/{model}: {actual} != {expected}"
+                ),
+                (None, None) => {}
+                (actual, expected) => {
+                    panic!("{provider}/{model}: got {actual:?}, expected {expected:?}")
+                }
+            }
+        }
+    }
 
     struct ResetGlobalPricingCatalog;
 

@@ -4134,13 +4134,13 @@ impl Agent {
         // any return below drops it — including the error path, which must
         // still report usage from calls that succeeded earlier in the turn.
         let usage = cost_context.snapshot_turn_usage();
-        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        if !usage.is_zero() {
             guard.set_usage(
                 Some(zeroclaw_api::observability_traits::TurnTokenUsage {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
                 }),
-                None,
+                usage.complete_cost(),
             );
         }
         // Write back any token-budget trim that happened inside the loop to
@@ -4754,13 +4754,13 @@ impl Agent {
             // below drops it — the error paths must still report usage from
             // calls that succeeded earlier in the turn.
             let usage = cost_context.snapshot_turn_usage();
-            if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            if !usage.is_zero() {
                 guard.set_usage(
                     Some(zeroclaw_api::observability_traits::TurnTokenUsage {
                         input_tokens: usage.input_tokens,
                         output_tokens: usage.output_tokens,
                     }),
-                    None,
+                    usage.complete_cost(),
                 );
             }
 
