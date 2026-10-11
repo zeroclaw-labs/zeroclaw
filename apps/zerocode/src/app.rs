@@ -1930,6 +1930,7 @@ pub async fn run(
     }
 
     loop {
+        pause_config_query_outside_mode(mode, &mut config_app);
         // Draw
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -2323,7 +2324,10 @@ pub async fn run(
                     Mode::Quickstart => quickstart.wants_text_input(),
                     Mode::Sop => sop_pane.wants_text_input(),
                 };
-                let global = GlobalAction::from_chord(&key);
+                let global = binding_query_global_action(
+                    GlobalAction::from_chord(&key),
+                    mode == Mode::Config && config_app.binding_query_claims_key(&key),
+                );
 
                 // Quit-confirm modal. The first exit chord closes any open
                 // transient widgets and arms the modal; a second exit chord —
@@ -2825,6 +2829,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
         ),
         HelpEntry::spacer(),
     ]
+}
+
+/// Every mode departure ends query text ownership before the next input event.
+fn pause_config_query_outside_mode(mode: Mode, config: &mut config_manager::App) {
+    if mode != Mode::Config {
+        config.finish_binding_query_edit();
+    }
+}
+
+/// Printable globals yield only while the client keybinding query owns text.
+fn binding_query_global_action(
+    global: Option<GlobalAction>,
+    query_claims_key: bool,
+) -> Option<GlobalAction> {
+    if query_claims_key { None } else { global }
 }
 
 fn pane_switch_delta(
@@ -3640,6 +3659,161 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    // Keep process-wide keymap overrides serialized through current-thread UI calls.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn binding_query_global_dispatch_keeps_quit_and_modified_shortcuts() {
+        use crate::keymap::{Chord, RebindableActions};
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut config = config_manager::App::new(rpc, dir.path());
+        let mut term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        config
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            config
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+        }
+        config
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        let printable = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(!config.binding_query_claims_key(&printable));
+        config
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(config.binding_query_claims_key(&printable));
+        for action in [
+            GlobalAction::ToggleSidebar,
+            GlobalAction::PaneNavLeft,
+            GlobalAction::PaneNavRight,
+            GlobalAction::Help,
+            GlobalAction::ReloadDaemon,
+        ] {
+            crate::keymap::overrides::reset();
+            let action_key = action.key();
+            let (tag, variant) = action_key.split_once('.').unwrap();
+            crate::keymap::overrides::set_row(
+                tag,
+                variant,
+                vec![Chord::char('j'), Chord::ctrl('b')],
+            );
+            assert_eq!(GlobalAction::from_chord(&printable), Some(action));
+            assert_eq!(
+                binding_query_global_action(
+                    GlobalAction::from_chord(&printable),
+                    config.binding_query_claims_key(&printable)
+                ),
+                None
+            );
+            let modified = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(
+                binding_query_global_action(
+                    GlobalAction::from_chord(&modified),
+                    config.binding_query_claims_key(&modified)
+                ),
+                Some(action)
+            );
+        }
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "global",
+            "quit",
+            vec![Chord::char('q'), Chord::ctrl('c')],
+        );
+        let quit = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(
+            binding_query_global_action(
+                GlobalAction::from_chord(&quit),
+                config.binding_query_claims_key(&quit)
+            ),
+            None
+        );
+        let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+        config.handle_key(quit, &mut term).await.unwrap();
+        assert_eq!(
+            before,
+            std::fs::read(crate::config::config_path(dir.path())).unwrap()
+        );
+        let modified_quit = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            binding_query_global_action(
+                GlobalAction::from_chord(&modified_quit),
+                config.binding_query_claims_key(&modified_quit)
+            ),
+            Some(GlobalAction::Quit)
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| config.draw_into(frame, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("Search: q"),
+            "printable quit must be query text: {text}"
+        );
+        // This shared invariant runs after mouse mode-bar/sidebar changes too.
+        for departure in [Mode::Chat, Mode::Dashboard] {
+            pause_config_query_outside_mode(Mode::Config, &mut config);
+            assert!(config.binding_query_claims_key(&printable));
+            pause_config_query_outside_mode(departure, &mut config);
+            assert!(!config.binding_query_claims_key(&printable));
+            terminal
+                .draw(|frame| config.draw_into(frame, frame.area()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains("Search: q"),
+                "departure preserves query: {text}"
+            );
+            config
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        }
+        config.finish_binding_query_edit();
+        assert!(!config.binding_query_claims_key(&printable));
+        crate::keymap::overrides::reset();
+    }
 
     fn test_dock() -> ConversationDock {
         ConversationDock {

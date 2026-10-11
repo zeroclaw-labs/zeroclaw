@@ -171,6 +171,11 @@ pub(crate) struct ZerocodePane {
     rows: Vec<BindingRow>,
     binding_cursor: usize,
     capture: Option<Capture>,
+    binding_query: String,
+    binding_query_editing: bool,
+    binding_query_anchor: Option<String>,
+    binding_list_area: Rect,
+    binding_list_offset: usize,
     // Locale: registry from the daemon (locales/list), fed by config_manager.
     locales: Vec<crate::client::LocaleOption>,
     locale_cursor: usize,
@@ -308,6 +313,11 @@ impl ZerocodePane {
             rows: Vec::new(),
             binding_cursor: 0,
             capture: None,
+            binding_query: String::new(),
+            binding_query_editing: false,
+            binding_query_anchor: None,
+            binding_list_area: Rect::default(),
+            binding_list_offset: 0,
             locales: Vec::new(),
             locale_cursor: 0,
             active_locale: config::ensure_and_load(config_dir)
@@ -356,14 +366,123 @@ impl ZerocodePane {
     /// Materialise the binding rows from every rebindable action enum's
     /// resolved bindings — defaults merged with any active override.
     fn rebuild_rows(&mut self) {
+        let selected = self
+            .rows
+            .get(self.binding_cursor)
+            .map(|r| r.action_key.clone());
         self.rows = collect_binding_rows();
-        if self.binding_cursor >= self.rows.len() {
-            self.binding_cursor = self.rows.len().saturating_sub(1);
+        self.binding_cursor = selected
+            .and_then(|key| self.rows.iter().position(|r| r.action_key == key))
+            .unwrap_or_else(|| self.binding_cursor.min(self.rows.len().saturating_sub(1)));
+        self.reconcile_binding_selection();
+    }
+
+    fn visible_binding_indices(&self) -> Vec<usize> {
+        let query = self.binding_query.trim().to_lowercase();
+        let chord_query = query.parse::<Chord>().ok();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                (query.is_empty()
+                    || row.action_key.to_lowercase().contains(&query)
+                    || row.label.to_lowercase().contains(&query)
+                    || row.chords.iter().any(|chord| {
+                        chord.display().to_lowercase().contains(&query)
+                            || chord.wire().to_lowercase().contains(&query)
+                            || chord_query.as_ref().is_some_and(|q| chord.same_key(q))
+                    }))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn reconcile_binding_selection(&mut self) {
+        let visible = self.visible_binding_indices();
+        if !visible.contains(&self.binding_cursor)
+            && let Some(first) = visible.first()
+        {
+            self.binding_cursor = *first;
         }
     }
 
+    fn begin_binding_search(&mut self) {
+        if !self.binding_query_editing() {
+            self.binding_query_anchor = self
+                .rows
+                .get(self.binding_cursor)
+                .map(|r| r.action_key.clone());
+        }
+        self.binding_query_editing = true;
+    }
+
+    fn clear_binding_search(&mut self) {
+        self.binding_query.clear();
+        self.binding_query_editing = false;
+        if let Some(anchor) = self.binding_query_anchor.take()
+            && let Some(index) = self.rows.iter().position(|r| r.action_key == anchor)
+        {
+            self.binding_cursor = index;
+        }
+        self.reconcile_binding_selection();
+    }
+
+    pub(crate) fn binding_query_editing(&self) -> bool {
+        self.focus == Focus::Bindings
+            && self.cursor == PaneCursor::Detail
+            && self.binding_query_editing
+            && self.capture.is_none()
+            && self.conn_edit.is_none()
+    }
+
+    pub(crate) fn binding_query_claims_key(&self, key: &KeyEvent) -> bool {
+        self.binding_query_editing()
+            && matches!(key.code, KeyCode::Char(_)) // keyguard: classify literal query text, not a remappable command
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    }
+
+    pub(crate) fn finish_binding_query_edit(&mut self) {
+        self.binding_query_editing = false;
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.conn_edit.is_some()
+        self.conn_edit.is_some() || self.binding_query_editing()
+    }
+
+    fn handle_binding_search_key(&mut self, key: KeyEvent) {
+        use crate::keymap::SearchBoxAction as A;
+        match A::from_chord(&key) {
+            Some(A::Accept) => self.finish_binding_query_edit(),
+            Some(A::Cancel) => self.clear_binding_search(),
+            Some(A::Backspace) => {
+                self.binding_query.pop();
+                self.reconcile_binding_selection();
+            }
+            Some(A::Up) => self.move_cursor(-1),
+            Some(A::Down) => self.move_cursor(1),
+            _ if self.binding_query_claims_key(&key) => {
+                if let KeyCode::Char(c) = key.code {
+                    self.binding_query.push(c);
+                    self.reconcile_binding_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if self.binding_query_editing() {
+            self.binding_query
+                .extend(text.chars().filter(|c| !c.is_control()));
+            self.reconcile_binding_selection();
+        } else if let Some(edit) = self.conn_edit.as_mut() {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            edit.buf.extend(text.chars().filter(|c| {
+                !c.is_control() || (*c == '\n' && edit.field == ConnField::SkipVerifyRoutes)
+            }));
+        }
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -556,50 +675,14 @@ impl ZerocodePane {
         let mut state = ListState::default();
         state.select(Some(self.agent_cursor.min(items.len() - 1)));
 
-        // Reserve a one-line hint footer inside the panel so the key actions
-        // are visible without opening the help modal.
-        use ratatui::layout::{Constraint, Direction, Layout};
-        let block = theme::panel_block(" Agent Themes ");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(inner);
         frame.render_stateful_widget(
             List::new(items)
+                .block(theme::panel_block(" Agent Themes "))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
-            rows[0],
+            area,
             &mut state,
         );
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(Line::from(Span::styled(
-                self.agent_theme_hint(),
-                theme::dim_style(),
-            ))),
-            rows[1],
-        );
-    }
-
-    /// One-line key hint for the Agent Themes section, with key labels derived
-    /// from the keymap (assign / clear) rather than hardcoded.
-    fn agent_theme_hint(&self) -> String {
-        use crate::keymap::{ConfigTabAction as A, RebindableActions};
-        let label = |a: A| -> String {
-            a.resolved()
-                .iter()
-                .map(Chord::display)
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-        crate::i18n::t_args(
-            "zc-zerocode-agent-theme-hint",
-            &[
-                ("assign", &label(A::Enter)),
-                ("clear", &label(A::DeleteRow)),
-            ],
-        )
     }
 
     fn draw_presets(&self, frame: &mut Frame, area: Rect) {
@@ -622,39 +705,86 @@ impl ZerocodePane {
         );
     }
 
-    fn draw_bindings(&self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .rows
-            .iter()
-            .map(|r| {
-                let chords = if r.chords.is_empty() {
-                    "(unbound)".to_string()
+    fn draw_bindings(&mut self, frame: &mut Frame, area: Rect) {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let visible = self.visible_binding_indices();
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        let query = crate::i18n::t_args(
+            "zc-zerocode-binding-query",
+            &[
+                ("query", &self.binding_query),
+                ("matched", &visible.len().to_string()),
+                ("total", &self.rows.len().to_string()),
+            ],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    "{query}{}",
+                    if self.binding_query_editing() {
+                        "█"
+                    } else {
+                        ""
+                    }
+                ),
+                if self.binding_query_editing() {
+                    theme::input_style()
                 } else {
-                    r.chords
+                    theme::dim_style()
+                },
+            )),
+            rows[0],
+        );
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|index| {
+                let row = &self.rows[*index];
+                let chords = if row.chords.is_empty() {
+                    crate::i18n::t("zc-zerocode-binding-unbound")
+                } else {
+                    row.chords
                         .iter()
                         .map(Chord::display)
                         .collect::<Vec<_>>()
                         .join("  ")
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<28}", r.action_key), theme::dim_style()),
-                    Span::styled(format!("{:<22}", r.label), theme::body_style()),
+                    Span::styled(format!("{:<28}", row.action_key), theme::dim_style()),
+                    Span::styled(format!("{:<22}", row.label), theme::body_style()),
                     Span::styled(chords, theme::accent_style()),
                 ]))
             })
             .collect();
         let mut state = ListState::default();
-        if !items.is_empty() {
-            state.select(Some(self.binding_cursor.min(items.len() - 1)));
-        }
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(theme::panel_block(" Keybindings (Enter to rebind) "))
-                .highlight_style(self.detail_highlight().0)
-                .highlight_symbol(self.detail_highlight().1),
-            area,
-            &mut state,
+        state.select(
+            visible
+                .iter()
+                .position(|index| *index == self.binding_cursor),
         );
+        let block = theme::panel_block(&crate::i18n::t("zc-zerocode-bindings-title"));
+        self.binding_list_area = rows[1];
+        if items.is_empty() {
+            self.binding_list_offset = 0;
+            frame.render_widget(
+                Paragraph::new(crate::i18n::t("zc-zerocode-binding-no-results"))
+                    .style(theme::dim_style())
+                    .block(block),
+                rows[1],
+            );
+        } else {
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(block)
+                    .highlight_style(self.detail_highlight().0)
+                    .highlight_symbol(self.detail_highlight().1),
+                rows[1],
+                &mut state,
+            );
+            self.binding_list_offset = state.offset();
+        }
     }
 
     /// Total selectable rows on the Locale tab: one per registry locale, plus
@@ -711,7 +841,9 @@ impl ZerocodePane {
         state.select(Some(self.locale_cursor.min(items.len().saturating_sub(1))));
         frame.render_stateful_widget(
             List::new(items)
-                .block(theme::panel_block(" Locale (Enter to select / download) "))
+                .block(theme::panel_block(&crate::i18n::t(
+                    "zc-zerocode-locale-title",
+                )))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
             area,
@@ -745,17 +877,7 @@ impl ZerocodePane {
 
     fn draw_connection(&self, frame: &mut Frame, area: Rect) {
         if let Some(edit) = &self.conn_edit {
-            use ratatui::layout::{Constraint, Direction, Layout};
             let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
-            let hint = match edit.field {
-                ConnField::SkipVerify => crate::i18n::t("zc-zerocode-conn-edit-bool"),
-                ConnField::SkipVerifyRoutes => crate::i18n::t("zc-zerocode-conn-edit-routes"),
-                ConnField::Uri => crate::i18n::t("zc-zerocode-conn-edit-text"),
-            };
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(area);
 
             let buf_lines: Vec<&str> = edit.buf.split('\n').collect();
             let lines: Vec<Line> = buf_lines
@@ -774,11 +896,7 @@ impl ZerocodePane {
                 Paragraph::new(lines)
                     .block(theme::panel_block(&title))
                     .wrap(Wrap { trim: false }),
-                rows[0],
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled(hint, theme::dim_style())),
-                rows[1],
+                area,
             );
             return;
         }
@@ -800,7 +918,7 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&crate::i18n::t(
-                    "zc-zerocode-conn-title",
+                    "zc-zerocode-connection-panel-title",
                 )))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
@@ -867,7 +985,7 @@ impl ZerocodePane {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&crate::i18n::t(
-                        "zc-zerocode-tracker-title",
+                        "zc-zerocode-tracker-panel-title",
                     )))
                     .highlight_style(self.detail_highlight().0)
                     .highlight_symbol(self.detail_highlight().1),
@@ -880,7 +998,7 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&crate::i18n::t(
-                    "zc-zerocode-tracker-title",
+                    "zc-zerocode-tracker-panel-title",
                 )))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
@@ -1061,7 +1179,7 @@ impl ZerocodePane {
             lines.push(Line::from(Span::styled(err.clone(), theme::warn_style())));
         }
         lines.push(Line::from(Span::styled(
-            crate::i18n::t_args("zc-zerocode-hint-cancel", &[("keys", "Esc")]),
+            self.capture_cancel_hint(),
             theme::dim_style(),
         )));
 
@@ -1095,6 +1213,10 @@ impl ZerocodePane {
             self.handle_conn_edit_key(key);
             return true;
         }
+        if self.binding_query_editing() {
+            self.handle_binding_search_key(key);
+            return true;
+        }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
             // Up/Down move within whichever side holds the cursor: the section
@@ -1116,7 +1238,11 @@ impl ZerocodePane {
                 if self.cursor == PaneCursor::Sections {
                     return false;
                 }
-                self.leave_detail();
+                if self.focus == Focus::Bindings && !self.binding_query.is_empty() {
+                    self.clear_binding_search();
+                } else {
+                    self.leave_detail();
+                }
             }
             // Enter: from Sections steps into the detail; from Detail activates
             // the highlighted row.
@@ -1130,7 +1256,16 @@ impl ZerocodePane {
                 if self.cursor == PaneCursor::Sections {
                     return false;
                 }
-                self.leave_detail();
+                if self.focus == Focus::Bindings && !self.binding_query.is_empty() {
+                    self.clear_binding_search();
+                } else {
+                    self.leave_detail();
+                }
+            }
+            Some(ConfigTabAction::BeginSearch)
+                if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
+            {
+                self.begin_binding_search();
             }
             Some(ConfigTabAction::DeleteRow)
                 if self.cursor == PaneCursor::Detail && self.focus == Focus::Bindings =>
@@ -1201,10 +1336,12 @@ impl ZerocodePane {
         if self.cursor == PaneCursor::Detail {
             self.theme_target_agent = None;
         }
+        self.finish_binding_query_edit();
         self.cursor = PaneCursor::Sections;
     }
 
     fn cycle_focus(&mut self, delta: isize) {
+        self.finish_binding_query_edit();
         // Moving off Agent Themes drops any pending assignment defensively;
         // assignment normally lives in the detail pane, so this rarely fires.
         if self.focus == Focus::AgentTheme {
@@ -1216,6 +1353,18 @@ impl ZerocodePane {
     }
 
     fn move_cursor(&mut self, delta: isize) {
+        if self.focus == Focus::Bindings {
+            let visible = self.visible_binding_indices();
+            if !visible.is_empty() {
+                let position = visible
+                    .iter()
+                    .position(|index| *index == self.binding_cursor)
+                    .unwrap_or(0);
+                self.binding_cursor = visible
+                    [(position as isize + delta).clamp(0, visible.len() as isize - 1) as usize];
+            }
+            return;
+        }
         // While assigning, Agent Themes drives the borrowed theme list.
         let len = if self.focus == Focus::AgentTheme && self.assigning_theme() {
             self.themes.len()
@@ -1224,7 +1373,7 @@ impl ZerocodePane {
                 Focus::Theme => self.themes.len(),
                 Focus::AgentTheme => self.agents.len(),
                 Focus::Presets => self.presets.len(),
-                Focus::Bindings => self.rows.len(),
+                Focus::Bindings => self.visible_binding_indices().len(),
                 Focus::Locale => self.locales.len() + 1,
                 Focus::Connection => CONN_FIELDS.len(),
                 Focus::TodoTracker => TRACKER_FIELDS.len(),
@@ -1260,7 +1409,10 @@ impl ZerocodePane {
             Focus::AgentTheme => self.begin_agent_assign(),
             Focus::Presets => self.apply_preset(),
             Focus::Bindings => {
-                if !self.rows.is_empty() {
+                if self
+                    .visible_binding_indices()
+                    .contains(&self.binding_cursor)
+                {
                     self.capture = Some(Capture {
                         row: self.binding_cursor,
                         error: None,
@@ -1560,6 +1712,12 @@ impl ZerocodePane {
     }
 
     fn reset_row(&mut self) {
+        if !self
+            .visible_binding_indices()
+            .contains(&self.binding_cursor)
+        {
+            return;
+        }
         let Some(row) = self.rows.get(self.binding_cursor) else {
             return;
         };
@@ -1627,120 +1785,292 @@ impl ZerocodePane {
 
     // ── Contextual help ──────────────────────────────────────────
 
-    pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::keymap::ConfigTabAction as A;
-        use crate::widgets::{HelpEntry as E, HelpNode};
-        // Render the live chords for an action, never a hardcoded glyph, so the
-        // help tracks the actual (possibly overridden) keymap.
-        let keys = |a: A| -> Vec<String> {
-            use crate::keymap::RebindableActions;
-            a.resolved().iter().map(Chord::display).collect()
-        };
+    /// Global shortcuts run before Config, except where active text owns them.
+    fn global_preempts_local(&self, event: &KeyEvent) -> bool {
+        use crate::keymap::GlobalAction as A;
+        if self.binding_query_claims_key(event) {
+            return false;
+        }
+        match A::from_chord(event) {
+            Some(A::Quit | A::ToggleSidebar | A::PaneNavLeft | A::PaneNavRight) => true,
+            Some(A::Help) => {
+                !self.wants_text_input() || crate::keymap::help_bypasses_text_input(event)
+            }
+            Some(A::ReloadDaemon) => !self.wants_text_input(),
+            _ => false,
+        }
+    }
 
+    fn connection_editor_claims_key(&self, event: &KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction as E;
+        self.conn_edit.is_some()
+            && matches!(E::from_chord(event), Some(E::Save | E::Confirm | E::Cancel))
+    }
+
+    /// Display only local chords that can reach the active widget.
+    fn local_hint_keys<A: crate::keymap::RebindableActions>(&self, action: A) -> Vec<String> {
+        let advertised = crate::keymap::action_key_labels(action);
+        action
+            .resolved()
+            .iter()
+            .filter(|chord| {
+                let event = KeyEvent::new(chord.code, chord.effective_modifiers());
+                advertised.contains(&chord.display())
+                    && !self.global_preempts_local(&event)
+                    && (self.binding_query_claims_key(&event)
+                        || self.connection_editor_claims_key(&event)
+                        || !matches!(
+                            crate::keymap::ConfigTabAction::from_chord(&event),
+                            Some(
+                                crate::keymap::ConfigTabAction::SectionNext
+                                    | crate::keymap::ConfigTabAction::SectionPrev
+                            )
+                        ))
+            })
+            .map(Chord::display)
+            .collect()
+    }
+
+    fn capture_cancel_hint(&self) -> String {
+        let keys = self.local_hint_keys(crate::keymap::CaptureAction::Cancel);
+        if keys.is_empty() {
+            String::new()
+        } else {
+            crate::i18n::t_args("zc-zerocode-hint-cancel", &[("keys", &keys.join("/"))])
+        }
+    }
+
+    /// The footer and help share the same active actions and resolved bindings.
+    fn contextual_actions(&self) -> Vec<crate::widgets::HelpEntry> {
+        use crate::keymap::{
+            ConfigEditorAction as E, ConfigTabAction as A, RebindableActions, SearchBoxAction as S,
+        };
+        use crate::widgets::HelpEntry;
+        let mut entries = Vec::new();
+        let mut add = |keys: Vec<String>, label: &str| {
+            if !keys.is_empty() {
+                entries.push(HelpEntry::new(keys, crate::i18n::t(label)));
+            }
+        };
         if self.capture.is_some() {
-            return HelpNode::entries(vec![
-                E::key("any key", crate::i18n::t("zc-zerocode-capture-assign")),
-                E::new(keys(A::Back), crate::i18n::t("zc-zerocode-capture-cancel")),
-            ]);
-        }
-
-        let mouse = || {
-            E::new(
-                Vec::<String>::new(),
-                format!(
-                    "{}: {}",
-                    crate::i18n::t("zc-zerocode-help-mouse-label"),
-                    crate::i18n::t("zc-zerocode-help-mouse-desc"),
+            add(
+                self.local_hint_keys(crate::keymap::CaptureAction::Cancel),
+                "zc-zerocode-capture-cancel",
+            );
+        } else if let Some(edit) = &self.conn_edit {
+            if edit.field == ConnField::SkipVerifyRoutes {
+                add(
+                    self.local_hint_keys(E::Confirm),
+                    "zc-config-footer-action-new-line",
+                );
+                add(
+                    self.local_hint_keys(E::Save),
+                    "zc-config-footer-action-save",
+                );
+            } else {
+                add(
+                    [
+                        self.local_hint_keys(E::Confirm),
+                        self.local_hint_keys(E::Save),
+                    ]
+                    .concat(),
+                    "zc-config-footer-action-save",
+                );
+            }
+            add(
+                self.local_hint_keys(E::Cancel),
+                "zc-config-footer-action-cancel",
+            );
+        } else if self.binding_query_editing() {
+            add(
+                self.local_hint_keys(S::Accept),
+                "zc-zerocode-hint-browse-matches",
+            );
+            add(
+                self.local_hint_keys(S::Cancel),
+                "zc-config-footer-action-clear-filter",
+            );
+            add(
+                [self.local_hint_keys(S::Up), self.local_hint_keys(S::Down)].concat(),
+                "zc-zerocode-help-navigate-rows",
+            );
+        } else if self.cursor == PaneCursor::Sections {
+            add(
+                [self.local_hint_keys(A::Up), self.local_hint_keys(A::Down)].concat(),
+                "zc-zerocode-help-choose-section",
+            );
+            add(
+                [
+                    self.local_hint_keys(A::TabRight),
+                    self.local_hint_keys(A::Enter),
+                ]
+                .concat(),
+                "zc-zerocode-help-open-section",
+            );
+            add(
+                [
+                    self.local_hint_keys(A::TabLeft),
+                    self.local_hint_keys(A::Back),
+                ]
+                .concat(),
+                "zc-zerocode-hint-back",
+            );
+        } else {
+            match self.focus {
+                Focus::Theme => add(
+                    self.local_hint_keys(A::Enter),
+                    "zc-zerocode-hint-apply-theme",
                 ),
-            )
+                Focus::AgentTheme if self.assigning_theme() => add(
+                    self.local_hint_keys(A::Enter),
+                    "zc-zerocode-hint-assign-theme",
+                ),
+                Focus::AgentTheme => {
+                    add(
+                        self.local_hint_keys(A::Enter),
+                        "zc-zerocode-hint-pick-theme",
+                    );
+                    add(
+                        self.local_hint_keys(A::DeleteRow),
+                        "zc-zerocode-hint-clear-theme",
+                    );
+                }
+                Focus::Presets => add(
+                    self.local_hint_keys(A::Enter),
+                    "zc-zerocode-hint-apply-preset",
+                ),
+                Focus::Bindings => {
+                    if !self.visible_binding_indices().is_empty() {
+                        add(self.local_hint_keys(A::Enter), "zc-zerocode-hint-rebind");
+                        add(
+                            self.local_hint_keys(A::DeleteRow),
+                            "zc-config-footer-action-reset",
+                        );
+                    }
+                    add(
+                        self.local_hint_keys(A::BeginSearch),
+                        "zc-zerocode-hint-search",
+                    );
+                }
+                Focus::Locale => add(self.local_hint_keys(A::Enter), "zc-zerocode-hint-locale"),
+                Focus::Connection => add(
+                    self.local_hint_keys(A::Enter),
+                    "zc-zerocode-hint-connection",
+                ),
+                Focus::TodoTracker => {
+                    add(self.local_hint_keys(A::Enter), "zc-zerocode-hint-toggle")
+                }
+            }
+            add(
+                [self.local_hint_keys(A::Up), self.local_hint_keys(A::Down)].concat(),
+                "zc-zerocode-help-navigate-rows",
+            );
+            add(
+                [
+                    self.local_hint_keys(A::TabLeft),
+                    self.local_hint_keys(A::Back),
+                ]
+                .concat(),
+                if self.focus == Focus::Bindings && !self.binding_query.is_empty() {
+                    "zc-config-footer-action-clear-filter"
+                } else {
+                    "zc-zerocode-hint-back"
+                },
+            );
+        }
+        // Active editor commands and printable query text precede section dispatch.
+        let outer_keys = |action: A| {
+            action
+                .resolved()
+                .iter()
+                .filter(|chord| {
+                    let event = KeyEvent::new(chord.code, chord.effective_modifiers());
+                    !self.binding_query_claims_key(&event)
+                        && !self.connection_editor_claims_key(&event)
+                        && !(self.wants_text_input()
+                            && matches!(event.code, KeyCode::Char(_)) // keyguard: classify literal editor text, not a remappable command
+                            && !event.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                            ))
+                        && !self.global_preempts_local(&event)
+                        && A::from_chord(&event) == Some(action)
+                })
+                .map(Chord::display)
+                .collect::<Vec<_>>()
         };
+        add(
+            [outer_keys(A::SectionNext), outer_keys(A::SectionPrev)].concat(),
+            "zc-zerocode-hint-section",
+        );
+        let help = crate::keymap::GlobalAction::Help
+            .resolved()
+            .iter()
+            .filter(|chord| {
+                let event = KeyEvent::new(chord.code, chord.effective_modifiers());
+                !self.binding_query_claims_key(&event)
+                    && crate::keymap::GlobalAction::from_chord(&event)
+                        == Some(crate::keymap::GlobalAction::Help)
+                    && (!self.wants_text_input() || crate::keymap::help_bypasses_text_input(&event))
+            })
+            .map(Chord::display)
+            .collect();
+        add(help, "zc-config-footer-action-help");
+        entries
+    }
 
-        // Cursor in the section list: navigate sections and step into one.
+    pub(crate) fn bottom_hint(&self) -> String {
+        let level = crate::i18n::t(if self.cursor == PaneCursor::Sections {
+            "zc-zerocode-context-sections"
+        } else {
+            "zc-zerocode-context-detail"
+        });
+        let context = crate::i18n::t_args(
+            "zc-zerocode-footer-context",
+            &[
+                ("level", &level),
+                ("page", &crate::i18n::t(self.focus.fluent_key())),
+            ],
+        );
+        let mut entries = self.contextual_actions();
         if self.cursor == PaneCursor::Sections {
-            return HelpNode::entries(vec![
-                E::new(
-                    [keys(A::Up), keys(A::Down)].concat(),
-                    crate::i18n::t("zc-zerocode-help-choose-section"),
-                ),
-                E::new(
-                    [keys(A::TabRight), keys(A::Enter)].concat(),
-                    crate::i18n::t("zc-zerocode-help-open-section"),
-                ),
-                E::spacer(),
-                mouse(),
-            ]);
+            let open = crate::i18n::t("zc-zerocode-help-open-section");
+            if let Some(index) = entries.iter().position(|entry| entry.action == open) {
+                let entry = entries.remove(index);
+                entries.insert(0, entry);
+            }
         }
+        let back = crate::i18n::t("zc-zerocode-hint-back");
+        let clear = crate::i18n::t("zc-config-footer-action-clear-filter");
+        let cancel = crate::i18n::t("zc-config-footer-action-cancel");
+        if let Some(index) = entries.iter().position(|entry| {
+            [back.as_str(), clear.as_str(), cancel.as_str()].contains(&entry.action.as_str())
+        }) {
+            let entry = entries.remove(index);
+            entries.insert(1.min(entries.len()), entry);
+        }
+        let hints = entries
+            .iter()
+            .map(|entry| format!("{}={}", entry.keys.join("/"), entry.action))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{context} {hints}")
+    }
 
-        // Cursor in the detail pane: navigate rows, act, walk back.
-        let mut entries = vec![E::new(
-            [keys(A::Up), keys(A::Down)].concat(),
-            crate::i18n::t("zc-zerocode-help-navigate-rows"),
-        )];
-        match self.focus {
-            Focus::Theme => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-apply-theme"),
-                ));
-            }
-            Focus::AgentTheme if self.assigning_theme() => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-assign-agent-theme"),
-                ));
-            }
-            Focus::AgentTheme => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-pick-agent"),
-                ));
-                entries.push(E::new(
-                    keys(A::DeleteRow),
-                    crate::i18n::t("zc-zerocode-help-clear-agent-theme"),
-                ));
-            }
-            Focus::Presets => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-apply-preset"),
-                ));
-            }
-            Focus::Bindings => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-rebind"),
-                ));
-                entries.push(E::new(
-                    keys(A::DeleteRow),
-                    crate::i18n::t("zc-zerocode-help-reset-default"),
-                ));
-            }
-            Focus::Locale => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-locale"),
-                ));
-            }
-            Focus::Connection => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-conn"),
-                ));
-            }
-            Focus::TodoTracker => {
-                entries.push(E::new(
-                    keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-todo-tracker"),
-                ));
-            }
+    pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
+        let mut entries = self.contextual_actions();
+        if self.capture.is_some() {
+            entries.insert(
+                0,
+                crate::widgets::HelpEntry::desc(crate::i18n::t("zc-zerocode-capture-assign")),
+            );
+        } else {
+            entries.push(crate::widgets::HelpEntry::desc(format!(
+                "{}: {}",
+                crate::i18n::t("zc-zerocode-help-mouse-label"),
+                crate::i18n::t("zc-zerocode-help-mouse-desc")
+            )));
         }
-        entries.push(E::new(
-            [keys(A::TabLeft), keys(A::Back)].concat(),
-            crate::i18n::t("zc-zerocode-help-back-to-sections"),
-        ));
-        entries.push(E::spacer());
-        entries.push(mouse());
-        HelpNode::entries(entries)
+        crate::widgets::HelpNode::entries(entries)
     }
 
     // ── Mouse ────────────────────────────────────────────────────
@@ -1766,6 +2096,7 @@ impl ZerocodePane {
                         // A section click ends any pending assignment so focus,
                         // the detail surface, and the cursor stay consistent.
                         self.theme_target_agent = None;
+                        self.finish_binding_query_edit();
                         self.focus = FOCI[idx.min(FOCI.len() - 1)];
                         self.cursor = PaneCursor::Sections;
                     }
@@ -1774,9 +2105,19 @@ impl ZerocodePane {
                 // Content list click moves the cursor into the detail pane and
                 // selects (double-click activates).
                 if mouse::in_rect(mouse.column, mouse.row, self.content_area) {
+                    if self.focus == Focus::Bindings && mouse.row == self.content_area.y {
+                        self.cursor = PaneCursor::Detail;
+                        self.begin_binding_search();
+                        return;
+                    }
+                    self.finish_binding_query_edit();
                     let len = self.current_len();
-                    if let Some(idx) = mouse::list_click_index(mouse.row, self.content_area, 0, len)
-                    {
+                    let (area, offset) = if self.focus == Focus::Bindings {
+                        (self.binding_list_area, self.binding_list_offset)
+                    } else {
+                        (self.content_area, 0)
+                    };
+                    if let Some(idx) = mouse::list_click_index(mouse.row, area, offset, len) {
                         self.cursor = PaneCursor::Detail;
                         self.set_current_cursor(idx);
                         if self.double_click.click(mouse.column, mouse.row) {
@@ -1797,12 +2138,28 @@ impl ZerocodePane {
                 self.cycle_focus(-1);
             }
             MouseEventKind::ScrollDown
-                if mouse::in_rect(mouse.column, mouse.row, self.content_area) =>
+                if mouse::in_rect(
+                    mouse.column,
+                    mouse.row,
+                    if self.focus == Focus::Bindings {
+                        self.binding_list_area
+                    } else {
+                        self.content_area
+                    },
+                ) =>
             {
                 self.move_cursor(1);
             }
             MouseEventKind::ScrollUp
-                if mouse::in_rect(mouse.column, mouse.row, self.content_area) =>
+                if mouse::in_rect(
+                    mouse.column,
+                    mouse.row,
+                    if self.focus == Focus::Bindings {
+                        self.binding_list_area
+                    } else {
+                        self.content_area
+                    },
+                ) =>
             {
                 self.move_cursor(-1);
             }
@@ -1818,7 +2175,7 @@ impl ZerocodePane {
             Focus::Theme => self.themes.len(),
             Focus::AgentTheme => self.agents.len(),
             Focus::Presets => self.presets.len(),
-            Focus::Bindings => self.rows.len(),
+            Focus::Bindings => self.visible_binding_indices().len(),
             Focus::Locale => self.locales.len() + 1,
             Focus::Connection => CONN_FIELDS.len(),
             Focus::TodoTracker => TRACKER_FIELDS.len(),
@@ -1839,7 +2196,11 @@ impl ZerocodePane {
             Focus::Theme => *self.theme_list_cursor_mut() = idx,
             Focus::AgentTheme => self.agent_cursor = idx,
             Focus::Presets => self.preset_cursor = idx,
-            Focus::Bindings => self.binding_cursor = idx,
+            Focus::Bindings => {
+                if let Some(index) = self.visible_binding_indices().get(idx) {
+                    self.binding_cursor = *index;
+                }
+            }
             Focus::Locale => self.locale_cursor = idx,
             Focus::Connection => self.conn_cursor = idx,
             Focus::TodoTracker => self.tracker_cursor = idx,
@@ -1971,6 +2332,448 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn binding_test_pane(dir: &Path) -> ZerocodePane {
+        let mut pane = ZerocodePane::new(dir);
+        pane.focus = Focus::Bindings;
+        pane.cursor = PaneCursor::Detail;
+        pane
+    }
+
+    #[test]
+    fn binding_query_typing_and_confirmation_do_not_write_or_rebind() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let before = std::fs::read(config::config_path(dir.path())).unwrap();
+        let rows_before: Vec<_> = pane
+            .rows
+            .iter()
+            .map(|row| (row.action_key.clone(), row.chords.clone()))
+            .collect();
+        pane.handle_key(key(KeyCode::Char('/')));
+        assert!(pane.wants_text_input());
+        for c in "dqj?".chars() {
+            pane.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(pane.binding_query, "dqj?");
+        pane.handle_key(key(KeyCode::Enter));
+        assert!(!pane.wants_text_input());
+        assert!(pane.capture.is_none());
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        assert_eq!(
+            rows_before,
+            pane.rows
+                .iter()
+                .map(|row| (row.action_key.clone(), row.chords.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            before,
+            std::fs::read(config::config_path(dir.path())).unwrap()
+        );
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_query_new_edit_session_restores_current_selection() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("input_bar.");
+        pane.handle_key(key(KeyCode::Enter));
+        pane.handle_key(key(KeyCode::Down));
+        let selected = pane.binding_cursor;
+        assert_ne!(
+            pane.rows[selected].action_key,
+            pane.binding_query_anchor.as_deref().unwrap()
+        );
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("no-match-11492");
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.binding_cursor, selected);
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_query_targets_canonical_action_and_rebuilds_chord_matches() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let index = focus_binding(&mut pane, "input_bar.clear_input");
+        assert!(index > 0);
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("input_bar.clear_input");
+        assert_eq!(pane.visible_binding_indices(), vec![index]);
+        pane.handle_key(key(KeyCode::Enter));
+        assert!(pane.capture.is_none());
+        pane.handle_key(key(KeyCode::Enter));
+        assert_eq!(pane.capture.as_ref().unwrap().row, index);
+        pane.handle_key(KeyEvent::new(KeyCode::F(11), KeyModifiers::ALT));
+        assert_eq!(
+            pane.rows[index].chords,
+            vec![Chord::with(KeyCode::F(11), KeyModifiers::ALT)]
+        );
+        pane.binding_query = "alt+f11".into();
+        pane.reconcile_binding_selection();
+        assert_eq!(pane.visible_binding_indices(), vec![index]);
+        pane.handle_key(key(KeyCode::Char('d')));
+        assert!(pane.visible_binding_indices().is_empty());
+        assert_eq!(
+            pane.rows[index].chords,
+            default_chords_for("input_bar.clear_input")
+        );
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        assert_eq!(pane.binding_cursor, index);
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_query_empty_results_and_layered_cancel_preserve_selection() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let selected = focus_binding(&mut pane, "input_bar.clear_input");
+        let before = std::fs::read(config::config_path(dir.path())).unwrap();
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("no-matching-action-11492");
+        pane.handle_key(key(KeyCode::Enter));
+        pane.handle_key(key(KeyCode::Enter));
+        pane.handle_key(key(KeyCode::Char('d')));
+        pane.move_cursor(1);
+        assert!(pane.capture.is_none());
+        assert_eq!(
+            before,
+            std::fs::read(config::config_path(dir.path())).unwrap()
+        );
+        pane.handle_key(key(KeyCode::Esc));
+        assert!(pane.binding_query.is_empty());
+        assert_eq!(pane.binding_cursor, selected);
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.cursor, PaneCursor::Sections);
+        pane.enter_detail();
+        pane.handle_key(key(KeyCode::Char('/')));
+        pane.handle_paste("clear_input");
+        pane.handle_key(key(KeyCode::Esc));
+        assert_eq!(pane.cursor, PaneCursor::Detail);
+        assert!(!pane.wants_text_input());
+        assert_eq!(pane.binding_cursor, selected);
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_query_matches_labels_wire_keys_and_aliases() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        given_explicit_row("input_bar.clear_input", vec![Chord::ctrl('z')]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let index = focus_binding(&mut pane, "input_bar.clear_input");
+        for query in [
+            "clear input",
+            "INPUT_BAR.CLEAR_INPUT",
+            "Ctrl+z",
+            "control+z",
+        ] {
+            pane.binding_query = query.into();
+            assert!(pane.visible_binding_indices().contains(&index), "{query}");
+        }
+        overrides::reset();
+    }
+
+    #[test]
+    fn binding_query_mouse_uses_filtered_rows_and_leaves_text_editing() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        let index = focus_binding(&mut pane, "input_bar.clear_input");
+        pane.begin_binding_search();
+        pane.handle_paste("input_bar.");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| pane.draw(frame, frame.area()))
+            .unwrap();
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: pane.content_area.x + 2,
+            row: pane.content_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let selected = pane.binding_cursor;
+        pane.handle_mouse(wheel);
+        assert_eq!(
+            pane.binding_cursor, selected,
+            "wheel on query header must not move results"
+        );
+        pane.handle_mouse(MouseEvent {
+            row: pane.binding_list_area.y + 1,
+            ..wheel
+        });
+        assert_ne!(
+            pane.binding_cursor, selected,
+            "wheel on results moves among visible matches"
+        );
+        pane.clear_binding_search();
+        pane.begin_binding_search();
+        pane.handle_paste("input_bar.clear_input");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| pane.draw(frame, frame.area()))
+            .unwrap();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.binding_list_area.x + 2,
+            row: pane.binding_list_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        pane.handle_mouse(click);
+        assert!(!pane.wants_text_input());
+        assert_eq!(pane.binding_cursor, index);
+        pane.handle_mouse(click);
+        assert_eq!(pane.capture.as_ref().unwrap().row, index);
+        pane.handle_key(key(KeyCode::Esc));
+        let header = MouseEvent {
+            row: pane.content_area.y,
+            ..click
+        };
+        pane.handle_mouse(header);
+        assert!(pane.wants_text_input());
+        let section = MouseEvent {
+            column: pane.focus_area.x + 2,
+            row: pane.focus_area.y + 1,
+            ..click
+        };
+        pane.handle_mouse(section);
+        assert!(!pane.wants_text_input());
+        overrides::reset();
+    }
+
+    #[test]
+    fn settings_hints_omit_chords_intercepted_by_outer_and_global_dispatch() {
+        use crate::keymap::{
+            ConfigEditorAction as E, ConfigTabAction as A, RebindableActions, SearchBoxAction as S,
+        };
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        pane.conn_edit = Some(ConnEdit {
+            field: ConnField::SkipVerifyRoutes,
+            buf: String::new(),
+        });
+        let effective = Chord::with(KeyCode::F(9), KeyModifiers::ALT);
+        given_explicit_row(
+            &E::Save.key(),
+            vec![Chord::key(KeyCode::Tab), effective.clone()],
+        );
+        assert_eq!(
+            pane.local_hint_keys(E::Save),
+            vec!["Tab".to_string(), effective.display()]
+        );
+        assert!(pane.bottom_hint().contains(&effective.display()));
+        assert!(pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-config-footer-action-save")
+        }));
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
+        given_explicit_row(&E::Save.key(), vec![Chord::ctrl('b')]);
+        assert!(pane.local_hint_keys(E::Save).is_empty());
+        assert!(
+            !pane
+                .help_context()
+                .entries
+                .iter()
+                .any(|entry| entry.action == crate::i18n::t("zc-config-footer-action-save"))
+        );
+        given_explicit_row(&E::Cancel.key(), vec![Chord::key(KeyCode::Tab)]);
+        assert_eq!(pane.local_hint_keys(E::Cancel), vec!["Tab"]);
+        assert!(pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-config-footer-action-cancel")
+        }));
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"Tab".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
+        given_explicit_row(&A::SectionNext.key(), vec![Chord::char('n')]);
+        assert!(!pane.help_context().entries.iter().any(|entry| {
+            entry.keys.contains(&"n".to_string())
+                && entry.action == crate::i18n::t("zc-zerocode-hint-section")
+        }));
+        assert!(pane.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert_eq!(pane.conn_edit.as_ref().unwrap().buf, "n");
+        given_explicit_row(&A::SectionNext.key(), vec![Chord::key(KeyCode::Tab)]);
+        pane.conn_edit = None;
+        pane.begin_binding_search();
+        given_explicit_row(&S::Accept.key(), vec![Chord::key(KeyCode::Tab)]);
+        assert!(pane.local_hint_keys(S::Accept).is_empty());
+        assert!(
+            pane.help_context()
+                .entries
+                .iter()
+                .any(|entry| entry.keys.contains(&"Tab".to_string())
+                    && entry.action == crate::i18n::t("zc-zerocode-hint-section"))
+        );
+        // Printable globals are query text, so a local search binding can still reach its widget.
+        given_explicit_row("global.quit", vec![Chord::char('q'), Chord::ctrl('c')]);
+        given_explicit_row(&S::Accept.key(), vec![Chord::char('q')]);
+        assert_eq!(pane.local_hint_keys(S::Accept), vec!["q"]);
+        overrides::reset();
+    }
+
+    #[test]
+    fn settings_footer_keeps_context_activation_and_back_visible_at_eighty_columns() {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        for focus in FOCI {
+            pane.focus = focus;
+            for cursor in [PaneCursor::Sections, PaneCursor::Detail] {
+                pane.cursor = cursor;
+                let visible = truncate_to_width(&pane.bottom_hint(), 80);
+                assert!(visible.contains("ZeroCode"), "{visible}");
+                assert!(
+                    visible.contains(if cursor == PaneCursor::Sections {
+                        "Sections"
+                    } else {
+                        "Detail"
+                    }),
+                    "{visible}"
+                );
+                assert!(
+                    visible.contains(&crate::i18n::t(focus.fluent_key())),
+                    "{visible}"
+                );
+                assert!(visible.contains("Enter"), "{focus:?}: {visible}");
+                assert!(visible.contains("back"), "{focus:?}: {visible}");
+            }
+        }
+        overrides::reset();
+    }
+
+    #[test]
+    fn settings_hints_follow_overrides_disable_actions_and_editor_semantics() {
+        use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as A, RebindableActions};
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        given_explicit_row(
+            &A::Enter.key(),
+            vec![Chord::with(KeyCode::F(8), KeyModifiers::ALT)],
+        );
+        given_explicit_row(&A::DeleteRow.key(), Vec::new());
+        given_explicit_row(
+            &E::Save.key(),
+            vec![Chord::with(KeyCode::F(9), KeyModifiers::ALT)],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = binding_test_pane(dir.path());
+        for focus in FOCI {
+            pane.focus = focus;
+            let hint = pane.bottom_hint();
+            assert!(
+                hint.contains(&Chord::with(KeyCode::F(8), KeyModifiers::ALT).display()),
+                "{focus:?}: {hint}"
+            );
+            assert!(
+                !pane
+                    .help_context()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.action == crate::i18n::t("zc-config-footer-action-reset"))
+            );
+        }
+        pane.focus = Focus::Bindings;
+        pane.begin_binding_search();
+        let help = pane.help_context();
+        assert!(
+            !help
+                .entries
+                .iter()
+                .flat_map(|entry| &entry.keys)
+                .any(|key| key == "?")
+        );
+        assert!(
+            help.entries
+                .iter()
+                .flat_map(|entry| &entry.keys)
+                .any(|key| key == &Chord::ctrl('g').display())
+        );
+        pane.finish_binding_query_edit();
+        pane.capture = Some(Capture {
+            row: 0,
+            error: None,
+        });
+        let cancel = pane
+            .help_context()
+            .entries
+            .into_iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-zerocode-capture-cancel"))
+            .unwrap();
+        assert_eq!(
+            cancel.keys,
+            crate::keymap::action_key_labels(crate::keymap::CaptureAction::Cancel)
+        );
+        assert!(!cancel.keys.contains(&"q".to_string()));
+        pane.capture = None;
+        for field in [ConnField::Uri, ConnField::SkipVerifyRoutes] {
+            pane.conn_edit = Some(ConnEdit {
+                field,
+                buf: String::new(),
+            });
+            let entries = pane.help_context().entries;
+            let confirm = entries
+                .iter()
+                .find(|entry| entry.keys.contains(&"Enter".to_string()))
+                .unwrap();
+            assert_eq!(
+                confirm.action,
+                crate::i18n::t(if field == ConnField::Uri {
+                    "zc-config-footer-action-save"
+                } else {
+                    "zc-config-footer-action-new-line"
+                })
+            );
+            assert!(
+                pane.bottom_hint()
+                    .contains(&Chord::with(KeyCode::F(9), KeyModifiers::ALT).display())
+            );
+        }
+        overrides::reset();
     }
 
     // Park the section cursor on `target` within the left section list, leaving
