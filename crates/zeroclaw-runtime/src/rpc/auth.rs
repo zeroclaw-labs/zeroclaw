@@ -28,8 +28,8 @@ use std::sync::{
 
 use parking_lot::RwLock;
 
-use zeroclaw_api::grants::ResolvedGrants;
-use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN};
+use zeroclaw_api::grants::{ResolvedGrants, Resource, Verb};
+use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN, INVALID_PARAMS};
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, Principal,
 };
@@ -81,59 +81,396 @@ pub enum LocalCredentialEvidence {
     Oidc,
 }
 
+/// Why an RPC request was refused, as a stable identifier.
+///
+/// The identifier is what a denial's audit record carries as `reason`, so an
+/// operator can group and alert on refusals without depending on the wording
+/// of the message or on the daemon's locale. Each identifier is spelled out in
+/// [`Self::as_str`] rather than derived from the variant name, so renaming a
+/// variant cannot change one. The JSON-RPC code and the message follow from
+/// the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum_macros::EnumIter))]
+#[non_exhaustive]
+pub enum RpcDenialReason {
+    /// No credential was presented.
+    NoCredential,
+    /// The credential failed verification, or no longer verifies under the
+    /// accepted policy.
+    BadCredential,
+    /// The credential expired.
+    TokenExpired,
+    /// The provider's assurance requirement (MFA or ACR) was not met.
+    MfaRequired,
+    /// The handshake named a provider that is not configured.
+    UnknownProvider,
+    /// The principal maps to no permission profile, so it would hold no
+    /// grants at all.
+    NotEntitled,
+    /// The principal is not entitled to the requested agent alias.
+    AliasNotEntitled,
+    /// The provider or the accepted policy is inconsistent for this identity
+    /// (for example an OIDC mapping, or a profile it names, is missing), so
+    /// the daemon fails closed.
+    Misconfigured,
+    /// The connection has not completed `initialize`.
+    NotInitialized,
+    /// The credential's revalidation deadline passed.
+    RevalidationDue,
+    /// The native pairing token behind the connection was revoked.
+    PairingRevoked,
+    /// A new authorization policy was published while the request was being
+    /// checked.
+    PolicyGenerationMoved,
+    /// A local user roster is configured and the connection presented no
+    /// credential.
+    LocalRosterRequired,
+    /// A remote connection presented no credential.
+    RemoteTokenRequired,
+    /// The principal lacks the resource and verb grant the method requires.
+    GrantMissing,
+    /// The principal may not write the requested config path.
+    ConfigPathNotGranted,
+    /// The principal may not use the requested agent.
+    AgentNotEntitled,
+    /// The principal may not use the agent that owns the requested cron job.
+    CronJobAgentNotEntitled,
+    /// The requested session workspace is not a directory the agent may both
+    /// read and write.
+    SessionWorkspaceNotAuthorized,
+    /// The principal may not list the requested directory.
+    FsListingNotGranted,
+    /// The principal may not attach the requested local file.
+    AttachmentSourceNotGranted,
+    /// The session holds a local operator environment this connection may
+    /// not use.
+    SessionEnvironmentRetained,
+    /// The session's environment differs from the one this connection would
+    /// give it.
+    SessionEnvironmentMismatch,
+    /// A scoped principal requested a daemon-wide log or event stream, the
+    /// event history, or persisted log records.
+    GlobalStreamScoped,
+    /// A principal whose tool selector names a subset of the tools requested
+    /// a procedure.
+    SopToolSelectorConstrained,
+    /// The procedure to replace or delete cannot be loaded to check which
+    /// agents it runs as.
+    SopDefinitionUnreadable,
+    /// The request names a session the principal does not own.
+    SessionNotOwned,
+}
+
+impl RpcDenialReason {
+    /// The identifier a denial's audit record carries as `reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCredential => "no_credential",
+            Self::BadCredential => "bad_credential",
+            Self::TokenExpired => "token_expired",
+            Self::MfaRequired => "mfa_required",
+            Self::UnknownProvider => "unknown_provider",
+            Self::NotEntitled => "not_entitled",
+            Self::AliasNotEntitled => "alias_not_entitled",
+            Self::Misconfigured => "misconfigured",
+            Self::NotInitialized => "not_initialized",
+            Self::RevalidationDue => "revalidation_due",
+            Self::PairingRevoked => "pairing_revoked",
+            Self::PolicyGenerationMoved => "policy_generation_moved",
+            Self::LocalRosterRequired => "local_roster_required",
+            Self::RemoteTokenRequired => "remote_token_required",
+            Self::GrantMissing => "grant_missing",
+            Self::ConfigPathNotGranted => "config_path_not_granted",
+            Self::AgentNotEntitled => "agent_not_entitled",
+            Self::CronJobAgentNotEntitled => "cron_job_agent_not_entitled",
+            Self::SessionWorkspaceNotAuthorized => "session_workspace_not_authorized",
+            Self::FsListingNotGranted => "fs_listing_not_granted",
+            Self::AttachmentSourceNotGranted => "attachment_source_not_granted",
+            Self::SessionEnvironmentRetained => "session_environment_retained",
+            Self::SessionEnvironmentMismatch => "session_environment_mismatch",
+            Self::GlobalStreamScoped => "global_stream_scoped",
+            Self::SopToolSelectorConstrained => "sop_tool_selector_constrained",
+            Self::SopDefinitionUnreadable => "sop_definition_unreadable",
+            Self::SessionNotOwned => "session_not_owned",
+        }
+    }
+
+    /// The JSON-RPC error code a client refused for this reason receives.
+    fn code(self) -> i32 {
+        match self {
+            Self::NoCredential
+            | Self::BadCredential
+            | Self::TokenExpired
+            | Self::MfaRequired
+            | Self::UnknownProvider
+            | Self::NotInitialized
+            | Self::RevalidationDue
+            | Self::PairingRevoked
+            | Self::PolicyGenerationMoved
+            | Self::LocalRosterRequired
+            | Self::RemoteTokenRequired => AUTH_REQUIRED,
+            Self::NotEntitled
+            | Self::AliasNotEntitled
+            | Self::Misconfigured
+            | Self::GrantMissing
+            | Self::ConfigPathNotGranted
+            | Self::AgentNotEntitled
+            | Self::SessionWorkspaceNotAuthorized
+            | Self::FsListingNotGranted
+            | Self::AttachmentSourceNotGranted
+            | Self::SessionEnvironmentRetained
+            | Self::SessionEnvironmentMismatch
+            | Self::GlobalStreamScoped
+            | Self::SopToolSelectorConstrained
+            | Self::SopDefinitionUnreadable
+            | Self::SessionNotOwned => FORBIDDEN,
+            // The client is told the job was not found, the answer a missing
+            // job gets, so the refusal does not confirm that the job exists.
+            Self::CronJobAgentNotEntitled => INVALID_PARAMS,
+        }
+    }
+
+    /// The Fluent key of the denial's message.
+    fn message_key(self) -> &'static str {
+        match self {
+            Self::NoCredential => "rpc-auth-required-token",
+            Self::BadCredential => "rpc-auth-credential-rejected",
+            Self::TokenExpired => "rpc-auth-credential-expired",
+            Self::MfaRequired => "rpc-auth-assurance-required",
+            Self::UnknownProvider => "rpc-auth-unknown-provider",
+            Self::NotEntitled => "rpc-auth-not-entitled",
+            Self::AliasNotEntitled => "rpc-auth-alias-not-entitled",
+            Self::Misconfigured => "rpc-auth-misconfigured",
+            Self::NotInitialized => "rpc-auth-first-call-initialize",
+            // A policy published mid-request asks the client to do what a
+            // passed revalidation deadline does: initialize again.
+            Self::RevalidationDue | Self::PolicyGenerationMoved => "rpc-auth-revalidation-due",
+            Self::PairingRevoked => "rpc-auth-pairing-revoked",
+            Self::LocalRosterRequired => "rpc-auth-local-roster-required",
+            Self::RemoteTokenRequired => "rpc-auth-remote-token-required",
+            Self::GrantMissing => "rpc-auth-grant-missing",
+            Self::ConfigPathNotGranted => "rpc-auth-config-path-not-granted",
+            Self::AgentNotEntitled => "rpc-auth-agent-not-entitled",
+            Self::CronJobAgentNotEntitled => "rpc-auth-cron-job-agent-not-entitled",
+            Self::SessionWorkspaceNotAuthorized => "rpc-auth-session-workspace-not-authorized",
+            Self::FsListingNotGranted => "rpc-auth-fs-listing-not-granted",
+            Self::AttachmentSourceNotGranted => "rpc-auth-attachment-source-not-granted",
+            Self::SessionEnvironmentRetained => "rpc-auth-session-environment-retained",
+            Self::SessionEnvironmentMismatch => "rpc-auth-session-environment-mismatch",
+            Self::GlobalStreamScoped => "rpc-auth-global-stream-scoped",
+            Self::SopToolSelectorConstrained => "rpc-auth-sop-tool-selector-constrained",
+            Self::SopDefinitionUnreadable => "rpc-auth-sop-definition-unreadable",
+            Self::SessionNotOwned => "rpc-auth-session-not-owned",
+        }
+    }
+}
+
+impl From<DenyReason> for RpcDenialReason {
+    fn from(reason: DenyReason) -> Self {
+        match reason {
+            DenyReason::NoCredential => Self::NoCredential,
+            DenyReason::BadCredential => Self::BadCredential,
+            DenyReason::TokenExpired => Self::TokenExpired,
+            DenyReason::MfaRequired => Self::MfaRequired,
+            DenyReason::UnknownProvider => Self::UnknownProvider,
+            DenyReason::NotEntitled => Self::NotEntitled,
+            DenyReason::AliasNotEntitled => Self::AliasNotEntitled,
+            DenyReason::Misconfigured => Self::Misconfigured,
+            // DenyReason is non_exhaustive; anything unknown fails closed.
+            _ => Self::BadCredential,
+        }
+    }
+}
+
 /// A handshake or authorization denial, pre-mapped to its JSON-RPC error.
+///
+/// The constructors below are the only way to build one. Each sets the
+/// [`RpcDenialReason`], the code that follows from it, and the message in the
+/// daemon's locale, so every denial carries a reason that does not depend on
+/// its wording.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthDenied {
     pub code: i32,
     pub message: String,
+    reason: RpcDenialReason,
+}
+
+/// A request value as a denial message names it: quoted and escaped the way
+/// a Rust debug string is, so a control character in an agent alias or a path
+/// cannot break the message or the audit record that carries it.
+fn quoted(value: &str) -> String {
+    format!("{value:?}")
 }
 
 impl AuthDenied {
-    pub(crate) fn auth_required(message: impl Into<String>) -> Self {
+    fn new(reason: RpcDenialReason, message: String) -> Self {
         Self {
-            code: AUTH_REQUIRED,
-            message: message.into(),
+            code: reason.code(),
+            message,
+            reason,
         }
     }
 
-    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            code: FORBIDDEN,
-            message: message.into(),
-        }
+    fn with_message(reason: RpcDenialReason) -> Self {
+        Self::new(
+            reason,
+            crate::i18n::get_required_cli_string(reason.message_key()),
+        )
+    }
+
+    fn with_values(reason: RpcDenialReason, values: &[(&str, &str)]) -> Self {
+        Self::new(
+            reason,
+            crate::i18n::get_required_cli_string_with_args(reason.message_key(), values),
+        )
+    }
+
+    /// Why the request was refused.
+    pub fn reason(&self) -> RpcDenialReason {
+        self.reason
+    }
+
+    /// The attributes of this denial's audit record: the method refused, the
+    /// stable reason apart from the message, the code, and the principal and
+    /// provider the connection was bound to, if any.
+    ///
+    /// The text goes in `denial_message`, not `message`: log exporters copy
+    /// attributes out flat, and log backends reserve `message` for the
+    /// record's own message.
+    pub(crate) fn audit_attrs(
+        &self,
+        method: &str,
+        auth: Option<&ConnectionAuth>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "method": method,
+            "reason": self.reason.as_str(),
+            "denial_message": self.message,
+            "code": self.code,
+            "principal_id": auth.map(|auth| auth.principal.id.as_str()),
+            "auth_provider": auth.map(|auth| auth.principal.auth_provider_label()),
+        })
     }
 
     pub(crate) fn from_deny_reason(reason: DenyReason) -> Self {
-        match reason {
-            DenyReason::NoCredential => Self::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-required-token",
-            )),
-            DenyReason::BadCredential => Self::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-credential-rejected",
-            )),
-            DenyReason::TokenExpired => Self::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-credential-expired",
-            )),
-            DenyReason::MfaRequired => Self::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-assurance-required",
-            )),
-            DenyReason::UnknownProvider => Self::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-unknown-provider"),
-            ),
-            DenyReason::NotEntitled => Self::forbidden(crate::i18n::get_required_cli_string(
-                "rpc-auth-not-entitled",
-            )),
-            DenyReason::AliasNotEntitled => Self::forbidden(crate::i18n::get_required_cli_string(
-                "rpc-auth-alias-not-entitled",
-            )),
-            DenyReason::Misconfigured => Self::forbidden(crate::i18n::get_required_cli_string(
-                "rpc-auth-misconfigured",
-            )),
-            // DenyReason is non_exhaustive; anything unknown fails closed.
-            _ => Self::auth_required(crate::i18n::get_required_cli_string(
-                "rpc-auth-credential-rejected",
-            )),
-        }
+        Self::with_message(reason.into())
+    }
+
+    pub(crate) fn not_initialized() -> Self {
+        Self::with_message(RpcDenialReason::NotInitialized)
+    }
+
+    pub(crate) fn token_expired() -> Self {
+        Self::with_message(RpcDenialReason::TokenExpired)
+    }
+
+    pub(crate) fn revalidation_due() -> Self {
+        Self::with_message(RpcDenialReason::RevalidationDue)
+    }
+
+    pub(crate) fn pairing_revoked() -> Self {
+        Self::with_message(RpcDenialReason::PairingRevoked)
+    }
+
+    pub(crate) fn policy_generation_moved() -> Self {
+        Self::with_message(RpcDenialReason::PolicyGenerationMoved)
+    }
+
+    pub(crate) fn local_roster_required() -> Self {
+        Self::with_message(RpcDenialReason::LocalRosterRequired)
+    }
+
+    pub(crate) fn remote_token_required() -> Self {
+        Self::with_message(RpcDenialReason::RemoteTokenRequired)
+    }
+
+    pub(crate) fn grant_missing(resource: Resource, verb: Verb, method: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::GrantMissing,
+            &[
+                ("resource", resource.to_string().as_str()),
+                ("verb", verb.to_string().as_str()),
+                ("method", method),
+            ],
+        )
+    }
+
+    pub(crate) fn config_path_not_granted(path: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::ConfigPathNotGranted,
+            &[("path", quoted(path).as_str())],
+        )
+    }
+
+    pub(crate) fn agent_not_entitled(agent: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::AgentNotEntitled,
+            &[("agent", quoted(agent).as_str())],
+        )
+    }
+
+    pub(crate) fn cron_job_agent_not_entitled(agent: &str, job: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::CronJobAgentNotEntitled,
+            &[
+                ("agent", quoted(agent).as_str()),
+                ("job", quoted(job).as_str()),
+            ],
+        )
+    }
+
+    pub(crate) fn session_workspace_not_authorized(workspace: &str, agent: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::SessionWorkspaceNotAuthorized,
+            &[
+                ("workspace", quoted(workspace).as_str()),
+                ("agent", quoted(agent).as_str()),
+            ],
+        )
+    }
+
+    pub(crate) fn fs_listing_not_granted(path: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::FsListingNotGranted,
+            &[("path", quoted(path).as_str())],
+        )
+    }
+
+    pub(crate) fn attachment_source_not_granted(path: &str, agent: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::AttachmentSourceNotGranted,
+            &[
+                ("path", quoted(path).as_str()),
+                ("agent", quoted(agent).as_str()),
+            ],
+        )
+    }
+
+    pub(crate) fn session_environment_retained() -> Self {
+        Self::with_message(RpcDenialReason::SessionEnvironmentRetained)
+    }
+
+    pub(crate) fn session_environment_mismatch() -> Self {
+        Self::with_message(RpcDenialReason::SessionEnvironmentMismatch)
+    }
+
+    pub(crate) fn global_stream_scoped() -> Self {
+        Self::with_message(RpcDenialReason::GlobalStreamScoped)
+    }
+
+    pub(crate) fn sop_tool_selector_constrained() -> Self {
+        Self::with_message(RpcDenialReason::SopToolSelectorConstrained)
+    }
+
+    pub(crate) fn sop_definition_unreadable(name: &str) -> Self {
+        Self::with_values(
+            RpcDenialReason::SopDefinitionUnreadable,
+            &[("name", quoted(name).as_str())],
+        )
+    }
+
+    pub(crate) fn session_not_owned() -> Self {
+        Self::with_message(RpcDenialReason::SessionNotOwned)
     }
 }
 
@@ -549,9 +886,7 @@ impl RpcInboundAuth {
         if let Some(hash) = auth.native_token_hash.as_deref()
             && !self.pairing.token_hash_is_paired(hash)
         {
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
-            ));
+            return Err(AuthDenied::pairing_revoked());
         }
         Ok(())
     }
@@ -596,9 +931,7 @@ impl AuthorityLease<'_> {
         if let Some(hash) = auth.native_token_hash.as_deref()
             && !is_paired(hash)
         {
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
-            ));
+            return Err(AuthDenied::pairing_revoked());
         }
         if auth.generation != self.state.resolver.generation() {
             self.state
@@ -627,16 +960,12 @@ fn credential_unexpired(auth: &ConnectionAuth) -> Result<(), AuthDenied> {
     if let Some(expires_at) = auth.principal.expires_at
         && expires_at <= now
     {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
-        ));
+        return Err(AuthDenied::token_expired());
     }
     if let Some(revalidate_by) = auth.principal.revalidate_by
         && revalidate_by <= now
     {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-        ));
+        return Err(AuthDenied::revalidation_due());
     }
     Ok(())
 }
@@ -657,9 +986,7 @@ impl RpcInboundAuth {
         if resolved.generation != self.generation() {
             // The accepted state moved between the resolution and this read.
             // Fail closed rather than act under a policy nobody observed.
-            return Err(AuthDenied::auth_required(
-                crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-            ));
+            return Err(AuthDenied::policy_generation_moved());
         }
         Ok(resolved.grants)
     }
@@ -727,14 +1054,10 @@ impl RpcInboundAuth {
                     LocalCredentialEvidence::LocalCompatibility,
                 ),
                 TransportKind::Local => {
-                    return Err(AuthDenied::auth_required(
-                        crate::i18n::get_required_cli_string("rpc-auth-local-roster-required"),
-                    ));
+                    return Err(AuthDenied::local_roster_required());
                 }
                 TransportKind::Wss => {
-                    return Err(AuthDenied::auth_required(
-                        crate::i18n::get_required_cli_string("rpc-auth-remote-token-required"),
-                    ));
+                    return Err(AuthDenied::remote_token_required());
                 }
             }
         };
@@ -793,6 +1116,7 @@ impl RpcInboundAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strum::IntoEnumIterator;
     use zeroclaw_api::grants::{Resource, Verb};
     use zeroclaw_api::principal::{ActorKind, PrincipalId};
     use zeroclaw_config::pairing::PairingCodePolicy;
@@ -2007,6 +2331,365 @@ mod tests {
         assert_eq!(
             denied.code, AUTH_REQUIRED,
             "a moved generation forces OIDC reinitialize even when the claim still maps"
+        );
+    }
+
+    // ── Denials: stable reasons, their codes, and their wording ──
+
+    /// Operators group and alert on these identifiers, so renaming, removing,
+    /// or adding one has to be a deliberate edit to this list.
+    #[test]
+    fn denial_reason_identifiers_are_pinned_in_declaration_order() {
+        let identifiers: Vec<&str> = RpcDenialReason::iter()
+            .map(RpcDenialReason::as_str)
+            .collect();
+        assert_eq!(
+            identifiers,
+            [
+                "no_credential",
+                "bad_credential",
+                "token_expired",
+                "mfa_required",
+                "unknown_provider",
+                "not_entitled",
+                "alias_not_entitled",
+                "misconfigured",
+                "not_initialized",
+                "revalidation_due",
+                "pairing_revoked",
+                "policy_generation_moved",
+                "local_roster_required",
+                "remote_token_required",
+                "grant_missing",
+                "config_path_not_granted",
+                "agent_not_entitled",
+                "cron_job_agent_not_entitled",
+                "session_workspace_not_authorized",
+                "fs_listing_not_granted",
+                "attachment_source_not_granted",
+                "session_environment_retained",
+                "session_environment_mismatch",
+                "global_stream_scoped",
+                "sop_tool_selector_constrained",
+                "sop_definition_unreadable",
+                "session_not_owned",
+            ]
+        );
+        let unique: std::collections::HashSet<&str> = identifiers.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            identifiers.len(),
+            "identifiers must be unique"
+        );
+        for identifier in identifiers {
+            assert!(
+                !identifier.is_empty()
+                    && identifier
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{identifier:?} must be lowercase ASCII letters and underscores only"
+            );
+        }
+    }
+
+    /// A provider's outcome is recorded under the spelling the API already
+    /// serializes it as, and is refused with the code it had before denials
+    /// carried a reason.
+    #[test]
+    fn credential_denials_keep_the_api_spelling_and_their_codes() {
+        let outcomes = [
+            (DenyReason::NoCredential, AUTH_REQUIRED),
+            (DenyReason::BadCredential, AUTH_REQUIRED),
+            (DenyReason::TokenExpired, AUTH_REQUIRED),
+            (DenyReason::MfaRequired, AUTH_REQUIRED),
+            (DenyReason::UnknownProvider, AUTH_REQUIRED),
+            (DenyReason::NotEntitled, FORBIDDEN),
+            (DenyReason::AliasNotEntitled, FORBIDDEN),
+            (DenyReason::Misconfigured, FORBIDDEN),
+        ];
+        for (outcome, code) in outcomes {
+            let reason = RpcDenialReason::from(outcome);
+            assert_eq!(
+                serde_json::to_value(outcome).expect("a deny reason serializes"),
+                reason.as_str(),
+                "{outcome:?} must be recorded under its serialized spelling"
+            );
+            let denied = AuthDenied::from_deny_reason(outcome);
+            assert_eq!(denied.reason(), reason, "{outcome:?}");
+            assert_eq!(denied.code, code, "{outcome:?} must keep its code");
+        }
+        assert_eq!(
+            AuthDenied::token_expired(),
+            AuthDenied::from_deny_reason(DenyReason::TokenExpired),
+            "an expired binding is refused exactly as an expired credential is"
+        );
+    }
+
+    /// One denial per reason, built through the constructor the daemon uses
+    /// for it, with the code a refused client receives written out here
+    /// rather than read back from the mapping under test, and the values the
+    /// message must name.
+    fn sample_denial(reason: RpcDenialReason) -> (AuthDenied, i32, &'static [&'static str]) {
+        /// A provider's outcome, refused the way the handshake refuses it.
+        fn outcome(deny: DenyReason, code: i32) -> (AuthDenied, i32, &'static [&'static str]) {
+            (AuthDenied::from_deny_reason(deny), code, &[])
+        }
+
+        // No wildcard arm: a new reason does not compile until it has a case.
+        match reason {
+            RpcDenialReason::NoCredential => outcome(DenyReason::NoCredential, AUTH_REQUIRED),
+            RpcDenialReason::BadCredential => outcome(DenyReason::BadCredential, AUTH_REQUIRED),
+            RpcDenialReason::TokenExpired => outcome(DenyReason::TokenExpired, AUTH_REQUIRED),
+            RpcDenialReason::MfaRequired => outcome(DenyReason::MfaRequired, AUTH_REQUIRED),
+            RpcDenialReason::UnknownProvider => outcome(DenyReason::UnknownProvider, AUTH_REQUIRED),
+            RpcDenialReason::NotEntitled => outcome(DenyReason::NotEntitled, FORBIDDEN),
+            RpcDenialReason::AliasNotEntitled => outcome(DenyReason::AliasNotEntitled, FORBIDDEN),
+            RpcDenialReason::Misconfigured => outcome(DenyReason::Misconfigured, FORBIDDEN),
+            RpcDenialReason::NotInitialized => (AuthDenied::not_initialized(), AUTH_REQUIRED, &[]),
+            RpcDenialReason::RevalidationDue => {
+                (AuthDenied::revalidation_due(), AUTH_REQUIRED, &[])
+            }
+            RpcDenialReason::PairingRevoked => (AuthDenied::pairing_revoked(), AUTH_REQUIRED, &[]),
+            RpcDenialReason::PolicyGenerationMoved => {
+                (AuthDenied::policy_generation_moved(), AUTH_REQUIRED, &[])
+            }
+            RpcDenialReason::LocalRosterRequired => {
+                (AuthDenied::local_roster_required(), AUTH_REQUIRED, &[])
+            }
+            RpcDenialReason::RemoteTokenRequired => {
+                (AuthDenied::remote_token_required(), AUTH_REQUIRED, &[])
+            }
+            RpcDenialReason::GrantMissing => (
+                AuthDenied::grant_missing(Resource::Config, Verb::Update, "config/set"),
+                FORBIDDEN,
+                &["config:update", "config/set"],
+            ),
+            RpcDenialReason::ConfigPathNotGranted => (
+                AuthDenied::config_path_not_granted("agents.main.model"),
+                FORBIDDEN,
+                &["\"agents.main.model\""],
+            ),
+            RpcDenialReason::AgentNotEntitled => (
+                AuthDenied::agent_not_entitled("main"),
+                FORBIDDEN,
+                &["\"main\""],
+            ),
+            RpcDenialReason::CronJobAgentNotEntitled => (
+                AuthDenied::cron_job_agent_not_entitled("main", "nightly-digest"),
+                INVALID_PARAMS,
+                &["\"main\"", "\"nightly-digest\""],
+            ),
+            RpcDenialReason::SessionWorkspaceNotAuthorized => (
+                AuthDenied::session_workspace_not_authorized("/srv/workspace", "main"),
+                FORBIDDEN,
+                &["\"/srv/workspace\"", "\"main\""],
+            ),
+            RpcDenialReason::FsListingNotGranted => (
+                AuthDenied::fs_listing_not_granted("/etc"),
+                FORBIDDEN,
+                &["\"/etc\""],
+            ),
+            RpcDenialReason::AttachmentSourceNotGranted => (
+                AuthDenied::attachment_source_not_granted("/etc/passwd", "main"),
+                FORBIDDEN,
+                &["\"/etc/passwd\"", "\"main\""],
+            ),
+            RpcDenialReason::SessionEnvironmentRetained => {
+                (AuthDenied::session_environment_retained(), FORBIDDEN, &[])
+            }
+            RpcDenialReason::SessionEnvironmentMismatch => {
+                (AuthDenied::session_environment_mismatch(), FORBIDDEN, &[])
+            }
+            RpcDenialReason::GlobalStreamScoped => {
+                (AuthDenied::global_stream_scoped(), FORBIDDEN, &[])
+            }
+            RpcDenialReason::SopToolSelectorConstrained => {
+                (AuthDenied::sop_tool_selector_constrained(), FORBIDDEN, &[])
+            }
+            RpcDenialReason::SopDefinitionUnreadable => (
+                AuthDenied::sop_definition_unreadable("nightly-report"),
+                FORBIDDEN,
+                &["\"nightly-report\""],
+            ),
+            RpcDenialReason::SessionNotOwned => (AuthDenied::session_not_owned(), FORBIDDEN, &[]),
+        }
+    }
+
+    #[test]
+    fn every_denial_reason_builds_a_denial_with_its_code_and_a_resolved_message() {
+        for reason in RpcDenialReason::iter() {
+            let (denied, code, values) = sample_denial(reason);
+            assert_eq!(denied.reason(), reason);
+            assert_eq!(denied.code, code, "{reason:?} carries the wrong code");
+            assert!(
+                !denied.message.starts_with('{'),
+                "{reason:?} rendered the missing-key sentinel {:?}",
+                denied.message
+            );
+            for value in values {
+                assert!(
+                    denied.message.contains(value),
+                    "{reason:?} message {:?} must name {value}",
+                    denied.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_newline_or_quote_in_a_value_stays_escaped_in_the_message() {
+        let newline = AuthDenied::agent_not_entitled("evil\nline");
+        assert!(
+            newline.message.contains(r#""evil\nline""#),
+            "the newline must be escaped inside the quotes: {:?}",
+            newline.message
+        );
+        assert!(
+            !newline.message.contains('\n'),
+            "a raw newline would split the message and its audit record: {:?}",
+            newline.message
+        );
+
+        let quote = AuthDenied::agent_not_entitled(r#"main" or agent "admin"#);
+        assert!(
+            quote.message.contains(r#""main\" or agent \"admin""#),
+            "an embedded quote must not end the quoted value: {:?}",
+            quote.message
+        );
+    }
+
+    /// The catalogue must render what the dispatcher's literals and `format!`
+    /// calls produced before they moved into it. Each expected string is that
+    /// old code's output for the same sample values, which the constructors
+    /// pass already quoted.
+    #[test]
+    fn english_denial_wording_matches_the_literals_it_replaced() {
+        /// A catalogue key, the values it is rendered with, and the exact
+        /// text the replaced literal produced for them.
+        type WordingCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
+        let cases: [WordingCase<'_>; 13] = [
+            (
+                "rpc-auth-grant-missing",
+                &[
+                    ("resource", "config"),
+                    ("verb", "update"),
+                    ("method", "config/set"),
+                ],
+                "Principal is not granted config:update (required by config/set)",
+            ),
+            (
+                "rpc-auth-config-path-not-granted",
+                &[("path", "\"agents.main.model\"")],
+                "Principal is not granted config write access to \"agents.main.model\"",
+            ),
+            (
+                "rpc-auth-agent-not-entitled",
+                &[("agent", "\"main\"")],
+                "Principal is not entitled to agent \"main\"",
+            ),
+            (
+                "rpc-auth-cron-job-agent-not-entitled",
+                &[("agent", "\"main\""), ("job", "\"nightly-digest\"")],
+                "Principal is not entitled to agent \"main\", which owns cron job \
+                 \"nightly-digest\"",
+            ),
+            (
+                "rpc-auth-session-workspace-not-authorized",
+                &[("workspace", "\"/srv/workspace\""), ("agent", "\"main\"")],
+                "Session workspace \"/srv/workspace\" is not an existing directory agent \
+                 \"main\" may both read and write; add it to the agent's risk profile \
+                 allowed_roots to authorize it",
+            ),
+            (
+                "rpc-auth-fs-listing-not-granted",
+                &[("path", "\"/etc\"")],
+                "Principal is not granted a listing of \"/etc\": only absolute local paths \
+                 that an enabled agent it may use can read can be listed",
+            ),
+            (
+                "rpc-auth-attachment-source-not-granted",
+                &[("path", "\"/etc/passwd\""), ("agent", "\"main\"")],
+                "Principal is not granted attachment source \"/etc/passwd\": only an absolute \
+                 local path that agent \"main\" may read can be attached by path",
+            ),
+            (
+                "rpc-auth-session-environment-retained",
+                &[],
+                "Session retains a local operator environment; create a new session on this \
+                 connection",
+            ),
+            (
+                "rpc-auth-session-environment-mismatch",
+                &[],
+                "Session environment differs from this connection; create a new session",
+            ),
+            (
+                "rpc-auth-global-stream-scoped",
+                &[],
+                "Scoped principals cannot read the daemon-wide logs and events: their records \
+                 are not attributed to an owning principal, so the log and event streams, the \
+                 event history, and the persisted log are limited to administrators and the \
+                 shared operator",
+            ),
+            (
+                "rpc-auth-sop-tool-selector-constrained",
+                &[],
+                "Principal has a constrained tool selector; procedures run outside \
+                 per-session tool narrowing and are refused to it",
+            ),
+            (
+                "rpc-auth-sop-definition-unreadable",
+                &[("name", "\"nightly-report\"")],
+                "Principal may not replace or delete procedure \"nightly-report\": its \
+                 definition cannot be loaded to check which agents it runs as",
+            ),
+            (
+                "rpc-auth-session-not-owned",
+                &[],
+                "Session not found or not owned by this principal",
+            ),
+        ];
+        for (key, values, expected) in cases {
+            assert_eq!(
+                crate::i18n::get_english_cli_string_with_args(key, values),
+                expected,
+                "{key} must keep the English wording of the literal it replaced"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_record_keeps_the_reason_apart_from_the_message() {
+        let auth = auth_for(&config_with_roster(4242), &[]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect("roster uid authenticates");
+
+        let denied = AuthDenied::agent_not_entitled("main");
+        let record = denied.audit_attrs("cost/query", Some(&conn));
+        assert_eq!(record["method"], "cost/query");
+        assert_eq!(record["reason"], "agent_not_entitled");
+        assert_eq!(record["denial_message"], denied.message.as_str());
+        assert_eq!(record["code"], FORBIDDEN);
+        assert_eq!(record["principal_id"], "user:alice");
+        assert_eq!(record["auth_provider"], "peercred");
+
+        let unbound = AuthDenied::not_initialized().audit_attrs("session/list", None);
+        assert_eq!(unbound["reason"], "not_initialized");
+        assert!(
+            unbound["principal_id"].is_null(),
+            "an unbound connection has no principal to record"
+        );
+        assert!(
+            unbound["auth_provider"].is_null(),
+            "an unbound connection has no provider to record"
         );
     }
 }
