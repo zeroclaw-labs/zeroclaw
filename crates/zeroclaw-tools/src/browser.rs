@@ -15,6 +15,14 @@ use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
+/// Deadline for the `agent-browser --version` availability probe. It is a
+/// liveness check, not user work, so it is deliberately short and not
+/// configurable.
+const AGENT_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Fallback for `browser.timeout_secs` used by the legacy `new()` constructor.
+const AGENT_BROWSER_DEFAULT_TIMEOUT_SECS: u64 = 60;
+
 /// Computer-use sidecar settings.
 #[derive(Clone)]
 pub struct ComputerUseConfig {
@@ -73,6 +81,7 @@ pub struct BrowserTool {
     #[cfg(feature = "browser-native")]
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    timeout_secs: u64,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -218,6 +227,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            AGENT_BROWSER_DEFAULT_TIMEOUT_SECS,
             Vec::new(),
         )
     }
@@ -233,6 +243,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        timeout_secs: u64,
         allowed_private_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         #[cfg(not(feature = "browser-native"))]
@@ -258,6 +269,7 @@ impl BrowserTool {
             #[cfg(feature = "browser-native")]
             native_chrome_path,
             computer_use,
+            timeout_secs,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         })
@@ -270,14 +282,30 @@ impl BrowserTool {
         } else {
             "agent-browser"
         };
-        Command::new(cmd)
+        Self::probe_agent_browser(Command::new(cmd), AGENT_BROWSER_PROBE_TIMEOUT).await
+    }
+
+    /// Bounded `--version` probe: a wedged CLI must make the backend read as
+    /// unavailable instead of hanging the agent turn indefinitely.
+    async fn probe_agent_browser(mut command: Command, deadline: Duration) -> bool {
+        command
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .kill_on_drop(true);
+        match tokio::time::timeout(deadline, command.status()).await {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(_)) => false,
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "agent-browser availability probe timed out; treating backend as unavailable"
+                );
+                false
+            }
+        }
     }
 
     /// Backward-compatible alias.
@@ -509,6 +537,10 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
+        if self.timeout_secs == 0 {
+            anyhow::bail!("browser.timeout_secs must be > 0");
+        }
+
         let mut cmd = self.agent_browser_command();
 
         // Add --json for machine-readable output
@@ -520,11 +552,9 @@ impl BrowserTool {
             &format!("Running: agent-browser {} --json", args.join(" "))
         );
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        let action = args.first().copied().unwrap_or("<none>");
+        let output =
+            Self::run_bounded_command(cmd, action, Duration::from_secs(self.timeout_secs)).await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -555,6 +585,33 @@ impl BrowserTool {
                 data: None,
                 error: Some(stderr.trim().to_string()),
             })
+        }
+    }
+
+    /// Await an agent-browser subprocess with a wall-clock deadline, killing
+    /// the child when the deadline passes or the awaiting future is dropped.
+    /// The error names the action so a hung command is distinguishable from a
+    /// hung availability probe.
+    ///
+    /// Containment is scoped to the direct child: `kill_on_drop` does not
+    /// walk the process tree, so descendants the CLI spawned (e.g. a
+    /// browser) are left to the CLI's own lifecycle handling. Bounding the
+    /// agent turn is this seam's contract; tree-wide reaping would need the
+    /// process-group/Job-Object approach used by the coding-CLI runners.
+    async fn run_bounded_command(
+        mut cmd: Command,
+        action: &str,
+        deadline: Duration,
+    ) -> anyhow::Result<std::process::Output> {
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match tokio::time::timeout(deadline, cmd.output()).await {
+            Ok(output) => Ok(output?),
+            Err(_) => anyhow::bail!(
+                "agent-browser '{action}' timed out after {}s (browser.timeout_secs); the subprocess was killed",
+                deadline.as_secs()
+            ),
         }
     }
 
@@ -2867,6 +2924,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -2895,6 +2953,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -2923,6 +2982,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -2942,6 +3002,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -2967,6 +3028,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -2991,6 +3053,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -3015,6 +3078,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -3202,6 +3266,108 @@ mod tests {
         }
     }
 
+    // ── bounded subprocess wait tests ───────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_times_out_stalled_cli_and_reports_unavailable() {
+        // `sh -c 'sleep 60'` ignores the appended `--version` argument, so
+        // this models a CLI that accepts the probe but never returns.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 60");
+
+        let started = std::time::Instant::now();
+        let available = BrowserTool::probe_agent_browser(command, Duration::from_millis(20)).await;
+
+        assert!(!available, "a stalled probe must read as unavailable");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe waited too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reports_available_for_successful_process() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        assert!(BrowserTool::probe_agent_browser(command, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_unavailable_for_missing_binary() {
+        let command = Command::new("zeroclaw-test-missing-agent-browser");
+        assert!(!BrowserTool::probe_agent_browser(command, Duration::from_secs(5)).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_command_times_out_and_names_action() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exec sleep 60");
+
+        let started = std::time::Instant::now();
+        let error = BrowserTool::run_bounded_command(cmd, "open", Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("'open' timed out"),
+            "timeout error must name the action: {message}"
+        );
+        assert!(
+            message.contains("browser.timeout_secs"),
+            "timeout error must name the config key: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded command waited too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_command_passes_through_completed_process() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf ok");
+
+        let output = BrowserTool::run_bounded_command(cmd, "open", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_zero_timeout() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "agent_browser".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            0,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let error = tool.run_command(&["open"]).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("browser.timeout_secs must be > 0")
+        );
+    }
+
     // ── allowed_private_hosts opt-in tests ──────────────────────
 
     fn private_host_tool(
@@ -3219,6 +3385,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            60,
             allowed_private_hosts
                 .into_iter()
                 .map(String::from)
@@ -3681,6 +3848,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             test_computer_use_config(),
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -4151,6 +4319,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             config,
+            60,
             Vec::new(),
         )
         .unwrap()
@@ -4242,6 +4411,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             config,
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -4310,6 +4480,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             config,
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -4382,6 +4553,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             config,
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -4474,6 +4646,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             config,
+            60,
             Vec::new(),
         )
         .unwrap();
@@ -4628,6 +4801,7 @@ mod tests {
                 "http://127.0.0.1:9515".into(),
                 None,
                 config,
+                60,
                 Vec::new(),
             )
             .unwrap();
