@@ -424,7 +424,7 @@ pub fn build_spec() -> serde_json::Value {
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeAcceptedResponse" } } }
                     },
                     "400": version_error("Invalid JSON body, or `auto_restart` is not available in this environment (container/non-unix bare process)."),
-                    "403": version_error("Self-upgrade is disabled (`gateway.allow_self_upgrade = false`)."),
+                    "403": version_error("Self-upgrade is disabled (`gateway.allow_self_upgrade = false`), or this kernel was installed by ZeroClaw Desktop (`desktop_bundled` in `/api/status`) and is upgraded by updating the desktop app."),
                     "409": version_error("An upgrade is already in progress."),
                 }
             }

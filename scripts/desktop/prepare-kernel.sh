@@ -22,8 +22,13 @@ set -euo pipefail
 # Environment:
 #   ZEROCLAW_KERNEL_PATH   Reuse an existing kernel binary instead of building
 #                          (single-target only; ignored for universal). Requested
-#                          features must already be present in that binary.
+#                          features must already be present in that binary, and
+#                          it must have been built with ZEROCLAW_DESKTOP_SIDECAR=1.
 #   CARGO_PROFILE          Cargo profile to build (default: release).
+#
+# Every kernel built here carries ZEROCLAW_DESKTOP_SIDECAR=1, which tells the
+# kernel it ships inside a desktop package: it then leaves its upgrades to the
+# desktop app's installer instead of swapping itself in place.
 #
 # Then bundle with the sidecar overlay:
 #   cd apps/tauri && cargo tauri build --config tauri.bundled.conf.json
@@ -38,7 +43,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
     --features) FEATURES="$2"; shift 2 ;;
-    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,10 +84,10 @@ build_kernel() {
   fi
   if [[ -n "$FEATURES" ]]; then
     echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple --features $FEATURES" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple" --features "$FEATURES")
+    (cd "$REPO_ROOT" && ZEROCLAW_DESKTOP_SIDECAR=1 cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple" --features "$FEATURES")
   else
     echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple")
+    (cd "$REPO_ROOT" && ZEROCLAW_DESKTOP_SIDECAR=1 cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple")
   fi
   local dir="release"
   [[ "$PROFILE" != "release" ]] && dir="$PROFILE"

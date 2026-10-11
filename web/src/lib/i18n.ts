@@ -972,6 +972,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'upgrade.restart_to_apply': "Restart to apply:",
     'upgrade.failed': "Upgrade failed",
     'upgrade.disabled': "Self-upgrade is disabled on this gateway (set gateway.allow_self_upgrade).",
+    'upgrade.desktop_bundled': "This ZeroClaw was installed with ZeroClaw Desktop. Update the desktop app to upgrade it.",
     'upgrade.checks_disabled': "Automatic update checks are disabled (set gateway.check_updates).",
     'upgrade.recheck': "Check again",
     'upgrade.restart_waiting': "Waiting for the new process to come back online",
