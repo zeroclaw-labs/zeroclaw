@@ -30,6 +30,10 @@ const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 /// from the required gate's critical path entirely.
 const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
+/// Only task-owner recovery uses the measured Blacksmith Windows runner.
+/// Compilation and service smoke keep their GitHub-hosted images.
+const WINDOWS_RECOVERY_LABEL: &str = "blacksmith-8vcpu-windows-2025";
+
 /// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
 /// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
 const HOUSEKEEPING_JOBS: [&str; 19] = [
@@ -223,6 +227,45 @@ fn rust_cache_callers_pass_a_reviewed_provider_input() {
              cache the rest of the fleet never reads silently loses its cache"
         );
     }
+}
+
+#[test]
+fn windows_recovery_pins_its_runner_and_trusted_cache_writer() {
+    let blocks = runner_workflow_jobs();
+    let windows_label =
+        Regex::new(r"blacksmith-[a-z0-9-]*windows-[a-z0-9-]+").expect("valid runner-label pattern");
+    let claiming: BTreeSet<&str> = blocks
+        .iter()
+        .filter(|(_, block)| windows_label.is_match(block))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        claiming,
+        BTreeSet::from(["ci.yml/windows-task-owner-recovery"]),
+        "only task-owner recovery may use a Blacksmith Windows runner"
+    );
+
+    let recovery = &blocks["ci.yml/windows-task-owner-recovery"];
+    assert!(
+        recovery.contains(&format!("    runs-on: {WINDOWS_RECOVERY_LABEL}\n")),
+        "recovery must pin the measured Windows runner"
+    );
+    assert!(
+        recovery.contains("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
+            && !recovery.contains("uses: ./.github/actions/rust-cache"),
+        "recovery must use the tested pinned cache action, not the archived Blacksmith fork"
+    );
+    assert!(
+        recovery.contains("          shared-key: windows-recovery-blacksmith\n"),
+        "recovery needs its own stable cache rather than the GitHub compilation cache"
+    );
+    assert!(
+        recovery.contains("          cache-on-failure: 'false'\n")
+            && recovery.contains(
+                "          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}\n"
+            ),
+        "only successful master pushes may seed recovery; PRs and merge-queue runs must only read"
+    );
 }
 
 #[test]
