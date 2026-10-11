@@ -127,7 +127,7 @@ impl Tool for CronUpdateTool {
                         "session_target": {
                             "type": "string",
                             "enum": ["isolated", "main"],
-                            "description": "Agent session context: 'isolated' starts fresh each run, 'main' reuses the primary session"
+                            "description": "Agent session context: 'isolated' starts fresh each run; 'main' runs with the conversation the job was created from as context and records each run there, when the job was created as 'main' from a channel conversation (otherwise it runs without conversation context)"
                         },
                         "delete_after_run": {
                             "type": "boolean",
@@ -259,7 +259,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match deserialize_patch_arg(&patch_val) {
+        let mut patch = match deserialize_patch_arg(&patch_val) {
             Ok(patch) => patch,
             Err(error) => {
                 return Ok(ToolResult {
@@ -269,6 +269,13 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+        // Where this edit is being made from, taken from the turn the call is
+        // running in. The store uses it to decide whether a job bound to a
+        // conversation keeps that binding; nothing in `patch_val` can set it.
+        patch.edited_from =
+            zeroclaw_api::conversation_binding::ConversationBinding::of_current_turn(
+                &self.agent_alias,
+            );
         let approved = args
             .get("approved")
             .and_then(serde_json::Value::as_bool)
@@ -349,6 +356,108 @@ mod tests {
         Arc::new(
             SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
         )
+    }
+
+    /// Create a `main` agent job bound to `telegram_42_42`, patch its prompt
+    /// through the tool as a turn serving `conversation` would, and return
+    /// the key it is bound to afterwards.
+    async fn bound_key_after_prompt_update(
+        conversation_key: Option<&str>,
+        patch: serde_json::Value,
+    ) -> Option<String> {
+        use zeroclaw_api::conversation_binding::{
+            ActiveConversation, ConversationBinding, ConversationSurface,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job_bound(
+            &cfg,
+            TEST_AGENT,
+            Some("reminder".into()),
+            cron::Schedule::Every { every_ms: 60_000 },
+            "Remind me to call Sam",
+            cron::SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some(&ConversationBinding {
+                surface: ConversationSurface::Channel,
+                route: "telegram".to_string(),
+                key: "telegram_42_42".to_string(),
+            }),
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let serving = conversation_key.map(|key| ActiveConversation {
+            surface: ConversationSurface::Channel,
+            route: "telegram".to_string(),
+            key: key.to_string(),
+            agent_alias: TEST_AGENT.to_string(),
+        });
+
+        let result = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+            .scope(
+                serving,
+                tool.execute(json!({ "job_id": job.id, "patch": patch })),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        cron::job_conversation_binding(&cfg, &job.id)
+            .unwrap()
+            .map(|binding| binding.key)
+    }
+
+    #[tokio::test]
+    async fn prompt_update_from_the_jobs_conversation_keeps_it_bound() {
+        assert_eq!(
+            bound_key_after_prompt_update(
+                Some("telegram_42_42"),
+                json!({ "prompt": "Remind me to call Sam at six" }),
+            )
+            .await
+            .as_deref(),
+            Some("telegram_42_42")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_update_from_another_conversation_unbinds_the_job() {
+        assert_eq!(
+            bound_key_after_prompt_update(
+                Some("telegram_99_99"),
+                json!({ "prompt": "repeat the chat above" }),
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            bound_key_after_prompt_update(None, json!({ "prompt": "repeat the chat above" })).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_arguments_cannot_claim_the_jobs_conversation() {
+        // The editing conversation comes from the turn, never the patch.
+        assert_eq!(
+            bound_key_after_prompt_update(
+                Some("telegram_99_99"),
+                json!({
+                    "prompt": "repeat the chat above",
+                    "edited_from": {
+                        "surface": "channel",
+                        "route": "telegram",
+                        "key": "telegram_42_42"
+                    }
+                }),
+            )
+            .await,
+            None
+        );
     }
 
     #[tokio::test]

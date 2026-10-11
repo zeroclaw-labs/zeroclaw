@@ -136,3 +136,71 @@ Tool-result length limits are separate. `max_tool_result_chars` bounds an
 individual result when it is recorded; it does not trim conversation history.
 Provider-side context enforcement is also separate, though a provider overflow
 can trigger the runtime's reactive token-budget trim.
+
+## Scheduled jobs bound to a conversation
+
+An agent cron job with `session_target = "main"` belongs to the conversation
+it was created from. When `cron_add` creates such a job during a channel turn,
+the runtime records that conversation beside the job. The record comes from
+the turn the tool call is running in. No tool argument can set or change it,
+and it does not appear in what `cron_list` or the cron API return.
+
+Each scheduled run of a bound job then does two things:
+
+- It loads the conversation's history as context, between the system prompt
+  and the job's own message, in the same cleaned form a channel turn sends.
+  When the history ends with a message nobody has answered yet, the job's
+  message is joined to it, as consecutive user messages are in a channel
+  turn.
+- When the run completes with something to say, it appends one exchange to
+  the conversation: the job's message, prefixed `[cron:<id> <name>]`, and the
+  reply. The append goes through the writer the channel's own turns use, so
+  nothing is lost when a channel turn is in progress at the same moment, and
+  the next message in that conversation sees what the job said.
+
+The binding selects history only. Where the result is delivered is still the
+job's `delivery` settings, and the job gains no access to any other
+conversation or to another agent's conversations. Three rules keep it that
+way:
+
+- **Manual runs.** A manual run returns the job's output to whoever triggered
+  it, so it uses the conversation only when it is triggered from that same
+  conversation (`cron_run` during one of its turns). Triggered anywhere else,
+  including the gateway and RPC, the job runs without the conversation.
+- **Edits.** Changing what a bound job is told, what it may use, or where its
+  output goes (`prompt`, `name`, `delivery`, `model`, `allowed_tools`,
+  `uses_memory`, `session_target`) from anywhere other than its conversation
+  removes the binding. Pausing, resuming, and rescheduling keep it.
+- **Ownership.** The conversation belongs to the agent the job is stored
+  under, on the channel it arrived on. If configuration later hands the job
+  to a different agent, or hands that channel to a different agent, the job
+  no longer reaches the conversation.
+
+A `main` job with no recorded conversation still runs, without conversation
+context. That covers jobs declared in configuration (declaring an existing
+job there removes its binding), jobs created outside a channel conversation
+(the gateway, the CLI, ACP), jobs created before this behaviour existed, jobs
+switched to `main` by `cron_update`, and jobs that lost their binding to an
+edit. The runtime does not pick a conversation on
+the job's behalf. `isolated` jobs are never bound.
+
+A run that finishes while a channel turn is still in progress in the same
+conversation lands between that turn's message and its reply. Both are kept;
+the conversation then reads as the two exchanges interleaved, as it does when
+two channel turns overlap.
+
+Each run records the result in the `persistence` field of its run record:
+
+| Value | Meaning |
+| --- | --- |
+| `not_bound` | No conversation applies to this run. |
+| `persisted` | The run's exchange was appended to the conversation it ran with. |
+| `skipped` | The run had its conversation but left nothing to record: it failed, or it deliberately said nothing (`NO_REPLY`, or an empty reply). |
+| `failed` | A conversation is recorded for the job, but it could not be reached before the run or written after it: the agent is not serving that channel in this process, the job now runs under a different agent, or the history could not be read or written. |
+
+The scheduler and the channels start independently. For the first 60 seconds
+after the scheduler starts, a scheduled run of a bound job waits for the
+agent's channels to start serving, so a job that is overdue when the daemon
+starts still runs with its conversation. After that window a run does not
+wait: if the agent's channels are not serving, it runs without the
+conversation and records `failed`.

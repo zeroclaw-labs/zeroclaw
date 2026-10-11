@@ -205,8 +205,8 @@ pub struct CronRun {
     /// `None` on rows recorded before the triple existed.
     #[serde(default)]
     pub delivery: Option<String>,
-    /// Persistence axis (`not_bound | persisted | failed`). `None` on rows
-    /// recorded before the triple existed.
+    /// Persistence axis (`not_bound | persisted | skipped | failed`). `None`
+    /// on rows recorded before the triple existed.
     #[serde(default)]
     pub persistence: Option<String>,
     /// The initiating principal stamped at dispatch, verbatim — immune to
@@ -249,6 +249,14 @@ pub struct CronJobPatch {
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
     pub shell_output_format: Option<CronShellOutputFormat>,
+    /// The conversation this patch is being made from. Set by the calling
+    /// surface from its own turn state; never read from a request or from
+    /// tool arguments, and never written out. A patch that redirects a job
+    /// bound to a conversation keeps that binding only when this names the
+    /// same conversation; left `None`, as every caller outside a conversation
+    /// leaves it, such a patch unbinds the job.
+    #[serde(skip)]
+    pub edited_from: Option<zeroclaw_api::conversation_binding::ConversationBinding>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for CronJob {
