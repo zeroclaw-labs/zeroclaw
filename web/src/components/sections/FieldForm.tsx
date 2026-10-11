@@ -384,6 +384,14 @@ function defaultInputValue(entry: ListResponseEntry): string {
 }
 
 function parseInput(entry: ListResponseEntry, raw: string): unknown {
+  if (entry.kind === "object" && /^cron\.[^.]+\.schedule$/.test(entry.path)) {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // Let the config API return its field-specific error for invalid JSON.
+      return raw;
+    }
+  }
   switch (rendererFor(entry)) {
     case "bool":
       return raw === "true";

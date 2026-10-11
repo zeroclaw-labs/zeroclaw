@@ -15530,7 +15530,7 @@ pub enum CronShellOutputFormat {
 }
 
 /// Schedule variant for declarative cron jobs.
-#[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::ConfigEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CronScheduleDecl {
@@ -15544,6 +15544,11 @@ pub enum CronScheduleDecl {
     Every { every_ms: u64 },
     /// One-shot at an RFC 3339 timestamp.
     At { at: String },
+}
+
+// Unlike unit enums, a tagged schedule is a table with variant-specific fields.
+impl HasPropKind for CronScheduleDecl {
+    const PROP_KIND: PropKind = PropKind::Object;
 }
 
 impl Default for CronScheduleDecl {
@@ -28090,6 +28095,66 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn declarative_cron_schedule_property_accepts_tagged_objects() {
+        use crate::traits::PropKind;
+
+        let mut config = super::Config::default();
+        config.cron.insert(
+            "daily".to_string(),
+            super::CronJobDecl {
+                command: Some("date".to_string()),
+                ..Default::default()
+            },
+        );
+        let schedule = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "cron.daily.schedule")
+            .expect("declarative schedule must be an editable property");
+        assert_eq!(schedule.kind, PropKind::Object);
+        let output_format = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "cron.daily.shell_output_format")
+            .expect("ordinary cron enum remains a scalar property");
+        assert_eq!(output_format.kind, PropKind::Enum);
+        config
+            .set_prop_persistent("cron.daily.shell_output_format", "raw")
+            .expect("ordinary enum values still write as strings");
+        assert_eq!(
+            config.cron["daily"].shell_output_format,
+            super::CronShellOutputFormat::Raw,
+        );
+
+        for value in [
+            serde_json::json!({"kind":"cron","expr":"0 9 * * *","tz":"UTC"}),
+            serde_json::json!({"kind":"cron","expr":"0 10 * * *","tz":null}),
+            serde_json::json!({"kind":"every","every_ms":60000}),
+            serde_json::json!({"kind":"at","at":"2026-10-01T09:00:00Z"}),
+        ] {
+            config
+                .set_prop_persistent("cron.daily.schedule", &value.to_string())
+                .expect("config property writer accepts every tagged schedule variant");
+            assert_eq!(
+                serde_json::to_value(&config.cron["daily"].schedule).unwrap(),
+                value
+            );
+        }
+
+        let before = serde_json::to_value(&config.cron["daily"].schedule).unwrap();
+        assert!(
+            config
+                .set_prop_persistent("cron.daily.schedule", r#"{"kind":"cron"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&config.cron["daily"].schedule).unwrap(),
+            before,
+            "a malformed schedule must not replace the last valid one"
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
