@@ -205,6 +205,12 @@ jobs:
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
 
+      - name: Test binary size report
+        run: bash scripts/ci/binary_size_report.test.sh
+
+      - name: Test dependency footprint report
+        run: bash scripts/ci/dependency_footprint.test.sh
+
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
 
@@ -666,7 +672,7 @@ jobs:
     name: Test Windows task-owner recovery
     needs: [windows-required-changes, master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && needs.windows-required-changes.outputs.windows_recovery == 'true' }}
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -674,14 +680,14 @@ jobs:
         with:
           toolchain: 1.98.0
           targets: x86_64-pc-windows-msvc
-      # Restore the Windows build leg's master-seeded cache (registry, git, and
-      # shared dependency artifacts) under the same key, and never write: a
-      # second Windows cache would compete for the repository's cache quota.
-      - uses: ./.github/actions/rust-cache
+      # Keep a recovery cache on this runner; do not assume the GitHub build
+      # cache's Rust environment hash matches. Only successful master pushes seed
+      # it; PRs and merge-queue runs read without competing writes.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          use-blacksmith: 'false'
-          shared-key: build
-          save-if: 'false'
+          shared-key: windows-recovery-blacksmith
+          cache-on-failure: 'false'
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -846,6 +852,15 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # Channel WebSocket lifecycle proof. A root target for the same
+      # crate-graph reason as the two steps above: it drives the production
+      # configured-channel path against a loopback WebSocket server and asserts
+      # on what the server saw (one socket across polls, one redial after a
+      # server close, a closed socket and released lease on shutdown, and no
+      # packet at all when the destination is not granted).
+      - name: Run channel WebSocket lifecycle e2e
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: cargo test --locked --features plugins-wasm-cranelift --test channel_websocket_e2e
       # The root binary's tests with plugin support compiled in. `mod plugins`,
       # the plugin registry and the plugin CLI's tests in `main.rs` only
       # compile under `plugins-wasm`, so the default-feature Test job never sees
@@ -1066,8 +1081,8 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # Feature configurations keep their original defaults and test filters.
-  # In particular, Lark runs without defaults and QQ excludes live-auth tests.
+  # Optional channel configurations run without default channels so each leg
+  # isolates its named feature. QQ still excludes live-auth tests.
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
     needs: [master-debounce]
@@ -1079,13 +1094,13 @@ jobs:
       matrix:
         include:
           - name: WeChat
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-wechat --lib wechat::"
           - name: Lark
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
           - name: Matrix
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
           - name: QQ
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1

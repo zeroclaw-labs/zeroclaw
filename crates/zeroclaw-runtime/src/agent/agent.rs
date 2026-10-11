@@ -442,6 +442,21 @@ impl HistoryTrimNotice {
     }
 }
 
+/// Closes a lent steering receiver when dropped, so every exit from a
+/// steered turn (including the turn future being dropped) refuses later
+/// senders instead of accepting messages nobody will read.
+struct CloseSteeringOnExit<'a>(
+    Option<&'a mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+);
+
+impl Drop for CloseSteeringOnExit<'_> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.0.as_deref_mut() {
+            rx.close();
+        }
+    }
+}
+
 async fn forward_history_trim_notice(
     event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     notice: Option<HistoryTrimNotice>,
@@ -3382,15 +3397,32 @@ impl Agent {
     }
 
     fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
-        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
-            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
-            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
-        )))
+        Ok(Arc::new(
+            crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                // The turn may switch transport after construction: keep both
+                // variants complete (0 = no cap, as in `finalize_system_prompt`)
+                // and cap the provider-bound request after the swap.
+                self.build_system_prompt_with_dispatcher_and_cap(&NativeToolDispatcher, 0)?,
+                self.build_system_prompt_with_dispatcher_and_cap(&XmlToolDispatcher, 0)?,
+                self.config.resolved.max_system_prompt_chars,
+            ),
+        ))
     }
 
     fn build_system_prompt_with_dispatcher(
         &self,
         dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        self.build_system_prompt_with_dispatcher_and_cap(
+            dispatcher,
+            self.config.resolved.max_system_prompt_chars,
+        )
+    }
+
+    fn build_system_prompt_with_dispatcher_and_cap(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+        max_chars: usize,
     ) -> Result<String> {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
@@ -3434,7 +3466,6 @@ impl Agent {
         let mut prompt = self
             .prompt_builder
             .build_with_approval_policy(&ctx, &prompt_always_ask)?;
-        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -3457,7 +3488,14 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
         }
-        Ok(prompt)
+        // Keep the runtime orientation at the end of the complete prompt so
+        // truncation cannot retain an earlier copy and append a second one.
+        append_timestamp_orientation(&mut prompt);
+        // Match the channel/CLI prompt path: cap the fully assembled prompt,
+        // including dispatcher instructions, receipts, and MCP sections.
+        Ok(crate::agent::system_prompt::finalize_system_prompt(
+            prompt, max_chars,
+        ))
     }
 
     fn rebuild_system_prompt_for_dispatcher(
@@ -4277,7 +4315,35 @@ impl Agent {
         Ok((response, new_messages))
     }
 
+    /// Run one streamed turn that can take steering messages mid-turn.
+    ///
+    /// The steering receiver is closed on every exit: success, error,
+    /// cancellation, a response-cache hit, and the returned future being
+    /// dropped. The caller usually lends the receiver (`&mut`) and keeps it
+    /// alive after the turn, so without the close a late `try_send` would
+    /// get `Ok` and the message would never be read. Closed, the sender sees
+    /// `Closed` and can send the text as an ordinary prompt instead.
     pub async fn turn_streamed_with_steering_state(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let mut steering = CloseSteeringOnExit(steering_rx);
+        self.turn_streamed_with_steering_body(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering.0.as_deref_mut(),
+        )
+        .await
+    }
+
+    /// Body of [`Self::turn_streamed_with_steering_state`]. The successful
+    /// finish closes the receiver itself before its last drain; every other
+    /// exit relies on the wrapper's guard.
+    async fn turn_streamed_with_steering_body(
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
@@ -4815,7 +4881,29 @@ impl Agent {
                                 steered_continuation = Some(admitted);
                                 continue;
                             }
+                            // About to finish. Close first, then drain once
+                            // more: a sender whose message landed after the
+                            // drain above got `Ok` from `try_send`, and
+                            // without this the turn would end and drop it.
+                            // Anything that slipped in before the close still
+                            // gets its round; a later sender sees `Closed` and
+                            // can fall back to an ordinary prompt.
+                            if let Some(rx) = steering_rx.as_deref_mut() {
+                                rx.close();
+                            }
+                            let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                            let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                            if !admitted.is_empty() {
+                                steered_continuation = Some(admitted);
+                                continue;
+                            }
                         }
+                    }
+                    // Finishing (budget spent, cancelled, or nothing
+                    // admitted): close now rather than at the wrapper's guard,
+                    // so a sender during the awaits below is already refused.
+                    if let Some(rx) = steering_rx.as_deref_mut() {
+                        rx.close();
                     }
 
                     // Cache put only when the turn was a single tool-free
@@ -9058,6 +9146,61 @@ mod tests {
                 prompt.contains("SOUL_MD_CONTROL_9341"),
                 "SOUL.md must still reach the Chat system prompt"
             );
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_caps_fully_assembled_system_prompt_on_every_turn() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            agent.config.resolved.compact_context = true;
+            agent.config.resolved.max_system_prompt_chars = 4_000;
+            // MCP/tool guidance is appended after the base identity prompt.
+            // The cap must cover this tail, even when the dispatcher switches
+            // from native to XML tool instructions at the turn boundary.
+            agent.mcp_pinned = vec![zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                key: "docs__large".into(),
+                rendered: format!("<mcp-resource>{}</mcp-resource>", "界".repeat(5_000)),
+            }];
+            let assert_capped = |prompt: &str| {
+                assert_eq!(prompt.chars().count(), 4_000);
+                assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+                assert_eq!(
+                    prompt
+                        .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .count(),
+                    1,
+                    "the capped prompt must not repeat the timestamp orientation"
+                );
+                assert!(prompt.contains("## Project Context"));
+            };
+
+            let initial = agent.build_system_prompt().expect("initial prompt");
+            assert_capped(&initial);
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(initial))];
+            agent.set_tool_dispatcher(Box::new(XmlToolDispatcher));
+            let ConversationMessage::Chat(rebuilt) = &agent.history[0] else {
+                panic!("rebuilt system prompt must be a chat message");
+            };
+            assert_capped(&rebuilt.content);
+            assert!(rebuilt.content.contains(XML_TOOLS_MARKER));
+
+            for message in ["first", "follow-up"] {
+                let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+                agent
+                    .turn_streamed(message, event_tx, None)
+                    .await
+                    .expect("streamed Agent turn should succeed");
+            }
+            let captured = captured.lock();
+            assert_eq!(captured.len(), 2);
+            for request in captured.iter() {
+                let system = request
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .expect("provider-visible system prompt");
+                assert_capped(&system.content);
+                assert!(system.content.contains(XML_TOOLS_MARKER));
+            }
         }
 
         #[tokio::test]
@@ -14075,10 +14218,14 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let (steering_tx, mut steering_rx) =
             tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        // The receiver comes back out of the task alive, as it does for the
+        // gateway (which lends `&mut`): only an explicit close, not a drop,
+        // can make the late send below fail.
         let handle = zeroclaw_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -14094,11 +14241,18 @@ mod tests {
             }
         }
 
-        let outcome = handle
-            .await
-            .expect("turn task should finish")
-            .expect("steered turn should succeed");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let outcome = outcome.expect("steered turn should succeed");
         assert_eq!(outcome.response, "draftfinal");
+        // The turn has ended: a late steer must be refused visibly rather
+        // than accepted into a receiver nobody will drain again.
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a finished turn must close its steering channel"
+        );
 
         let new_chat_messages: Vec<_> = outcome
             .new_messages
@@ -14268,9 +14422,10 @@ mod tests {
         let (steering_tx, mut steering_rx) =
             tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
         let handle = zeroclaw_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -14286,10 +14441,15 @@ mod tests {
             }
         }
 
-        let err = handle
-            .await
-            .expect("turn task should finish")
-            .expect_err("second provider call should fail");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let err = outcome.expect_err("second provider call should fail");
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends on a provider error must close its steering channel"
+        );
         assert_eq!(err.committed_response, "draft");
         assert!(
             err.new_messages.iter().any(|msg| {
@@ -14303,6 +14463,187 @@ mod tests {
             }),
             "accepted steering user message should still be returned after continuation failure"
         );
+    }
+
+    fn assert_steering_closed(
+        steering_tx: &tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+        exit: &str,
+    ) {
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends by {exit} must close its steering channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_cancelled() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = AtomicUsize::new(0);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamingSteeringModelProvider {
+                seen_messages: Arc::new(Mutex::new(Vec::new())),
+                call_count: calls,
+                fail_on_call: None,
+                fail_chat_on_call: None,
+                fail_after_delta_on_call: None,
+                delay_chat_on_call: None,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let err = agent
+            .turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                Some(cancel),
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect_err("a cancelled turn must return an error");
+        assert!(
+            err.error
+                .downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()
+                .is_some(),
+            "the turn must end on the cancellation path, got: {}",
+            err.error
+        );
+        // `steering_rx` is still alive here; only an explicit close fails the send.
+        assert_steering_closed(&steering_tx, "cancellation");
+        drop(steering_rx);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_on_response_cache_hit() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = context_recovery_cache_agent(
+            tmp.path(),
+            cache.clone(),
+            first_calls.clone(),
+            "cached answer",
+            false,
+        );
+        let mut second = context_recovery_cache_agent(
+            tmp.path(),
+            cache,
+            second_calls.clone(),
+            "fresh answer",
+            false,
+        );
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (warm_tx, mut warm_rx) = tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let warmed = first
+            .turn_streamed_with_steering_state("same request", event_tx_a, None, Some(&mut warm_rx))
+            .await
+            .expect("first turn should reach the provider and fill the cache");
+        assert_eq!(warmed.response, "cached answer");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        drop(warm_tx);
+
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let hit = second
+            .turn_streamed_with_steering_state(
+                "same request",
+                event_tx_b,
+                None,
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect("cache hit should succeed");
+        assert_eq!(
+            hit.response, "cached answer",
+            "the second turn must be served from the response cache"
+        );
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "a cache hit must not reach the provider"
+        );
+        assert_steering_closed(&steering_tx, "a response-cache hit");
+        drop(steering_rx);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_turn_future_is_dropped() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                started: started_tx,
+                release: Arc::new(tokio::sync::Notify::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        {
+            let mut turn = Box::pin(agent.turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ));
+            tokio::select! {
+                _ = &mut turn => panic!("the gated provider must hold the turn open"),
+                started = started_rx.recv() => {
+                    started.expect("provider should signal that the turn is in flight");
+                }
+            }
+            steering_tx
+                .try_send("while the turn runs".into())
+                .expect("a turn in flight must accept steering");
+            // Dropping `turn` here abandons it mid-provider-call, as a caller
+            // racing the turn against a disconnect would.
+        }
+        assert_steering_closed(&steering_tx, "its future being dropped");
+        drop(steering_rx);
     }
 
     #[tokio::test]

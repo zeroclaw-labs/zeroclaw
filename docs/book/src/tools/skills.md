@@ -87,6 +87,8 @@ A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` tab
 
 HTTP skill tools use only `http` and `https` URLs. Arguments are percent-encoded before insertion, redirects and ambient proxies are disabled, and the resolved destination must pass ZeroClaw's public-network egress policy. Private or metadata destinations are rejected, and response bodies larger than one megabyte are truncated before they can expand runtime memory.
 
+Each HTTP skill call shares one 30-second timeout across destination validation, DNS lookup, request dispatch, and response-body reading. A timeout returns a failed tool result without including the URL or argument values. This bounds the call's wait; a platform DNS lookup already running on a blocking worker may continue until the operating system's resolver timeout.
+
 ### Slash command options and localizations
 
 A skill tagged `slash` is surfaced as a chat-channel slash command (e.g. Discord `/search`). It may declare typed `[[skill.slash_options]]`; a skill that declares none falls back to a single required free-text input. Both the command description and each option description accept an optional `description_localizations` map keyed by locale code. Unknown or unsupported locale codes are dropped with a warning rather than failing registration, so a typo never wedges command registration.

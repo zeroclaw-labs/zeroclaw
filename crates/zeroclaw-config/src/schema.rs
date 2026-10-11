@@ -7197,14 +7197,17 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. When a
-    /// new image takes the count past the limit, the oldest surviving
-    /// image is removed from its message, which can invalidate a
-    /// provider's cached prefix from that message onward; a larger limit
-    /// delays cap eviction and reduces how many happen over a session,
-    /// but once the limit is full each further image still evicts one.
-    /// Acts as the upper bound on per-turn upload cost when tool outputs
-    /// surface local image paths.
+    /// dropped first. When a new image takes the count past the limit, the
+    /// oldest images are removed in one batch, down to half the limit
+    /// rounded up (4 -> 2, 8 -> 4, 16 -> 8); the count then grows back to the
+    /// limit before the next batch. Removing an image changes the message
+    /// that held it, which can invalidate a provider's cached prefix from
+    /// that message onward; batching means a session past the limit pays
+    /// that once every `max_images / 2 + 1` new images rather than on every
+    /// one. Right after a batch the model sees fewer older images than the
+    /// limit allows. A larger limit delays the first batch and makes each
+    /// one less frequent. Acts as the upper bound on per-turn upload cost
+    /// when tool outputs surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
