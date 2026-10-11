@@ -205,24 +205,24 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let listener_channel = Arc::clone(&channel);
     let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
-    let sink = registry
+    let route = registry
         .get("fixture")
         .expect("validated guest route is published atomically");
     let (reply, outcome) = tokio::sync::oneshot::channel();
-    sink.send(RawWebhook {
-        method: "POST".to_string(),
-        query: String::new(),
-        headers: vec![(
-            "x-fixture-secret".to_string(),
-            "channel-secret".to_string(),
-        )],
-        body: br#"{"id":"runtime-1","sender":"tester","reply_target":"room","content":"from webhook"}"#.to_vec(),
-        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
-        idempotency: None,
-        reply,
-    })
-    .await
-    .expect("published route remains live");
+    route
+        .try_send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
+            headers: vec![(
+                "x-fixture-secret".to_string(),
+                "channel-secret".to_string(),
+            )],
+            body: br#"{"id":"runtime-1","sender":"tester","reply_target":"room","content":"from webhook"}"#.to_vec(),
+            cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+            idempotency: None,
+            reply,
+        })
+        .expect("published route remains live");
     assert!(matches!(
         outcome.await.expect("webhook worker replies"),
         Ok(WebhookOutcome::Ack)
@@ -236,17 +236,17 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     assert_eq!(message.channel, "plugin");
     assert_eq!(message.channel_alias.as_deref(), Some("operations"));
     let (reply, outcome) = tokio::sync::oneshot::channel();
-    sink.send(RawWebhook {
-        method: "GET".to_string(),
-        query: "challenge=runtime-echo".to_string(),
-        headers: vec![("x-fixture-secret".to_string(), "channel-secret".to_string())],
-        body: Vec::new(),
-        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
-        idempotency: None,
-        reply,
-    })
-    .await
-    .expect("published GET route remains live");
+    route
+        .try_send(RawWebhook {
+            method: "GET".to_string(),
+            query: "challenge=runtime-echo".to_string(),
+            headers: vec![("x-fixture-secret".to_string(), "channel-secret".to_string())],
+            body: Vec::new(),
+            cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+            idempotency: None,
+            reply,
+        })
+        .expect("published GET route remains live");
     assert!(matches!(outcome.await.expect("challenge worker replies"),
         Ok(WebhookOutcome::Body(body)) if body == "challenge=runtime-echo"));
     assert!(
