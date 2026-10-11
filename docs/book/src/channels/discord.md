@@ -111,8 +111,142 @@ search; the bot still replies normally either way.
 | Bot ignores most messages | `mention_only = true` | @-mention the bot, or set it to `false` |
 | "Invalid token" at startup | Token mistyped or reset | Reset the token in the portal, set it again (step 3) |
 
+## Running Discord as a plugin (experimental)
+
+Everything above uses the Discord channel compiled into ZeroClaw. Discord is
+also available as an installable WASM channel plugin, the `discord` package
+from the plugin registry. The plugin runs inside the plugin sandbox and can
+reach only the hosts you grant it. It is experimental and handles text
+messages only; the built-in channel remains the default.
+
+> Give each bot token to the built-in channel or the plugin, never both. Discord
+> delivers every event to each connection made with the token, so the two
+> would both answer every message. Before you move a bot to the plugin, remove
+> its `[channels.discord.<alias>]` table. The plugin never reads that table.
+
+### What you need
+
+- A `zeroclaw` binary whose plugin host compiles `.wasm` components, that is,
+  one built with the `plugins-wasm-cranelift` feature (see
+  [build features](../developing/plugin-protocol.md#build-features)). On a
+  binary without the plugin host, the `zeroclaw plugin` command does not
+  exist. `zeroclaw plugin install` checks that the package loads on this host
+  before it installs anything.
+- The bot from the [Quickstart](#quickstart): its token, the **Message Content
+  Intent** switched on, and the bot invited to your server.
+- The numeric user ID of each person allowed to talk to the agent. Enable
+  **Developer Mode** (User Settings -> Advanced), right-click the user, and
+  click **Copy User ID**.
+
+### 1. Install the package and bind an instance
+
+Pick an alias for the instance, here `main`, and install the package bound to
+it:
+
+```sh
+zeroclaw plugin install discord --channel-alias main --egress declared
+```
+
+The command downloads `discord` from the registry, verifies it, writes a
+`[channels.plugin.main]` binding, and creates the instance's config row.
+`--egress declared` grants the hosts the package declares: `discord.com` for
+the REST API, and `*.discord.gg` for the gateway WebSocket, since Discord hands
+out its gateway and resume hosts under that domain. With `--egress none`
+instead, the instance has no network reach until you grant it.
+
+If the package is already installed, bind the alias on its own:
+
+```sh
+zeroclaw plugin bind discord --channel-alias main --egress declared
+```
+
+[Binding a channel instance](../plugins/index.md#binding-a-channel-instance)
+describes both commands and the report they print.
+
+The instance keeps its settings under a key derived from the package, the
+`channel` capability, and the alias. For the alias `main` the key is
+`zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ`, and
+`zeroclaw plugin info discord` prints the key of every bound alias.
+
+### 2. Set the bot token
+
+The token is a secret. Leave the value off the command line and
+`zeroclaw config set` prompts for it without echo and stores it encrypted:
+
+```sh
+zeroclaw config set plugins.entries.zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ.config.bot_token
+```
+
+The other settings sit beside the token under `.config.` and are optional:
+`guild_ids` and `channel_ids` narrow where the bot listens (see
+[Narrowing where the bot listens](#narrowing-where-the-bot-listens)), and
+`mention_only` and `listen_to_bots` take `true` or `false`. Set a list as JSON
+text:
+
+```sh
+zeroclaw config set plugins.entries.zpi1_WyJkaXNjb3JkIiwiY2hhbm5lbCIsIm1haW4iXQ.config.channel_ids '["123456789012345678"]'
+```
+
+### 3. Turn it on and route it to an agent
+
+Binding never turns on the plugin system and never assigns the instance to an
+agent. Turn the plugin system on:
+
+```sh
+zeroclaw config set plugins.enabled true
+```
+
+Then add `plugin.main` to the `channels` list of the agent that should answer,
+keeping the channels it already has, and admit your users with a peer group on
+the same channel:
+
+```toml
+[agents.assistant]
+channels = ["plugin.main"]
+
+[peer_groups.discord_plugin]
+channel = "plugin.main"
+external_peers = ["111111111111111111"]
+```
+
+The plugin reports each sender by numeric user ID, and a plugin channel
+matches senders exactly, so list user IDs, not usernames. Restart ZeroClaw
+(`zeroclaw service restart`) to start the instance.
+
+### 4. Check that it runs
+
+- `zeroclaw plugin info discord` reports whether the package loads on this
+  host, prints the instance key, and lists anything the instance still needs
+  before it can start.
+- At startup, the daemon's channel list includes `plugin.main`, and the
+  gateway's `/health` snapshot lists a `channel:plugin.main` component. The
+  component reads `error` when the plugin's poll fails, and otherwise follows
+  the plugin's own health check, which ZeroClaw asks for about every 30
+  seconds. What that check covers is up to the plugin, so the proof that the
+  bot is connected to Discord is a message from an admitted user reaching the
+  agent and the agent's reply appearing in Discord.
+- A message from an admitted user is logged as `channel inbound message` with
+  `zeroclaw.channel = plugin.main`. A message from anyone else is dropped and
+  logged with `error_key = plugin_channel_sender_denied`.
+- A connection to a host outside the grant is refused, and the refusal is
+  logged with `error_key = plugin_egress_denied`, the refused host, and the
+  `zeroclaw config set` command that grants it.
+
+### How the plugin differs from the built-in channel
+
+| | Built-in channel | `discord` plugin |
+|---|---|---|
+| Configuration | `[channels.discord.<alias>]` | `[channels.plugin.<alias>]` and the instance's `plugins.entries` row |
+| Channel name in logs, peer groups, and sessions | `discord.<alias>` | `plugin.<alias>` |
+| Network reach | No per-host grant | Only the hosts in the instance's `egress_hosts` |
+| Features | Everything on this page | Text messages only: no attachments, threads, slash commands, reactions, streaming, typing indicators, or archive search |
+
+Conversations are kept per channel name, so a bot moved from `discord.main` to
+`plugin.main` starts new conversations.
+
 ## See also
 
 - [Who can talk to the agent](#who-can-talk-to-the-agent) (peer groups)
+- [Plugins](../plugins/index.md) (installing and binding channel plugins)
 - [Slack](./slack.md)
 - [Channels overview](./overview.md)
