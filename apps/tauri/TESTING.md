@@ -102,9 +102,36 @@ open /Applications/ZeroClaw.app
   usable. After completion, relaunching the app lands on the dashboard.
 - **Returning run** (agent already configured): the dashboard opens on the
   normal dashboard, not the Quickstart.
-- Quit from the tray → relaunch → splash → dashboard again (tray icon persists
-  in the menu bar).
+- Close the dashboard window: the app and its daemon keep running in the tray.
+- Quit from the tray when this app instance started the daemon: the daemon
+  stops too (`pgrep -fl 'zeroclaw daemon'` shows nothing). Relaunch → splash →
+  dashboard again with a new daemon.
+- Start `zeroclaw daemon` yourself first, then launch and Quit the app: the app
+  reused your daemon, so it keeps running after Quit.
 - Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
+
+### Process ownership
+
+The app stops only processes it launched in this run. It keeps the handle
+returned when it spawns the desktop supervisor and, on Quit, stops those trees
+newest first:
+
+- **Unix:** the supervisor leads its own process group. Quit sends SIGTERM to
+  the group, allows up to 15 seconds for the supervisor to stop its daemon, then
+  sends SIGKILL to anything left in the group. The supervisor is not reaped until
+  those signals are sent, so its PID and group ID cannot be reused by another
+  process in the meantime.
+- **Windows:** the supervisor is created suspended inside a Job Object the app
+  holds, before it can start anything. Quit terminates that job, which reaches
+  exactly the processes created in it; no process ID or parent relationship is
+  consulted. The job does not kill on close, so an app crash leaves the daemon
+  running, as on Unix.
+
+Quit first seals the registry: a daemon launch that has not started is refused,
+and one still waiting for readiness is waited for and stopped with the rest.
+Nothing is recorded across app runs: a daemon the app reused, or one left behind
+by an earlier run or a crash, is external and is never stopped by Quit, whatever
+its PID or executable. Closing windows keeps everything running.
 
 ### Native command boundary
 
