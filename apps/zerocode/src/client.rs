@@ -2322,11 +2322,9 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
-            .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
-            .await?;
-        Ok(())
+    pub async fn config_delete(&self, prop: &str) -> Result<ConfigDeleteResult> {
+        self.call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
+            .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2395,14 +2393,44 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
-            .call(
-                method::CONFIG_MAP_KEY_DELETE,
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyDeleteResult> {
+        self.call(
+            method::CONFIG_MAP_KEY_DELETE,
+            serde_json::json!({ "path": path, "key": key }),
+        )
+        .await
+    }
+
+    /// Older daemons do not expose the canonical cascade preview over RPC.
+    /// Only METHOD_NOT_FOUND means unavailable; permission and transport errors
+    /// must not silently turn into an allowed delete.
+    pub async fn config_delete_plan(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<Option<ConfigDeletePlan>> {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.rpc.request(
+                "config/delete-plan",
                 serde_json::json!({ "path": path, "key": key }),
-            )
-            .await?;
-        Ok(())
+            ),
+        )
+        .await
+        .context("config/delete-plan timed out")?;
+        match result {
+            Err(error) if error.code == jsonrpc::error_codes::METHOD_NOT_FOUND => Ok(None),
+            Err(error) => {
+                anyhow::bail!("RPC config/delete-plan: {} ({})", error.message, error.code)
+            }
+            Ok(value) => Ok(Some(
+                serde_json::from_value(value).context("deserializing config/delete-plan result")?,
+            )),
+        }
     }
 
     pub async fn config_map_key_rename(
@@ -3279,7 +3307,36 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    pub prop: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyDeleteResult {
+    pub path: String,
+    pub key: String,
+    pub deleted: bool,
+    #[serde(default)]
+    pub warnings: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigDeleteRefSite {
+    pub path: String,
+}
+
+/// Wire projection of the daemon-owned delete planner, without secret values.
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigDeletePlan {
+    pub path: String,
+    pub key: String,
+    pub allowed: bool,
+    pub blockers: Vec<ConfigDeleteRefSite>,
+    pub scrubs: Vec<ConfigDeleteRefSite>,
+    pub live_acp_sessions: Option<usize>,
+    pub cascades_owned_state: bool,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

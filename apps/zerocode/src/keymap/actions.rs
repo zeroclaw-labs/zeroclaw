@@ -20,13 +20,13 @@ fn distinct_effective_chords(chords: Vec<Chord>) -> Vec<Chord> {
 macro_rules! keyactions {
     (
         $vis:vis enum $name:ident ( $tag:literal ) {
-            $( $variant:ident [ $($chord:expr),* $(,)? ] => $label:expr ),* $(,)?
+            $( $(#[$attr:meta])* $variant:ident [ $($chord:expr),* $(,)? ] => $label:expr ),* $(,)?
         }
     ) => {
         #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         $vis enum $name {
-            $( $variant ),*
+            $( $(#[$attr])* $variant ),*
         }
 
         impl $name {
@@ -295,8 +295,11 @@ keyactions! {
         SectionNext   [Chord::key(KeyCode::Tab)] => "next section",
         SectionPrev   [Chord::key(KeyCode::BackTab)] => "prev section",
         BeginSearch   [Chord::char('/')] => "search",
-        ToggleSecret  [Chord::char('x')] => "toggle secret",
-        DeleteRow     [Chord::char('d')] => "delete row",
+        // Keep persisted override keys stable while naming the actual actions.
+        #[serde(rename = "toggle_secret", alias = "delete")]
+        Delete        [Chord::char('x')] => "delete",
+        #[serde(rename = "delete_row", alias = "reset")]
+        Reset         [Chord::char('d')] => "reset",
         ApplyTemplate [Chord::char('t')] => "apply template",
     }
 }
@@ -480,6 +483,46 @@ keyactions! {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn config_destructive_actions_keep_legacy_override_keys_with_accurate_labels() {
+        use super::ConfigTabAction;
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for (action, legacy, label, chord) in [
+            (
+                ConfigTabAction::Delete,
+                "toggle_secret",
+                "delete",
+                Chord::char('z'),
+            ),
+            (
+                ConfigTabAction::Reset,
+                "delete_row",
+                "reset",
+                Chord::char('r'),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ConfigTabAction>(serde_json::json!(legacy)).unwrap(),
+                action
+            );
+            assert_eq!(action.action_key(), format!("config_tab.{legacy}"));
+            assert_eq!(action.label(), label);
+            crate::keymap::overrides::set_row("config_tab", legacy, vec![chord]);
+        }
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Some(ConfigTabAction::Delete)
+        );
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(ConfigTabAction::Reset)
+        );
+        crate::keymap::overrides::reset();
+    }
 
     fn assert_distinct_defaults<A: crate::keymap::RebindableActions>() {
         for action in A::all() {
