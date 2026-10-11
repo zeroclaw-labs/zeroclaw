@@ -14625,6 +14625,12 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Glob patterns that `file_read` paths must match (matched against the
+    /// canonicalized absolute path). Empty list disables glob filtering,
+    /// preserving the backward-compatible behaviour where any path inside an
+    /// allowed root is readable. Example: `["**/SKILL.md", "**/references/*.md"]`.
+    #[serde(default)]
+    pub file_read_allowed_patterns: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -14657,6 +14663,7 @@ impl Default for RiskProfileConfig {
             allowed_tools: Vec::new(),
             deny_all_tools: false,
             excluded_tools: Vec::new(),
+            file_read_allowed_patterns: Vec::new(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),

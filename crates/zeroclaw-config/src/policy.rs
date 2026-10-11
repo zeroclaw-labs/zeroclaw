@@ -376,6 +376,11 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Glob patterns that `file_read` paths must match (against the
+    /// canonicalized absolute path). Empty list disables glob filtering
+    /// (backward-compatible). Patterns are ANDed with the directory-level
+    /// `is_resolved_path_readable` check.
+    pub file_read_allowed_patterns: Vec<String>,
     /// Container image for the docker sandbox backend. `None` inherits the
     /// built-in default; carried here so status surfaces report the image the
     /// sandbox will actually run rather than assuming the default.
@@ -778,6 +783,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            file_read_allowed_patterns: Vec::new(),
             sandbox_image: None,
             tracker: PerSenderTracker::new(),
         }
@@ -4205,6 +4211,50 @@ impl SecurityPolicy {
         false
     }
 
+    /// Normalize a path for glob matching. Canonical Windows paths use `\`,
+    /// so on Windows it is rewritten to the `/` the patterns use. On Unix a
+    /// backslash is an ordinary filename character and must be preserved so a
+    /// pattern cannot match a file outside its intended directory (e.g.
+    /// `references\private.md` must not satisfy `**/references/*.md`).
+    fn glob_match_path(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.into_owned()
+        }
+    }
+
+    /// Second-stage glob check for `file_read`: after the directory-level
+    /// [`Self::is_resolved_path_readable`] passes, verify the canonicalized
+    /// path matches at least one pattern in `file_read_allowed_patterns`.
+    /// Returns `true` when the patterns list is empty (no restriction,
+    /// backward-compatible default).
+    ///
+    /// Match semantics: `glob::Pattern::matches_with` with
+    /// `require_literal_separator: true`, so `*` and `?` do not match path
+    /// separators. `**/references/*.md` matches files directly under
+    /// `references/` but not `references/sub/inner.md`; deeper nesting must
+    /// be spelled `**/*.md`. An invalid pattern fails closed (treated as a
+    /// non-match).
+    pub fn is_file_read_pattern_allowed(&self, resolved: &Path) -> bool {
+        if self.file_read_allowed_patterns.is_empty() {
+            return true;
+        }
+        let path_str = Self::glob_match_path(resolved);
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        self.file_read_allowed_patterns
+            .iter()
+            .any(|pattern| match glob::Pattern::new(pattern) {
+                Ok(pat) => pat.matches_with(&path_str, options),
+                Err(_) => false,
+            })
+    }
+
     fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
         let mut approved_roots = Vec::new();
         for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
@@ -4726,6 +4776,7 @@ impl SecurityPolicy {
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
+            file_read_allowed_patterns: risk_profile.file_read_allowed_patterns.clone(),
             tracker: PerSenderTracker::new(),
         }
     }
@@ -5091,6 +5142,7 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            file_read_allowed_patterns: vec!["**/SKILL.md".into()],
             sandbox_image: None,
         };
 
@@ -5140,6 +5192,11 @@ mod tests {
             policy.firejail_args,
             vec!["--net=none".to_string()],
             "firejail_args"
+        );
+        assert_eq!(
+            policy.file_read_allowed_patterns,
+            vec!["**/SKILL.md".to_string()],
+            "file_read_allowed_patterns must reach the policy"
         );
     }
 
@@ -10576,5 +10633,122 @@ mod tests {
         );
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
+    }
+
+    // ── is_file_read_pattern_allowed ────────────────────────────────
+
+    fn pattern_policy(patterns: Vec<String>) -> SecurityPolicy {
+        SecurityPolicy {
+            file_read_allowed_patterns: patterns,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_empty_list_disables_filter() {
+        let p = pattern_policy(Vec::new());
+        // Backward-compatible default: empty list admits every path.
+        assert!(p.is_file_read_pattern_allowed(Path::new("/anywhere/foo.md")));
+        assert!(p.is_file_read_pattern_allowed(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_single_pattern_match() {
+        let p = pattern_policy(vec!["**/skills/**/SKILL.md".into()]);
+        assert!(p.is_file_read_pattern_allowed(Path::new(
+            "/home/u/.zeroclaw/agents/router/workspace/skills/dailynews/SKILL.md"
+        )));
+        assert!(!p.is_file_read_pattern_allowed(Path::new(
+            "/home/u/.zeroclaw/agents/router/workspace/skills/dailynews/skill-card.md"
+        )));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_multiple_patterns_any_match_passes() {
+        let p = pattern_policy(vec![
+            "**/skills/**/SKILL.md".into(),
+            "**/skills/**/references/**/*.md".into(),
+        ]);
+        assert!(p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/SKILL.md")));
+        assert!(p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/sub/inner.md")));
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/scripts/get-daily.js")));
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/inner.txt")));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_star_does_not_cross_separator() {
+        // `require_literal_separator` means `*.md` only matches one segment.
+        let p = pattern_policy(vec!["**/references/*.md".into()]);
+        assert!(p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/ceshi.md")));
+        assert!(
+            !p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/sub/inner.md"))
+        );
+        assert!(
+            !p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/sub/inner.txt"))
+        );
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_double_star_picks_up_nesting() {
+        let p = pattern_policy(vec!["**/references/**/*.md".into()]);
+        assert!(p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/sub/inner.md")));
+        assert!(p.is_file_read_pattern_allowed(Path::new(
+            "/x/skills/foo/references/sub/deeper/notes.md"
+        )));
+        assert!(
+            !p.is_file_read_pattern_allowed(Path::new("/x/skills/foo/references/sub/inner.txt"))
+        );
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_invalid_glob_fails_closed() {
+        let p = pattern_policy(vec!["[unclosed".into()]);
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/x/SKILL.md")));
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/anything")));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_valid_pattern_compensates_for_invalid_sibling() {
+        let p = pattern_policy(vec!["[unclosed".into(), "**/SKILL.md".into()]);
+        assert!(p.is_file_read_pattern_allowed(Path::new("/x/SKILL.md")));
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/x/other.md")));
+    }
+
+    #[test]
+    fn is_file_read_pattern_allowed_posix_devices_need_explicit_allow() {
+        let p = pattern_policy(vec!["**/SKILL.md".into()]);
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/dev/null")));
+        assert!(!p.is_file_read_pattern_allowed(Path::new("/dev/zero")));
+
+        let p_allow_null = pattern_policy(vec!["**/SKILL.md".into(), "/dev/null".into()]);
+        assert!(p_allow_null.is_file_read_pattern_allowed(Path::new("/dev/null")));
+        assert!(!p_allow_null.is_file_read_pattern_allowed(Path::new("/dev/zero")));
+
+        assert!(pattern_policy(Vec::new()).is_file_read_pattern_allowed(Path::new("/dev/null")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn is_file_read_pattern_allowed_normalizes_windows_separators() {
+        let p = pattern_policy(vec!["**/SKILL.md".into()]);
+        assert!(
+            p.is_file_read_pattern_allowed(Path::new(r"C:\Users\u\.zeroclaw\skills\foo\SKILL.md"))
+        );
+        assert!(
+            !p.is_file_read_pattern_allowed(Path::new(
+                r"C:\Users\u\.zeroclaw\skills\foo\notes.txt"
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn is_file_read_pattern_allowed_preserves_unix_backslash_filename() {
+        // On Unix `references\private.md` is a single filename directly under
+        // the workspace root, not a file inside `references/`. It must not
+        // satisfy `**/references/*.md`.
+        let p = pattern_policy(vec!["**/references/*.md".into()]);
+        assert!(!p.is_file_read_pattern_allowed(Path::new(r"/workspace/references\private.md")));
+        assert!(p.is_file_read_pattern_allowed(Path::new("/workspace/references/private.md")));
     }
 }

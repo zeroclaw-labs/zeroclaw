@@ -145,6 +145,22 @@ impl FileReadTool {
             });
         }
 
+        // Second-stage glob check: restrict to configured patterns
+        // (e.g. only SKILL.md + references/*.md inside skill bundles).
+        // Returns `success: false` without charging an extra budget slot,
+        // leaving the outer `RateLimitedTool` / `PathGuardedTool` wrappers
+        // to enforce the per-sender rate limit.
+        if !self.security.is_file_read_pattern_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "tool-file-read-error-pattern-not-allowed",
+                    &[("path", path)],
+                )),
+            });
+        }
+
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {

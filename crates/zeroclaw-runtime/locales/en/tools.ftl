@@ -92,6 +92,7 @@ tool-file-download-error-move = Failed to move downloaded file into place: { $er
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
+tool-file-read-error-pattern-not-allowed = Path not allowed by file_read allowed patterns: '{ $path }'
 
 tool-file-write = Write contents to a file in the workspace
 tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
