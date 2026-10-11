@@ -17,8 +17,16 @@ mod component {
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
     use zeroclaw::plugin::websocket::{ConnectOptions, Event, Message, connect};
 
-    /// Receive polls before giving up. Each empty poll yields to the host.
-    const RECEIVE_POLLS: usize = 5_000;
+    /// Receive polls before giving up. Every poll is one of the frame's host
+    /// calls, and a frame that spends the host's budget of 1,000 gets
+    /// `unavailable`, so this stays well inside it.
+    const RECEIVE_POLLS: usize = 400;
+
+    /// Pause after an empty poll. `receive` never blocks, so a loop that does
+    /// not pause spends its whole budget within milliseconds, sooner than a
+    /// loaded machine completes a loopback echo. The sleep is a WASI clock
+    /// wait: the host runs the peer meanwhile, and it costs no host call.
+    const IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
     struct WebSocketFixtureTool;
 
@@ -72,7 +80,8 @@ mod component {
                             error: None,
                         });
                     }
-                    Some(Event::Message(Message::Binary(_))) | None => {}
+                    Some(Event::Message(Message::Binary(_))) => {}
+                    None => std::thread::sleep(IDLE_BACKOFF),
                     Some(Event::Closed(_)) => return Err("closed".to_string()),
                     Some(Event::Failed(error)) => return Err(format!("{error:?}")),
                 }

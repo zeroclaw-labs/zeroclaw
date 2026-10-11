@@ -80,6 +80,7 @@ pub struct ResolvedPluginConfig {
     public_json: Value,
     secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
     host_only: HashSet<SecretPropertyRef>,
+    tls_config_witness: Option<crate::egress::TlsConfigWitness>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -94,7 +95,56 @@ impl ResolvedPluginConfig {
             public_json,
             secrets,
             host_only: HashSet::new(),
+            tls_config_witness: None,
         }
+    }
+
+    /// Bind this frame view to the canonical inputs used for TLS authorization.
+    #[must_use]
+    pub fn with_tls_config_witness(mut self, witness: crate::egress::TlsConfigWitness) -> Self {
+        self.tls_config_witness = Some(witness);
+        self
+    }
+
+    /// Refuse pairing frame-owned material with a different policy view.
+    /// Call before reading any TLS secret or constructing a connection.
+    pub fn ensure_tls_authorization(
+        &self,
+        authorized: &crate::egress::AuthorizedEgress,
+    ) -> Result<(), crate::egress::EgressError> {
+        use crate::egress::EgressError;
+        if !self.scope.same_issuance(authorized.request().scope()) {
+            return Err(EgressError::AuthorizationScopeMismatch);
+        }
+        if authorized.tls_config_witness().is_none()
+            || self.tls_config_witness.as_ref() != authorized.tls_config_witness()
+        {
+            return Err(EgressError::TlsConfigMismatch);
+        }
+        Ok(())
+    }
+
+    /// Materialize a connection-owned TLS config only from a coherent authorization.
+    /// System roots are supplied by the host transport; private profiles need none.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub fn tls_client_config(
+        &self,
+        authorized: &crate::egress::AuthorizedEgress,
+        roots: &rustls::RootCertStore,
+    ) -> Result<std::sync::Arc<rustls::ClientConfig>, crate::egress::EgressError> {
+        self.ensure_tls_authorization(authorized)?;
+        let profile = authorized.tls_profile();
+        crate::egress::build_tls_client_config(profile, roots, |reference| {
+            self.secret_ref(reference)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| crate::egress::EgressError::TlsSecretUnavailable {
+                    profile: profile
+                        .map(|p| p.name().as_str())
+                        .unwrap_or("system-roots")
+                        .to_string(),
+                    property: reference.as_str().to_string(),
+                })
+        })
     }
 
     /// Withhold `references` from the guest while leaving them readable by

@@ -776,10 +776,75 @@ pub fn shell_tool_for_runtime(
 /// differently.
 ///
 /// [key]: zeroclaw_plugins::instance::PluginInstanceScope::config_entry_key
+/// Derive a transient coherence witness from one locked canonical config view.
+/// The process key prevents a witness from becoming an offline secret oracle;
+/// neither key nor digest is logged, serialized, or exposed to the guest.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_config_witness(
+    config: &Config,
+    instance_key: &str,
+) -> Result<zeroclaw_plugins::egress::TlsConfigWitness, zeroclaw_plugins::error::PluginError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    struct DigestWriter(Hmac<Sha256>);
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let error = || {
+        zeroclaw_plugins::error::PluginError::InvalidConfig(
+            "plugin TLS coherence inputs are unavailable".to_string(),
+        )
+    };
+    let mut entries = config
+        .plugins
+        .entries
+        .iter()
+        .filter(|entry| entry.name == instance_key);
+    let entry = entries.next();
+    if entries.next().is_some() {
+        return Err(error());
+    }
+    // Borrow sorted values: no extra plaintext serialization buffer survives.
+    let values = entry.map(|entry| {
+        entry
+            .config
+            .iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
+    let inputs = (
+        instance_key,
+        entry.map(|entry| {
+            (
+                &entry.egress_hosts,
+                &entry.egress_allow_private,
+                &entry.tls_profiles,
+            )
+        }),
+        values,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    );
+    let mut writer = DigestWriter(
+        Hmac::<Sha256>::new_from_slice(KEY.get_or_init(rand::random)).map_err(|_| error())?,
+    );
+    serde_json::to_writer(&mut writer, &inputs).map_err(|_| error())?;
+    Ok(zeroclaw_plugins::egress::TlsConfigWitness::new(
+        writer.0.finalize().into_bytes().into(),
+    ))
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
+    may_read_config: bool,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
     use zeroclaw_plugins::egress::{
         EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
@@ -839,6 +904,16 @@ fn plugin_egress_policy(
         config.plugins.limits.max_connections_per_instance,
     )?
     .with_tls_profiles(profiles)
+    .and_then(|policy| {
+        // Permissionless transports must not inspect the material inputs merely
+        // to authorize a destination. Materialization will fail closed later.
+        if !may_read_config {
+            return Ok(policy);
+        }
+        let witness = plugin_tls_config_witness(config, instance_key)
+            .map_err(|error| EgressError::PolicyUnavailable(error.to_string()))?;
+        Ok(policy.with_tls_config_witness(witness))
+    })
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -871,9 +946,14 @@ pub(crate) fn plugin_egress_service(
             let instance_key = scope.id().config_entry_key().map_err(|error| {
                 zeroclaw_plugins::egress::EgressError::PolicyUnavailable(error.to_string())
             })?;
+            let may_read_config = scope
+                .grants()
+                .allows(zeroclaw_plugins::PluginPermission::ConfigRead);
             match live_config.as_ref() {
-                Some(handle) => plugin_egress_policy(&handle.read(), &instance_key),
-                None => plugin_egress_policy(&config, &instance_key),
+                Some(handle) => {
+                    plugin_egress_policy(&handle.read(), &instance_key, may_read_config)
+                }
+                None => plugin_egress_policy(&config, &instance_key, may_read_config),
             }
         }),
     )
@@ -948,12 +1028,14 @@ pub(crate) fn plugin_host_services(
         // Filled from the same config view the values come from, so the
         // reserved set and the secrets it withholds share one revision.
         let mut host_only = Vec::new();
+        let mut witness = None;
         let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
                 let config = live_config.read();
+                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(&config, &config_entry_key);
                 plugin_config_values(&config, &config_entry_key, package)
             })
@@ -964,11 +1046,20 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
         };
-        resolved.map(|resolved| resolved.reserve_for_host(host_only))
+        resolved.map(|resolved| {
+            let resolved = resolved.reserve_for_host(host_only);
+            // A schema permitted to withhold config does not invoke the source
+            // closure. Preserve that empty view; it cannot materialize TLS secrets.
+            match witness {
+                Some(witness) => resolved.with_tls_config_witness(witness),
+                None => resolved,
+            }
+        })
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -3132,6 +3223,245 @@ const = true
             services.resolve_config(&backup_scope).is_ok(),
             "backup must resolve independently through the shared service"
         );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn plugin_tls_coherence_preserves_frame_identity_and_live_grants() {
+        use zeroclaw_plugins::egress::{EgressError, EgressRequest, EgressTransport};
+        use zeroclaw_plugins::{PluginCapability, PluginPermission};
+        let tmp = TempDir::new().unwrap();
+        let package = tmp.path().join("tls-coherence");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            package.join("manifest.toml"),
+            r#"
+name = "tls-coherence"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read", "socket_client", "websocket_client"]
+[config_schema]
+type = "object"
+additionalProperties = false
+[config_schema.properties.ca]
+type = "string"
+x-secret = true
+[config_schema.properties.cert]
+type = "string"
+x-secret = true
+[config_schema.properties.key]
+type = "string"
+x-secret = true
+"#,
+        )
+        .unwrap();
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(tmp.path()).unwrap());
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "coherence",
+            [
+                PluginPermission::ConfigRead,
+                PluginPermission::SocketClient,
+                PluginPermission::WebSocketClient,
+            ],
+        )
+        .unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&ca_key).unwrap();
+        let client = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            (cert, key)
+        };
+        let (cert_a, key_a) = client("identity-a");
+        let (cert_b, key_b) = client("identity-b");
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert =
+            rcgen::CertificateParams::new(vec!["a.example".into(), "b.example".into()])
+                .unwrap()
+                .signed_by(&server_key, &ca, &ca_key)
+                .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        async fn peer_identity(
+            client: Arc<rustls::ClientConfig>,
+            server: Arc<rustls::ServerConfig>,
+            name: &'static str,
+        ) -> Vec<u8> {
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let future = async {
+                let (client, server) = tokio::join!(
+                    tokio_rustls::TlsConnector::from(client)
+                        .connect(rustls::pki_types::ServerName::try_from(name).unwrap(), a),
+                    tokio_rustls::TlsAcceptor::from(server).accept(b)
+                );
+                assert!(client.is_ok());
+                server.unwrap().get_ref().1.peer_certificates().unwrap()[0]
+                    .as_ref()
+                    .to_vec()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), future)
+                .await
+                .unwrap()
+        }
+        let row = |destination: &str, cert: &rcgen::Certificate, key: &rcgen::KeyPair| {
+            zeroclaw_config::schema::PluginEntryConfig {
+                name: scope.id().config_entry_key().unwrap(),
+                config: HashMap::from([
+                    ("ca".into(), ca.pem()),
+                    ("cert".into(), cert.pem()),
+                    ("key".into(), key.serialize_pem()),
+                ]),
+                egress_hosts: vec![destination.into()],
+                tls_profiles: vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+                    name: "identity".into(),
+                    hosts: vec![destination.into()],
+                    system_roots: false,
+                    custom_ca_secret: Some("ca".into()),
+                    client_certificate_secret: Some("cert".into()),
+                    client_private_key_secret: Some("key".into()),
+                }],
+                ..Default::default()
+            }
+        };
+        let mut initial = Config::default();
+        initial.plugins.entries = vec![row("a.example", &cert_a, &key_a)];
+        let live = Arc::new(parking_lot::RwLock::new(initial.clone()));
+        let withheld_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "withheld",
+            [PluginPermission::SocketClient],
+        )
+        .unwrap();
+        let services = plugin_host_services(host, Arc::new(initial.clone()), Some(live.clone()));
+        assert!(
+            services.resolve_config(&withheld_scope).is_ok(),
+            "withheld config remains an empty valid view without secret reads"
+        );
+        let egress = plugin_egress_service(Arc::new(initial.clone()), Some(live.clone()));
+        let authorize = |host: &str, transport| {
+            egress.authorize_addresses(
+                EgressRequest::new(scope.clone(), transport, host, 443)
+                    .unwrap()
+                    .with_tls_profile("identity")
+                    .unwrap(),
+                [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+            )
+        };
+        let frame_a = services.resolve_config(&scope).unwrap();
+        let admission_a = authorize("a.example", EgressTransport::Tls).unwrap();
+        let connection_a = frame_a
+            .tls_client_config(&admission_a, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_a.clone(), server.clone(), "a.example").await,
+            cert_a.der().as_ref()
+        );
+        live.write().plugins.entries = vec![row("b.example", &cert_b, &key_b)];
+        for transport in [
+            EgressTransport::Tls,
+            EgressTransport::StartTls,
+            EgressTransport::WebSocket { encrypted: true },
+        ] {
+            let admission_b = authorize("b.example", transport).unwrap();
+            let presented =
+                match frame_a.tls_client_config(&admission_b, &rustls::RootCertStore::empty()) {
+                    Ok(client) => Some(peer_identity(client, server.clone(), "b.example").await),
+                    Err(EgressError::TlsConfigMismatch) => None,
+                    Err(error) => panic!("unexpected materialization refusal: {error}"),
+                };
+            assert!(
+                presented.is_none(),
+                "destination B received an identity from the old frame: {presented:?}"
+            );
+        }
+        assert!(
+            authorize("a.example", EgressTransport::Tls).is_err(),
+            "grants remain live"
+        );
+        let frame_b = services.resolve_config(&scope).unwrap();
+        assert!(
+            matches!(
+                frame_b.ensure_tls_authorization(&admission_a),
+                Err(EgressError::TlsConfigMismatch)
+            ),
+            "old authorization cannot consume a newly resolved frame"
+        );
+        let admission_b = authorize("b.example", EgressTransport::Tls).unwrap();
+        let connection_b = frame_b
+            .tls_client_config(&admission_b, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_b, server.clone(), "b.example").await,
+            cert_b.der().as_ref()
+        );
+        assert_eq!(
+            peer_identity(connection_a, server, "a.example").await,
+            cert_a.der().as_ref(),
+            "already materialized connections keep their identity"
+        );
+        // Each material/reference field participates even if destination is unchanged.
+        let current = live.read().clone();
+        for property in ["ca", "cert", "key"] {
+            *live.write() = current.clone();
+            live.write().plugins.entries[0]
+                .config
+                .insert(property.into(), "changed".into());
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        for property in ["ca", "cert", "key"] {
+            *live.write() = current.clone();
+            let mut config = live.write();
+            let profile = &mut config.plugins.entries[0].tls_profiles[0];
+            match property {
+                "ca" => profile.custom_ca_secret = Some("new_ca".into()),
+                "cert" => profile.client_certificate_secret = Some("new_cert".into()),
+                _ => profile.client_private_key_secret = Some("new_key".into()),
+            }
+            drop(config);
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        *live.write() = current;
+        live.write().plugins.entries[0].tls_profiles.clear();
+        assert!(matches!(
+            authorize("b.example", EgressTransport::Tls),
+            Err(EgressError::UnknownTlsProfile(_))
+        ));
     }
 
     /// End-to-end over the resolver the registry actually installs: an operator
