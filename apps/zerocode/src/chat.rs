@@ -4362,6 +4362,38 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
+                    // While a turn runs, a text-only message with nothing
+                    // queued ahead of it goes into that turn instead of
+                    // waiting for it to end. Anything the daemon does not
+                    // take (turn just ended, steering full, older daemon)
+                    // falls back to the queue unchanged.
+                    if state.can_steer_running_turn(&prompt, &attachments) {
+                        let session_id = state.session_id.clone();
+                        let steered = self
+                            .rpc
+                            .session_steer(&session_id, &prompt)
+                            .await
+                            .is_ok_and(|result| result.accepted);
+                        if let ChatPhase::Active(ref mut state) = self.phase
+                            && state.session_id == session_id
+                        {
+                            if steered {
+                                state.push_steered_user_message(prompt);
+                                return false;
+                            }
+                            let enq = state.enqueue_message(prompt, attachments);
+                            self.after_enqueue(enq);
+                            return false;
+                        }
+                        // The pane changed session while the request was out.
+                        // An undelivered message must not land in another
+                        // session's queue; drop its temp files like any
+                        // discarded draft.
+                        if !steered {
+                            let _ = cleanup_attachment_temps(&attachments);
+                        }
+                        return false;
+                    }
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
@@ -11747,6 +11779,42 @@ impl ChatState {
         self.message_queue.next_dispatch_index(self.turn_in_flight)
     }
 
+    /// Whether a message submitted now can be steered into the running turn
+    /// (`session/steer`) instead of queued behind it. Text only (the method
+    /// carries no attachments), and only with an empty queue: steering past
+    /// earlier queued messages would reorder what the user sent.
+    pub(crate) fn can_steer_running_turn(
+        &self,
+        text: &str,
+        attachments: &[PendingAttachment],
+    ) -> bool {
+        self.turn_in_flight
+            && !matches!(self.turn_status, TurnStatus::Cancelling)
+            && self.pending_approval().is_none()
+            && attachments.is_empty()
+            && !text.trim().is_empty()
+            && self.message_queue.is_empty()
+    }
+
+    /// Record a message the daemon accepted into the running turn. Unlike
+    /// [`Self::push_user_message`] this starts no turn: the generation,
+    /// in-flight flag and error state belong to the turn being steered. Text
+    /// streamed so far is committed first so the message sits where it was
+    /// sent; the daemon folds it in at that turn's next round boundary.
+    pub(crate) fn push_steered_user_message(&mut self, text: String) {
+        self.flush_streaming_thought();
+        self.flush_streaming_text();
+        if self.first_message.is_none() && !text.trim().is_empty() {
+            self.first_message = Some(text.clone());
+        }
+        self.entries.push(ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from(text)),
+            attachments: vec![],
+        });
+        self.mark_dirty_append();
+        self.message_count = self.message_count.saturating_add(1);
+    }
+
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
         self.message_queue
             .take_next_dispatchable(self.turn_in_flight)
@@ -17234,6 +17302,88 @@ mod tests {
             SidebarStatus::Errored,
             "error outranks everything"
         );
+    }
+
+    #[test]
+    fn steering_is_offered_only_for_a_plain_message_into_a_running_turn() {
+        let mut s = state();
+        assert!(
+            !s.can_steer_running_turn("hi", &[]),
+            "idle: an ordinary prompt, not a steer"
+        );
+        s.push_user_message(Some("first".into()), Vec::new());
+        assert!(s.can_steer_running_turn("follow-up", &[]));
+        assert!(!s.can_steer_running_turn("   ", &[]), "blank text");
+        let attachment = PendingAttachment {
+            path: std::path::PathBuf::from("/nonexistent/a.txt"),
+            mime_type: "text/plain".to_string(),
+            filename: "a.txt".to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        };
+        assert!(
+            !s.can_steer_running_turn("with file", std::slice::from_ref(&attachment)),
+            "session/steer carries no attachments"
+        );
+        s.enqueue_message("queued earlier".into(), Vec::new())
+            .unwrap();
+        assert!(
+            !s.can_steer_running_turn("later", &[]),
+            "steering past a queued message would reorder what the user sent"
+        );
+        s.message_queue.clear();
+        s.enter_cancelling();
+        assert!(
+            !s.can_steer_running_turn("too late", &[]),
+            "a cancelling turn will not read it"
+        );
+    }
+
+    #[test]
+    fn a_steered_message_joins_the_running_turn_without_starting_one() {
+        let mut s = state();
+        s.push_user_message(Some("first".into()), Vec::new());
+        let generation = s.turn_generation;
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "partial answer".to_string(),
+        });
+        let count_before = s.message_count;
+
+        s.push_steered_user_message("actually, also do X".into());
+
+        assert!(s.turn_in_flight, "the steered turn is still running");
+        assert_eq!(
+            s.turn_generation, generation,
+            "a steer must not start a new client turn generation"
+        );
+        assert_eq!(s.message_count, count_before + 1);
+        let tail: Vec<String> = s
+            .entries
+            .iter()
+            .rev()
+            .take(2)
+            .map(|entry| match entry {
+                ChatEntry::AgentMessage(text) => format!("agent:{text}"),
+                ChatEntry::UserMessage { text, .. } => {
+                    format!("user:{}", text.as_deref().unwrap_or(""))
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "user:actually, also do X".to_string(),
+                "agent:partial answer".to_string(),
+            ],
+            "text streamed before the steer is committed above it"
+        );
+        assert!(s.streaming_text.is_empty());
+
+        // The turn's own completion still settles it.
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(!s.turn_in_flight);
     }
 
     #[test]
@@ -30657,6 +30807,108 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    /// Enter while a turn runs sends `session/steer`. Accepted: the message
+    /// is in the transcript and nothing is queued. Refused (no active turn on
+    /// the daemon, or a daemon without the method): it lands in the queue as
+    /// before, so nothing typed is lost.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn submit_during_a_running_turn_steers_and_falls_back_to_the_queue() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+
+        for (reply, expect_steered) in [
+            (
+                Some(serde_json::json!({"session_id": "sess-1", "accepted": true})),
+                true,
+            ),
+            (None, false),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+            let mut chat = Chat::new(client, PaneKind::Acp);
+            let mut active = state();
+            active.push_user_message(Some("first".into()), Vec::new());
+            active.input_bar.insert_text("also do X");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+
+            let responder = {
+                let rpc = rpc.clone();
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    // Bounded: if Submit never sends (steering not attempted),
+                    // fail here instead of hanging the whole test binary.
+                    let line = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                        .await
+                        .expect("Enter during a running turn must send session/steer")
+                        .expect("submit must send a request");
+                    let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(req["method"], "session/steer");
+                    assert_eq!(req["params"]["content"], "also do X");
+                    let id = req["id"].as_str().unwrap().to_string();
+                    match reply {
+                        Some(result) => rpc.dispatch_response(&id, Some(result), None),
+                        None => rpc.dispatch_response(
+                            &id,
+                            None,
+                            Some(crate::jsonrpc::JsonRpcError {
+                                code: -32001,
+                                message: "No active turn for this session".to_string(),
+                                data: None,
+                            }),
+                        ),
+                    }
+                    rx
+                })
+            };
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await;
+            let mut rx = tokio::time::timeout(std::time::Duration::from_secs(5), responder)
+                .await
+                .expect("responder must finish")
+                .expect(
+                    "responder must not panic: Enter during a running turn must send session/steer",
+                );
+
+            let state = active_state(&mut chat);
+            let last_user = state.entries.iter().rev().find_map(|entry| match entry {
+                ChatEntry::UserMessage { text, .. } => text.as_deref().map(str::to_owned),
+                _ => None,
+            });
+            if expect_steered {
+                assert_eq!(last_user.as_deref(), Some("also do X"));
+                assert_eq!(state.queue_len(), 0, "a steered message is not queued");
+            } else {
+                assert_eq!(
+                    last_user.as_deref(),
+                    Some("first"),
+                    "a refused steer must not appear as sent"
+                );
+                assert_eq!(
+                    state.queue_len(),
+                    1,
+                    "a refused steer falls back to the queue"
+                );
+            }
+            assert!(state.turn_in_flight);
+            assert!(
+                rx.try_recv().is_err(),
+                "no session/prompt while the turn is still running"
+            );
+        }
     }
 
     // Keymap overrides are process-global; retain the existing test lock across

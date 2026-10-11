@@ -114,6 +114,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_STEER: &str = "session/steer";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
@@ -2781,6 +2782,22 @@ impl RpcClient {
         .await
     }
 
+    /// Fold `content` into the session's running turn as its own user turn
+    /// (`session/steer`). The daemon answers `accepted` when a turn took it;
+    /// an error (no active turn, full steering queue, or a daemon without the
+    /// method) means the message was not delivered and the caller still owns it.
+    pub async fn session_steer(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<SessionSteerResult> {
+        self.call(
+            method::SESSION_STEER,
+            serde_json::json!({ "session_id": session_id, "content": content }),
+        )
+        .await
+    }
+
     pub async fn session_cancel(&self, session_id: &str) -> Result<SessionCancelResult> {
         self.call(
             method::SESSION_CANCEL,
@@ -4376,6 +4393,12 @@ pub struct SessionCancelResult {}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct SessionSteerResult {
+    pub accepted: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct SessionStateResult {
     pub state: String,
     #[serde(default)]
@@ -5278,6 +5301,32 @@ mod session_method_tests {
             .expect("client.session_new_acp must resolve")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_steer_sends_content_and_reads_accepted() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_steer("s1", "also X").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_steer must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/steer");
+        assert_eq!(req["params"]["session_id"], "s1");
+        assert_eq!(req["params"]["content"], "also X");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"session_id":"s1","accepted":true})), None);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_steer must resolve")
+            .unwrap()
+            .unwrap();
+        assert!(result.accepted);
     }
 
     #[tokio::test]
