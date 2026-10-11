@@ -2007,9 +2007,10 @@ pub async fn run(
                     let dock_layout = dock.layout(chunks[1], mode, plan_visible);
                     content_area = dock_layout.conversation;
                     dock.draw_shell(frame);
-                    sidebar.clear_geometry();
                     if let Some(sidebar_area) = dock_layout.sessions {
                         sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
+                    } else {
+                        sidebar.clear_geometry();
                     }
 
                     match mode {
@@ -2309,6 +2310,7 @@ pub async fn run(
         match input_event {
             Event::Key(key) => {
                 dock.clear_capture();
+                sidebar.cancel_drag();
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
@@ -2573,6 +2575,7 @@ pub async fn run(
             }
             Event::Mouse(mouse) => {
                 if let Some(state) = help_overlay.as_mut() {
+                    sidebar.cancel_drag();
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             state.scroll = state.scroll.saturating_sub(3);
@@ -2615,6 +2618,19 @@ pub async fn run(
                     .unwrap_or(menu_open);
                 if menu_consumed {
                     dock.clear_capture();
+                    sidebar.cancel_drag();
+                    continue;
+                }
+                // A row drag owns its release, including over another dock
+                // section or the transcript. Do not start another gesture there.
+                if sidebar.captures_mouse(&mouse) {
+                    route_agent_sidebar_mouse(
+                        mode,
+                        &mut chat_pane,
+                        &mut acp_pane,
+                        &mut sidebar,
+                        &mouse,
+                    );
                     continue;
                 }
                 let (dock_consumed, dock_action) =
@@ -2761,7 +2777,10 @@ pub async fn run(
                     })
                     .await;
             }
-            Event::Resize(_, _) => dock.clear_capture(),
+            Event::Resize(_, _) => {
+                dock.clear_capture();
+                sidebar.cancel_drag();
+            }
             _ => {}
         }
     }
@@ -2888,7 +2907,7 @@ fn route_agent_sidebar_mouse(
     sidebar: &mut crate::agent_sidebar::AgentSidebar,
     mouse: &crossterm::event::MouseEvent,
 ) -> (bool, Option<crate::agent_sidebar::SidebarEvent>) {
-    if !sidebar.contains(mouse.column, mouse.row) {
+    if !sidebar.contains(mouse.column, mouse.row) && !sidebar.captures_mouse(mouse) {
         return (false, None);
     }
 
@@ -4131,6 +4150,109 @@ mod tests {
             Some(crate::turn_status::TurnStatus::WaitingForApproval)
         ));
         assert_eq!(agent, Some("code"));
+    }
+
+    #[tokio::test]
+    async fn sidebar_session_drag_routes_outside_release_and_keeps_order_after_reconnect() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client.clone());
+        chat_pane.activate_session_for_test("chat-session");
+        acp_pane.activate_session_for_test("code-session");
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(70, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut rows = acp_pane.session_summaries();
+        rows.extend(chat_pane.session_summaries());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let mut mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
+        );
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        mouse.row += 1;
+        assert!(sidebar.captures_mouse(&mouse));
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        mouse.column = 20; // Release over the conversation, outside Sessions.
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert!(!sidebar.captures_mouse(&mouse));
+
+        // Use the same constructors and handoff as build_panes on reconnect.
+        let mut reconnected_chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        reconnected_chat.set_resume_sessions(chat_pane.resume_entries());
+        let mut reconnected_code = acp::Acp::new(client);
+        reconnected_code.set_resume_sessions(acp_pane.resume_entries());
+        let mut rows = reconnected_code.session_summaries();
+        rows.extend(reconnected_chat.session_summaries());
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        mouse.column = area.x + 1;
+        mouse.row = area.y + 1;
+        let (_, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut reconnected_chat,
+            &mut reconnected_code,
+            &mut sidebar,
+            &mouse,
+        );
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-session".into(),
+            })
+        );
     }
 
     #[tokio::test]

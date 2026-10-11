@@ -2,9 +2,9 @@
 //! live status dots, `+`/`-` session controls, and the Quickstart
 //! launcher at the bottom.
 //!
-//! The sidebar owns only widget state (scroll, hit rects,
-//! picker). Session rows are derived per frame from the panes'
-//! `session_summaries()` — the panes stay the single source of truth.
+//! The sidebar owns widget state and the user's display order. Session rows
+//! are derived per frame from the panes' `session_summaries()`; the panes
+//! remain authoritative for session membership and state.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -86,9 +86,14 @@ impl SidebarPicker {
 pub(crate) struct AgentSidebar {
     /// Scroll offset into the session rows.
     scroll: u16,
+    /// User-selected display order across both panes, retained until UI exit.
+    row_order: Vec<(PaneKind, String)>,
+    /// Session identity captured by a row-body press, never a close control.
+    drag: Option<(PaneKind, String)>,
     // Geometry recorded by draw, read by the mouse handler (repo convention:
     // draw records, mouse reads). All `Rect::default()` while hidden.
     area: Rect,
+    rows_area: Rect,
     minus_rect: Rect,
     /// The focused session in the active pane, captured during the last draw.
     minus_target: Option<(PaneKind, String)>,
@@ -103,7 +108,10 @@ impl AgentSidebar {
     pub(crate) fn new() -> Self {
         Self {
             scroll: 0,
+            row_order: Vec::new(),
+            drag: None,
             area: Rect::default(),
+            rows_area: Rect::default(),
             minus_rect: Rect::default(),
             minus_target: None,
             plus_rect: Rect::default(),
@@ -120,6 +128,20 @@ impl AgentSidebar {
 
     pub(crate) fn close_picker(&mut self) {
         self.picker = None;
+        self.cancel_drag();
+    }
+
+    pub(crate) fn cancel_drag(&mut self) {
+        self.drag = None;
+    }
+
+    /// Route a captured gesture even when the pointer leaves the panel.
+    pub(crate) fn captures_mouse(&self, mouse: &MouseEvent) -> bool {
+        self.drag.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
     }
 
     /// Whether `(col, row)` falls inside the sidebar panel (not the picker).
@@ -130,7 +152,13 @@ impl AgentSidebar {
     /// Invalidate panel hit targets when the shell hides or relocates Sessions.
     /// Scroll and picker lifecycle are deliberately preserved.
     pub(crate) fn clear_geometry(&mut self) {
+        self.cancel_drag();
+        self.reset_geometry();
+    }
+
+    fn reset_geometry(&mut self) {
         self.area = Rect::default();
+        self.rows_area = Rect::default();
         self.minus_rect = Rect::default();
         self.minus_target = None;
         self.plus_rect = Rect::default();
@@ -148,9 +176,27 @@ impl AgentSidebar {
         rows: &[SidebarSessionSummary],
         ctx: &SidebarCtx,
     ) {
-        self.clear_geometry();
+        self.reset_geometry();
         if area.width == 0 || area.height == 0 {
+            self.cancel_drag();
             return;
+        }
+        self.row_order.retain(|(pane, sid)| {
+            rows.iter()
+                .any(|row| row.pane_kind == *pane && row.session_id == *sid)
+        });
+        for row in rows {
+            let key = (row.pane_kind, row.session_id.clone());
+            if !self.row_order.contains(&key) {
+                self.row_order.push(key);
+            }
+        }
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|key| !self.row_order.contains(key))
+        {
+            self.cancel_drag();
         }
         self.area = area;
         frame.render_widget(Clear, area);
@@ -250,8 +296,10 @@ impl AgentSidebar {
         rows: &[SidebarSessionSummary],
         ctx: &SidebarCtx,
     ) {
+        self.rows_area = rows_area;
         if rows_area.height == 0 {
             self.scroll = 0;
+            self.cancel_drag();
             return;
         }
         if rows.is_empty() {
@@ -276,8 +324,17 @@ impl AgentSidebar {
         let max_scroll = rows.len().saturating_sub(visible) as u16;
         self.scroll = self.scroll.min(max_scroll);
 
-        for (i, summary) in rows
+        let ordered_rows: Vec<_> = self
+            .row_order
             .iter()
+            .filter_map(|(pane, sid)| {
+                rows.iter()
+                    .enumerate()
+                    .find(|(_, row)| row.pane_kind == *pane && row.session_id == *sid)
+            })
+            .collect();
+        for (i, (source_index, summary)) in ordered_rows
+            .into_iter()
             .skip(self.scroll as usize)
             .take(visible)
             .enumerate()
@@ -331,7 +388,8 @@ impl AgentSidebar {
             let name = if duplicate {
                 let ordinal = rows
                     .iter()
-                    .take(self.scroll as usize + i + 1)
+                    // Moving a row must not rename duplicate-agent sessions.
+                    .take(source_index + 1)
                     .filter(|row| row.agent_alias == summary.agent_alias)
                     .count();
                 let suffix = format!(" #{ordinal}");
@@ -417,6 +475,7 @@ impl AgentSidebar {
         open_aliases: HashSet<String>,
         rpc: &Arc<RpcClient>,
     ) {
+        self.cancel_drag();
         let (tx, rx) = mpsc::unbounded_channel();
         let rpc = Arc::clone(rpc);
         tokio::spawn(async move {
@@ -527,6 +586,7 @@ impl AgentSidebar {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.cancel_drag();
                 let (col, row) = (mouse.column, mouse.row);
                 if mouse::in_rect(col, row, self.minus_rect)
                     && let Some((pane, session_id)) = self.minus_target.clone()
@@ -540,7 +600,7 @@ impl AgentSidebar {
                     return Some(SidebarEvent::OpenQuickstart);
                 }
                 // A per-row `✕` closes that specific session; the rest of
-                // the row only moves focus.
+                // the row focuses and can start a reorder gesture.
                 for (pane, sid, rect) in &self.row_close_rects {
                     if mouse::in_rect(col, row, *rect) {
                         return Some(SidebarEvent::CloseSession {
@@ -551,12 +611,21 @@ impl AgentSidebar {
                 }
                 for (pane, sid, rect) in &self.row_rects {
                     if mouse::in_rect(col, row, *rect) {
+                        self.drag = Some((*pane, sid.clone()));
                         return Some(SidebarEvent::FocusSession {
                             pane: *pane,
                             session_id: sid.clone(),
                         });
                     }
                 }
+                None
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.reorder_drag(mouse.column, mouse.row);
+                None
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.cancel_drag();
                 None
             }
             MouseEventKind::ScrollUp => {
@@ -569,6 +638,37 @@ impl AgentSidebar {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn reorder_drag(&mut self, col: u16, row: u16) {
+        let Some(key) = self.drag.as_ref() else {
+            return;
+        };
+        let Some(from) = self.row_order.iter().position(|entry| entry == key) else {
+            self.cancel_drag();
+            return;
+        };
+        let area = self.rows_area;
+        if area.height == 0 || col < area.x || col >= area.right() {
+            return;
+        }
+        let visible = usize::from(area.height);
+        let max_scroll = self.row_order.len().saturating_sub(visible) as u16;
+        // Dragging beyond either end reveals another row on each mouse event.
+        let offset = if row < area.y {
+            self.scroll = self.scroll.saturating_sub(1);
+            0
+        } else if row >= area.bottom() {
+            self.scroll = self.scroll.saturating_add(1).min(max_scroll);
+            visible - 1
+        } else {
+            usize::from(row - area.y)
+        };
+        let to = (usize::from(self.scroll) + offset).min(self.row_order.len() - 1);
+        if from != to {
+            let key = self.row_order.remove(from);
+            self.row_order.insert(to, key);
         }
     }
 
@@ -624,17 +724,7 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseEventKind};
 
     fn sidebar() -> AgentSidebar {
-        AgentSidebar {
-            scroll: 0,
-            area: Rect::default(),
-            minus_rect: Rect::default(),
-            minus_target: None,
-            plus_rect: Rect::default(),
-            quickstart_rect: Rect::default(),
-            row_rects: Vec::new(),
-            row_close_rects: Vec::new(),
-            picker: None,
-        }
+        AgentSidebar::new()
     }
 
     fn summary(alias: &str, sid: &str, focused: bool) -> SidebarSessionSummary {
@@ -655,6 +745,142 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn draw_rows(sidebar: &mut AgentSidebar, rows: &[SidebarSessionSummary], height: u16) {
+        let backend = ratatui::backend::TestBackend::new(30, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                sidebar.draw(
+                    frame,
+                    Rect::new(0, 0, 30, height),
+                    rows,
+                    &SidebarCtx {
+                        active_pane: Some(PaneKind::Chat),
+                        quickstart_active: false,
+                        connected: true,
+                    },
+                );
+            })
+            .unwrap();
+    }
+
+    fn drag_to(sidebar: &mut AgentSidebar, col: u16, row: u16) {
+        let mut mouse = click(col, row);
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(sidebar.handle_mouse(&mouse), None);
+    }
+
+    fn visible_sessions(sidebar: &AgentSidebar) -> Vec<&str> {
+        sidebar
+            .row_rects
+            .iter()
+            .map(|(_, sid, _)| sid.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn session_drag_reorders_across_panes_and_survives_summary_refresh() {
+        let mut sidebar = sidebar();
+        let mut rows = vec![
+            summary("alpha", "chat-a", true),
+            summary("beta", "chat-b", false),
+            summary("code", "code-a", true),
+        ];
+        rows[2].pane_kind = PaneKind::Acp;
+        draw_rows(&mut sidebar, &rows, 10);
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        let (_, _, last) = sidebar.row_rects[2].clone();
+        assert_eq!(
+            sidebar.handle_mouse(&click(first.x, first.y)),
+            Some(SidebarEvent::FocusSession {
+                pane: PaneKind::Chat,
+                session_id: "chat-a".into(),
+            })
+        );
+        // Each mouse event is followed by a real widget redraw in the shell.
+        draw_rows(&mut sidebar, &rows, 10);
+        drag_to(&mut sidebar, last.x, last.y);
+        draw_rows(&mut sidebar, &rows, 10);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-a"]);
+
+        sidebar.close_picker(); // Also runs while the daemon is disconnected.
+        rows[0].status = SidebarStatus::Running;
+        draw_rows(&mut sidebar, &rows, 10);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-a"]);
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        let (_, _, last) = sidebar.row_rects[2].clone();
+        sidebar.handle_mouse(&click(last.x, last.y));
+        drag_to(&mut sidebar, first.x, first.y);
+        draw_rows(&mut sidebar, &rows, 10);
+        assert_eq!(visible_sessions(&sidebar), ["chat-a", "chat-b", "code-a"]);
+
+        sidebar.handle_mouse(&click(first.x, first.y));
+        rows.remove(0);
+        rows.push(summary("new", "chat-c", false));
+        draw_rows(&mut sidebar, &rows, 10);
+        assert_eq!(visible_sessions(&sidebar), ["chat-b", "code-a", "chat-c"]);
+        assert!(sidebar.drag.is_none(), "removal ends the captured gesture");
+    }
+
+    #[test]
+    fn session_drag_close_control_does_not_capture_and_hiding_clears_capture() {
+        let mut sidebar = sidebar();
+        let rows = vec![summary("alpha", "a", true), summary("beta", "b", false)];
+        draw_rows(&mut sidebar, &rows, 8);
+        let (_, _, close) = sidebar.row_close_rects[0].clone();
+        assert_eq!(
+            sidebar.handle_mouse(&click(close.x, close.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "a".into(),
+            })
+        );
+        let (_, _, last) = sidebar.row_rects[1].clone();
+        drag_to(&mut sidebar, last.x, last.y);
+        draw_rows(&mut sidebar, &rows, 8);
+        assert_eq!(visible_sessions(&sidebar), ["a", "b"]);
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        sidebar.handle_mouse(&click(first.x, first.y));
+        drag_to(&mut sidebar, last.x, last.y);
+        sidebar.clear_geometry();
+        assert!(sidebar.drag.is_none());
+        draw_rows(&mut sidebar, &rows, 8);
+        assert_eq!(visible_sessions(&sidebar), ["b", "a"]);
+    }
+
+    #[test]
+    fn session_drag_scrolls_beyond_visible_rows_without_leaking_after_release() {
+        let mut sidebar = sidebar();
+        let rows: Vec<_> = (0..5)
+            .map(|i| summary("alpha", &format!("s{i}"), i == 0))
+            .collect();
+        draw_rows(&mut sidebar, &rows, 6); // Two visible session rows.
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        sidebar.handle_mouse(&click(first.x, first.y));
+        for _ in 0..3 {
+            let below = sidebar.rows_area.bottom();
+            drag_to(&mut sidebar, first.x, below);
+            draw_rows(&mut sidebar, &rows, 6);
+        }
+        assert_eq!(visible_sessions(&sidebar), ["s4", "s0"]);
+        for _ in 0..3 {
+            let above = sidebar.rows_area.y - 1;
+            drag_to(&mut sidebar, first.x, above);
+            draw_rows(&mut sidebar, &rows, 6);
+        }
+        assert_eq!(visible_sessions(&sidebar), ["s0", "s1"]);
+
+        let mut release = click(50, 50);
+        release.kind = MouseEventKind::Up(MouseButton::Left);
+        assert!(sidebar.captures_mouse(&release));
+        sidebar.handle_mouse(&release);
+        assert!(!sidebar.captures_mouse(&release));
+        let below = sidebar.rows_area.bottom();
+        drag_to(&mut sidebar, first.x, below);
+        draw_rows(&mut sidebar, &rows, 6);
+        assert_eq!(visible_sessions(&sidebar), ["s0", "s1"]);
     }
 
     #[test]
@@ -774,6 +1000,20 @@ mod tests {
                     session_id: sid,
                 })
             );
+        }
+        let (_, _, first) = sidebar.row_rects[0].clone();
+        let (_, _, last) = sidebar.row_rects[1].clone();
+        sidebar.handle_mouse(&click(last.x, last.y));
+        drag_to(&mut sidebar, first.x, first.y);
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert_eq!(visible_sessions(&sidebar), ["s2", "s1"]);
+        for (_, sid, rect) in &sidebar.row_rects {
+            let text: String = (rect.x..rect.right())
+                .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
+                .collect();
+            let ordinal = if sid == "s1" { 1 } else { 2 };
+            assert!(text.contains(&format!("alpha #{ordinal}")), "{text}");
         }
     }
 
