@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
 use zeroclaw_eval::case::load_suite;
 use zeroclaw_eval::grader::evaluate_expects;
-use zeroclaw_eval::{LlmTrace, Mode, RecordedCall, RunRecord, run_case, run_suite};
+use zeroclaw_eval::{LlmTrace, RecordedCall, RunDeps, RunRecord, run_case, run_suite};
 
 /// Resolve the gated suite from the shipped config default rather than a second
 /// hardcoded literal, so the directory this gate certifies cannot drift away
@@ -19,7 +19,7 @@ fn regression_dir() -> PathBuf {
 
 #[tokio::test]
 async fn regression_suite_replays_green() {
-    let report = run_suite(&regression_dir(), Mode::Replay)
+    let report = run_suite(&regression_dir(), &RunDeps::replay())
         .await
         .expect("regression suite must load and run");
     assert!(
@@ -42,7 +42,10 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
     let path = regression_dir().join("missing_tool_argument_continues_loop.json");
     let trace = LlmTrace::from_file(&path).expect("the committed fixture must load");
 
-    let observed = run_case(&trace).await.expect("the fixture must replay");
+    let observed = run_case(&trace, &RunDeps::replay())
+        .await
+        .expect("the fixture must replay");
+    let observed = observed.record;
     let graded = evaluate_expects(&trace.expects, &observed);
     assert!(
         graded.iter().all(|grade| grade.passed),
@@ -60,6 +63,8 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
         }],
         input_tokens: observed.input_tokens,
         output_tokens: observed.output_tokens,
+        duration_ms: observed.duration_ms,
+        llm_calls: observed.llm_calls,
     };
     let failures: Vec<String> = evaluate_expects(&trace.expects, &repaired)
         .into_iter()
@@ -93,6 +98,8 @@ async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
             tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            duration_ms: 0,
+            llm_calls: 0,
         };
         let grades = evaluate_expects(&trace.expects, &idle);
         assert!(

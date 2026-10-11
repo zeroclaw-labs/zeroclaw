@@ -35,11 +35,6 @@ use zeroclaw_config::schema::{
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
-use zeroclaw_tools::memory_export::MemoryExportTool;
-use zeroclaw_tools::memory_forget::MemoryForgetTool;
-use zeroclaw_tools::memory_purge::MemoryPurgeTool;
-use zeroclaw_tools::memory_recall::MemoryRecallTool;
-use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -1228,19 +1223,6 @@ impl DelegateTool {
         zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
             .await
             .map(Some)
-    }
-
-    fn memory_tools_for_target(
-        memory: Arc<dyn Memory>,
-        security: Arc<SecurityPolicy>,
-    ) -> Vec<Box<dyn Tool>> {
-        vec![
-            Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryRecallTool::new(memory.clone())),
-            Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-            Box::new(MemoryExportTool::new(memory.clone())),
-            Box::new(MemoryPurgeTool::new(memory, security)),
-        ]
     }
 
     #[cfg(test)]
@@ -4725,7 +4707,7 @@ impl DelegateTool {
                         .await
                     {
                         Ok(Some(memory)) => {
-                            Self::memory_tools_for_target(memory, Arc::clone(&target_policy))
+                            crate::tools::memory_tools(memory, Arc::clone(&target_policy))
                                 .into_iter()
                                 .map(|tool| (tool.name().to_string(), tool))
                                 .collect()
