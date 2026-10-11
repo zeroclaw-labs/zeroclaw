@@ -43,7 +43,7 @@ struct AwsCredentials {
 }
 
 impl AwsCredentials {
-    /// Resolve credentials: first try environment variables, then EC2 IMDSv2.
+    /// Read SigV4 credentials from the standard AWS environment variables.
     fn from_env() -> anyhow::Result<Self> {
         let access_key_id = env_required("AWS_ACCESS_KEY_ID")?;
         let secret_access_key = env_required("AWS_SECRET_ACCESS_KEY")?;
@@ -210,6 +210,11 @@ impl AwsCredentials {
 
     /// Fetch credentials from EC2 IMDSv2 instance metadata service.
     async fn from_imds() -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !env_optional("AWS_EC2_METADATA_DISABLED")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            "EC2 instance metadata is disabled"
+        );
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()?;
@@ -898,7 +903,7 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
+    /// Resolve pinned/cached auth, then bearer env, SigV4 env, credential_process, and IMDS.
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
         // If we already have auth cached, re-resolve from the same source.
         if let Some(ref auth) = self.auth {
@@ -2003,12 +2008,16 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn chat_fails_without_credentials() {
+    async fn chat_honors_disabled_ec2_metadata() {
         let _env_lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        std::fs::write(&config_path, "").unwrap();
         let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
         let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
-        let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        let _config = EnvGuard::set("AWS_CONFIG_FILE", config_path.to_str());
+        let _imds = EnvGuard::set("AWS_EC2_METADATA_DISABLED", Some(" TrUe "));
         let model_provider = BedrockModelProvider {
             alias: "test".to_string(),
             auth: None,
@@ -2021,12 +2030,23 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("credentials not set")
-                || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("builder error"),
-            "Expected missing-credentials style error, got: {err}"
+            err.contains("EC2 instance metadata is disabled"),
+            "expected the explicit metadata opt-out before any IMDS request, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn environment_credentials_precede_disabled_imds() {
+        let _env_lock = env_lock();
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("FROM_ENV_WHILE_IMDS_DISABLED"));
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret_from_env"));
+        let _imds = EnvGuard::set("AWS_EC2_METADATA_DISABLED", Some("true"));
+
+        let creds = AwsCredentials::resolve().await.unwrap();
+
+        assert_eq!(creds.access_key_id, "FROM_ENV_WHILE_IMDS_DISABLED");
+        assert_eq!(creds.secret_access_key, "secret_from_env");
     }
 
     // ── Bearer token tests ──────────────────────────────────────
