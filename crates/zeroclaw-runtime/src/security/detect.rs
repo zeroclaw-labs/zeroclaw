@@ -20,9 +20,6 @@ pub struct SandboxExtraRoots {
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
 const FIREJAIL_DESCRIPTION: &str = "Linux user-space sandbox (requires firejail to be installed)";
-#[cfg(target_os = "linux")]
-const FIREJAIL_ARGS_REJECTED_DESCRIPTION: &str =
-    "Firejail selected, but firejail_args were rejected; commands are blocked";
 const BUBBLEWRAP_DESCRIPTION: &str = "User namespace sandbox (requires bwrap)";
 const DOCKER_DESCRIPTION: &str = "Docker container isolation (requires docker)";
 const SEATBELT_DESCRIPTION: &str = "macOS Seatbelt sandbox (built-in sandbox-exec)";
@@ -87,7 +84,7 @@ fn firejail_args_description(
     {
         super::firejail::FirejailSandbox::validate_extra_args(firejail_args)
             .err()
-            .map(|error| format!("{FIREJAIL_ARGS_REJECTED_DESCRIPTION} ({error})"))
+            .map(|error| firejail_args_rejected_description(&error))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -467,6 +464,14 @@ impl Sandbox for FailedSeatbeltSandbox {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn firejail_args_rejected_description(error: &std::io::Error) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-security-status-sandbox-description-firejail-args-rejected",
+        &[("reason", &error.to_string())],
+    )
+}
+
 /// Firejail was selected but its configured `firejail_args` were rejected.
 /// Running the command without them would present configured hardening as
 /// active when it is not, and running it unsandboxed would drop the sandbox
@@ -474,6 +479,7 @@ impl Sandbox for FailedSeatbeltSandbox {
 #[cfg(target_os = "linux")]
 struct RejectedFirejailArgsSandbox {
     error: std::io::Error,
+    description: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -498,7 +504,7 @@ impl Sandbox for RejectedFirejailArgsSandbox {
     }
 
     fn description(&self) -> &str {
-        FIREJAIL_ARGS_REJECTED_DESCRIPTION
+        &self.description
     }
 }
 
@@ -507,7 +513,10 @@ fn create_firejail_sandbox(firejail_args: &[String]) -> Option<Arc<dyn Sandbox>>
     match super::firejail::FirejailSandbox::with_args(firejail_args) {
         Ok(sandbox) => Some(Arc::new(sandbox)),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            Some(Arc::new(RejectedFirejailArgsSandbox { error }))
+            Some(Arc::new(RejectedFirejailArgsSandbox {
+                description: firejail_args_rejected_description(&error),
+                error,
+            }))
         }
         Err(_) => None,
     }
@@ -878,7 +887,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn selected_firejail_with_rejected_args_blocks_commands_instead_of_dropping_them() {
-        // #11594: the args are checked before Firejail is probed, so this
+        // The args are checked before Firejail is probed, so this
         // holds whether or not firejail is installed.
         let sandbox = create_selected_sandbox(
             SelectedSandboxBackend::Firejail,
@@ -909,7 +918,18 @@ mod tests {
             &["--ignore=noroot".to_string()],
         )
         .expect("rejected args are reported");
-        assert!(rejected.contains("commands are blocked"), "{rejected}");
+        let reason = super::super::firejail::FirejailSandbox::validate_extra_args(&[
+            "--ignore=noroot".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            rejected,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-security-status-sandbox-description-firejail-args-rejected",
+                &[("reason", &reason)],
+            )
+        );
         assert!(rejected.contains("--ignore"), "{rejected}");
         assert_eq!(
             firejail_args_description(

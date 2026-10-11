@@ -58,37 +58,51 @@ impl FirejailSandbox {
 
     /// Check configured `firejail_args` without probing for Firejail.
     pub fn validate_extra_args(args: &[String]) -> std::io::Result<Vec<OsString>> {
-        let invalid = |message: String| {
+        let invalid = |key: &str, extra: &[(&str, &str)]| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("firejail_args rejected: {message}"),
+                crate::i18n::get_required_cli_string_with_args(key, extra),
             )
         };
         args.iter()
             .map(|arg| {
                 if arg.trim().is_empty() {
-                    return Err(invalid("an entry is empty".to_string()));
+                    return Err(invalid("cli-security-firejail-args-error-empty", &[]));
                 }
+                let quoted = format!("{arg:?}");
                 if arg != arg.trim() {
-                    return Err(invalid(format!(
-                        "{arg:?} has leading or trailing whitespace"
-                    )));
-                }
-                if arg == "--" || !arg.starts_with("--") {
-                    return Err(invalid(format!(
-                        "{arg:?} is not a Firejail option; write each option as one \
-                         `--option` or `--option=value` entry"
-                    )));
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-whitespace",
+                        &[("arg", &quoted)],
+                    ));
                 }
                 let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+                if !Self::is_option_name(name) {
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-not-option",
+                        &[("arg", &quoted)],
+                    ));
+                }
                 if CONFLICTING_EXTRA_ARGS.contains(&name) {
-                    return Err(invalid(format!(
-                        "{name} conflicts with the options ZeroClaw's Firejail wrapper sets"
-                    )));
+                    return Err(invalid(
+                        "cli-security-firejail-args-error-conflict",
+                        &[("name", name)],
+                    ));
                 }
                 Ok(OsString::from(arg))
             })
             .collect()
+    }
+
+    /// `--name` where `name` is non-empty and made of the characters Firejail
+    /// option names use; a value may only follow after `=`.
+    fn is_option_name(name: &str) -> bool {
+        name.strip_prefix("--").is_some_and(|rest| {
+            rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
     }
 
     /// Probe if Firejail is available (for auto-detection)
@@ -543,7 +557,7 @@ mod tests {
         );
     }
 
-    // ── firejail_args (#11594) ─────────────────────────────────
+    // ── firejail_args ──────────────────────────────────────────
 
     #[test]
     fn firejail_wrap_passes_configured_args_before_the_wrapped_command() {
@@ -602,9 +616,18 @@ mod tests {
             "--net=none".to_string(),
             "--private-tmp".to_string(),
             "--rlimit-as=1g".to_string(),
+            "--env=GREETING=hello world".to_string(),
         ])
         .unwrap();
-        assert_eq!(accepted, ["--net=none", "--private-tmp", "--rlimit-as=1g"]);
+        assert_eq!(
+            accepted,
+            [
+                "--net=none",
+                "--private-tmp",
+                "--rlimit-as=1g",
+                "--env=GREETING=hello world"
+            ]
+        );
     }
 
     #[test]
@@ -625,6 +648,10 @@ mod tests {
             "--allow-debuggers",
             "--join=1234",
             "--join-or-start=work",
+            "--net none",
+            "--=x",
+            "---net=none",
+            "--net\tnone",
         ] {
             let error =
                 FirejailSandbox::validate_extra_args(&["--net=none".to_string(), bad.to_string()])

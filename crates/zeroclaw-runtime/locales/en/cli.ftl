@@ -808,6 +808,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options ZeroClaw's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
