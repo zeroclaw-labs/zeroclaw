@@ -26,16 +26,23 @@ for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
-`sandbox_backend = "auto"` picks the best available backend at startup:
+`sandbox_backend = "auto"` resolves a backend when the sandbox is created. The order depends on the platform, on the sandbox features the binary was compiled with, and on the runtime kind:
 
-| Platform | Preferred order |
+| Platform | Order tried |
 |---|---|
-| Linux | Landlock (kernel 5.13+) → Bubblewrap → Firejail → Docker → none |
-| macOS | Seatbelt (`sandbox-exec`, native) → Docker → none |
-| Windows | AppContainer (experimental) → Docker → none |
-| Any | Docker (if daemon reachable) → none |
+| Linux | Landlock (only when compiled with `sandbox-landlock`) → Firejail |
+| macOS | Bubblewrap (only when compiled with `sandbox-bubblewrap`) → Seatbelt (`sandbox-exec`) |
+| Windows | No OS-level backend |
 
-To force a specific backend, set `sandbox_backend` to one of the literal values listed above.
+Bubblewrap is not in the Linux auto-detection chain; it is only reachable by naming it explicitly. Landlock and Bubblewrap are compile-time features, and a build that does not enable one skips that backend entirely. Neither feature is in the `default` feature set or in the `dist` set the release build uses, so a stock build starts the Linux list at Firejail and the macOS list at Seatbelt.
+
+After the platform list, `auto` tries Docker only when the runtime kind is neither `native` nor `docker`. Docker is not part of the native runtime's automatic fallback: with `[runtime] kind = "native"` (the default), `auto` never selects Docker even when the daemon is reachable. Docker is also skipped when the runtime is already `docker`, because the runtime container is the boundary. The only other runtime kind, `cloudflare`, is rejected by `create_runtime` in `crates/zeroclaw-config/src/platform/mod.rs` as not implemented, so on a runnable configuration `auto` never reaches the Docker backend.
+
+When nothing on the list is available, selection ends at `none` on the native runtime: no OS-level sandbox wraps tool calls, and only the application-layer security described above applies. On the Docker runtime it ends at `docker-runtime` instead, keeping the container boundary with no second sandbox wrapper.
+
+Naming a backend explicitly does not walk this list. If the requested backend is not compiled in, does not work on the platform, is not compatible with the runtime kind, or fails its availability probe, selection goes straight to `none` (native) or `docker-runtime` (Docker runtime), not to the next backend.
+
+To force a specific backend, set `sandbox_backend` to a backend name: `landlock`, `firejail`, `bubblewrap`, `docker`, `sandbox-exec`, or `none`.
 
 ## What the sandbox confines
 
@@ -50,11 +57,13 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 ### Network
 
-By default, sandboxed tools have full network egress but no inbound listening. Per-backend caveats:
+Network access is per backend, and most of them leave it alone:
 
-- Landlock does not control network, it is filesystem-only.
-- Bubblewrap and Firejail can block network when configured.
-- Docker container network mode follows `[runtime.docker].network` when `[runtime].kind = "docker"`.
+- **Landlock** controls filesystem access only, so network egress is unchanged.
+- **Firejail** runs with `--noprofile` and no network flags, so it leaves network access unchanged too.
+- **Bubblewrap** runs with `--unshare-all` and never `--share-net`, so the sandbox gets no network.
+- **Seatbelt** denies outbound network by default and allows only DNS resolution through `/var/run/mDNSResponder` and connections to `localhost`.
+- **Docker** passes `--network none` for the `docker` sandbox backend; the Docker runtime passes `[runtime.docker].network`, which defaults to `none`.
 
 Tool-specific network gates (browser, HTTP, web_fetch) live on those tools' own config blocks (`[browser].allowed_domains`, `[http_request].allowed_domains`, `[web_fetch].allowed_domains`).
 
@@ -117,7 +126,7 @@ Limitations:
 
 ### Bubblewrap (`bwrap`)
 
-User-namespace-based sandbox from Flatpak. Confines filesystem and can block network. Requires `bubblewrap` installed.
+User-namespace-based sandbox from Flatpak. Confines filesystem and runs without network access. Requires `bubblewrap` installed.
 
 <div class="os-tabs-src">
 
@@ -155,7 +164,7 @@ sudo apt install firejail
 
 </div>
 
-Firejail's default profile is fairly permissive; ZeroClaw applies a custom profile. Pass extra args with `firejail_args` on the risk profile.
+Firejail's default profile is fairly permissive, and ZeroClaw skips it with `--noprofile`, passing an explicit flag set instead.
 
 ### Docker
 
@@ -185,12 +194,12 @@ No sandboxing. Tools run with the full privileges of the ZeroClaw service user. 
 
 ## Troubleshooting
 
-- **"Sandbox backend unavailable"** on startup: check `zeroclaw service status` and the journal; the auto-detect logs which backends it tried.
+- **No sandbox is active**: check `zeroclaw service status` and the journal. Selection logs the backend it settled on ("Landlock sandbox enabled (Linux kernel 5.13+)", "No sandbox backend available, using application-layer security"), and a backend requested explicitly that isn't available warns with its name ("Firejail requested but not available, falling back to application-layer"). The log names the outcome, not every backend it tried.
 - **Tools working on dev, failing in service**: the service user often differs from the CLI user. Verify both have whatever sandbox-adjacent permissions are needed (Landlock: nothing; Bubblewrap: userns enabled; Docker: service user in `docker` group).
 - **Slow tool invocations** on the Docker runtime: first invocation pulls the image, subsequent are fast. Pre-pull with `docker pull <image>`.
 
 ## Code reference
 
 - Detection: `crates/zeroclaw-runtime/src/security/detect.rs`
-- Backends: `crates/zeroclaw-runtime/src/security/sandbox/` (one file per backend)
+- Backends: `crates/zeroclaw-runtime/src/security/` (`landlock.rs`, `firejail.rs`, `bubblewrap.rs`, `docker.rs`, `seatbelt.rs`)
 - Schema: `RiskProfileConfig` and `DockerRuntimeConfig` in `crates/zeroclaw-config/src/schema.rs`
