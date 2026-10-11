@@ -125,6 +125,15 @@ pub trait TranscriptionProvider: Send + Sync + ::zeroclaw_api::attribution::Attr
     }
 }
 
+/// The Whisper `prompt` field biases recognition toward expected vocabulary;
+/// a blank value would bias it toward nothing, so it is not sent.
+fn non_empty_prompt(prompt: Option<&str>) -> Option<String> {
+    prompt
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 // ── GroqProvider ────────────────────────────────────────────────
 
 /// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
@@ -134,6 +143,7 @@ pub struct GroqProvider {
     model: String,
     api_key: String,
     language: Option<String>,
+    initial_prompt: Option<String>,
 }
 
 impl GroqProvider {
@@ -155,6 +165,7 @@ impl GroqProvider {
             model: config.model.clone(),
             api_key,
             language: config.language.clone(),
+            initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
         })
     }
 
@@ -185,6 +196,7 @@ impl GroqProvider {
                 .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
             api_key,
             language: cfg.base.language.clone(),
+            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
         })
     }
 }
@@ -212,6 +224,9 @@ impl TranscriptionProvider for GroqProvider {
         if let Some(ref lang) = self.language {
             form = form.text("language", lang.clone());
         }
+        if let Some(ref prompt) = self.initial_prompt {
+            form = form.text("prompt", prompt.clone());
+        }
 
         let resp = client
             .post(&self.api_url)
@@ -235,6 +250,7 @@ pub struct OpenAiWhisperProvider {
     api_key: String,
     model: String,
     language: Option<String>,
+    initial_prompt: Option<String>,
 }
 
 impl OpenAiWhisperProvider {
@@ -256,6 +272,7 @@ impl OpenAiWhisperProvider {
             api_key,
             model: config.model.clone(),
             language: None,
+            initial_prompt: None,
         })
     }
 
@@ -286,6 +303,7 @@ impl OpenAiWhisperProvider {
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "whisper-1".to_string()),
             language: cfg.base.language.clone(),
+            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
         })
     }
 }
@@ -311,6 +329,9 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
             .text("response_format", "json");
         if let Some(language) = &self.language {
             form = form.text("language", language.clone());
+        }
+        if let Some(prompt) = &self.initial_prompt {
+            form = form.text("prompt", prompt.clone());
         }
 
         let resp = client
@@ -1931,6 +1952,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(google.language_code, "en-US");
+    }
+
+    #[tokio::test]
+    async fn whisper_providers_send_initial_prompt_as_prompt_field() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let base = |prompt: &str| zeroclaw_config::schema::TranscriptionProviderConfig {
+            api_key: Some("test-key".to_string()),
+            initial_prompt: Some(prompt.to_string()),
+            ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
+        };
+
+        let mut legacy_groq = GroqProvider::from_config(
+            "groq",
+            &TranscriptionConfig {
+                api_key: Some("test-key".to_string()),
+                initial_prompt: Some("ZeroClaw".to_string()),
+                ..TranscriptionConfig::default()
+            },
+        )
+        .unwrap();
+        let mut typed_groq = GroqProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: base("  Kubernetes  "),
+                model: None,
+            },
+        )
+        .unwrap();
+        let mut typed_openai = OpenAiWhisperProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: base("PostgreSQL"),
+                model: None,
+            },
+        )
+        .unwrap();
+        let mut blank_openai = OpenAiWhisperProvider::from_typed_config(
+            "default",
+            &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
+                base: base(" \t "),
+                model: None,
+            },
+        )
+        .unwrap();
+
+        for provider in [&mut legacy_groq, &mut typed_groq] {
+            provider.api_url = format!("{}/groq", server.uri());
+            provider.transcribe(b"audio", "voice.wav").await.unwrap();
+        }
+        for provider in [&mut typed_openai, &mut blank_openai] {
+            provider.api_url = format!("{}/openai", server.uri());
+            provider.transcribe(b"audio", "voice.wav").await.unwrap();
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<_> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for (body, expected) in bodies.iter().zip(["ZeroClaw", "Kubernetes", "PostgreSQL"]) {
+            assert!(body.contains("name=\"prompt\""), "missing prompt: {body}");
+            assert!(
+                body.contains(&format!("\r\n\r\n{expected}\r\n")),
+                "prompt should be {expected:?}: {body}"
+            );
+        }
+        assert!(
+            !bodies[3].contains("name=\"prompt\""),
+            "a blank initial_prompt must not be sent: {}",
+            bodies[3]
+        );
     }
 
     #[test]
