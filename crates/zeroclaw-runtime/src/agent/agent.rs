@@ -2949,6 +2949,22 @@ impl Agent {
             live_config.clone(),
             execution_capability,
             acp_sessions,
+            // No ceiling is built here, and this is a known gap, not an absence
+            // of the thing it would bound.
+            //
+            // A session narrowed by an RPC principal's tool selector DOES carry a
+            // per-run allowlist: `principal_allowed_tools` is applied below as
+            // `caller_allowed` in the assembly and again as the builder's
+            // `allowed_tools` retain. Both filter tools BY NAME, after they were
+            // built. Neither hands the scheduler tools (`cron_add`, `cron_update`,
+            // `cron_run`, `schedule`) or `send_message_to_peer` a sealed ceiling,
+            // so with `None` here a job such a session stores is not capped by its
+            // list, and a relayed peer turn is not bound by it.
+            //
+            // Closing it means building a pre-sealed `CallerCeiling` from
+            // `principal_allowed_tools`, the way `run()` does from its per-run
+            // allowlist, instead of passing `None`.
+            None,
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -4110,6 +4126,13 @@ impl Agent {
                             c.config.as_deref().map(|config| {
                                 crate::agent::turn::SopStepReassembly {
                                     config,
+                                    // Not forwarded, although a session narrowed
+                                    // by an RPC principal's tool selector has an
+                                    // allowlist (`principal_allowed_tools`): a step
+                                    // naming another agent is re-assembled from
+                                    // that agent's own profile. Same gap as the
+                                    // `None` ceiling in `from_config`.
+                                    caller_allowed: None,
                                     live_config: c.live_config.clone(),
                                 }
                             })
@@ -4727,6 +4750,14 @@ impl Agent {
                                 c.config.as_deref().map(|config| {
                                     crate::agent::turn::SopStepReassembly {
                                         config,
+                                        // Not forwarded, although a session
+                                        // narrowed by an RPC principal's tool
+                                        // selector has an allowlist
+                                        // (`principal_allowed_tools`): a step naming
+                                        // another agent is re-assembled from that
+                                        // agent's own profile. Same gap as the
+                                        // `None` ceiling in `from_config`.
+                                        caller_allowed: None,
                                         live_config: c.live_config.clone(),
                                     }
                                 })

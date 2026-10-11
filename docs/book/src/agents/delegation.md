@@ -204,6 +204,30 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
 
+#### Command policy across hops and deferred work
+
+A bounded target runs commands under its own risk profile, but the caller's command policy stays authoritative. The target's `SecurityPolicy` therefore carries the command fields of every caller above it (`caller_command_bounds`: `autonomy`, `allowed_commands`, `block_high_risk_commands`, `require_approval_for_medium_risk`, root first), and `validate_command_execution_for_shell` requires a command to clear the target's own policy **and** each caller's. Neither side widens the other, and path arguments are still judged against the target's workspace.
+
+Because the chain lives in the policy, every consumer that validates a command against it is bound:
+
+- the target's `shell`;
+- shell jobs a target stores or re-arms with `cron_add`, `schedule` (including its one-shot forms) and `cron_update`, and `cron_run` launching one;
+- the command a `spawn_subagent` child of the target runs, and everything a further bounded hop below the target runs (the chain keeps growing: a second hop is bound by the root caller and by the first target).
+
+A `cron_update` that names no `command`, and a `schedule` resume, leave a stored command in force. For a bounded registration the guard re-judges that stored command against the same chain before the change is committed.
+
+The chain travels by cloning the policy, so it does not reach a turn that is started for a different agent and rebuilds that agent's policy from config. Today that is a `send_message_to_peer` relay (`process_message_inner`) and a live nested SOP step that names another agent (`assemble_owned_execution`): both receive only the caller's tool-name ceiling, so the recipient's `shell` is judged by the recipient's own command policy. This is a known boundary of the mechanism, not a guarantee.
+
+A hop to an `independent` target below a bounded one is configured design, not a gap: an independent target resolves its own policy and builds its own registry, so it carries neither the tool ceiling nor the command chain of the callers above it. Only bounded hops extend the chain.
+
+The scheduler itself validates a stored command with the owning agent's policy, rebuilt from config when the job fires. The callers' bounds are therefore enforced when the command is written, re-armed or run through these tools, and not again at each later scheduled run.
+
+A deferred **agent** job has no command yet, so there is nothing to judge when it is written. A bounded registration therefore refuses any stored `allowed_tools` list that keeps `shell`, whether it names `shell` or inherits it from a ceiling that holds it; list the tools the job needs without `shell`. A `SubAgentOverrides::policy` override cannot shed a bound its parent carries (`EscalationViolation::CallerCommandBoundDroppedByChild`).
+
+`sop_execute` and `sop_advance` can leave a SOP run parked for an external resume, and nothing in the calling turn follows that run. Under a caller tool ceiling they therefore cancel a run that would park (`WaitApproval`, `CheckpointWait` or `Pending`) and report the refusal instead, and a run they start records no initiating agent. This applies to a bounded target and to every registry assembled with a ceiling: a restricted `agent::run`, which includes a `spawn_subagent` child and a cron-fired job, and a `send_message_to_peer` relay. A SOP step turn never holds these two tools, because the step scope excludes them by name. The cancellation also applies to an operator-authored `allowed_tools` list on a job, so a job that needs a run to wait for approval must not be restricted by `allowed_tools`. An RPC principal session that restricts tools by name builds its registry with no ceiling and is not covered (a declared gap).
+
+`sop_workshop` leaves state that outlives the turn: `apply` writes a SOP definition and reloads the shared engine, and `propose`, `capture_run`, `reject` and `quarantine` save proposals. A bounded target therefore keeps only its read-only `list` and `inspect` actions; the other actions are refused. The same holds for any registry assembled with a caller tool ceiling: a job or SOP step replayed under a stored `allowed_tools` list, including an operator-authored one. It does not hold for an RPC principal session that restricts tools by name, which builds its registry with no ceiling (a declared gap).
+
 ### `delegate`: output strings the model sees
 
 User-visible failure strings are localized Fluent messages. Their English source

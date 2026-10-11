@@ -1619,6 +1619,7 @@ pub async fn run(
             (None, None)
         };
 
+        let turn_ceiling = crate::tools::caller_ceiling::pending_for_turn(allowed_tools.as_deref());
         let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
@@ -1644,6 +1645,13 @@ pub async fn run(
                 .as_ref()
                 .map(AgentExecutionCapability::config_handle),
             execution_capability.clone(),
+            // `run` is the entry point that carries a per-run allowlist, so it is
+            // also the one that can hand the scheduler tools the ceiling's value.
+            // Sealed after assembly, like the bounded delegate assembly: the
+            // incoming list is what the CALLER could use, and this turn's own
+            // policy removes tools from it, so the ceiling is sealed to the
+            // registry the turn ends up holding (`seal_to_registry`, below).
+            turn_ceiling.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -1694,6 +1702,11 @@ pub async fn run(
         // now takes `&ScopedToolRegistry`, so this local stays a scoped registry
         // (coerces to `&[Box<dyn Tool>]` at the leaf call sites via `Deref`).
         let tools_registry = registry;
+        crate::tools::caller_ceiling::seal_to_registry(
+            turn_ceiling.as_ref(),
+            allowed_tools.as_deref(),
+            &tools_registry,
+        );
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -2321,6 +2334,13 @@ pub async fn run(
                                 served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    // Forwarding this turn's own per-run
+                                    // allowlist keeps a re-assembled step
+                                    // agent inside the set this loop
+                                    // received. `process_message`'s own
+                                    // `SopStepReassembly` construction below
+                                    // does the same with its `allowed_tools`.
+                                    caller_allowed: allowed_tools.as_deref(),
                                     live_config: None,
                                 }),
                             }),
@@ -2936,6 +2956,11 @@ pub async fn run(
                                     served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        // Same `run` ceiling as the sibling
+                                        // construction above; both frames of this
+                                        // entry point must forward it or the bound
+                                        // holds on only one of them.
+                                        caller_allowed: allowed_tools.as_deref(),
                                         live_config: None,
                                     }),
                                 }),
@@ -3263,6 +3288,7 @@ pub(crate) async fn process_message_shared(
         agent_alias,
         message,
         session_id,
+        None,
         origin,
         None,
         internal_principal,
@@ -3355,6 +3381,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission(
         agent_alias,
         message,
         session_id,
+        None,
         origin,
         execution_admission,
         None,
@@ -3368,6 +3395,10 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    // The per-run caller ceiling: `send_message_to_peer`'s bounded relay is the
+    // one producer that has one. Every other entry point in this family has no
+    // caller to bound against and passes `None` to `process_message_inner`.
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
@@ -3378,6 +3409,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
         agent_alias,
         message,
         session_id,
+        allowed_tools,
         origin,
         execution_admission,
         internal_principal,
@@ -3422,6 +3454,7 @@ pub async fn process_message_with_live_config_and_admission(
         agent_alias,
         message,
         session_id,
+        None,
         origin,
         execution_admission,
         None,
@@ -3435,6 +3468,11 @@ async fn process_message_inner(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    // The per-run caller ceiling, when this entry point has one (the
+    // `send_message_to_peer` bounded relay). `process_message`'s other three
+    // sibling entry points (the channel daemon, the gateway, and the plain
+    // shared-snapshot path) have no caller to bound against and pass `None`.
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
@@ -3570,6 +3608,7 @@ async fn process_message_inner(
             (None, None)
         };
 
+        let turn_ceiling = crate::tools::caller_ceiling::pending_for_turn(allowed_tools.as_deref());
         let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
             Arc::clone(&config),
             &security,
@@ -3595,6 +3634,11 @@ async fn process_message_inner(
             sop_audit,
             live_config.clone(),
             execution_capability.clone(),
+            // `process_message` carries a per-run allowlist when its caller has
+            // one (`send_message_to_peer`'s bounded relay). Same shape as `run()`
+            // above: sealed to the registry this turn holds, not to the names
+            // the sender could use (`seal_to_registry`, below).
+            turn_ceiling.clone(),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3604,7 +3648,9 @@ async fn process_message_inner(
             built: all_tools_result_pm,
             skills: &skills,
             runtime: runtime.clone(),
-            caller_allowed: None,
+            // Most callers have no per-run allowlist (`None`, unchanged); a
+            // bounded `send_message_to_peer` relay is the one caller that does.
+            caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
@@ -3639,6 +3685,11 @@ async fn process_message_inner(
         // Stays sealed: `agent_turn_with_sop_reassembly` now takes
         // `&ScopedToolRegistry`; leaf uses coerce via `Deref`.
         let tools_registry = registry;
+        crate::tools::caller_ceiling::seal_to_registry(
+            turn_ceiling.as_ref(),
+            allowed_tools.as_deref(),
+            &tools_registry,
+        );
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -4030,8 +4081,17 @@ async fn process_message_inner(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
+                    // `process_message` carries a per-run allowlist when its
+                    // caller has one (the same `allowed_tools` value the
+                    // assembly call above in this function already uses) —
+                    // forwarding it here keeps a cross-agent re-assembled
+                    // step agent inside the set this turn received, instead
+                    // of rebuilding it from the step agent's own full policy
+                    // one hop further out. Same reasoning as `run()`'s own
+                    // `SopStepReassembly` construction.
                     Some(SopStepReassembly {
                         config: &config,
+                        caller_allowed: allowed_tools.as_deref(),
                         live_config,
                     }),
                 ),
@@ -8413,6 +8473,320 @@ mod tests {
         assert_eq!(run.step_results.len(), 2);
         assert_eq!(run.step_results[0].output, "step one done");
         assert_eq!(run.step_results[1].output, "step two done");
+    }
+
+    /// A bounded caller's `sop_execute` guard only sees the action `start_run`
+    /// returns. When that action is an ungated step, the guard lets it through
+    /// to the live driver, which runs the step and then advances the run itself
+    /// (`advance_sop_step` in `drive_live_sop_actions`). If the NEXT step is
+    /// gated, the driver stops there and the run stays parked, resolvable by an
+    /// external approver after this turn, outside the caller's ceiling. The
+    /// tool is built the way production builds it: registered with an
+    /// initiator, then rebound with a sealed ceiling by the bounded assembly.
+    #[tokio::test]
+    async fn run_tool_call_loop_bounded_sop_execute_cannot_leave_a_run_parked_after_a_live_step() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"sop_execute","arguments":{"name":"live-gated-sop"}}
+</tool_call>"#,
+            "step one done",
+            "outer done",
+        ]);
+
+        let sop = crate::sop::Sop {
+            name: "live-gated-sop".to_string(),
+            description: "live sop gated at step two".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![
+                crate::sop::SopStep {
+                    number: 1,
+                    title: "First".to_string(),
+                    body: "Do the first step".to_string(),
+                    requires_confirmation: false,
+                    ..crate::sop::SopStep::default()
+                },
+                crate::sop::SopStep {
+                    number: 2,
+                    title: "Second".to_string(),
+                    body: "Do the second step".to_string(),
+                    requires_confirmation: true,
+                    ..crate::sop::SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+        let ceiling: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = ceiling.set(vec!["sop_execute".to_string()]);
+        let bounded_sop_execute = crate::tools::SopExecuteTool::new(Arc::clone(&engine))
+            .with_initiator("test-agent")
+            .rebound_with_ceiling(ceiling);
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                bounded_sop_execute,
+            )]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the live sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                security: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        // Positive half: the ungated first step really ran in this turn, so the
+        // assertions below are about the transition the live driver made.
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let mut engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable")
+            .clone();
+        assert_eq!(run.step_results.len(), 1, "step one must have run: {run:?}");
+        assert_eq!(
+            engine.get_run(&started).map(|r| r.status),
+            Some(crate::sop::SopRunStatus::Cancelled),
+            "the park must end in a cancellation, not any other terminal state"
+        );
+
+        assert!(
+            !engine.active_runs().contains_key(&started),
+            "a bounded caller's run must not stay active after the live driver reaches a \
+             gated step; status={:?}, initiating_agent={:?}",
+            run.status,
+            run.initiating_agent
+        );
+        let outcome = engine
+            .resolve_gate(
+                &started,
+                crate::sop::approval::ApprovalDecision::Approve,
+                crate::sop::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("resolving the run's gate must not error");
+        assert!(
+            !matches!(outcome, crate::sop::approval::ResolveOutcome::Resumed(_)),
+            "an external approver must not be able to resume a bounded caller's run, \
+             got: {outcome:?}"
+        );
+    }
+
+    /// Same escape through the other tool that queues live actions: a bounded
+    /// `sop_advance` completes step one of a run it did not start, the live
+    /// driver runs step two in this turn, and step three is gated.
+    #[tokio::test]
+    async fn run_tool_call_loop_bounded_sop_advance_cannot_leave_a_run_parked_after_a_live_step() {
+        let step = |number: u32, requires_confirmation: bool| crate::sop::SopStep {
+            number,
+            title: format!("Step {number}"),
+            body: format!("Do step {number}"),
+            requires_confirmation,
+            ..crate::sop::SopStep::default()
+        };
+        let sop = crate::sop::Sop {
+            name: "advance-gated-sop".to_string(),
+            description: "gated at step three".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![step(1, false), step(2, false), step(3, true)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let run_id = match engine
+            .start_run(
+                "advance-gated-sop",
+                crate::sop::SopEvent {
+                    source: crate::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-25T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts")
+        {
+            crate::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+            other => panic!("expected step one to be executable, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+        let ceiling: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = ceiling.set(vec!["sop_advance".to_string()]);
+        let bounded_sop_advance =
+            crate::tools::SopAdvanceTool::new(Arc::clone(&engine)).rebound_with_ceiling(ceiling);
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                bounded_sop_advance,
+            )]);
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let advance_call = format!(
+            "<tool_call>\n{{\"name\":\"sop_advance\",\"arguments\":{{\"run_id\":\"{run_id}\",\
+             \"status\":\"completed\",\"output\":\"step one done\"}}}}\n</tool_call>"
+        );
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            advance_call.as_str(),
+            "step two done",
+            "outer done",
+        ]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("advance the sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                security: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&run_id)
+            .expect("run stays queryable")
+            .clone();
+        assert_eq!(
+            run.step_results.len(),
+            2,
+            "step one (advanced) and step two (live) must both have completed: {run:?}"
+        );
+        assert_eq!(
+            run.status,
+            crate::sop::SopRunStatus::Cancelled,
+            "a bounded caller's run must be cancelled when the live driver reaches the \
+             gated step three"
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
     }
 
     #[tokio::test]
@@ -20008,6 +20382,150 @@ Let me check the result."#;
             "revoked private-host policy must fail before contacting the private endpoint"
         );
         download_server.verify().await;
+    }
+
+    /// A bounded sender relays a turn to a peer whose own policy has no `shell`.
+    /// The ceiling sealed for the peer's turn must describe what that turn holds,
+    /// so `cron_add` there cannot store a shell job on the strength of a `shell`
+    /// the peer never received. Broken state this pins: the raw incoming names
+    /// were sealed, `require_shell_within_ceiling` found `shell` in them, and the
+    /// job was written.
+    #[tokio::test]
+    async fn relayed_peer_turn_cannot_store_a_shell_job_when_its_own_registry_has_no_shell() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_shell_cron_add_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                let arguments = serde_json::json!({
+                    "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+                    "job_type": "shell",
+                    "command": "echo ok",
+                })
+                .to_string();
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-cron-add",
+                                "type": "function",
+                                "function": {"name": "cron_add", "arguments": arguments}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({"choices": [{"message": {"content": "done"}}]})
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_shell_cron_add_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "no-shell".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                // The peer can schedule, and has no `shell` of its own.
+                allowed_tools: vec!["cron_add".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "peer".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "no-shell".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("peer")).expect("peer workspace");
+
+        // The sender could run `shell` and `cron_add`, so both arrive as its ceiling.
+        let result = super::process_message_shared_with_live_config_and_admission_and_principal(
+            Arc::new(config),
+            None,
+            "peer",
+            "schedule the shell job",
+            Some("session"),
+            Some(vec!["shell".to_string(), "cron_add".to_string()]),
+            TurnOrigin::Channel,
+            None,
+            None,
+        )
+        .await
+        .expect("the relayed peer turn should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the cron_add result"
+        );
+        let requests = provider_state
+            .requests
+            .lock()
+            .expect("provider requests lock should be valid");
+        assert!(
+            requests.iter().any(|body| body
+                .to_string()
+                .contains("outside the calling agent's bounded tool ceiling")),
+            "cron_add must be refused: the peer's registry has no shell, got {requests:?}"
+        );
     }
 
     #[tokio::test]

@@ -50,12 +50,39 @@ impl McpToolWrapper {
             security,
         }
     }
-}
 
+    /// The same tool against a different policy.
+    ///
+    /// The registry, name and schema are routing facts and stay shared; the
+    /// policy is the only per-agent part, and it is what decides where an
+    /// embedded resource blob is materialized. Handing a Bounded target the
+    /// caller's instance therefore lands the target's attachments in the
+    /// caller's workspace.
+    #[must_use]
+    pub fn rebound(&self, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            prefixed_name: self.prefixed_name.clone(),
+            description: self.description.clone(),
+            input_schema: Arc::clone(&self.input_schema),
+            registry: Arc::clone(&self.registry),
+            security,
+        }
+    }
+
+    /// Server this tool routes to, per the registry's own index.
+    #[must_use]
+    pub fn server_name(&self) -> Option<&str> {
+        self.registry.server_name_for(&self.prefixed_name)
+    }
+}
 #[async_trait]
 impl Tool for McpToolWrapper {
     fn name(&self) -> &str {
         &self.prefixed_name
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn description(&self) -> &str {

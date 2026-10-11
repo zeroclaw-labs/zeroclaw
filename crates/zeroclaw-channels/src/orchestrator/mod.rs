@@ -10077,6 +10077,10 @@ async fn process_channel_message_body(
                 served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // The channel daemon runs an agent as itself: this turn is
+                    // assembled with `caller_allowed: None`, so there is no
+                    // inherited ceiling to forward into a step re-assembly.
+                    caller_allowed: None,
                     live_config: Some(ctx.live_config.clone()),
                 }),
             }));
@@ -16670,6 +16674,11 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             sop_audit.clone(),
             Some(config_arc.clone()),
             Some(authority.execution_capability()),
+            // A channel turn runs an agent under its own policy, with no caller
+            // ceiling (`assemble_channel_agent_tools` passes `caller_allowed:
+            // None` for the same reason), so its scheduler tools have no
+            // inherited bound to cap stored jobs by.
+            None,
         )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
