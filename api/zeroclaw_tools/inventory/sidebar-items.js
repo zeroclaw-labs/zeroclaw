@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BUILTIN_TOOLS"],"enum":["ToolTier"],"fn":["builtin_tool","builtin_tools_in","is_builtin_tool_name"],"struct":["BuiltinToolSpec"]};

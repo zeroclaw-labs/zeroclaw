@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_UPLOADS_PER_CONNECTION","MAX_UPLOAD_FILENAME_BYTES","PROCESS_STAGED_BYTES","UPLOAD_CHUNK_BYTES","UPLOAD_IDLE_TIMEOUT"],"struct":["BeginRequest","CompletedUpload","UploadBudget","UploadStaging","UploadTarget"]};

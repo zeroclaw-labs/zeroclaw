@@ -1,0 +1,50 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Count image markers in the latest user message whose references would actually resolve to an attachment: an inline `data:` URI that passes the shared structural check, a remote `http(s)` URL when `remote_allowed` is set (counted without any network access), or a local path that the caller’s `path_allowed` predicate accepts and that exists as a file. Marker syntax alone does not count, so prose that merely looks like a marker cannot fail a turn on a text-only model."><title>MAX_RESOLVABILITY_CANDIDATES in zeroclaw_providers::multimodal - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-0c87338a.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_providers" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0 (b940084d7 2026-09-28)" data-channel="1.99.0" data-search-js="search-cf4fc35e.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">MAX_RESOLVABILITY_CANDIDATES</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_providers/index.html">zeroclaw_<wbr>providers</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw_<wbr>providers::<wbr>multimodal</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_providers</a>::<wbr><a href="index.html">multimodal</a></div><h1>Constant <span class="constant">MAX_<wbr>RESOLVABILITY_<wbr>CANDIDATES</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><pre class="rust item-decl"><code>pub const MAX_RESOLVABILITY_CANDIDATES: <a class="primitive" href="https://doc.rust-lang.org/1.99.0/std/primitive.usize.html">usize</a> = 16;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Count image markers in the latest user message whose references would
+actually resolve to an attachment: an inline <code>data:</code> URI that passes the
+shared structural check, a remote <code>http(s)</code> URL when <code>remote_allowed</code> is
+set (counted without any network access), or a local path that the
+caller’s <code>path_allowed</code> predicate accepts and that exists as a file.
+Marker syntax alone does not count, so prose that merely looks
+like a marker cannot fail a turn on a text-only model.</p>
+<p>A local reference counts only when it is absolute AND <code>path_allowed</code>
+accepts it. Relative references never count: this module has no agent
+workspace of its own, and a bare existence check would resolve a relative
+reference against the process working directory instead, which is not
+where the runtime’s file tools resolve relative paths, so there is no
+answer this module could give that matches the loader. The predicate
+exists because the ledger of who may read a path is the agent’s
+filesystem policy in the runtime, which this crate cannot depend on;
+callers pass the same check their file tools apply, so “resolvable” means
+exactly “the agent could read this file”.</p>
+<p>This touches at most the markers of the latest user message. The
+classification pass over them is inline and I/O-free: a <code>data:</code>
+reference needs only the shared structural check, a remote URL only
+the <code>remote_allowed</code> flag, a relative reference never counts, and an
+absolute reference only appends to a candidate list. For at most
+<a href="constant.MAX_RESOLVABILITY_CANDIDATES.html" title="constant zeroclaw_providers::multimodal::MAX_RESOLVABILITY_CANDIDATES"><code>MAX_RESOLVABILITY_CANDIDATES</code></a> absolute candidates the caller’s
+<code>path_allowed</code> predicate and one <code>std::fs::metadata</code> existence
+probe each run inside a single <code>tokio::task::spawn_blocking</code> task,
+so no policy-resolution or filesystem work runs on the async
+executor thread (a predicate may do arbitrary synchronous
+filesystem work; the runtime’s resolves symlinks). A path the
+predicate rejects is never probed, and neither is a relative
+reference, a data URI, or a remote URL. It does no network I/O and
+no decoding.</p>
+<p>The maximum number of absolute local-path markers in the latest user
+message for which ANY work runs, policy resolution and the existence
+probe alike: at most this many candidates reach the one
+[<code>tokio::task::spawn_blocking</code>] task inside
+<a href="fn.count_latest_user_resolvable_image_markers.html" title="fn zeroclaw_providers::multimodal::count_latest_user_resolvable_image_markers"><code>count_latest_user_resolvable_image_markers</code></a>. Absolute markers past
+the bound count as resolvable with NO policy call and NO probe, so the
+caller fails toward its loud capability error, never toward silently
+degrading away a real attachment (over budget the count can only
+grow). The bound sits BEFORE the policy check, so a message cannot buy
+unbounded policy work with unbounded markers; this is a semantic
+change from the earlier probe-budget shape, which still ran the policy
+for overflow markers. The bound exists because no upstream limit bounds
+the marker count of a single inbound user message (transport frame
+caps operate at megabytes, not markers). <code>parse_image_markers</code> remains
+the single source of truth for what a marker reference is, and
+<code>split_base64_image_data_uri</code> for what a valid inline data URI is.</p>
+</div></details></section></div></main></body></html>

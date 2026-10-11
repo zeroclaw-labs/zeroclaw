@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["MemoryRequest","ProviderRequest","RuntimeCapabilities","ToolRequest"],"trait":["ChannelSource","MemorySource","ProviderSource","ToolSource"]};

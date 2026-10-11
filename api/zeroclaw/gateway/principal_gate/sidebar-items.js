@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AUTH_PROVIDER_HEADER"],"fn":["authorize_config_write","authorize_whole_config_write","config_route_auth"],"struct":["ConfigWriteAuthorization","ConfigWriteSet","GatewayInboundAuth","RequestAuth","WriteDenied"],"type":["RequestPrincipal"]};

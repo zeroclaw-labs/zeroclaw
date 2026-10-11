@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_PORTABLE_PLUGIN_KEY_BYTES"],"fn":["is_valid_portable_plugin_key"],"struct":["PortablePluginKey","PortablePluginKeyError","SecretPropertyRef"]};

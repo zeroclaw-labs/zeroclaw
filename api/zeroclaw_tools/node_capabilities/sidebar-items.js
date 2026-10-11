@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RiskLevel"],"fn":["all_standard_capabilities","camera_capabilities","detect_platform","location_capabilities","notification_capabilities","requires_approval","screen_capabilities"],"struct":["NodeCapabilityDef"]};

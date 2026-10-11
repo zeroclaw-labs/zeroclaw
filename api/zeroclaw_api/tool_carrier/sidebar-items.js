@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TOOL_RESULTS_PREFIX"],"enum":["CarrierKind"],"fn":["classify","image_refs","is_prompt_tool_carrier","is_tool_result_carrier","marker_line","native_attachments","parse_marker_line","parse_native_tool_carrier","parse_prompt_tool_carrier","rebuild_carrier","render_native_attachments","render_prompt_tool_carrier"],"struct":["CarrierParts"]};
