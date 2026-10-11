@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27
+ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.99-slim@sha256:24e632c09342c20abf8312cf4f61430a911c01ed3a5e4c02b87292b1c39c5273
 # >>> end generated:base-arg-rust-slim <<<
 # >>> generated:base-arg-debian from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 # >>> end generated:base-arg-debian <<<
 # >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
+ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
 # >>> end generated:base-arg-distroless <<<
 
 # ── Stage 0: Frontend build ─────────────────────────────────────

@@ -41273,7 +41273,7 @@ mod tests {
             // fallback; both must fail before the loop can trim and retry.
             if self
                 .overflows_left
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |left| left.checked_sub(1),

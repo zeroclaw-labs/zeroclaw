@@ -454,7 +454,7 @@ assert "\n  windows-test:" not in workflow
 assert "save-if: false" in advisory
 assert "persist-credentials: false" in advisory
 assert "ref: ${{ github.sha }}" in advisory
-assert "toolchain: 1.98.0\n          components: rustfmt" in advisory
+assert "toolchain: 1.99.0\n          components: rustfmt" in advisory
 plugin_backend_job = workflow.split("\n  check-plugin-backends:\n", 1)[1].split(
     "\n  msrv:\n", 1
 )[0]

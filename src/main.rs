@@ -4928,7 +4928,10 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -5279,7 +5282,7 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
+        assert_eq!(
             effective_server_sans(
                 dir.path(),
                 &wss_with_sans(&[]),
@@ -5287,8 +5290,8 @@ mod wss_client_auth_tests {
                     hostname_override: None
                 },
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            Vec::<String>::new()
         );
     }
 
@@ -16565,8 +16568,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert_eq!(domains, Vec::<String>::new());
+                assert_eq!(tools, Vec::<String>::new());
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -17037,7 +17040,7 @@ mod tests {
                 .expect("resource-keyed sections are ignored, not rejected")
                 .is_none()
         );
-        assert!(config.cost.rates.providers.models.openai.is_empty());
+        assert_eq!(config.cost.rates.providers.models.openai.len(), 0);
     }
 
     #[test]
@@ -17049,7 +17052,7 @@ mod tests {
             err.to_string().contains("reserved"),
             "message should name the reserved alias: {err}"
         );
-        assert!(config.agents.is_empty());
+        assert_eq!(config.agents.len(), 0);
 
         assert_eq!(
             init_map_alias(&mut config, "agents.researcher")
@@ -18354,7 +18357,7 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert_eq!(clean.degraded_security, Vec::<String>::new());
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 
@@ -19747,10 +19750,9 @@ type = "string"
             runtime_accepts_row(&config, &instance_key),
             "the repaired row must be one the runtime's own constructor accepts"
         );
-        assert!(
-            egress_grant_gap_lines(&config, &manifest)
-                .expect("gap lines must build")
-                .is_empty()
+        assert_eq!(
+            egress_grant_gap_lines(&config, &manifest).expect("gap lines must build"),
+            Vec::<String>::new()
         );
     }
 
@@ -19807,11 +19809,13 @@ type = "string"
         // A row that grants nothing has nothing to inherit or keep.
         config.plugins.entries[0].egress_hosts.clear();
         config.plugins.entries[0].egress_allow_private.clear();
-        assert!(
-            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
+        assert_eq!(
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]),
+            Vec::<String>::new()
         );
-        assert!(
-            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]).is_empty()
+        assert_eq!(
+            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]),
+            Vec::<String>::new()
         );
     }
 

@@ -1303,7 +1303,7 @@ impl TelegramChannel {
                 && route.model == selected.model
         };
         if !Self::configured_model_provider(config, &selected.model_provider)
-            || !config.model_routes.iter().any(&is_selected_route)
+            || !config.model_routes.iter().any(is_selected_route)
             || !runtime_routes.iter().any(|route| route == selected)
         {
             return Some(ModelPickerExclusion::Unresolvable);
