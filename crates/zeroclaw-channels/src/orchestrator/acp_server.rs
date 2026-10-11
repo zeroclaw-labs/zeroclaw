@@ -22,6 +22,7 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+use zeroclaw_runtime::rpc::types::{PlanPersistenceOperation, PlanPersistenceStatus};
 use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
@@ -1745,14 +1746,21 @@ impl AcpServer {
             .unwrap_or_default();
 
         // Replay the durable TodoWrite plan so the resuming client's tracker
-        // repopulates without a model round-trip — parity with the daemon RPC
-        // ACP bridge. Best-effort: a load failure or empty plan emits nothing.
-        if let Some(store) = self.store.as_ref() {
-            let entries = store.get_plan(&session_id).unwrap_or_default();
-            if !entries.is_empty()
-                && let Some(notification) =
+        // repopulates without a model round-trip. Durability is best-effort,
+        // but storage failure is observable instead of being flattened into
+        // the same shape as "no saved plan".
+        match load_plan_from_acp_store(Arc::clone(store), session_id.clone()).await {
+            Ok(entries) if !entries.is_empty() => {
+                if let Some(notification) =
                     notification_for_turn_event(&session_id, &TurnEvent::Plan { entries })
-            {
+                {
+                    self.write_notification(&notification).await;
+                }
+            }
+            Ok(_) => {}
+            Err(failure) => {
+                log_plan_persistence_failure(&session_id, &failure);
+                let notification = plan_persistence_notification(&session_id, failure.operation);
                 self.write_notification(&notification).await;
             }
         }
@@ -2362,26 +2370,12 @@ impl AcpServer {
         // empty list (a cleared plan).
         if let Some(store) = &self.store
             && let Some(entries) = latest_plan
+            && let Err(failure) =
+                write_plan_to_acp_store(store.clone(), session_id.clone(), entries).await
         {
-            let store = store.clone();
-            let sid = session_id.clone();
-            let persisted =
-                tokio::task::spawn_blocking(move || store.set_plan(&sid, &entries)).await;
-            let error = match persisted {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({ "error": detail })),
-                    "Failed to persist TodoWrite plan; session continues in memory"
-                );
-            }
+            log_plan_persistence_failure(&session_id, &failure);
+            let notification = plan_persistence_notification(&session_id, failure.operation);
+            self.write_notification(&notification).await;
         }
 
         ::zeroclaw_log::record!(
@@ -3476,6 +3470,80 @@ async fn persist_acp_usage_snapshot_ordered(
                 })),
             "Failed to persist ACP session token_count"
         );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PlanPersistenceFailure {
+    operation: PlanPersistenceOperation,
+    error: String,
+}
+
+fn map_plan_task_result<T>(
+    operation: PlanPersistenceOperation,
+    result: std::result::Result<anyhow::Result<T>, tokio::task::JoinError>,
+) -> std::result::Result<T, PlanPersistenceFailure> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(PlanPersistenceFailure {
+            operation,
+            error: error.to_string(),
+        }),
+        Err(join) => Err(PlanPersistenceFailure {
+            operation,
+            error: join.to_string(),
+        }),
+    }
+}
+
+async fn load_plan_from_acp_store(
+    store: Arc<AcpSessionStore>,
+    session_id: String,
+) -> std::result::Result<Vec<PlanEntry>, PlanPersistenceFailure> {
+    let result = tokio::task::spawn_blocking(move || store.get_plan(&session_id)).await;
+    map_plan_task_result(PlanPersistenceOperation::Load, result)
+}
+
+async fn write_plan_to_acp_store(
+    store: Arc<AcpSessionStore>,
+    session_id: String,
+    entries: Vec<PlanEntry>,
+) -> std::result::Result<(), PlanPersistenceFailure> {
+    let result = tokio::task::spawn_blocking(move || store.set_plan(&session_id, &entries)).await;
+    map_plan_task_result(PlanPersistenceOperation::Write, result)
+}
+
+fn log_plan_persistence_failure(session_id: &str, failure: &PlanPersistenceFailure) {
+    let action = match failure.operation {
+        PlanPersistenceOperation::Load => ::zeroclaw_log::Action::Read,
+        PlanPersistenceOperation::Write => ::zeroclaw_log::Action::Write,
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), action)
+            .with_category(::zeroclaw_log::EventCategory::Channel)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "session_id": session_id,
+                "operation": failure.operation,
+                "error": failure.error,
+            })),
+        "TodoWrite plan persistence unavailable"
+    );
+}
+
+fn plan_persistence_notification(
+    session_id: &str,
+    operation: PlanPersistenceOperation,
+) -> JsonRpcNotification {
+    JsonRpcNotification {
+        jsonrpc: "2.0",
+        method: "_zeroclaw/plan_persistence",
+        params: serde_json::json!({
+            "sessionId": session_id,
+            "operation": operation,
+            "status": PlanPersistenceStatus::Unavailable,
+        }),
     }
 }
 
@@ -10550,6 +10618,101 @@ mod tests {
         assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
         assert_eq!(v["params"]["update"]["entries"][0]["content"], "Resume me");
         assert_eq!(v["params"]["update"]["entries"][0]["status"], "in_progress");
+    }
+
+    #[tokio::test]
+    async fn session_resume_reports_plan_load_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-plan-load-fails";
+        store
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
+            .unwrap();
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        let second = rusqlite::Connection::open(&db_path).unwrap();
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json TO plan_json_broken;")
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume remains best-effort for plan restore");
+
+        let raw = writer_rx
+            .try_recv()
+            .expect("resume must report plan storage status");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "_zeroclaw/plan_persistence");
+        assert_eq!(v["params"]["sessionId"], session_id);
+        assert_eq!(v["params"]["operation"], "load");
+        assert_eq!(v["params"]["status"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn plan_write_failure_reports_status_and_later_write_recovers() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-plan-write-recovers";
+        store
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
+            .unwrap();
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        let second = rusqlite::Connection::open(&db_path).unwrap();
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json TO plan_json_broken;")
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Recover on next refresh".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let failure =
+            write_plan_to_acp_store(Arc::clone(&store), session_id.to_string(), entries.clone())
+                .await
+                .expect_err("missing plan_json should make the durable write observable");
+        assert_eq!(failure.operation, PlanPersistenceOperation::Write);
+
+        let notification = plan_persistence_notification(session_id, failure.operation);
+        assert_eq!(notification.method, "_zeroclaw/plan_persistence");
+        assert_eq!(notification.params["operation"], "write");
+        assert_eq!(notification.params["status"], "unavailable");
+
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json_broken TO plan_json;")
+            .unwrap();
+        write_plan_to_acp_store(Arc::clone(&store), session_id.to_string(), entries.clone())
+            .await
+            .expect("later TodoWrite refresh should persist once storage recovers");
+        assert_eq!(store.get_plan(session_id).unwrap(), entries);
     }
 
     #[tokio::test]

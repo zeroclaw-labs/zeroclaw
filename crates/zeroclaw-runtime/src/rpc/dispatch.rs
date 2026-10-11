@@ -4998,6 +4998,7 @@ impl RpcDispatcher {
             let mut message_count = 0;
             let mut seed_event = None;
             let mut plan = Vec::new();
+            let mut plan_persistence_failure = None;
             match chat_mode {
                 crate::rpc::types::ChatMode::Acp => {
                     // Reuse the data already loaded for cwd recovery on resume so the
@@ -5086,13 +5087,12 @@ impl RpcDispatcher {
                             // model round-trip. Robust against tmux detach, socket
                             // drop, suspend/resume, and daemon restart.
                             if let Some(ref store) = self.ctx.acp_session_store {
-                                let store = store.clone();
-                                let sid = session_id.clone();
-                                plan = tokio::task::spawn_blocking(move || {
-                                    store.get_plan(&sid).unwrap_or_default()
-                                })
-                                .await
-                                .unwrap_or_default();
+                                match load_plan_from_acp_store(store.clone(), session_id.clone())
+                                    .await
+                                {
+                                    Ok(entries) => plan = entries,
+                                    Err(failure) => plan_persistence_failure = Some(failure),
+                                }
                             }
                         }
                         Ok(Ok(AcpSessionNewLoad::Created)) => {}
@@ -5242,10 +5242,10 @@ impl RpcDispatcher {
                     .await
                     .map_err(|error| rpc_err(INTERNAL_ERROR, format!("Failed to persist ACP seed trim: {error}")))?;
             }
-            Ok::<_, JsonRpcError>((message_count, seed_event, plan))
+            Ok::<_, JsonRpcError>((message_count, seed_event, plan, plan_persistence_failure))
         }
         .await;
-        let (message_count, seed_event, plan) = match prepared {
+        let (message_count, seed_event, plan, plan_persistence_failure) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 if unpublished.is_none() {
@@ -5284,6 +5284,14 @@ impl RpcDispatcher {
         self.forward_seed_event(&session_id, seed_event).await;
         if let Some(notification) = plan_notification {
             let _ = self.rpc.send_raw(notification).await;
+        }
+        if let Some(failure) = plan_persistence_failure {
+            log_plan_persistence_failure(&session_id, &failure);
+            if let Some(notification) =
+                plan_persistence_notification(&session_id, failure.operation)
+            {
+                let _ = self.rpc.send_raw(notification).await;
+            }
         }
 
         // Stamp the persisted chat row with the owning principal so the
@@ -6061,11 +6069,11 @@ impl RpcDispatcher {
         // construction snapshot's history policy, and no prompt can observe a
         // partially restored incarnation.
         agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
-        let plan_sid = sid.to_string();
-        let plan =
-            tokio::task::spawn_blocking(move || store.get_plan(&plan_sid).unwrap_or_default())
-                .await
-                .unwrap_or_default();
+        let (plan, plan_persistence_failure) =
+            match load_plan_from_acp_store(store.clone(), sid.to_string()).await {
+                Ok(entries) => (entries, None),
+                Err(failure) => (Vec::new(), Some(failure)),
+            };
         let plan_notification = plan_replay_notification(sid, &plan);
         let message_count = data.messages.len();
         // Contended gate means this session may be excluded from an in-flight
@@ -6178,6 +6186,12 @@ impl RpcDispatcher {
         self.forward_seed_event(sid, seed_event).await;
         if let Some(notification) = plan_notification {
             let _ = self.rpc.send_raw(notification).await;
+        }
+        if let Some(failure) = plan_persistence_failure {
+            log_plan_persistence_failure(sid, &failure);
+            if let Some(notification) = plan_persistence_notification(sid, failure.operation) {
+                let _ = self.rpc.send_raw(notification).await;
+            }
         }
         self.ctx.sessions.touch(sid).await;
 
@@ -6964,8 +6978,21 @@ impl RpcDispatcher {
                         })
                         .await;
                     }
-                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
-                        .await;
+                    if let Some(failure) = persist_plan_if_any(
+                        &sessions_for_plan,
+                        acp_token_store.as_ref(),
+                        &sid,
+                        &event,
+                    )
+                    .await
+                    {
+                        log_plan_persistence_failure(&sid, &failure);
+                        if let Some(notification) =
+                            plan_persistence_notification(&sid, failure.operation)
+                        {
+                            let _ = rpc.send_raw(notification).await;
+                        }
+                    }
                     // Usage already carries the serving call's context limits.
                     // Keep checkpoint persistence ahead of the same projection.
                     if checkpoint_error.lock().await.is_some() {
@@ -13439,31 +13466,89 @@ async fn persist_plan_if_any(
     acp_store: Option<&std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
     session_id: &str,
     event: &TurnEvent,
-) {
+) -> Option<PlanPersistenceFailure> {
     let TurnEvent::Plan { entries } = event else {
-        return;
+        return None;
     };
     sessions.set_plan(session_id, entries.clone()).await;
     if let Some(store) = acp_store {
-        let store = store.clone();
-        let sid = session_id.to_string();
-        let entries = entries.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = store.set_plan(&sid, &entries) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "session_id": sid,
-                            "error": e.to_string(),
-                        })),
-                    "Failed to persist TodoWrite plan to ACP session store"
-                );
-            }
-        })
-        .await;
+        return write_plan_to_acp_store(store.clone(), session_id.to_string(), entries.clone())
+            .await
+            .err();
     }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct PlanPersistenceFailure {
+    operation: PlanPersistenceOperation,
+    error: String,
+}
+
+fn map_plan_task_result<T>(
+    operation: PlanPersistenceOperation,
+    result: Result<anyhow::Result<T>, tokio::task::JoinError>,
+) -> Result<T, PlanPersistenceFailure> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(PlanPersistenceFailure {
+            operation,
+            error: error.to_string(),
+        }),
+        Err(join) => Err(PlanPersistenceFailure {
+            operation,
+            error: join.to_string(),
+        }),
+    }
+}
+
+async fn load_plan_from_acp_store(
+    store: std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: String,
+) -> Result<Vec<zeroclaw_api::plan::PlanEntry>, PlanPersistenceFailure> {
+    let result = tokio::task::spawn_blocking(move || store.get_plan(&session_id)).await;
+    map_plan_task_result(PlanPersistenceOperation::Load, result)
+}
+
+async fn write_plan_to_acp_store(
+    store: std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: String,
+    entries: Vec<zeroclaw_api::plan::PlanEntry>,
+) -> Result<(), PlanPersistenceFailure> {
+    let result = tokio::task::spawn_blocking(move || store.set_plan(&session_id, &entries)).await;
+    map_plan_task_result(PlanPersistenceOperation::Write, result)
+}
+
+fn log_plan_persistence_failure(session_id: &str, failure: &PlanPersistenceFailure) {
+    let action = match failure.operation {
+        PlanPersistenceOperation::Load => ::zeroclaw_log::Action::Read,
+        PlanPersistenceOperation::Write => ::zeroclaw_log::Action::Write,
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), action)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "session_id": session_id,
+                "operation": failure.operation,
+                "error": failure.error,
+            })),
+        "TodoWrite plan persistence unavailable"
+    );
+}
+
+fn plan_persistence_notification(
+    session_id: &str,
+    operation: PlanPersistenceOperation,
+) -> Option<String> {
+    let update = SessionUpdateEvent::PlanPersistence {
+        session_id: session_id.to_string(),
+        operation,
+        status: PlanPersistenceStatus::Unavailable,
+    };
+    let params = serde_json::to_value(update).ok()?;
+    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&n).ok()
 }
 
 fn plan_replay_notification(
@@ -26985,6 +27070,18 @@ mod tests {
         assert!(plan_replay_notification("sess-9", &[]).is_none());
     }
 
+    #[test]
+    fn plan_persistence_notification_has_stable_status_shape() {
+        let json =
+            plan_persistence_notification("sess-10", PlanPersistenceOperation::Write).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan_persistence");
+        assert_eq!(v["params"]["session_id"], "sess-10");
+        assert_eq!(v["params"]["operation"], "write");
+        assert_eq!(v["params"]["status"], "unavailable");
+    }
+
     async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -27025,7 +27122,11 @@ mod tests {
         let event = TurnEvent::Plan {
             entries: entries.clone(),
         };
-        persist_plan_if_any(&store, None, sid, &event).await;
+        assert!(
+            persist_plan_if_any(&store, None, sid, &event)
+                .await
+                .is_none()
+        );
         assert_eq!(store.get_plan(sid).await.unwrap(), entries);
     }
 
@@ -27033,7 +27134,11 @@ mod tests {
     async fn non_plan_event_does_not_touch_stored_plan() {
         let sid = "no-touch-sess";
         let store = store_with_one_session(sid).await;
-        persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() }).await;
+        assert!(
+            persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() })
+                .await
+                .is_none()
+        );
         assert!(store.get_plan(sid).await.unwrap().is_empty());
     }
 
@@ -27058,12 +27163,98 @@ mod tests {
         let event = TurnEvent::Plan {
             entries: entries.clone(),
         };
-        persist_plan_if_any(&sessions, Some(&acp), sid, &event).await;
+        assert!(
+            persist_plan_if_any(&sessions, Some(&acp), sid, &event)
+                .await
+                .is_none()
+        );
 
         // In-memory cache updated…
         assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
         // …and durable store updated (survives daemon restart / eviction).
         assert_eq!(acp.get_plan(sid).unwrap(), entries);
+    }
+
+    #[tokio::test]
+    async fn plan_event_reports_durable_write_failure_but_keeps_memory_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "durable-plan-write-failure";
+        let sessions = store_with_one_session(sid).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let db_path = tmp.path().join("sessions/acp-sessions.db");
+        let second = rusqlite::Connection::open(&db_path).unwrap();
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json TO plan_json_broken;")
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Still visible".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        let failure = persist_plan_if_any(&sessions, Some(&acp), sid, &event)
+            .await
+            .expect("durable write failure should be reported");
+
+        assert_eq!(failure.operation, PlanPersistenceOperation::Write);
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
+
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json_broken TO plan_json;")
+            .unwrap();
+        let refreshed = vec![PlanEntry {
+            content: "Persist after recovery".to_string(),
+            status: PlanStatus::Completed,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: refreshed.clone(),
+        };
+        assert!(
+            persist_plan_if_any(&sessions, Some(&acp), sid, &event)
+                .await
+                .is_none()
+        );
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), refreshed);
+        assert_eq!(acp.get_plan(sid).unwrap(), refreshed);
+    }
+
+    #[tokio::test]
+    async fn plan_load_and_blocking_task_failures_are_classified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "durable-plan-load-failure";
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        let db_path = tmp.path().join("sessions/acp-sessions.db");
+        let second = rusqlite::Connection::open(&db_path).unwrap();
+        second
+            .execute_batch("ALTER TABLE acp_sessions RENAME COLUMN plan_json TO plan_json_broken;")
+            .unwrap();
+
+        let failure = load_plan_from_acp_store(acp, sid.to_string())
+            .await
+            .expect_err("missing plan_json should be surfaced");
+        assert_eq!(failure.operation, PlanPersistenceOperation::Load);
+
+        let joined = tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
+            panic!("plan task panic");
+        })
+        .await;
+        let failure = map_plan_task_result(PlanPersistenceOperation::Write, joined)
+            .expect_err("join failure should be mapped");
+        assert_eq!(failure.operation, PlanPersistenceOperation::Write);
     }
 
     #[test]

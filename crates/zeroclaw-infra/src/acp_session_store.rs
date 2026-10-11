@@ -2810,7 +2810,9 @@ impl AcpSessionStore {
     /// Load the session's stored plan. Returns an empty vec when the
     /// session has no plan (NULL or absent). Malformed JSON is treated
     /// as an empty plan rather than a hard error, so a corrupt plan
-    /// column never blocks session restore.
+    /// column never blocks session restore. SQLite read failures still
+    /// propagate; callers surface those as best-effort persistence status
+    /// instead of reporting a legitimate empty plan.
     pub fn get_plan(&self, session_uuid: &str) -> Result<Vec<PlanEntry>> {
         let conn = self.conn.lock();
         let plan_json: Option<String> = conn

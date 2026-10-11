@@ -329,6 +329,13 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+    /// TodoWrite plan durability is best-effort, but storage failures are
+    /// explicit so the UI can distinguish them from a legitimately empty plan.
+    PlanPersistence {
+        session_id: String,
+        operation: PlanPersistenceOperation,
+        status: PlanPersistenceStatus,
+    },
 }
 
 impl SessionUpdate {
@@ -344,9 +351,23 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::PlanPersistence { session_id, .. } => session_id,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPersistenceOperation {
+    Load,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPersistenceStatus {
+    Unavailable,
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from
@@ -447,6 +468,11 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 entries,
             })
         }
+        "plan_persistence" => Some(SessionUpdate::PlanPersistence {
+            session_id: sid,
+            operation: serde_json::from_value(params.get("operation")?.clone()).ok()?,
+            status: serde_json::from_value(params.get("status")?.clone()).ok()?,
+        }),
         _ => None,
     }
 }
@@ -6532,6 +6558,24 @@ mod plan_parse_tests {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
         }
+    }
+
+    #[test]
+    fn parses_plan_persistence_status_update() {
+        let params = serde_json::json!({
+            "type": "plan_persistence",
+            "session_id": "sess-2",
+            "operation": "load",
+            "status": "unavailable"
+        });
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::PlanPersistence {
+                session_id,
+                operation: PlanPersistenceOperation::Load,
+                status: PlanPersistenceStatus::Unavailable,
+            }) if session_id == "sess-2"
+        ));
     }
 
     #[test]

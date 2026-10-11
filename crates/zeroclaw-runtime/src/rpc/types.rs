@@ -1705,6 +1705,19 @@ rpc_type! {
 
 /// Typed session update events pushed via `session/update` notifications.
 /// Replaces the hand-built `notification_for_turn_event` function.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPersistenceOperation {
+    Load,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPersistenceStatus {
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdateEvent {
@@ -1757,6 +1770,15 @@ pub enum SessionUpdateEvent {
     Plan {
         session_id: String,
         entries: Vec<zeroclaw_api::plan::PlanEntry>,
+    },
+    /// Emitted when the TodoWrite plan remains live in memory, but the ACP
+    /// durable store could not load or save the persisted projection. The
+    /// details stay in logs; the client gets a stable status it can present
+    /// without parsing storage errors.
+    PlanPersistence {
+        session_id: String,
+        operation: PlanPersistenceOperation,
+        status: PlanPersistenceStatus,
     },
     /// Terminal event for a turn. Replaces the response of `session/prompt`.
     /// `outcome` distinguishes a clean finish from a user-initiated cancel.
