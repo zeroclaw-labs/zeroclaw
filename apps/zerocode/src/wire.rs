@@ -303,6 +303,13 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup facts supplied by the canonical config owner. Absence of this
+/// metadata means requirements are unknown, not that a field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
 /// Single config-property descriptor returned by `config/list` and
 /// `config/sections`. Mirrors `zeroclaw_config::traits::ConfigFieldEntry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +333,8 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors

@@ -341,6 +341,7 @@ fn lookup_prop_field(
                     tab: zeroclaw_config::traits::ConfigTab::None,
                     alias_source: None,
                     multiline: false,
+                    setup: None,
                 }
             })
         })

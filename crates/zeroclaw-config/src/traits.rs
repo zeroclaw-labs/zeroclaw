@@ -349,6 +349,13 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup information for a field required by a covered configuration contract.
+/// Absence of this metadata means the requirement is unknown.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
@@ -388,6 +395,9 @@ pub struct PropFieldInfo {
     /// should render a multi-line text area (e.g. a PEM key body) rather
     /// than a single-line input.
     pub multiline: bool,
+    /// Derived from typed config independently of secret display masking. Present only
+    /// for fields required by a covered setup contract.
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 impl PropKind {
@@ -855,6 +865,9 @@ pub struct ConfigFieldEntry {
     /// instead of a single-line input.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multiline: bool,
+    /// A present entry identifies a required field. Absence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 impl ConfigFieldEntry {
@@ -888,6 +901,7 @@ impl ConfigFieldEntry {
             tab: info.tab,
             alias_source: info.alias_source,
             multiline: info.multiline,
+            setup: info.setup,
         }
     }
 }
