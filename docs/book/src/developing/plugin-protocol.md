@@ -821,8 +821,11 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
-cannot extend the host deadline. An interrupted warm store is never resumed:
-channels recreate it from host-owned inputs on the next call, while memory
+cannot extend the host deadline. An interrupted warm store is never resumed,
+and a channel never reuses a store whose call trapped: channels recreate the
+instance from host-owned inputs on the next call, waiting when traps and
+missed deadlines, other than in approval and choice prompts, outrun a rebuild
+budget of three at once and one per five minutes after that, while memory
 instances remain unavailable until their owner rebuilds them. The canonical
 fields and defaults live in the
 [Config reference](../reference/index.md).

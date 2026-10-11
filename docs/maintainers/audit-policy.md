@@ -35,13 +35,7 @@ tool blocks the PR. What actually fails each tool differs by category:
 - **`cargo audit`** (bare, no `--deny warnings`): vulnerability
   advisories are errors (exit 1); informational and unmaintained
   advisories are reported as allowed warnings and exit 0.
-- **`cargo deny check advisories`**: vulnerability *and* unmaintained
-  advisories for crates in the resolved graph are errors (exit 1) —
-  that is exactly why the one live unmaintained deny
-  (`rustls-pemfile`) must stay in `deny.toml`.
-  A stale graph-ignore instead emits `advisory-not-detected`, which is
-  a warning (exit 0); it is never triggered by removing an entry from
-  `.cargo/audit.toml`.
+- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile` and `anymap2` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
 An audit-only ignore covers a crate `cargo deny`'s resolved graph does
 not pull in, so it affects only `cargo audit`: removing it while the
@@ -112,6 +106,10 @@ Live, deny+audit (both files):
 bump; see the change log entry below. Neither crate is in `Cargo.lock`
 any more, so the visible `bitmaps` unsoundness warning
 (`RUSTSEC-2025-0167`) is gone with them.
+
+Live, deny-only:
+
+- **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
 
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
@@ -197,6 +195,7 @@ unaffected by the advisory):
   `RUSTSEC-2026-0247`, `RUSTSEC-2026-0292`, and the separate visible
   `RUSTSEC-2025-0167` warning are all gone, and the waiver text is out of
   both tool files and this document.
+- **#11429**: *Remove the `anymap2` maintenance exception after Matrix migrates.* The RUSTSEC-2026-0319 exception is present only in `deny.toml`. Keep this issue open until the Matrix dependency update removes the affected crate from the resolved graph, then remove the exception and update this inventory.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the

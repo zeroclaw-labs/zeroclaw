@@ -246,9 +246,8 @@ impl GatewayReadinessReporter {
 /// most once per process and is a no-op unless a provider sets
 /// `live_pricing = true`.
 pub fn spawn_pricing_refresher(config: &Config) {
-    zeroclaw_providers::pricing::spawn_refresher(std::sync::Arc::new(parking_lot::RwLock::new(
-        config.clone(),
-    )));
+    let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+    zeroclaw_providers::pricing::spawn_refresher(live.handle());
 }
 
 /// Wrap a gateway readiness reporter so the `on_gateway_start` hook fires when
@@ -724,7 +723,7 @@ pub async fn run_with_authority(
     DaemonExit,
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
 )> {
-    let config = live_config_authority.config().read().clone();
+    let config = live_config_authority.snapshot_config();
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -781,7 +780,7 @@ pub async fn run_with_authority(
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
-        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
+        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::for_config(&config));
 
     // Canonical live pairing authority for this daemon generation. The
     // gateway serves /pair, rotation, and revocation from THIS instance
@@ -799,13 +798,13 @@ pub async fn run_with_authority(
     // under the process-wide config write lock. A revocation persisted
     // through either surface therefore binds the other before the writer
     // returns, not at the next daemon reload.
-    let live_config = live_config_authority.config();
+    let live_config = live_config_authority.live_handle();
     // The daemon owns the live-pricing refresher, so it runs whether or not the
     // gateway is enabled. It follows this generation's live configuration, the
     // one the RPC context and the supervised gateway both write in place, so
     // an operator's change reaches the next refresh from either surface
     // without a reload. A reload starts a new generation and re-binds it.
-    zeroclaw_providers::pricing::spawn_refresher(std::sync::Arc::clone(&live_config));
+    zeroclaw_providers::pricing::spawn_refresher(live_config.clone());
     let inbound_auth = std::sync::Arc::new(
         crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
             |e| anyhow::Error::msg(format!("building the inbound authentication layer: {e:#}")),
@@ -818,7 +817,7 @@ pub async fn run_with_authority(
         let gateway_authority = DaemonInboundAuthority {
             pairing: pairing_guard.as_ref().clone(),
             inbound_auth: std::sync::Arc::clone(&inbound_auth),
-            config: std::sync::Arc::clone(&live_config),
+            config: live_config.clone(),
         };
         let gateway_host = host.clone();
         let gateway_event_bus = event_bus.clone();
@@ -1084,8 +1083,6 @@ pub async fn run_with_authority(
             None
         };
 
-        let (rpc_config, rpc_config_write_lock) =
-            RpcContext::config_handles_for_authority(&live_config_authority);
         // The generation's shared inbound-auth state (see `inbound_auth`
         // above): the gateway authenticates and publishes against these same
         // instances.
@@ -1094,8 +1091,8 @@ pub async fn run_with_authority(
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
             config_commit_pause: None,
-            config: rpc_config,
-            config_write_lock: rpc_config_write_lock,
+            config: live_config_authority.live_handle(),
+            config_authority: live_config_authority.clone(),
             agent_lifecycle: live_config_authority.agent_lifecycle(),
             channel_generation_control: Some(channel_generation_control.clone()),
             sessions,
@@ -1392,6 +1389,10 @@ pub async fn run_with_authority(
     // drain as well as component workers before process ownership is released.
     live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
+    // The gateway stops on its own shutdown signal, not the cancellation
+    // token. Without it the gateway is aborted at the grace window below and
+    // never withdraws what it published, such as its tunnel forwards.
+    let _ = gateway_shutdown_tx.send(true);
 
     // Retire the accepted RPC connections before the component handles are
     // touched. Each connection cancels and joins its prompts, and its listener
@@ -3190,6 +3191,98 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervised_channel_retry_reads_latest_published_config() {
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.port = 41_001;
+        config.reliability.channel_initial_backoff_secs = 1;
+        config.reliability.channel_max_backoff_secs = 1;
+        config.channels.webhook.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let authority = crate::LiveConfigAuthority::new_owned(config).unwrap();
+        let publisher = authority.clone();
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_channels = attempts.clone();
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let published_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(published_rx)));
+        let (reload_tx, reload_rx) = tokio::sync::oneshot::channel();
+        let reload_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(reload_rx)));
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_channels(Box::new(move |authority, cancel| {
+            let attempt_tx = attempt_tx.clone();
+            let attempt = attempts_for_channels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let published_rx = (attempt == 0).then(|| published_rx.lock().take().unwrap());
+            Box::pin(async move {
+                attempt_tx
+                    .send(authority.snapshot_config().gateway.port)
+                    .unwrap();
+                if let Some(published_rx) = published_rx {
+                    published_rx.await.unwrap();
+                    return Err(anyhow::Error::msg("force channel retry"));
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _authority, _events, controls, _tui, _pairing, _ready| {
+                let reload_rx = reload_rx.lock().take().unwrap();
+                Box::pin(async move {
+                    reload_rx.await.unwrap();
+                    controls.unwrap().reload_tx.send(true).unwrap();
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let daemon = zeroclaw_spawn::spawn!(run_with_authority(
+            authority,
+            "127.0.0.1".to_string(),
+            0,
+            registry,
+            false,
+            false,
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(41_001)
+        );
+        let mut updated = publisher.snapshot_config();
+        updated.gateway.port = 41_002;
+        publisher.publish_for_test(updated);
+        published_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(41_002),
+            "the retry must resolve the config published after the failed attempt"
+        );
+
+        reload_tx.send(()).unwrap();
+        let (exit, ownership) = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, DaemonExit::Reload);
+        drop(ownership);
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             data_dir: tmp.path().join("data"),
@@ -4468,6 +4561,65 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_exit_signals_the_gateway_instead_of_aborting_it() {
+        // Exit without the RPC reload helper, which signals the gateway itself:
+        // the same teardown a SIGTERM takes. The gateway must be told to stop
+        // so it can withdraw what it published (its tunnel) before returning,
+        // rather than being aborted when the component grace window ends.
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _live_config_authority,
+                  _event_tx,
+                  reload_controls,
+                  _tui_registry,
+                  _pairing,
+                  _ready_tx| {
+                let signalled_tx = signalled_tx.clone();
+                Box::pin(async move {
+                    let controls =
+                        reload_controls.expect("daemon should pass reload controls to gateway");
+                    let mut shutdown_rx = controls.shutdown_tx.subscribe();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    if shutdown_rx.wait_for(|stop| *stop).await.is_ok() {
+                        signalled_tx.send(()).ok();
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let exit = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(
+                config,
+                "127.0.0.1".to_string(),
+                4243,
+                registry,
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect("daemon must not deadlock on exit")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            signalled_rx.try_recv().is_ok(),
+            "the daemon aborted the gateway without signalling its shutdown"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -7073,12 +7225,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -7415,7 +7569,7 @@ mod tests {
                       _tui,
                       authority,
                       _ready| {
-                    *handed.lock().unwrap() = authority.map(|authority| authority.config);
+                    *handed.lock().unwrap() = authority.map(|_| _live_config_authority.clone());
                     Box::pin(std::future::pending::<Result<()>>())
                 },
             ));
@@ -7439,7 +7593,9 @@ mod tests {
             "the refresher follows the generation's live configuration, which opts in"
         );
 
-        live.write()
+        let commit = live.begin_config_commit().await.unwrap();
+        let mut published = commit.current_config();
+        published
             .providers
             .models
             .ollama
@@ -7447,6 +7603,8 @@ mod tests {
             .expect("the opted-in provider exists")
             .base
             .live_pricing = false;
+        let revision = commit.next_revision().unwrap();
+        commit.publish(revision, published).unwrap();
         assert!(
             !zeroclaw_providers::pricing::live_pricing_enabled(),
             "a write to the shared live configuration must reach the refresher without a reload"

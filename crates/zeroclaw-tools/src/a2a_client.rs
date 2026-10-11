@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use futures_util::stream::TryStreamExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use zeroclaw_api::a2a_wire::{
@@ -28,8 +28,12 @@ use zeroclaw_api::a2a_wire::{
 };
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
+use zeroclaw_config::live::LiveConfigHandle;
+#[cfg(test)]
 use zeroclaw_config::schema::Config;
 
+#[cfg(test)]
+use zeroclaw_config::live::LiveConfig;
 #[cfg(test)]
 use zeroclaw_config::multi_agent::A2aClientPeerConfig;
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
@@ -38,10 +42,6 @@ use crate::helpers::domain_guard::{is_cloud_metadata_ip, is_private_or_local_hos
 
 /// A2A protocol version sent on every request (spec §3.2 `A2A-Version` header).
 const A2A_VERSION: &str = "1.0";
-
-/// Live config handle: shared `Arc<RwLock<Config>>` so the client reads the
-/// canonical, hot-reloadable config at call time rather than a startup snapshot.
-type LiveConfig = Arc<RwLock<Config>>;
 
 /// Shared task-route state that survives tool-set reassembly across
 /// `process_message` turns. A `SendMessage` stores the selected endpoint here;
@@ -65,7 +65,7 @@ pub struct A2aHttpClient {
     /// Request timeout applied to every outbound call; retained as a plain
     /// `Duration` so each per-request pinned client re-applies it.
     request_timeout: std::time::Duration,
-    config: LiveConfig,
+    config: LiveConfigHandle,
     /// Config file parent dir (the zeroclaw data dir), used to locate the
     /// `SecretStore` for decrypting encrypted peer tokens. `None` when the
     /// client is built without a config path (tests) — encrypted tokens then
@@ -105,7 +105,7 @@ impl A2aHttpClient {
     /// decrypting encrypted peer tokens via the canonical `SecretStore` (the
     /// same path `http_request` uses).
     pub fn new(
-        config: LiveConfig,
+        config: LiveConfigHandle,
         request_timeout_secs: u64,
         zeroclaw_dir: Option<std::path::PathBuf>,
         secrets_encrypt: bool,
@@ -2270,7 +2270,7 @@ mod tests {
         let discover = A2aDiscoverTool::new(
             Arc::new(
                 A2aHttpClient::new(
-                    Arc::new(RwLock::new(Config::default())),
+                    LiveConfig::new(Config::default()).handle(),
                     10,
                     None,
                     false,
@@ -2283,7 +2283,7 @@ mod tests {
         let send = A2aSendTool::new(
             Arc::new(
                 A2aHttpClient::new(
-                    Arc::new(RwLock::new(Config::default())),
+                    LiveConfig::new(Config::default()).handle(),
                     10,
                     None,
                     false,
@@ -2296,7 +2296,7 @@ mod tests {
         let get = A2aGetTaskTool::new(
             Arc::new(
                 A2aHttpClient::new(
-                    Arc::new(RwLock::new(Config::default())),
+                    LiveConfig::new(Config::default()).handle(),
                     10,
                     None,
                     false,
@@ -2309,7 +2309,7 @@ mod tests {
         let cancel = A2aCancelTool::new(
             Arc::new(
                 A2aHttpClient::new(
-                    Arc::new(RwLock::new(Config::default())),
+                    LiveConfig::new(Config::default()).handle(),
                     10,
                     None,
                     false,
@@ -3239,7 +3239,7 @@ mod tests {
             token: encrypted,
             tags: vec![],
         });
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let client =
             A2aHttpClient::new(config, 30, Some(tmp.clone()), true, test_route_cache()).unwrap();
         let peer = client.resolve_peer("enc-peer").unwrap();
@@ -3261,7 +3261,7 @@ mod tests {
             token: encrypted,
             tags: vec![],
         });
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         // No zeroclaw dir: encrypted resolution must error.
         let client = A2aHttpClient::new(config, 30, None, true, test_route_cache()).unwrap();
         assert!(client.resolve_peer("enc-peer").is_err());
@@ -3270,7 +3270,7 @@ mod tests {
     #[tokio::test]
     #[serial(a2a)]
     async fn guard_host_rejects_private_and_metadata() {
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         // Literal private/metadata hosts are rejected by the host-literal
         // check (no DNS lookup needed).
@@ -3299,7 +3299,7 @@ mod tests {
     async fn guard_host_allows_loopback_when_operator_opted_in() {
         let mut config = Config::default();
         config.a2a.client.allow_private_hosts = true;
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         // Loopback is accepted when the operator flipped the global switch.
         assert!(
@@ -3315,7 +3315,7 @@ mod tests {
     async fn guard_host_allows_pinned_private_host_but_not_others() {
         let mut config = Config::default();
         config.a2a.client.allowed_private_hosts = vec!["127.0.0.1".to_string()];
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         // The pinned private host is allowed.
         assert!(
@@ -3439,7 +3439,7 @@ mod tests {
                 runtime_proxy_active_for_a2a(),
                 "{scheme} proxy must be detected as active"
             );
-            let config = Arc::new(RwLock::new(Config::default()));
+            let config = LiveConfig::new(Config::default()).handle();
             let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
             let url = parse_peer_url("https://peer.example.com").unwrap();
             let result = client
@@ -3478,7 +3478,7 @@ mod tests {
             std::env::set_var("HTTPS_PROXY", "http://evil-proxy.example:3128");
             std::env::set_var("ALL_PROXY", "http://evil-proxy.example:3128");
         }
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         let url = parse_peer_url("https://peer.example.com").unwrap();
         // Should build successfully (no proxy guard trip, and the builder's
@@ -3520,7 +3520,7 @@ mod tests {
             all_proxy: Some("http://proxy.example:3128".to_string()),
             ..Default::default()
         });
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let url = parse_peer_url("http://127.0.0.1:8080").unwrap();
         let client =
             A2aHttpClient::new(config.clone(), 30, None, false, test_route_cache()).unwrap();
@@ -3556,7 +3556,7 @@ mod tests {
     async fn guard_host_rejects_invalid_allowed_private_hosts_entry() {
         let mut config = Config::default();
         config.a2a.client.allowed_private_hosts = vec!["!!not a domain!!".to_string()];
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         // An un-normalizable allowlist entry surfaces as a config error at
         // guard time rather than being silently skipped.
@@ -3571,7 +3571,7 @@ mod tests {
     #[test]
     #[serial(a2a)]
     fn resolve_peer_errors_on_unknown() {
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         assert!(client.resolve_peer("nonexistent").is_err());
     }
@@ -3600,7 +3600,7 @@ mod tests {
                 tags: vec![],
             },
         ];
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let err = A2aHttpClient::new(config, 30, None, false, test_route_cache())
             .err()
             .expect("duplicate peer names must fail construction")
@@ -3618,7 +3618,7 @@ mod tests {
             token: String::new(),
             tags: vec![],
         }];
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let err = A2aHttpClient::new(config, 30, None, false, test_route_cache())
             .err()
             .expect("empty peer name must fail construction")
@@ -3638,29 +3638,32 @@ mod tests {
         // silently select the first matching entry (and its credential).
         use zeroclaw_config::multi_agent::A2aClientPeerConfig;
 
-        let live = Arc::new(RwLock::new(Config::default()));
+        let live = LiveConfig::new(Config::default());
         {
-            let mut cfg = live.write();
+            let mut cfg = live.snapshot();
             cfg.a2a.client.peers = vec![A2aClientPeerConfig {
                 name: "team-a".into(),
                 base_url: "https://valid.example.com".into(),
                 token: String::new(),
                 tags: vec![],
             }];
+            live.publish(live.next_revision().unwrap(), cfg).unwrap();
         }
-        let client = A2aHttpClient::new(live.clone(), 30, None, false, test_route_cache()).unwrap();
+        let client =
+            A2aHttpClient::new(live.handle(), 30, None, false, test_route_cache()).unwrap();
         // Resolves fine against the valid single peer.
         assert!(client.resolve_peer("team-a").is_ok());
 
         // Simulate a hot reload that introduces a duplicate name.
         {
-            let mut cfg = live.write();
+            let mut cfg = live.snapshot();
             cfg.a2a.client.peers.push(A2aClientPeerConfig {
                 name: "team-a".into(), // duplicate injected by reload
                 base_url: "https://evil.example.com".into(),
                 token: String::new(),
                 tags: vec![],
             });
+            live.publish(live.next_revision().unwrap(), cfg).unwrap();
         }
         let err = client
             .resolve_peer("team-a")
@@ -3678,7 +3681,7 @@ mod tests {
         // B3: send is an Act operation; a read-only autonomy session must
         // deny it before any network I/O (no peer contact attempted).
         use zeroclaw_config::autonomy::AutonomyLevel;
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy {
@@ -3705,7 +3708,7 @@ mod tests {
         // let it through the gate. A denial would have returned an Ok
         // ToolResult with success=false and a "read-only" error.
         use zeroclaw_config::autonomy::AutonomyLevel;
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy {
@@ -3735,7 +3738,7 @@ mod tests {
         // composite key prevents same-task-id collision across agents on one
         // peer. Terminal-state tasks are evicted. Direct map manipulation
         // (no HTTP) proves the cache wiring without a live peer.
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         let route = RouteHandle {
             rpc_url: "https://peer.example.com/a2a/beta".to_string(),
@@ -3784,7 +3787,7 @@ mod tests {
         // is count- AND byte-bounded, so a peer cannot turn advertised
         // non-terminal IDs into ~1 GB of retained memory.
         let cache = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, Arc::clone(&cache)).unwrap();
         let route = RouteHandle {
             rpc_url: "https://peer.example.com/a2a/beta".to_string(),
@@ -3828,7 +3831,7 @@ mod tests {
         // route state, so a send in one turn is reachable by a poll/cancel in
         // a later turn.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client_a = A2aHttpClient::new(config.clone(), 30, None, false, shared.clone()).unwrap();
         let client_b = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
         let route = RouteHandle {
@@ -3856,7 +3859,7 @@ mod tests {
         // Eviction retains by (peer, task_id) so a terminal-state poll/cancel
         // that omitted the agent still clears the route stored under the
         // originating agent.
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, test_route_cache()).unwrap();
         let route = RouteHandle {
             rpc_url: "https://peer.example.com/a2a/beta".to_string(),
@@ -3887,7 +3890,7 @@ mod tests {
         // sends that exceed the cap; the oldest route is dropped, newer ones
         // survive.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let _client = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
 
         // Insert MAX + 1 entries with strictly increasing inserted_at so the
@@ -3937,7 +3940,7 @@ mod tests {
         // `!task.status.state.is_terminal()` in send_message; the direct
         // helper-level assertion proves the wiring.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let _client = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
 
         // Non-terminal → inserted.
@@ -3973,7 +3976,7 @@ mod tests {
         // This mirrors the production `task.status.state.is_terminal()` guard
         // in cancel(); the two branches below prove the semantics.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
         let route = RouteHandle {
             rpc_url: "https://peer.example.com/a2a/beta".to_string(),
@@ -4022,7 +4025,7 @@ mod tests {
         // nonterminal route — the composite (peer, agent, task_id) key exists
         // precisely to isolate those collisions.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
 
         let route_a = RouteHandle {
@@ -4077,7 +4080,7 @@ mod tests {
         // eviction must NOT delete any route (can't tell which served the
         // call). Deleting any could drop a live nonterminal route.
         let shared = test_route_cache();
-        let config = Arc::new(RwLock::new(Config::default()));
+        let config = LiveConfig::new(Config::default()).handle();
         let client = A2aHttpClient::new(config, 30, None, false, shared.clone()).unwrap();
         for (agent, rpc) in [("alpha", "a2a/alpha"), ("beta", "a2a/beta")] {
             client.route_cache.lock().insert(
@@ -4214,7 +4217,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4290,7 +4293,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4348,7 +4351,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4409,7 +4412,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4485,7 +4488,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4582,7 +4585,7 @@ mod tests {
                 inserted_at: std::time::Instant::now(),
             },
         );
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, Arc::clone(&cache)).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4655,7 +4658,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let cache = test_route_cache();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, Arc::clone(&cache)).unwrap());
@@ -4734,7 +4737,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4811,7 +4814,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4873,7 +4876,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -4933,7 +4936,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let cache = test_route_cache();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, Arc::clone(&cache)).unwrap());
@@ -5040,10 +5043,10 @@ mod tests {
             tags: vec![],
         });
         config.a2a.client = client_cfg;
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config);
 
         let client = Arc::new(
-            A2aHttpClient::new(Arc::clone(&config), 10, None, false, test_route_cache()).unwrap(),
+            A2aHttpClient::new(config.handle(), 10, None, false, test_route_cache()).unwrap(),
         );
         let security = Arc::new(SecurityPolicy::default());
         // The tool is shared between the spawned first send (whose card fetch
@@ -5061,7 +5064,11 @@ mod tests {
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        config.write().a2a.client.card_cache_ttl_secs = 0;
+        let mut updated = config.snapshot();
+        updated.a2a.client.card_cache_ttl_secs = 0;
+        config
+            .publish(config.next_revision().unwrap(), updated)
+            .unwrap();
         let first = first.await.unwrap().unwrap();
         assert!(first.success, "first send must succeed: {:?}", first.error);
 
@@ -5116,7 +5123,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5167,7 +5174,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5247,7 +5254,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5345,7 +5352,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5394,7 +5401,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy {
@@ -5424,7 +5431,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy {
@@ -5483,7 +5490,7 @@ mod tests {
                 .await;
         }
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5553,7 +5560,7 @@ mod tests {
         // 1KB RPC body is rejected.
         let mut config = test_config(&server);
         config.a2a.client.max_response_bytes = 512;
-        let config = Arc::new(RwLock::new(config));
+        let config = LiveConfig::new(config).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5622,7 +5629,7 @@ mod tests {
         // the async lifecycle the RFC requires.
         let base_url = std::env::var("A2A_CROSS_HARNESS_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:9999".to_string());
-        let config = Arc::new(RwLock::new(cross_harness_config(&base_url)));
+        let config = LiveConfig::new(cross_harness_config(&base_url)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5704,7 +5711,7 @@ mod tests {
         // CANCELED. This closes the lifecycle the RFC gate requires.
         let base_url = std::env::var("A2A_CROSS_HARNESS_CANCEL_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:43100".to_string());
-        let config = Arc::new(RwLock::new(cross_harness_config(&base_url)));
+        let config = LiveConfig::new(cross_harness_config(&base_url)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5779,7 +5786,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5818,7 +5825,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5876,7 +5883,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
@@ -5927,7 +5934,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = Arc::new(RwLock::new(test_config(&server)));
+        let config = LiveConfig::new(test_config(&server)).handle();
         let client =
             Arc::new(A2aHttpClient::new(config, 10, None, false, test_route_cache()).unwrap());
         let security = Arc::new(SecurityPolicy::default());

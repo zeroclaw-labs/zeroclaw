@@ -13,6 +13,7 @@ bridge. Bridges plugin-exported functions into ZeroClaw's `Tool` and
 - `wasmtime` (Component Model host)
 - `wasmtime-wasi` and `wasmtime-wasi-http` (WASI Preview 2 host support)
 - `ring` (Ed25519 signatures)
+- `rustix` (Unix only: handle-relative, no-follow opens when admitting a component)
 - `serde`, `serde_json`, `toml`, `toml_edit` (serialization)
 - `jsonschema` (manifest-owned plugin config-contract validation; network resolvers disabled)
 - `tokio` (async bridging via `spawn_blocking`)

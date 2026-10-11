@@ -327,9 +327,10 @@ impl ApprovalManager {
     }
 
     /// Prompt the user on the CLI and return their decision.
+    /// EOF or a read error means no operator decision was available.
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
-    pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
+    pub fn prompt_cli(&self, request: &ApprovalRequest) -> io::Result<ApprovalResponse> {
         prompt_cli_interactive(request)
     }
 }
@@ -338,7 +339,7 @@ impl ApprovalManager {
 
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+fn prompt_cli_interactive(request: &ApprovalRequest) -> io::Result<ApprovalResponse> {
     let summary = summarize_args(&request.arguments);
     let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
@@ -353,11 +354,15 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     );
     let _ = io::stderr().flush();
 
-    let Ok(line) = read_cli_approval_line() else {
-        return ApprovalResponse::No;
-    };
+    let line = read_cli_approval_line()?;
+    if line.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "approval input ended without an operator decision",
+        ));
+    }
 
-    parse_cli_approval_response(&line)
+    Ok(parse_cli_approval_response(&line))
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {

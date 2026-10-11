@@ -2,10 +2,7 @@
 //! feed the pattern-based loop detector, and run the time-gated
 //! identical-output abort.
 
-use crate::agent::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
-    truncate_tool_result_with_metadata,
-};
+use crate::agent::history::{append_or_merge_system_message, truncate_tool_result_with_metadata};
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
@@ -13,15 +10,30 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use zeroclaw_api::media::RenderedMarker;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
+/// One tool result of a round as it reaches history: the call id, the
+/// verbatim model-facing text, and the attachments the tool declared for it.
+/// Nothing is inferred from the text: a bare image path a tool printed is
+/// text, not an attachment — the attachment-identity boundary, nothing in
+/// tool text promoted unless the tool declared it.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolRoundResult {
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) output: String,
+    pub(crate) attachments: Vec<RenderedMarker>,
+}
+
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
-    /// Per-call `(tool_call_id, output)` so native-mode history can emit one
-    /// `role=tool` message per call with the correct ID.
-    pub(crate) individual_results: Vec<(Option<String>, String)>,
+    /// Per-call results so native-mode history can emit one `role=tool`
+    /// message per call with the correct ID, and prompt-mode history can
+    /// aggregate the round's attachments into one count header.
+    pub(crate) individual_results: Vec<ToolRoundResult>,
     /// XML `<tool_result>` blocks for prompt-mode history.
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
@@ -30,8 +42,9 @@ pub(crate) struct CollectedResults {
 
 /// Collect this round's tool results (upstream loop body, results-collection
 /// section): feed the loop detector (Warning/Block append system messages;
-/// Break bails), canonicalize media markers, truncate, append receipts, and
-/// build the per-call and XML result forms.
+/// Break bails), resolve each result's attachments (the tool's declarations
+/// alone), truncate, append receipts, and build the per-call and XML result
+/// forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
     ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
@@ -46,7 +59,7 @@ pub(crate) fn collect_tool_results(
     turn_id: &str,
 ) -> Result<CollectedResults> {
     let mut tool_results = String::new();
-    let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
+    let mut individual_results: Vec<ToolRoundResult> = Vec::new();
     let mut detection_relevant_output = String::new();
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
@@ -117,14 +130,19 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    return Err(TurnStop::close_out(
+                        TurnStopCode::LoopDetector,
+                        format!("Agent loop aborted by loop detector: {msg}"),
+                    )
+                    .into());
                 }
             }
         }
-        let canonical_output =
-            canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
-        let truncation =
-            truncate_tool_result_with_metadata(&canonical_output, max_tool_result_chars);
+        // Attachments are the tool's declarations alone: nothing in the
+        // output text is promoted, so a shell result that prints an image
+        // path stays text and attaches nothing.
+        let attachments = outcome.attachments.clone();
+        let truncation = truncate_tool_result_with_metadata(&outcome.output, max_tool_result_chars);
         if truncation.was_truncated() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -158,7 +176,11 @@ pub(crate) fn collect_tool_results(
                 v.push(format!("{tool_name}: {receipt}"));
             }
         }
-        individual_results.push((tool_call_id, result_output.clone()));
+        individual_results.push(ToolRoundResult {
+            tool_call_id,
+            output: result_output.clone(),
+            attachments,
+        });
         let _ = writeln!(
             tool_results,
             "<tool_result name=\"{}\">\n{}\n</tool_result>",
@@ -220,10 +242,14 @@ pub(crate) fn check_identical_output_abort(
                     })),
                 "tool_loop_identical_output_abort"
             );
-            anyhow::bail!(
-                "Agent loop aborted: identical tool output detected {} consecutive times",
-                *consecutive_identical_outputs
-            );
+            return Err(TurnStop::close_out(
+                TurnStopCode::IdenticalOutput,
+                format!(
+                    "Agent loop aborted: identical tool output detected {} consecutive times",
+                    *consecutive_identical_outputs
+                ),
+            )
+            .into());
         }
     }
     Ok(())
@@ -234,6 +260,7 @@ mod tests {
     use super::*;
     use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
     use crate::agent::tool_execution::ToolExecutionOutcome;
+    use zeroclaw_api::turn_stop::turn_stop;
     use zeroclaw_tool_call_parser::ParsedToolCall;
 
     const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
@@ -250,6 +277,7 @@ mod tests {
             duration: Duration::from_millis(1),
             receipt: None,
             output_data: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -431,5 +459,119 @@ mod tests {
     #[test]
     fn failed_identical_outputs_do_not_trip_hash_based_abort() {
         assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
+    }
+
+    #[test]
+    fn shell_result_printing_an_image_path_declares_no_attachments() {
+        // The attachment-identity boundary: nothing in a tool's output is
+        // promoted to an attachment unless the tool declared it. A shell
+        // result from `cat source.txt` that prints one existing PNG path
+        // stays verbatim text with zero attachments.
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("quoted.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let output = format!("source example: {}", image.display());
+
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let tool_calls = vec![ParsedToolCall {
+            name: "shell".to_string(),
+            arguments: serde_json::json!({ "command": "cat source.txt" }),
+            tool_call_id: None,
+        }];
+        let ordered = vec![Some(("shell".to_string(), None, outcome(&output, true)))];
+        let collected = collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )
+        .unwrap();
+
+        assert_eq!(collected.individual_results.len(), 1);
+        let result = &collected.individual_results[0];
+        assert!(
+            result.attachments.is_empty(),
+            "a bare image path in tool text must not become an attachment"
+        );
+        assert_eq!(result.output, output, "the tool text stays verbatim");
+        assert!(
+            collected
+                .tool_results
+                .contains(&image.display().to_string()),
+            "the path stays visible to the model as text"
+        );
+    }
+
+    #[test]
+    fn loop_detector_break_carries_a_typed_stop() {
+        // Identical tool + identical args is the unambiguous pattern; it still
+        // breaks, and the bail now carries its code.
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
+        for _ in 0..6 {
+            tool_calls.push(ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({ "command": "ls" }),
+                tool_call_id: None,
+            });
+            ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
+        }
+        let err = collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        );
+        let err = match err {
+            Ok(_) => panic!("identical tool+args must break the turn"),
+            Err(e) => e,
+        };
+
+        assert_eq!(
+            turn_stop(&err).expect("break must be typed").code,
+            TurnStopCode::LoopDetector
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Agent loop aborted by loop detector:"),
+            "the message must not change: {err}"
+        );
+    }
+
+    #[test]
+    fn identical_output_abort_carries_a_typed_stop() {
+        let err = run_hash_path(8, "byte-identical successful output", true)
+            .expect_err("identical successful output must abort");
+        assert_eq!(
+            turn_stop(&err).expect("abort must be typed").code,
+            TurnStopCode::IdenticalOutput
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Agent loop aborted: identical tool output detected"),
+            "the message must not change: {err}"
+        );
+    }
+
+    #[test]
+    fn a_plain_error_stays_untyped_for_the_string_fallback() {
+        assert!(turn_stop(&anyhow::Error::msg("upstream returned 500")).is_none());
     }
 }

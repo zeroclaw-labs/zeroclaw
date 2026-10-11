@@ -337,10 +337,24 @@ impl Tool for ShellTool {
         }
 
         let timeout_secs = self.timeout_secs;
-        // Run in own process group so `ChildGroupGuard` can reap the
-        // whole subtree (backgrounded jobs, subshells) on any exit path.
+        // A process group alone still inherits the daemon's controlling terminal.
+        // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
         #[cfg(unix)]
-        cmd.process_group(0);
+        {
+            use std::os::unix::process::CommandExt;
+
+            // SAFETY: setsid is async-signal-safe; the post-fork hook takes no
+            // locks and allocates nothing before exec.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         cmd.kill_on_drop(true);
         // `output()` pipes stdio implicitly; `spawn()` does not.
         cmd.stdout(std::process::Stdio::piped());
@@ -421,7 +435,7 @@ impl Tool for ShellTool {
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }
@@ -879,6 +893,103 @@ mod tests {
                 .expect("stdin reader should return a result")
                 .success
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_child_cannot_open_owners_controlling_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_MODE: &str = "ZEROCLAW_TEST_SHELL_TERMINAL_CHILD";
+        const TEST_NAME: &str =
+            "tools::shell::tests::shell_child_cannot_open_owners_controlling_terminal";
+
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            // SAFETY: the output pointers are valid, and optional settings are null.
+            let result = unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+            // SAFETY: openpty supplied two distinct, owned descriptors.
+            let (master, slave) = unsafe {
+                (
+                    OwnedFd::from_raw_fd(master_fd),
+                    OwnedFd::from_raw_fd(slave_fd),
+                )
+            };
+            for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+                // SAFETY: both descriptors remain live throughout this setup.
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    -1
+                );
+            }
+
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, "1")
+                .stdin(Stdio::from(slave))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: only libc syscalls and errno conversion run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                        || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == -1
+                    {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut command = tokio::process::Command::from(command);
+            command.kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("isolated PTY test should finish")
+                .expect("isolated PTY test should spawn");
+            assert!(
+                output.status.success(),
+                "isolated PTY test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let tty = std::fs::File::open("/dev/tty").expect("test owner must have a terminal");
+        // SAFETY: tty is live; the process-group query takes no pointers.
+        let owner_group = unsafe { libc::getpgrp() };
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
+        // Admit the probe so policy rejection cannot masquerade as terminal isolation.
+        let security = Arc::new(SecurityPolicy {
+            allowed_roots_read_only: vec!["/dev/tty".into()],
+            ..(*unrestricted_shell_test_security()).clone()
+        });
+        let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "if ( : < /dev/tty ) 2> /dev/null; then printf attached; else printf detached; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), "detached");
+        // SAFETY: tty still refers to this subprocess's isolated terminal.
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
     }
 
     #[tokio::test]
@@ -1817,6 +1928,96 @@ mod tests {
             MAX_OUTPUT_BYTES, 1_048_576,
             "max output must be 1 MB to prevent OOM"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_reaps_descendants_after_timeout_or_cancellation() {
+        for cancel in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: workspace.path().to_path_buf(),
+                ..(*unrestricted_shell_test_security()).clone()
+            });
+            let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(if cancel {
+                10
+            } else {
+                1
+            });
+            // The descendant publishes its own PID, then becomes the sleep, so
+            // the PID file proves it is running and names the process to check.
+            let task = zeroclaw_spawn::spawn!(async move {
+                tool.execute(json!({
+                    "command": "sh -c 'echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 30' & wait"
+                }))
+                .await
+            });
+            let pid_file = workspace.path().join("descendant.pid");
+            let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        break text.trim().parse().expect("descendant PID");
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "shell exited before starting its descendant"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shell descendant should start");
+
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let result = task.await.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.error.unwrap().contains("timed out"));
+            }
+            let exited = tokio::time::timeout(Duration::from_secs(2), async {
+                while descendant_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !exited {
+                // SAFETY: kill only signals the PID the descendant reported.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                exited,
+                "descendant {pid} survived {}",
+                if cancel { "cancellation" } else { "timeout" }
+            );
+        }
+    }
+
+    /// True while `pid` names a live process. A killed descendant whose new
+    /// parent has not reaped it yet still answers `kill(pid, 0)`, so a zombie
+    /// counts as exited. Only `kill(pid, 0)` failing or `ps` reporting a
+    /// zombie state counts as exited; a `ps` that fails or reports no state
+    /// counts as running, and the caller's next poll repeats both checks.
+    #[cfg(unix)]
+    fn descendant_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the PID exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return true;
+        };
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        if !output.status.success() || state.is_empty() {
+            return true;
+        }
+        !state.starts_with('Z')
     }
 
     #[cfg(unix)]

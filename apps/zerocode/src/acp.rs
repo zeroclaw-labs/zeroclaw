@@ -12,6 +12,11 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
+    pub(crate) fn from_chat_for_test(inner: chat::Chat) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
@@ -207,6 +212,10 @@ impl Acp {
 
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
     }
 }
 
