@@ -157,7 +157,7 @@
 # Maintainer-process docs (PM/process lane). Narrower than /docs/**, so it
 # must come after it (last match wins).
 # ---------------------------------------------------------------------------
-/docs/book/src/maintainers/** @Audacity88 @IftekharUddin
+/docs/book/src/maintainers/** @Audacity88 @IftekharUddin @JordanTheJet
 
 # ---------------------------------------------------------------------------
 # Governance, release, CI (high-risk)
