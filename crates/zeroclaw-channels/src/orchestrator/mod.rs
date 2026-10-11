@@ -797,6 +797,10 @@ impl ModelPickerDispatchOwnership {
     fn hold(_message_id: &str) -> Self {
         Self
     }
+
+    /// Nothing to settle. Mirrors the Telegram token's `release` so callers
+    /// never `drop()` this type, which has no drop glue.
+    fn release(self) {}
 }
 
 /// A turn waiting for its conversation lane.
@@ -11167,7 +11171,7 @@ async fn run_conversation_turn(
             Some(Arc::clone(&turn_lease)),
         )
         .await;
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11177,7 +11181,7 @@ async fn run_conversation_turn(
     // still queued; the slot is released without running it.
     if registration.cancellation.is_cancelled() {
         drop(registration);
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11192,7 +11196,7 @@ async fn run_conversation_turn(
     )
     .await;
     drop(registration);
-    drop(dispatch_ownership);
+    dispatch_ownership.release();
     drop(execution_permit);
     drop(pending_work);
 }
