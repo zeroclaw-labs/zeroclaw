@@ -524,6 +524,42 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   await unmount(mounted.renderer);
 });
 
+test('the composer stays focusable and read-only during a turn and sends nothing until it ends', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const pressEnter = () => act(async () => {
+    textarea(mounted.renderer).props.onKeyDown({
+      key: 'Enter',
+      shiftKey: false,
+      nativeEvent: { isComposing: false },
+      preventDefault: () => {},
+    });
+  });
+
+  await typeInComposer(mounted.renderer, 'first question');
+  await pressEnter();
+  assert.deepEqual(runtime.sockets[0]?.sent, ['first question']);
+  // Disabling the textarea would drop its focus for the whole turn.
+  assert.equal(textarea(mounted.renderer).props.readOnly, true);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+
+  // An image upload can still change the draft mid-turn; Enter must not send it.
+  await typeInComposer(mounted.renderer, '[IMAGE:uploads/photo.png] ');
+  await pressEnter();
+  assert.deepEqual(runtime.sockets[0]?.sent, ['first question']);
+
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer' });
+  });
+  await settle();
+  assert.equal(textarea(mounted.renderer).props.readOnly, false);
+  await unmount(mounted.renderer);
+});
+
 test('a deferred model PUT rebuilds the latest selected session socket', async () => {
   const runtime = new FakeSessionRuntime();
   const configPut = new Deferred<Response>();
