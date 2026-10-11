@@ -16,7 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::FutureExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::json;
 use std::any::Any;
 use std::future::Future;
@@ -42,7 +42,7 @@ struct PeerInboxTask {
 /// agent's resolved peer set.
 pub struct SendMessageToPeerTool {
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     sender_alias: String,
     description: String,
     task_control_plane: Option<ControlPlaneHandle>,
@@ -65,7 +65,7 @@ impl SendMessageToPeerTool {
     pub(crate) fn new_with_live_config_and_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
-        live_config: Option<Arc<RwLock<Config>>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
         let sender_alias = sender_alias.into();

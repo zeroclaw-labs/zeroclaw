@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, LineDmPolicy, LineGroupPolicy};
+#[cfg(test)]
+use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{LineDmPolicy, LineGroupPolicy};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -237,7 +239,7 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 ///
 /// Asked before `try_pair`, because pairing consumes the one-time code.
 fn line_pairing_deny_conflict(state: &LineState, user_id: &str) -> Option<String> {
-    let config = state.persist.as_ref()?.config();
+    let config = state.persist.as_ref()?.live_handle();
     let cfg = config.read();
     crate::identity_persist::external_peer_deny_conflict(
         &cfg,
@@ -874,16 +876,6 @@ impl LineChannel {
         }
     }
 
-    /// Wire a config handle so `persist_line_paired_identity` can write a
-    /// newly-paired userId into `peer_groups.line_<alias>.external_peers` and
-    /// save. Standalone callers get a local mutation witness; supervised
-    /// callers use [`Self::with_persistence_authority`] to share the daemon
-    /// witness.
-    pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
-    }
-
     /// Wire the daemon generation's live-config authority for pairing writes.
     pub fn with_persistence_authority(
         mut self,
@@ -1352,11 +1344,8 @@ mod tests {
         let channel = make_channel().with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[tokio::test]
@@ -1402,7 +1391,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("line", "line_test_alias")
                 .is_empty()
@@ -3240,8 +3229,7 @@ mod tests {
         let code = channel.pairing.as_ref().unwrap().pairing_code().unwrap();
         let waiting = Arc::new(tokio::sync::Notify::new());
         channel.persistence_waiting = Some(Arc::clone(&waiting));
-        let lock = authority.config_write_lock();
-        let guard = lock.lock().await;
+        let guard = authority.begin_config_commit().await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, _rx) = mpsc::channel(1);
@@ -3281,7 +3269,7 @@ mod tests {
         drop(guard);
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("line", "line_test_alias")
                 .is_empty()
@@ -3427,7 +3415,7 @@ mod tests {
             0,
         )
         .with_api_base_url(&api_server.uri())
-        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(config));
 
         // The guard is shared into `LineState`, so it outlives the move into
         // the webhook task and still answers for the code afterwards.
@@ -3521,7 +3509,7 @@ mod tests {
             0,
         )
         .with_api_base_url(&api_server.uri())
-        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(config));
 
         let guard = ch.pairing.as_ref().expect("pairing offered").clone();
         let code = guard.pairing_code().expect("a fresh guard issues a code");

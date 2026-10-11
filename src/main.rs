@@ -2957,7 +2957,7 @@ async fn run_quickstart_cli(
     };
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
             println!(
                 "{}",
@@ -2983,6 +2983,45 @@ async fn run_quickstart_cli(
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors,
+            },
+        ) => {
+            // The config was persisted (the agent exists) but a
+            // post-commit side effect — the personality files — failed.
+            // The committed config is not rolled back: report the partial
+            // success truthfully (no "complete" line), and preserve the
+            // historical nonzero failure result for this outcome.
+            eprintln!();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-quickstart-partial-personality-failure",
+                    &[("alias", &applied.alias)],
+                    "The agent config for {$alias} was saved, but installing its \
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
+                )
+            );
+            eprintln!();
+            for err in &errors {
+                eprintln!("  • {}: {}", quickstart_step_label(err.step), err.message);
+            }
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errors.len().to_string())],
+                )
+            )
         }
         Err(errs) => {
             eprintln!();
@@ -4734,14 +4773,22 @@ fn resolve_wss_client_auth(
         .map(|config| config.pinned_certs.clone())
         .unwrap_or_default();
     let byo_ca = client_auth
-        .filter(|config| config.enabled && !config.ca_cert_path.is_empty())
-        .map(|config| config.ca_cert_path.clone());
+        .and_then(zeroclaw_config::schema::WssClientAuthConfig::external_ca_path)
+        .map(str::to_string);
     Ok((byo_ca, pinned))
 }
 
 #[cfg(feature = "agent-runtime")]
-fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
-    if wss_cfg.sans.is_empty() {
+/// Server-certificate SANs shared by the WSS listener and the enrollment
+/// endpoint: `localhost`/`127.0.0.1`, the operator's `[wss].sans`, then
+/// `tailnet_sans` (resolved by `zeroclaw_runtime::tunnel::tailscale_server_sans`).
+/// Empty when there is nothing beyond the defaults, which keeps the
+/// default-SAN leaf reuse path in `ensure_server_materials_protected`.
+fn wss_server_sans(
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet_sans: &[String],
+) -> Vec<String> {
+    if wss_cfg.sans.is_empty() && tailnet_sans.is_empty() {
         return Vec::new();
     }
 
@@ -4750,10 +4797,89 @@ fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> 
         wss_cfg
             .sans
             .iter()
+            .chain(tailnet_sans)
             .filter(|value| !value.trim().is_empty())
             .cloned(),
     );
     sans
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The server-certificate SAN set for one daemon generation (one pass of the
+/// config-reload loop), shared by the WSS listener and the enrollment endpoint.
+///
+/// Both listeners materialize the same `<data_dir>/tls/server.*` leaf and each
+/// loads it into its own TLS acceptor, so they must agree on its SANs. The
+/// tailnet identity is therefore resolved once per generation and every
+/// listener receives that one answer; resolving it per listener let two
+/// `tailscale status` queries disagree (one failing, or a rename in between)
+/// and leave the listeners serving different leaves. A reload builds a fresh
+/// value, so a renamed node or reassigned tailnet IP is picked up then. This
+/// is the materialization the acceptors consume, not a second copy of config:
+/// the inputs are still read from live config and tailscaled at startup.
+#[derive(Clone, Default)]
+struct DaemonServerTls {
+    sans: Arc<tokio::sync::OnceCell<Vec<String>>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl DaemonServerTls {
+    /// Generate or reuse the server leaf under `tls_dir` with this
+    /// generation's SAN set. `discover` runs only for the first listener to
+    /// get here; later listeners reuse its outcome.
+    async fn materialize<F, Fut>(
+        &self,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        protection: &zeroclaw_tls::CaKeyProtection,
+        discover: F,
+    ) -> Result<zeroclaw_tls::ServerMaterials>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = zeroclaw_runtime::tunnel::TailnetSans>,
+    {
+        let sans = self
+            .sans
+            .get_or_try_init(|| async { effective_server_sans(tls_dir, wss_cfg, discover().await) })
+            .await?;
+        zeroclaw_tls::ensure_server_materials_protected(tls_dir, sans, protection)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The SAN set to request for the server leaf given the tailnet outcome.
+///
+/// When tailscaled cannot be queried the tailnet names are unknown, not
+/// absent, so the result never drops a name the existing leaf carries: it is
+/// the configured set plus every name already on the leaf. Configured
+/// additions still apply; a configured removal waits for the next start that
+/// can query tailscaled. An empty result keeps the generator's reuse path.
+fn effective_server_sans(
+    tls_dir: &Path,
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet: zeroclaw_runtime::tunnel::TailnetSans,
+) -> Result<Vec<String>> {
+    use zeroclaw_runtime::tunnel::TailnetSans;
+    match tailnet {
+        TailnetSans::NotApplicable => Ok(wss_server_sans(wss_cfg, &[])),
+        TailnetSans::Resolved(names) => Ok(wss_server_sans(wss_cfg, &names)),
+        TailnetSans::Unavailable { hostname_override } => {
+            let known: Vec<String> = hostname_override.into_iter().collect();
+            let mut sans = wss_server_sans(wss_cfg, &known);
+            let existing = zeroclaw_tls::server_leaf_sans(tls_dir)
+                .context("reading the existing WSS server certificate's SANs")?;
+            if let Some(existing) = existing
+                && !sans.is_empty()
+            {
+                for name in existing {
+                    if !sans.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                        sans.push(name);
+                    }
+                }
+            }
+            Ok(sans)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "agent-runtime"))]
@@ -4795,14 +4921,390 @@ mod wss_client_auth_tests {
         };
 
         assert_eq!(
-            wss_server_sans(&cfg),
+            wss_server_sans(&cfg, &[]),
             vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn wss_server_sans_appends_tailnet_names_after_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["zero".into()],
+            ..Default::default()
+        };
+        let tailnet = vec![
+            "node.tail1234.ts.net".to_string(),
+            "100.101.102.103".to_string(),
+        ];
+
+        assert_eq!(
+            wss_server_sans(&cfg, &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "zero".to_string(),
+                "node.tail1234.ts.net".to_string(),
+                "100.101.102.103".to_string(),
+            ]
+        );
+    }
+
+    use zeroclaw_runtime::tunnel::TailnetSans;
+
+    fn tailnet_names() -> Vec<String> {
+        vec![
+            "node.tail1234.ts.net".to_string(),
+            "node".to_string(),
+            "100.101.102.103".to_string(),
+        ]
+    }
+
+    fn wss_with_sans(sans: &[&str]) -> zeroclaw_config::schema::WssConfig {
+        zeroclaw_config::schema::WssConfig {
+            enabled: true,
+            sans: sans.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn leaf_fingerprint(tls_dir: &Path) -> String {
+        let der = zeroclaw_tls::load_certs(&tls_dir.join("server.crt").to_string_lossy())
+            .expect("server leaf");
+        zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref())
+    }
+
+    fn leaf_sans(tls_dir: &Path) -> Vec<String> {
+        zeroclaw_tls::server_leaf_sans(tls_dir)
+            .expect("read leaf")
+            .expect("leaf exists")
+    }
+
+    /// Run one listener's certificate step the way the WSS and enrollment
+    /// starters do, recording whether its discovery ran.
+    async fn materialize_as_listener(
+        shared: &DaemonServerTls,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        outcome: TailnetSans,
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> zeroclaw_tls::ServerMaterials {
+        shared
+            .materialize(
+                tls_dir,
+                wss_cfg,
+                &zeroclaw_tls::CaKeyProtection::None,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    outcome
+                },
+            )
+            .await
+            .expect("materialize server TLS")
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_tailnet_resolution_when_queries_would_differ() {
+        // WSS and enrollment share one tailnet resolution. Here the second
+        // listener's query would fail where the first succeeded: both must
+        // still load the same leaf, and it must carry the tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let wss = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let wss_leaf = leaf_fingerprint(&tls_dir);
+
+        let enroll = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            wss_leaf,
+            leaf_fingerprint(&tls_dir),
+            "the second listener replaced the leaf the first one loaded"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} missing from {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_resolution_when_the_first_query_fails() {
+        // Opposite order on fresh TLS state: the first listener's query fails
+        // and a later one would succeed. Both listeners must load the same
+        // leaf instead of the second regenerating it under the first.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+        let first = leaf_fingerprint(&tls_dir);
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first, leaf_fingerprint(&tls_dir));
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_keeps_names_the_existing_leaf_carries() {
+        // With configured SANs, a failed query must not regenerate the leaf
+        // without the previously discovered tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled reachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled unreachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "an outage must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    /// `tailscale status --json` as tailscaled reports it before receiving
+    /// its network map: exit status 0, OS hostname only, empty DNSName, null
+    /// TailscaleIPs, InNetworkMap false.
+    const NOT_READY_STATUS_JSON: &[u8] = br#"{
+        "BackendState": "Starting",
+        "Self": {
+            "HostName": "zcnode",
+            "DNSName": "",
+            "TailscaleIPs": null,
+            "InNetworkMap": false
+        }
+    }"#;
+
+    /// Discovery as production classifies a successful-but-not-ready status.
+    fn not_ready_status(hostname_override: Option<&str>) -> TailnetSans {
+        zeroclaw_runtime::tunnel::tailnet_sans_from_status(
+            Ok(zeroclaw_runtime::tunnel::parse_tailscale_self(
+                NOT_READY_STATUS_JSON,
+            )),
+            hostname_override.map(Into::into),
+        )
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_keeps_names_the_existing_leaf_carries() {
+        // A successful status with an empty identity is "not known yet"; with
+        // configured SANs it must not regenerate the leaf without its tailnet
+        // names, for either listener sharing this generation.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled ready.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled answers before its network map.
+        let shared = DaemonServerTls::default();
+        let wss =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+        let enroll =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "a not-ready status must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_with_override_keeps_discovered_names() {
+        // With a hostname override the not-ready path must keep the
+        // previously discovered names alongside it, not just the override.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            not_ready_status(Some("zero.tail1234.ts.net")),
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(
+            sans.contains(&"zero.tail1234.ts.net".to_string()),
+            "{sans:?}"
+        );
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_applies_configured_additions_without_stripping() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero"]),
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        // Operator adds a SAN while tailscaled is down.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero", "shard"]),
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(sans.contains(&"shard".to_string()), "{sans:?}");
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[test]
+    fn effective_server_sans_on_fresh_state_outage_uses_known_names() {
+        // No leaf yet and tailscaled down: only names known without it -
+        // loopback, [wss].sans, and the hostname override.
+        let dir = tempfile::tempdir().unwrap();
+        let sans = effective_server_sans(
+            dir.path(),
+            &wss_with_sans(&[]),
+            TailnetSans::Unavailable {
+                hostname_override: Some("zero.tail1234.ts.net".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
+        // Default config, nothing known: empty keeps the default leaf path.
+        assert!(
+            effective_server_sans(
+                dir.path(),
+                &wss_with_sans(&[]),
+                TailnetSans::Unavailable {
+                    hostname_override: None
+                },
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn wss_server_sans_tailnet_names_alone_still_keep_loopback() {
+        // No [wss].sans: tailnet names must not drop localhost/127.0.0.1,
+        // which local clients and the relay bridge dial.
+        let tailnet = vec!["node.tail1234.ts.net".to_string()];
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "node.tail1234.ts.net".to_string(),
+            ]
+        );
     }
 }
 
@@ -7571,11 +8073,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     })
                 }));
 
-                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                // One server-certificate SAN resolution per generation, shared
+                // by the WSS listener and the enrollment endpoint.
+                let daemon_server_tls = DaemonServerTls::default();
+                let daemon_server_tls_for_wss = daemon_server_tls.clone();
+                let daemon_server_tls_for_enroll = daemon_server_tls;
+                registry.register_wss(Box::new(move |ctx, cancel, client_count| {
+                    let daemon_server_tls = daemon_server_tls_for_wss.clone();
                     Box::pin(async move {
-                        let (wss_cfg, data_dir) = {
+                        let (wss_cfg, enroll_cfg, tunnel_cfg, data_dir) = {
                             let cfg = ctx.config.read();
-                            (cfg.wss.clone(), cfg.data_dir.clone())
+                            (
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.tunnel.clone(),
+                                cfg.data_dir.clone(),
+                            )
                         };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
@@ -7610,14 +8123,25 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 // enrollment + CLI read paths use), else 0600.
                                 // [wss].sans adds the hostnames/IPs a remote client
                                 // uses to reach the daemon to the server cert. The
-                                // enrollment endpoint uses the same resolver so both
-                                // TLS surfaces present matching daemon identities.
-                                let server_sans = wss_server_sans(&wss_cfg);
-                                let mats = zeroclaw_tls::ensure_server_materials_protected(
-                                    &data_dir.join("tls"),
-                                    &server_sans,
-                                    &ca_key_protection_from_env(),
-                                )?;
+                                // enrollment endpoint shares this generation's
+                                // DaemonServerTls, so both TLS surfaces present
+                                // the same leaf. When reached over the tailnet,
+                                // the node's MagicDNS name and tailnet IPs are
+                                // added too.
+                                let mats = daemon_server_tls
+                                    .materialize(
+                                        &data_dir.join("tls"),
+                                        &wss_cfg,
+                                        &ca_key_protection_from_env(),
+                                        || {
+                                            zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                                &tunnel_cfg,
+                                                &wss_cfg,
+                                                &enroll_cfg,
+                                            )
+                                        },
+                                    )
+                                    .await?;
                                 (
                                     mats.server_cert_path.to_string_lossy().into_owned(),
                                     mats.server_key_path.to_string_lossy().into_owned(),
@@ -7811,11 +8335,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // this works with no gateway. It is NOT the mTLS RPC plane.
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
+                    let daemon_server_tls = daemon_server_tls_for_enroll.clone();
                     Box::pin(async move {
                         let (
                             enroll_cfg,
                             wss_cfg,
                             relay_cfg,
+                            tunnel_cfg,
                             data_dir,
                             startup_pairing_code_policy,
                         ) = {
@@ -7824,6 +8350,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
+                                cfg.tunnel.clone(),
                                 cfg.data_dir.clone(),
                                 cfg.gateway.pairing_code,
                             )
@@ -7848,13 +8375,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         //      trusts an external CA cert whose key the daemon does
                         //      not hold. It cannot sign - fail closed: do not open
                         //      the endpoint (provision client certs out of band).
-                        let byo_ca = wss_cfg
-                            .client_auth
-                            .as_ref()
-                            .filter(|c| c.enabled)
-                            .map(|c| !c.ca_cert_path.is_empty())
-                            .unwrap_or(false);
-                        if byo_ca {
+                        // Same predicate the tunnel uses to decide whether to
+                        // publish this endpoint (`daemon_tcp_services`).
+                        if wss_cfg.external_client_ca().is_some() {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -7876,12 +8399,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let ca_provided =
                             tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
                         let protection = ca_key_protection_from_env();
-                        let server_sans = wss_server_sans(&wss_cfg);
-                        let mats = zeroclaw_tls::ensure_server_materials_protected(
-                            &tls_dir,
-                            &server_sans,
-                            &protection,
-                        )?;
+                        let mats = daemon_server_tls
+                            .materialize(&tls_dir, &wss_cfg, &protection, || {
+                                zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                    &tunnel_cfg,
+                                    &wss_cfg,
+                                    &enroll_cfg,
+                                )
+                            })
+                            .await?;
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(

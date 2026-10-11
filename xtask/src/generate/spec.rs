@@ -1675,6 +1675,7 @@ mod tests {
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
         assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
         assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert!(manual.contains("echo \"- SHA-256: $sha256\""));
         for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
             assert!(manual.contains(&format!(
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"

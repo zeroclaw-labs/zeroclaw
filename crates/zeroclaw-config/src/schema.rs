@@ -162,6 +162,18 @@ pub struct Config {
     /// CLI surfaces upgrade guidance without retaining the retired secret.
     #[serde(skip)]
     pub retired_node_transport_config: bool,
+    /// The config file this value was populated from — set by
+    /// `load_or_init` (both the existing-file read and the fresh-init
+    /// write) and by loaders that re-read a config file before mutating.
+    /// `Default`/programmatic construction leaves it `None`, and `save()`
+    /// then refuses to overwrite an existing file this value cannot prove
+    /// it read, so a near-empty snapshot cannot wipe an operator's config;
+    /// `force_save()` is the explicit intentional-overwrite path. Binding
+    /// provenance to the path (not a boolean) also refuses a value loaded
+    /// from file A that is later repointed at a different existing file B.
+    /// Never serialized — a load-time signal.
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -826,17 +838,18 @@ impl WireApi {
     }
 }
 
-/// Policy for image markers embedded in native tool-result content.
+/// Policy for images a native tool-result carrier declared in its
+/// `attachments` array.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Preserve tool-result image markers as structured `image_url` parts.
+    /// Send declared tool-result images as structured `image_url` parts.
     #[default]
     ImageUrl,
-    /// Remove tool-result image payloads and leave a fixed notice for the model.
+    /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
 }
 
@@ -1099,10 +1112,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// How native compatible chat-completions providers handle image markers in
-    /// role=`tool` results. `image_url` preserves structured image parts;
-    /// `omit` removes their payloads and appends a fixed notice. This does not
-    /// affect direct user image content or OpenAI Responses providers.
+    /// How native compatible chat-completions providers handle images a
+    /// role=`tool` result declared in its `attachments` array. `image_url`
+    /// sends them as structured image parts; `omit` drops them and appends a
+    /// fixed notice, keeping the result text verbatim. Legacy tool results
+    /// (no array key) pass verbatim under both settings: they declare
+    /// nothing and their bodies are text, so literal marker syntax in a
+    /// tool's output never drives this policy. This does not affect direct
+    /// user image content or OpenAI Responses providers.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_default_tool_result_image_policy")]
     pub tool_result_image_policy: ToolResultImagePolicy,
@@ -7164,16 +7181,17 @@ impl Default for PipelineConfig {
 ///
 /// # Privacy and cost note
 ///
-/// Tool results that print real local image paths (e.g. shell tools doing
-/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
-/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
-/// This means image bytes that previously stayed local will be uploaded to
-/// the configured provider when surfaced by a tool.
+/// Tool text is never scanned for image paths: a tool result that merely
+/// prints a local path (e.g. shell tools doing `ls /pictures` or
+/// `find . -name '*.png'`) stays text. Image bytes are uploaded only when a
+/// tool explicitly declares an attachment, and a declared attachment is
+/// base64-inlined into the next provider request, so operators running
+/// tools that declare image attachments over personal or sensitive files
+/// should be aware of the upload semantics.
 ///
 /// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
-/// image budget, but operators running shell-style tools over directories of
-/// personal or sensitive images should be aware of the upload semantics. See
-/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
+/// image budget. See `docs/book/src/contributing/privacy.md` for the
+/// project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
@@ -7182,14 +7200,17 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. When a
-    /// new image takes the count past the limit, the oldest surviving
-    /// image is removed from its message, which can invalidate a
-    /// provider's cached prefix from that message onward; a larger limit
-    /// delays cap eviction and reduces how many happen over a session,
-    /// but once the limit is full each further image still evicts one.
-    /// Acts as the upper bound on per-turn upload cost when tool outputs
-    /// surface local image paths.
+    /// dropped first. When a new image takes the count past the limit, the
+    /// oldest images are removed in one batch, down to half the limit
+    /// rounded up (4 -> 2, 8 -> 4, 16 -> 8); the count then grows back to the
+    /// limit before the next batch. Removing an image changes the message
+    /// that held it, which can invalidate a provider's cached prefix from
+    /// that message onward; batching means a session past the limit pays
+    /// that once every `max_images / 2 + 1` new images rather than on every
+    /// one. Right after a batch the model sees fewer older images than the
+    /// limit allows. A larger limit delays the first batch and makes each
+    /// one less frequent. Acts as the upper bound on per-turn upload cost
+    /// when tool outputs surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8169,6 +8190,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,
@@ -8226,6 +8251,25 @@ impl Default for WssConfig {
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
+    }
+}
+
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
     }
 }
 
@@ -15785,6 +15829,22 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Notice policy for ordinary same-family, different-model channel fallback.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallbackNotice {
+    /// Omit ordinary same-family model fallback notices.
+    #[default]
+    Off,
+    /// Report fallback without exposing provider or model identifiers.
+    Redacted,
+    /// Include requested and served provider/model identifiers.
+    Detailed,
+}
+
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -15966,6 +16026,13 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Notice mode for ordinary same-family, different-model fallback: `off`
+    /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
+    /// channels and is read from live config at outbound delivery. Detailed
+    /// notices expose requested and served provider/model identifiers to the
+    /// channel audience. Cross-family and safeguard notices are unchanged.
+    #[serde(default)]
+    pub model_fallback_notice: ModelFallbackNotice,
     /// Persist channel conversation history to JSONL files so sessions survive
     /// daemon restarts. Files are stored in `{workspace}/sessions/`. Default: `true`.
     #[serde(default = "default_true")]
@@ -16429,6 +16496,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -21035,6 +21103,7 @@ impl Default for Config {
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -22861,6 +22930,7 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.data_dir = workspace_dir;
+            config.loaded_from = Some(config_path.clone());
 
             // Ensure each configured skill-bundle's resolved directory
             // exists on disk so the bundle has somewhere for skills to
@@ -22934,6 +23004,9 @@ impl Config {
             // freshly-created config file. Env overrides apply post-save to
             // populate the in-memory Config for the running process.
             config.save().await?;
+            // This value just wrote the file; mark provenance so later full
+            // saves of the same value stay legitimate.
+            config.loaded_from = Some(config_path.clone());
 
             // Restrict permissions on newly created config file (may contain API keys)
             #[cfg(unix)]
@@ -22963,6 +23036,66 @@ impl Config {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
+    }
+
+    /// Hydrate one already-migrated config body exactly as a reload would,
+    /// without replacing the config file.
+    ///
+    /// This is the preparation step for config migration (see the
+    /// gateway's migrate endpoint): the candidate must be fully hydrated
+    /// — strict parse into the current schema, computed paths attached,
+    /// secrets decrypted through the install's store, env overrides
+    /// applied with their save-masking snapshots captured — and must pass
+    /// strict validation *before* the migrated file is allowed to replace
+    /// the live one. Any failure (parse, secret, unresolvable env path,
+    /// validation) refuses the migration with the original config file
+    /// untouched and nothing published. Migration acceptance is stricter
+    /// than resilient boot ([`Config::load_or_init`] warns and serves);
+    /// an operator-driven replacement may not install a config the
+    /// current schema rejects.
+    ///
+    /// The caller supplies the canonical `config_path` and `data_dir`
+    /// (from the currently published config) so the prepared candidate is
+    /// exactly the config the next daemon generation would load from the
+    /// migrated file.
+    pub async fn prepare_from_migrated_toml(
+        content: &str,
+        config_path: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let mut config = crate::migration::migrate_to_current(content)
+            .context("migrated config failed to hydrate as the current schema")?;
+        config.config_path = config_path.to_path_buf();
+        config.data_dir = data_dir.to_path_buf();
+
+        if let Some(default_profile) = config.risk_profiles.get_mut("default") {
+            default_profile.ensure_default_auto_approve();
+        }
+
+        let zeroclaw_dir = config_path
+            .parent()
+            .context("config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config = tokio::task::spawn_blocking(move || {
+            config.decrypt_secrets(&store)?;
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("migrated config secret decryption task failed")??;
+
+        let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+
+        // Strict validation: unlike resilient boot, an operator-driven
+        // migration refuses a candidate the current schema rejects. The
+        // refusal happens before any disk replacement, so the original
+        // file and the published pair are unchanged.
+        config
+            .validate()
+            .context("migrated config failed strict validation")?;
+        Ok(config)
     }
 
     /// Report that opting into `[verifiable_intent]` does not currently enable
@@ -26009,7 +26142,30 @@ impl Config {
         Ok(resolved)
     }
 
+    /// Full save. Refuses to overwrite an existing config file unless this
+    /// value was loaded from that exact file (`loaded_from`), so a default,
+    /// programmatically built, or repointed `Config` cannot replace an
+    /// operator's config with a near-empty snapshot. Creating a
+    /// missing file (first run) always succeeds — a value that never read
+    /// a file gets exactly one create and must then reload or use
+    /// `force_save()`; `force_save()` is the explicit overwrite path.
     pub async fn save(&self) -> Result<()> {
+        self.save_impl(false).await.map(|_| ())
+    }
+
+    /// Same as `save()`, but skips the loaded-provenance guard. Only for
+    /// callers that verifiably intend to replace an existing file with a
+    /// `Config` that never read it.
+    ///
+    /// Destination-path checks still apply. To replace an existing file, set
+    /// `config_path` to the intended path with a nonempty parent directory.
+    /// A bare filename such as `config.toml` is refused if its runtime-resolved
+    /// destination already exists.
+    pub async fn force_save(&self) -> Result<()> {
+        self.save_impl(true).await.map(|_| ())
+    }
+
+    async fn save_impl(&self, force: bool) -> Result<PathBuf> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -26018,6 +26174,35 @@ impl Config {
         // emit a body-newer-than-label file. See `save_dirty` and.
         config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
+        // Fail closed: a metadata error must not read as "file absent" and
+        // slip an unproven save past the guard.
+        let target_exists = config_path.try_exists().with_context(|| {
+            format!(
+                "Cannot check config target {}; refusing to save",
+                config_path.display()
+            )
+        })?;
+        if !force && target_exists && self.loaded_from.as_ref() != Some(&config_path) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.save_refused_unproven_overwrite",
+                        "path": config_path.display().to_string(),
+                    })),
+                "refusing to overwrite an existing config this Config was never loaded from"
+            );
+            anyhow::bail!(
+                "Refusing to overwrite existing config at {}: this Config was \
+                 not loaded from that file (default-constructed, built \
+                 programmatically, or loaded from a different file), so saving \
+                 would replace the operator's file with a near-empty snapshot. \
+                 Load it first (e.g. `Config::load_or_init`) or call \
+                 `force_save()` to overwrite deliberately.",
+                config_path.display()
+            );
+        }
         let zeroclaw_dir = config_path
             .parent()
             .context("Config path must have a parent directory")?;
@@ -26083,7 +26268,11 @@ impl Config {
             new_toml
         };
 
-        write_config_atomically(&config_path, &toml_str).await
+        write_config_atomically(&config_path, &toml_str).await?;
+        // Report the path actually written so `save_dirty`'s create
+        // fallback can record provenance without re-resolving (the
+        // resolver re-reads the environment for parentless paths).
+        Ok(config_path)
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -26099,11 +26288,16 @@ impl Config {
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save().await;
-            if result.is_ok() {
-                self.clear_dirty();
-            }
-            return result;
+            return match self.save_impl(false).await {
+                Ok(written) => {
+                    // This value just created the file; `written` is the
+                    // path the full save actually wrote.
+                    self.loaded_from = Some(written);
+                    self.clear_dirty();
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
         }
 
         let mut config_to_save = self.clone();
@@ -32723,6 +32917,7 @@ auto_save = true
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -32864,6 +33059,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
@@ -34038,6 +34234,7 @@ default_temperature = 0.7
             degraded_sections: Vec::new(),
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
+            loaded_from: None,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -34569,6 +34766,10 @@ default_temperature = 0.7
         );
         config.save().await.unwrap();
         assert!(config_path.exists());
+        // This value just wrote the file; mirror load_or_init's fresh-init
+        // provenance so the second save exercises the atomic-write path,
+        // not the unproven-overwrite guard.
+        config.loaded_from = Some(config_path.clone());
 
         config
             .providers
@@ -35038,6 +35239,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -35058,6 +35260,68 @@ allowed_users = ["@u:matrix.org"]
         let c = ChannelsConfig::default();
         assert!(c.imessage.is_empty());
         assert!(c.matrix.is_empty());
+    }
+
+    #[test]
+    async fn model_fallback_notice_defaults_round_trips_and_configurable_values() {
+        let parsed: Config = toml::from_str("[channels]").unwrap();
+        assert_eq!(
+            parsed.channels.model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+        assert_eq!(
+            ChannelsConfig::default().model_fallback_notice,
+            ModelFallbackNotice::Off
+        );
+
+        let mut config = Config::default();
+        for (value, mode) in [
+            ("off", ModelFallbackNotice::Off),
+            ("redacted", ModelFallbackNotice::Redacted),
+            ("detailed", ModelFallbackNotice::Detailed),
+        ] {
+            config
+                .set_prop("channels.model_fallback_notice", value)
+                .unwrap();
+            assert_eq!(config.channels.model_fallback_notice, mode);
+            assert_eq!(
+                config.get_prop("channels.model_fallback_notice").unwrap(),
+                value
+            );
+
+            let serialized = toml::to_string(&config.channels).unwrap();
+            assert!(serialized.contains(&format!("model_fallback_notice = \"{value}\"")));
+            let round_trip: ChannelsConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(round_trip.model_fallback_notice, mode);
+        }
+
+        assert!(toml::from_str::<ChannelsConfig>("model_fallback_notice = \"verbose\"").is_err());
+        assert!(
+            config
+                .set_prop("channels.model_fallback_notice", "verbose")
+                .is_err()
+        );
+        assert_eq!(
+            config.channels.model_fallback_notice,
+            ModelFallbackNotice::Detailed
+        );
+
+        #[cfg(feature = "schema-export")]
+        {
+            let field = config
+                .prop_fields()
+                .into_iter()
+                .find(|field| field.name == "channels.model_fallback_notice")
+                .unwrap();
+            assert_eq!(
+                field.enum_variants.unwrap()(),
+                vec![
+                    "off".to_string(),
+                    "redacted".to_string(),
+                    "detailed".to_string()
+                ]
+            );
+        }
     }
 
     // ── Edge cases: serde(default) for non-secret optional fields ─────
@@ -35594,6 +35858,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
@@ -38843,6 +39108,139 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn save_refuses_unproven_overwrite_of_existing_config() {
+        // A Config that never read the target file
+        // must not be able to overwrite an operator's populated config, and
+        // the refusal must leave the existing bytes untouched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let operator_bytes = "# operator's hand-written config\n[observability]\nenabled = false\n";
+        tokio::fs::write(&config_path, operator_bytes)
+            .await
+            .unwrap();
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+
+        let err = config
+            .save()
+            .await
+            .expect_err("unproven overwrite must fail");
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "error should name the refusal, got: {err:#}"
+        );
+        let after = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert_eq!(
+            after, operator_bytes,
+            "refused save must leave the existing file byte-identical"
+        );
+    }
+
+    #[test]
+    async fn force_save_overwrites_without_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(&config_path, "old = true\n")
+            .await
+            .unwrap();
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.force_save().await.unwrap();
+        let after = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !after.contains("old = true"),
+            "force_save must actually replace the file content, got: {after}"
+        );
+        assert!(
+            after.contains("schema_version"),
+            "force_save must write a real config body, got: {after}"
+        );
+    }
+
+    #[test]
+    async fn save_refuses_when_provenance_points_at_a_different_file() {
+        // Path-bound provenance: a value loaded from file A that is later
+        // repointed at a different existing file B must not overwrite B.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path_a = tmp.path().join("a-config.toml");
+        let path_b = tmp.path().join("b-config.toml");
+        let b_bytes = "# operator's file B\n[observability]\nenabled = false\n";
+        tokio::fs::write(&path_a, "# source file A\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&path_b, b_bytes).await.unwrap();
+
+        let mut config = Config {
+            config_path: path_a.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.loaded_from = Some(path_a.clone());
+        config.config_path = path_b.clone();
+
+        let err = config.save().await.expect_err("repointed save must fail");
+        assert!(
+            err.to_string().contains("Refusing to overwrite"),
+            "error should name the refusal, got: {err:#}"
+        );
+        let after = tokio::fs::read_to_string(&path_b).await.unwrap();
+        assert_eq!(after, b_bytes, "file B must stay byte-identical");
+    }
+
+    #[test]
+    async fn save_creates_missing_file_without_provenance() {
+        // First-run creation stays open: the guard only protects an
+        // existing file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    async fn load_or_init_config_saves_over_existing_file() {
+        // load_or_init establishes provenance in both branches: a value
+        // that read the file (or just created it) keeps full-save rights.
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        // ZEROCLAW_* vars outrank HOME in path resolution; remove them so an
+        // inherited developer environment cannot redirect this test at a
+        // real operator config. RAII guards restore on panic.
+        let _home = EnvValueGuard::set("HOME", &temp_home);
+        let _config_dir = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_dir = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _workspace = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let fresh = Box::pin(Config::load_or_init()).await.unwrap();
+        fresh
+            .save()
+            .await
+            .expect("fresh-init value keeps save rights");
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+        loaded
+            .save()
+            .await
+            .expect("loaded config keeps save rights");
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
     #[cfg(unix)]
     #[test]
     async fn save_restricts_existing_world_readable_config_to_owner_only() {
@@ -38854,6 +39252,10 @@ group_policy = "disabled"
             ..Default::default()
         };
         config.save().await.unwrap();
+        // This value just wrote the file; mirror load_or_init's fresh-init
+        // provenance so the second save below exercises the permission
+        // repair, not the unproven-overwrite guard.
+        config.loaded_from = Some(config_path.clone());
 
         // Simulate the regression state observed in issue.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -41297,6 +41699,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("a config carrying the retired table still loads");
+        config.loaded_from = Some(config_path.clone());
         config.config_path = config_path;
         config
     }
@@ -43136,6 +43539,9 @@ stream_tool_arguments = [
         let mut reloaded: Config = crate::migration::migrate_to_current(&raw).unwrap();
         reloaded.config_path = config.config_path.clone();
         reloaded.data_dir = config.data_dir.clone();
+        // Parsed from the on-disk file, like load_or_init's existing-file
+        // branch; keep full-save provenance for the save below.
+        reloaded.loaded_from = Some(reloaded.config_path.clone());
         let store = crate::secrets::SecretStore::new(dir.path(), reloaded.secrets.encrypt);
         reloaded.decrypt_secrets(&store).unwrap();
         assert_eq!(

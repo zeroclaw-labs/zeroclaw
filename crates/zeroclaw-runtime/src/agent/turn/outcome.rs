@@ -123,31 +123,6 @@ impl std::error::Error for StreamInterruptedAfterOutput {
     }
 }
 
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    /// The typed stream error that produced this outcome. `Terminal` is
-    /// load-bearing: the provider-call step reads it to skip the
-    /// non-streaming fallback the error's producer already performed.
-    pub(crate) source: zeroclaw_api::model_provider::StreamError,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
 /// side effects, so this bypasses the normal non-streaming fallback.
@@ -820,13 +795,9 @@ mod tests {
 
     #[test]
     fn streamed_refusal_cause_projects_safety_guidance() {
-        let error = anyhow::Error::new(StreamErrorWithUsage {
-            message: "model_provider stream error: refusal".to_string(),
-            usage: None,
-            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
-                private_refusal(),
-            )),
-        });
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ));
 
         let message = terminal_completion_error_message_in_english(&error, None)
             .expect("a streamed refusal must project a user-facing message");

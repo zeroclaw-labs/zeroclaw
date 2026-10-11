@@ -33,6 +33,9 @@ cli-integrations-chat-slack-prepare = 在 {$url} 创建应用，配置机器人�
 cli-integrations-chat-configure = 运行 {$command}，打开配置，设置 {$channel} 实例及其凭据。
 cli-integrations-chat-bind = 将频道别名绑定到智能体，并检查对等组的访问权限。
 cli-integrations-chat-enable = 确认设置和访问权限后，再启用频道实例。
+cli-integrations-chat-imessage-transport = 通过 AppleScript 自动化发送信息，并通过读取本地“信息”数据库接收信息。
+cli-integrations-chat-imessage-permissions = 授予 macOS“自动化”权限以控制“信息”，并授予“完全磁盘访问权限”以读取“信息”数据库。
+cli-integrations-chat-generic-setup = 运行 {$command}，打开“配置”，设置 {$channel} 所需的字段、路由和访问权限，确认设置后再启用。
 cli-skills-about = 管理技能（用户自定义能力）
 cli-sop-about = 管理标准操作程序（SOPs）
 cli-migrate-about = 从其他智能体运行时迁移数据
@@ -1005,6 +1008,7 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
     切换模型：/models
+channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
 turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]
