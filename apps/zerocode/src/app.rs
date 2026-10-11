@@ -2020,6 +2020,8 @@ pub async fn run(
                             chrome_status.health.as_ref(),
                             acp_pane.current_cwd(),
                             chat_pane.current_cwd(),
+                            acp_pane.focused_runtime_context(),
+                            chat_pane.focused_runtime_context(),
                         ),
                         Mode::Config => config_app.draw_into(frame, content_area),
                         Mode::Doctor => doctor_pane.draw(frame, content_area),

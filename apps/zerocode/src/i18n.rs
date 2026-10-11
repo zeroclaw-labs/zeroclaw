@@ -614,11 +614,26 @@ mod tests {
                 "zc-chat-status-awaiting-approval",
                 "zc-chat-status-awaiting-input",
                 "zc-chat-status-cancelling",
+                "zc-dashboard-label-context",
+                "zc-dashboard-label-code-context",
+                "zc-dashboard-label-chat-context",
+                "zc-dashboard-context-idle",
+                "zc-dashboard-context-working",
+                "zc-dashboard-context-blocked",
+                "zc-dashboard-context-done",
             ] {
                 assert!(
                     format_ftl_message(&bundle, key, &[]).is_some(),
                     "{key} must format for {locale}"
                 );
+            }
+            for key in [
+                "zc-dashboard-context-client-queue",
+                "zc-dashboard-context-client-queue-paused",
+            ] {
+                let queue = format_ftl_message(&bundle, key, &[("count", "2")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(queue.contains('2'), "{key} must interpolate for {locale}");
             }
             let calling_tool = format_ftl_message(
                 &bundle,

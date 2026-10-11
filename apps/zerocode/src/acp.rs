@@ -210,6 +210,10 @@ impl Acp {
         self.inner.selected_agent()
     }
 
+    pub(crate) fn focused_runtime_context(&self) -> Option<chat::FocusedRuntimeContext<'_>> {
+        self.inner.focused_runtime_context()
+    }
+
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
     }
