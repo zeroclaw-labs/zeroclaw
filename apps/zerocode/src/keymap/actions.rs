@@ -203,6 +203,7 @@ keyactions! {
         TodoToggle              [Chord::primary('p'), Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
+        RefreshSession          [Chord::key(KeyCode::F(5))] => "refresh focused session",
         DeleteSession           [] => "delete session",
         CancelTurn              [Chord::primary('d'), Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",

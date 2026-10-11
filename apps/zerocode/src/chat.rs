@@ -506,6 +506,10 @@ pub(crate) struct Chat {
     session_resync_tx: mpsc::Sender<SessionResyncResult>,
     session_resync_rx: mpsc::Receiver<SessionResyncResult>,
     session_resync_in_flight: HashMap<String, ResyncInFlight>,
+    /// One explicit read, independent of recovery and its dispatch gate.
+    session_refresh_tx: mpsc::Sender<Result<SessionResyncSnapshot, SessionRefreshError>>,
+    session_refresh_rx: mpsc::Receiver<Result<SessionResyncSnapshot, SessionRefreshError>>,
+    session_refresh: Option<SessionRefreshAttempt>,
     /// Request-form `session/prompt` completions. Terminal notifications remain
     /// transcript authority; this channel only prevents a lost terminal frame
     /// from leaving the matching local turn stuck in flight.
@@ -603,6 +607,17 @@ struct SessionReattachResult {
 struct SessionResyncResult {
     session_id: String,
     result: Result<SessionResyncSnapshot, String>,
+}
+
+struct SessionRefreshAttempt {
+    session_id: String,
+    turn_generation: u64,
+    invalidated: bool,
+}
+
+enum SessionRefreshError {
+    Busy,
+    Failed(String),
 }
 
 /// How a resync reconciles with the daemon before reloading the transcript.
@@ -859,6 +874,7 @@ impl Chat {
         let (session_reattach_tx, session_reattach_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (session_refresh_tx, session_refresh_rx) = mpsc::channel(1);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
@@ -876,6 +892,9 @@ impl Chat {
             session_resync_tx,
             session_resync_rx,
             session_resync_in_flight: HashMap::new(),
+            session_refresh_tx,
+            session_refresh_rx,
+            session_refresh: None,
             prompt_completion_tx,
             prompt_completion_rx,
             phase: ChatPhase::PickAgent {
@@ -1190,6 +1209,9 @@ impl Chat {
             return false;
         };
         let incoming = self.background.remove(idx);
+        if let Some(attempt) = self.session_refresh.as_mut() {
+            attempt.invalidated = true;
+        }
         // Swap with the focused session; a non-Active phase (picker, error)
         // is simply replaced — clicking a session row leaves those flows.
         match std::mem::replace(&mut self.phase, ChatPhase::Active(Box::new(incoming))) {
@@ -2677,6 +2699,11 @@ impl Chat {
                         // their stream too, so transcripts and status dots
                         // stay current while unfocused.
                         let sid = update.session_id().to_string();
+                        if let Some(attempt) = self.session_refresh.as_mut()
+                            && attempt.session_id == sid
+                        {
+                            attempt.invalidated = true;
+                        }
                         let mut terminal_reconcile = false;
                         if !self.session_resync_in_flight.contains_key(&sid)
                             && let Some(state) = self.state_for_session_mut(&sid)
@@ -2857,6 +2884,11 @@ impl Chat {
     }
 
     fn begin_session_resync(&mut self, session_id: String, mode: SessionResyncMode) {
+        if let Some(attempt) = self.session_refresh.as_mut()
+            && attempt.session_id == session_id
+        {
+            attempt.invalidated = true;
+        }
         // Ownership evidence exists only for `Reattach`, and only while the
         // pane's own prompt is still outstanding: read it before the prepare
         // below mutates the state.
@@ -3187,6 +3219,125 @@ impl Chat {
     fn drain_session_resync_results(&mut self) {
         while let Ok(update) = self.session_resync_rx.try_recv() {
             self.apply_session_resync_result(update);
+        }
+    }
+
+    fn begin_session_refresh(&mut self) {
+        if self.session_refresh.is_some() {
+            return;
+        }
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
+        };
+        if state.last_error == Some(SessionError::ResyncFailed) {
+            state.set_info_notice(crate::i18n::t("zc-chat-refresh-recovery-required"));
+            return;
+        }
+        if state.refresh_is_busy()
+            || self
+                .session_resync_in_flight
+                .contains_key(&state.session_id)
+            || self.session_reattach_in_flight.contains(&state.session_id)
+        {
+            state.set_info_notice(crate::i18n::t("zc-chat-refresh-busy"));
+            return;
+        }
+        let session_id = state.session_id.clone();
+        self.session_refresh = Some(SessionRefreshAttempt {
+            session_id: session_id.clone(),
+            turn_generation: state.turn_generation,
+            invalidated: false,
+        });
+        state.set_info_notice(crate::i18n::t("zc-chat-refresh-started"));
+        let rpc = self.rpc.clone();
+        let tx = self.session_refresh_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(20), async {
+                let before = rpc
+                    .session_state(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if before.state != "idle" {
+                    return Err(SessionRefreshError::Busy);
+                }
+                let messages = rpc
+                    .session_messages(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if messages.start != 0 || messages.total != messages.messages.len() {
+                    return Err(SessionRefreshError::Failed(crate::i18n::t(
+                        "zc-chat-refresh-incomplete",
+                    )));
+                }
+                let after = rpc
+                    .session_state(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if after.state != "idle" {
+                    return Err(SessionRefreshError::Busy);
+                }
+                Ok(SessionResyncSnapshot {
+                    messages: messages.messages,
+                    message_count: messages.total,
+                    plan: after.plan,
+                    turn_running: false,
+                })
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(SessionRefreshError::Failed(crate::i18n::t(
+                    "zc-chat-refresh-timeout",
+                )))
+            });
+            let _ = tx.send(result).await;
+        });
+    }
+
+    fn drain_session_refresh_results(&mut self) {
+        while let Ok(result) = self.session_refresh_rx.try_recv() {
+            let Some(attempt) = self.session_refresh.take() else {
+                continue;
+            };
+            let ChatPhase::Active(state) = &mut self.phase else {
+                continue;
+            };
+            if state.session_id != attempt.session_id {
+                continue;
+            }
+            if attempt.invalidated
+                || state.turn_generation != attempt.turn_generation
+                || state.refresh_is_busy()
+            {
+                state.set_info_notice(crate::i18n::t("zc-chat-refresh-stale"));
+                continue;
+            }
+            let notice = match result {
+                Ok(snapshot) => match state
+                    .refresh_history(snapshot.messages, self.pane_kind == PaneKind::Acp)
+                {
+                    Ok(()) => {
+                        state.message_count = snapshot.message_count;
+                        if let Some(plan) = snapshot.plan {
+                            let visible = state.todo_tracker.is_visible();
+                            state.todo_tracker.set_plan(plan);
+                            // Refresh updates the plan without changing the reading layout.
+                            // Installing it consumes the one-time auto-pop as usual.
+                            if state.todo_tracker.is_visible() != visible {
+                                state.todo_tracker.toggle();
+                            }
+                        }
+                        crate::i18n::t("zc-chat-refreshed")
+                    }
+                    Err(error) => {
+                        crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)])
+                    }
+                },
+                Err(SessionRefreshError::Busy) => crate::i18n::t("zc-chat-refresh-busy"),
+                Err(SessionRefreshError::Failed(error)) => {
+                    crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)])
+                }
+            };
+            state.set_info_notice(notice);
         }
     }
 
@@ -3751,6 +3902,7 @@ impl Chat {
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
+        self.drain_session_refresh_results();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -4052,6 +4204,13 @@ impl Chat {
                     || ChatTabAction::from_chord(&key) == Some(ChatTabAction::ErrorDismiss);
             }
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
+        }
+
+        if crate::keymap::ChatTabAction::from_chord(&key)
+            == Some(crate::keymap::ChatTabAction::RefreshSession)
+        {
+            self.begin_session_refresh();
+            return false;
         }
 
         // Active phase — borrow state directly to avoid double &mut self.
@@ -6081,6 +6240,10 @@ impl crate::widgets::HelpContext for Chat {
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
                         crate::i18n::t("zc-chat-help-switch-session"),
+                    ),
+                    E::key(
+                        chord_label(ChatTabAction::RefreshSession),
+                        crate::i18n::t("zc-chat-help-refresh-session"),
                     ),
                     E::spacer(),
                     E::key(
@@ -9469,7 +9632,7 @@ impl PendingElicitation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
     /// A response committed after the prompt RPC returned but before its
@@ -9495,6 +9658,98 @@ pub enum ChatEntry {
         /// `Some(Arc<str>)` once the result arrives.
         result: Option<Arc<str>>,
     },
+}
+
+impl ChatEntry {
+    fn refresh_matches(&self, canonical: &Self, strip_runtime_enrichment: bool) -> bool {
+        if let (
+            Self::UserMessage { text, attachments },
+            Self::UserMessage {
+                text: Some(stored), ..
+            },
+        ) = (self, canonical)
+            && !attachments.is_empty()
+        {
+            let stored = if strip_runtime_enrichment {
+                strip_refresh_enrichment_prefix(stored)
+            } else {
+                stored.as_ref()
+            };
+            let original = text.as_deref().unwrap_or("");
+            // Only remove the daemon suffix when this local row owns attachments.
+            // Never normalize marker-like text in an ordinary user message.
+            let suffix = if original.is_empty() {
+                Some(stored)
+            } else {
+                stored
+                    .strip_prefix(original)
+                    .and_then(|rest| rest.strip_prefix('\n'))
+            };
+            if let Some(suffix) = suffix {
+                let mut markers = suffix.lines();
+                let matched = attachments.iter().all(|_| {
+                    let Some(marker) = markers.next() else {
+                        return false;
+                    };
+                    if let Some(path) = marker
+                        .strip_prefix("[IMAGE:")
+                        .and_then(|m| m.strip_suffix(']'))
+                    {
+                        !path.is_empty()
+                    } else {
+                        // Content-addressed reuse may retain an earlier filename.
+                        marker
+                            .strip_prefix("[Document: ")
+                            .and_then(|rest| rest.split_once("] "))
+                            .is_some_and(|(name, path)| !name.is_empty() && !path.is_empty())
+                    }
+                });
+                if matched && markers.next().is_none() {
+                    return true;
+                }
+            }
+        }
+        match (self, canonical) {
+            (Self::SystemMessage(old), Self::SystemMessage(new)) if strip_runtime_enrichment => {
+                old == new
+            }
+            (Self::SystemMessage(_) | Self::AgentThought(_), _) => false,
+            (Self::UserMessage { text: old, .. }, Self::UserMessage { text: new, .. }) => {
+                if strip_runtime_enrichment {
+                    old.as_deref().map(strip_refresh_enrichment_prefix)
+                        == new.as_deref().map(strip_refresh_enrichment_prefix)
+                } else {
+                    old == new
+                }
+            }
+            (Self::AgentMessageContinuation(old), Self::AgentMessage(new)) => {
+                old.as_str() == new.as_ref()
+            }
+            _ => self == canonical,
+        }
+    }
+
+    fn refresh_identity(&self, strip_runtime_enrichment: bool) -> Option<Self> {
+        match self {
+            // Only ACP history can supply durable system notices to match.
+            Self::SystemMessage(_) if strip_runtime_enrichment => Some(self.clone()),
+            Self::SystemMessage(_) | Self::AgentThought(_) => None,
+            Self::UserMessage { text, .. } => Some(Self::UserMessage {
+                text: text.as_deref().map(|text| {
+                    Arc::from(if strip_runtime_enrichment {
+                        strip_refresh_enrichment_prefix(text)
+                    } else {
+                        text
+                    })
+                }),
+                attachments: Vec::new(),
+            }),
+            Self::AgentMessageContinuation(text) => {
+                Some(Self::AgentMessage(Arc::from(text.as_str())))
+            }
+            _ => Some(self.clone()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -12173,7 +12428,288 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
+        let mut entries = std::mem::take(&mut self.entries);
+        Self::append_history(&mut entries, messages, strip_runtime_enrichment);
+        self.seed_first_message(&entries, strip_runtime_enrichment);
+        self.entries = entries;
+        self.mark_dirty_full();
+    }
+
+    fn refresh_is_busy(&self) -> bool {
+        self.turn_in_flight
+            || self.pending_approval.is_some()
+            || self.pending_elicitation.is_some()
+            || !self.streaming_text.is_empty()
+            || !self.streaming_thought.is_empty()
+            || self.last_error == Some(SessionError::ResyncFailed)
+    }
+
+    /// Replace only transcript-derived state. Entry identities are ordered,
+    /// because identical messages in different turns are legitimate.
+    fn refresh_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) -> Result<(), String> {
+        let anchor_error = || crate::i18n::t("zc-chat-refresh-anchor");
+        let mut entries = Self::history_entries(messages, strip_runtime_enrichment);
+        let append_only = entries.len() >= self.entries.len()
+            && self
+                .entries
+                .iter()
+                .zip(&entries)
+                .all(|(old, new)| old.refresh_matches(new, strip_runtime_enrichment));
+        let mut mapped = vec![None; self.entries.len()];
+        if append_only {
+            for (index, old) in self.entries.iter().enumerate() {
+                mapped[index] = Some(index);
+                if matches!(old, ChatEntry::UserMessage { .. }) {
+                    entries[index] = old.clone();
+                }
+            }
+        } else {
+            let mut by_identity: HashMap<ChatEntry, VecDeque<usize>> = HashMap::new();
+            for (index, entry) in entries.iter().enumerate() {
+                if let Some(identity) = entry.refresh_identity(strip_runtime_enrichment) {
+                    by_identity.entry(identity).or_default().push_back(index);
+                }
+            }
+            let mut next = 0;
+            for (old_index, old) in self.entries.iter().enumerate() {
+                let Some(identity) = old.refresh_identity(strip_runtime_enrichment) else {
+                    continue;
+                };
+                let exact = by_identity.get_mut(&identity).and_then(|indices| {
+                    while indices.front().is_some_and(|index| *index < next) {
+                        indices.pop_front();
+                    }
+                    indices.front().copied()
+                });
+                let attachment_match = if matches!(old, ChatEntry::UserMessage { attachments, .. } if !attachments.is_empty())
+                {
+                    entries[next..]
+                        .iter()
+                        .position(|entry| old.refresh_matches(entry, strip_runtime_enrichment))
+                        .map(|index| next + index)
+                } else {
+                    None
+                };
+                if let Some(index) = exact.into_iter().chain(attachment_match).min() {
+                    mapped[old_index] = Some(index);
+                    next = index + 1;
+                    // Keep the already-rendered form of this unchanged user row.
+                    if matches!(old, ChatEntry::UserMessage { .. }) {
+                        entries[index] = old.clone();
+                    }
+                }
+            }
+        }
+        let map_index = |index: usize| {
+            mapped
+                .get(index)
+                .copied()
+                .flatten()
+                .ok_or_else(anchor_error)
+        };
+        let cursor = self.browse_cursor.map(map_index).transpose()?;
+        let browse_anchor = self.browse_anchor.map(map_index).transpose()?;
+        let validate_range = |a: usize, h: usize| -> Result<(), String> {
+            let lo = a.min(h);
+            let first = map_index(lo)?;
+            for index in lo..=a.max(h) {
+                if map_index(index)? != first + index - lo {
+                    return Err(anchor_error());
+                }
+            }
+            Ok(())
+        };
+        if let Some((lo, hi)) = self.browse_range() {
+            validate_range(lo, hi)?;
+        }
+        let browse_multi = self
+            .browse_multi
+            .iter()
+            .copied()
+            .map(map_index)
+            .collect::<Result<_, _>>()?;
+        let mouse_down_entry = self.mouse_down_entry.map(map_index).transpose()?;
+        let row_anchor = |row: u16| {
+            self.transcript_layout
+                .view()
+                .cached_screen_ranges
+                .iter()
+                .find(|(_, lo, hi, _)| *lo <= row && row < *hi)
+                .map(|(index, lo, _, _)| (*index, row.saturating_sub(*lo)))
+        };
+        let scroll_anchor = if self.pinned_to_bottom {
+            None
+        } else {
+            row_anchor(self.scroll_offset)
+                .map(|(index, row)| map_index(index).map(|i| (i, row)))
+                .transpose()?
+        };
+        let selection_anchors = self
+            .transcript_selection
+            .map(|selection| -> Result<_, String> {
+                let (a, a_row) = row_anchor(selection.anchor.row).ok_or_else(anchor_error)?;
+                let (h, h_row) = row_anchor(selection.head.row).ok_or_else(anchor_error)?;
+                // Do not silently select different text when a middle row changed.
+                validate_range(a, h)?;
+                Ok((map_index(a)?, a_row, map_index(h)?, h_row))
+            })
+            .transpose()?;
+        let natural_start = entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+        let mut start =
+            if self.pinned_to_bottom || self.transcript_layout.view().cached_render_width == 0 {
+                natural_start
+            } else {
+                mapped
+                    .get(self.transcript_layout.view().cached_render_start)
+                    .copied()
+                    .flatten()
+                    .or(scroll_anchor.map(|(index, _)| index))
+                    .unwrap_or(0)
+                    .min(natural_start)
+            };
+        if let Some(cursor) = cursor {
+            if cursor < start {
+                start = cursor;
+            } else if cursor >= start.saturating_add(MAX_RENDERED_ENTRIES) {
+                start = cursor
+                    .saturating_add(1)
+                    .saturating_sub(MAX_RENDERED_ENTRIES);
+            }
+        }
+        start = start.min(natural_start);
+        let end = start
+            .saturating_add(MAX_RENDERED_ENTRIES)
+            .min(entries.len());
+        if selection_anchors
+            .is_some_and(|(a, _, h, _)| a < start || h < start || a >= end || h >= end)
+            || scroll_anchor.is_some_and(|(index, _)| index < start || index >= end)
+        {
+            return Err(anchor_error());
+        }
+
+        // All fallible anchor checks precede the replacement.
+        let old_ranges = self.transcript_layout.view().cached_screen_ranges.clone();
+        let retain_prefix_cache =
+            append_only && start == self.transcript_layout.view().cached_render_start;
+        self.entries = entries;
+        self.first_message = None;
+        let entries = std::mem::take(&mut self.entries);
+        self.seed_first_message(&entries, strip_runtime_enrichment);
+        self.entries = entries;
+        self.browse_cursor = cursor;
+        self.browse_anchor = browse_anchor;
+        self.browse_multi = browse_multi;
+        self.mouse_down_entry = mouse_down_entry;
+        if start != self.transcript_layout.view().cached_render_start {
+            self.transcript_layout.set_render_start(start);
+        }
+        self.prompt_settled_stream_entry = None;
+        self.context_menu = self
+            .context_menu
+            .take()
+            .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        self.copy_feedback = None;
+        self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.tool_footer_rects.clear();
+        self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        if retain_prefix_cache {
+            self.mark_dirty_append();
+        } else {
+            self.mark_dirty_full();
+        }
+        if self.transcript_layout.view().cached_render_width != 0 {
+            self.rebuild_lines(self.transcript_layout.view().cached_render_width);
+            self.last_total_rows = self.transcript_layout.view().cached_total_rows;
+            let ranges = &self.transcript_layout.view().cached_screen_ranges;
+            let new_row = |index: usize, intra: u16| {
+                ranges
+                    .binary_search_by_key(&index, |(i, _, _, _)| *i)
+                    .ok()
+                    .map(|position| &ranges[position])
+                    .map(|(_, lo, _, _)| lo.saturating_add(intra))
+            };
+            if let Some((index, intra)) = scroll_anchor {
+                self.scroll_offset = new_row(index, intra).unwrap_or(self.scroll_offset);
+            }
+            if let (Some(selection), Some((a, a_row, h, h_row))) =
+                (&mut self.transcript_selection, selection_anchors)
+                && let (Some(anchor), Some(head)) = (new_row(a, a_row), new_row(h, h_row))
+            {
+                selection.anchor.row = anchor;
+                selection.head.row = head;
+            }
+            if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+                let remap_row = |row: u16| {
+                    let position = old_ranges.partition_point(|(_, _, hi, _)| *hi <= row);
+                    let (index, lo, hi, _) = old_ranges.get(position)?;
+                    if row < *lo || row >= *hi {
+                        return None;
+                    }
+                    new_row(
+                        mapped.get(*index).copied().flatten()?,
+                        row.saturating_sub(*lo),
+                    )
+                };
+                snapshot.cells = std::mem::take(&mut snapshot.cells)
+                    .into_iter()
+                    .filter_map(|(row, cells)| Some((remap_row(row)?, cells)))
+                    .collect();
+                snapshot.row_breaks = std::mem::take(&mut snapshot.row_breaks)
+                    .into_iter()
+                    .filter_map(|(row, kind)| Some((remap_row(row)?, kind)))
+                    .collect();
+                snapshot.total_rows = self.transcript_layout.view().cached_total_rows;
+                snapshot.scroll = self.scroll_offset;
+            }
+        }
+        Ok(())
+    }
+
+    fn seed_first_message(&mut self, entries: &[ChatEntry], strip_runtime_enrichment: bool) {
+        if self.first_message.is_some() {
+            return;
+        }
+        self.first_message = entries.iter().find_map(|entry| {
+            let ChatEntry::UserMessage {
+                text: Some(text), ..
+            } = entry
+            else {
+                return None;
+            };
+            let display = if strip_runtime_enrichment {
+                strip_enrichment_prefix(text)
+            } else {
+                text.as_ref()
+            };
+            (!display.trim().is_empty()).then(|| display.to_string())
+        });
+    }
+
+    fn history_entries(
+        messages: Vec<crate::client::MessageEntry>,
+        acp_history: bool,
+    ) -> Vec<ChatEntry> {
+        let mut entries = Vec::new();
+        Self::append_history(&mut entries, messages, acp_history);
+        entries
+    }
+
+    fn append_history(
+        entries: &mut Vec<ChatEntry>,
+        messages: Vec<crate::client::MessageEntry>,
+        acp_history: bool,
+    ) {
         for m in messages {
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
@@ -12182,7 +12718,7 @@ impl ChatState {
                         .as_ref()
                         .and_then(|value| serde_json::to_string(value).ok())
                         .unwrap_or_else(|| "null".to_string());
-                    self.entries.push(ChatEntry::Tool {
+                    entries.push(ChatEntry::Tool {
                         tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
                         name: Arc::<str>::from(
                             m.tool_name.unwrap_or_else(|| "unknown".to_string()),
@@ -12196,7 +12732,7 @@ impl ChatState {
                     let tool_call_id = m.tool_call_id.unwrap_or_default();
                     let output = bounded_tool_output(m.tool_output.unwrap_or(m.content));
                     if let Some(ChatEntry::Tool { result, .. }) =
-                        self.entries.iter_mut().rev().find(|entry| {
+                        entries.iter_mut().rev().find(|entry| {
                             matches!(
                                 entry,
                                 ChatEntry::Tool {
@@ -12209,7 +12745,7 @@ impl ChatState {
                     {
                         *result = Some(Arc::<str>::from(output));
                     } else {
-                        self.entries.push(ChatEntry::Tool {
+                        entries.push(ChatEntry::Tool {
                             tool_call_id: Arc::<str>::from(tool_call_id),
                             name: Arc::<str>::from(
                                 m.tool_name.unwrap_or_else(|| "unknown".to_string()),
@@ -12225,34 +12761,23 @@ impl ChatState {
             }
             match m.role() {
                 crate::client::MessageRole::User => {
-                    let display = if acp_history {
-                        strip_enrichment_prefix(&m.content)
-                    } else {
-                        &m.content
-                    };
-                    if self.first_message.is_none() && !display.trim().is_empty() {
-                        self.first_message = Some(display.to_string());
-                    }
-                    self.entries.push(ChatEntry::UserMessage {
+                    entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
                         attachments: vec![],
                     });
                 }
                 crate::client::MessageRole::Assistant => {
-                    self.entries
-                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                    entries.push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System if acp_history => {
                     // ACP history excludes real system prompts in the store.
                     // Its system rows are persisted recovery notices, not
                     // provider instructions. Ordinary Chat has no such contract.
-                    self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
+                    entries.push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
         }
-        self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
     /// Re-materialize this pane's state for a newly-entered session.
@@ -12339,6 +12864,20 @@ fn strip_enrichment_prefix(content: &str) -> &str {
         return content;
     };
     rest[bracket_end + 1..].trim_start()
+}
+
+/// Strip the runtime envelope without discarding authored whitespace.
+fn strip_refresh_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    // The runtime inserts exactly two newlines. Authored whitespace is identity.
+    rest[bracket_end + 1..]
+        .strip_prefix("\n\n")
+        .unwrap_or(content)
 }
 
 /// Body-only clipboard text.
@@ -15389,6 +15928,497 @@ mod tests {
                 data: None,
             }),
         );
+    }
+
+    fn refresh_messages(rows: &[(&str, &str)]) -> Vec<crate::client::MessageEntry> {
+        rows.iter()
+            .map(|(role, content)| crate::client::MessageEntry {
+                role: (*role).into(),
+                content: (*content).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    async fn finish_refresh(chat: &mut Chat) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_refresh_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh result");
+        chat.tick_transport_events();
+        assert!(chat.session_refresh.is_none());
+    }
+
+    async fn answer_refresh(
+        rx: &mut mpsc::Receiver<String>,
+        rpc: &RpcOutbound,
+        messages: serde_json::Value,
+        after: &str,
+    ) {
+        let before = next_rpc_request(rx, "read initial lifecycle").await;
+        assert_eq!(before["method"], method::SESSION_STATE);
+        respond_ok(rpc, &before, serde_json::json!({"state": "idle"}));
+        let history = next_rpc_request(rx, "read durable history").await;
+        assert_eq!(history["method"], method::SESSION_MESSAGES);
+        let total = messages.as_array().expect("history array").len();
+        respond_ok(
+            rpc,
+            &history,
+            serde_json::json!({"messages": messages, "total": total, "start": 0}),
+        );
+        let final_state = next_rpc_request(rx, "recheck lifecycle").await;
+        assert_eq!(final_state["method"], method::SESSION_STATE);
+        respond_ok(rpc, &final_state, serde_json::json!({"state": after}));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_refresh_action_imports_external_turn_without_touching_local_owners() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc.clone())), kind);
+            let mut prior = state();
+            prior.load_history(
+                refresh_messages(&[("user", "local ask"), ("assistant", "local answer")]),
+                false,
+            );
+            let dir = tempfile::tempdir().expect("attachment fixture");
+            let path = dir.path().join("draft.png");
+            std::fs::write(&path, b"fixture").expect("attachment file");
+            prior
+                .input_bar
+                .load_for_edit("keep draft".into(), vec![clipboard_att(&path, "draft.png")]);
+            prior
+                .enqueue_message("keep queue".into(), Vec::new())
+                .unwrap();
+            prior.queue_paused = true;
+            prior.queue_sel = prior.message_queue.front().map(|message| message.id);
+            let selected_queue = prior.queue_sel;
+            prior.git_branch_last_fetch = Some(Instant::now());
+            chat.phase = ChatPhase::Active(Box::new(prior));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            // This is the history now returned after a different client completed a turn.
+            answer_refresh(
+                &mut rx,
+                &rpc,
+                serde_json::json!([
+                    {"role": "user", "content": "local ask"},
+                    {"role": "assistant", "content": "local answer"},
+                    {"role": "system", "content": "durable recovery notice"},
+                    {"role": "user", "content": "external ask"},
+                    {"role": "assistant", "content": "external answer"}
+                ]),
+                "idle",
+            )
+            .await;
+            finish_refresh(&mut chat).await;
+            let state = active_state(&mut chat);
+            assert_eq!(state.input_bar.input(), "keep draft");
+            assert_eq!(state.input_bar.pending_attachments().len(), 1);
+            assert!(path.exists());
+            assert_eq!(state.message_queue.front().unwrap().text, "keep queue");
+            assert!(state.queue_paused);
+            assert_eq!(state.queue_sel, selected_queue);
+            assert_eq!(state.message_count, 5);
+            let mut output =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            output.draw(|frame| chat.draw(frame, frame.area())).unwrap();
+            let visible = overlay_text(&output, Rect::new(0, 0, 100, 30));
+            assert!(visible.contains("external answer"));
+            assert_eq!(
+                visible.contains("durable recovery notice"),
+                kind == PaneKind::Acp
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "refresh never dispatches, cancels, or answers an interaction"
+            );
+        }
+    }
+
+    #[test]
+    fn session_refresh_preserves_selection_and_scroll_through_final_render() {
+        let mut state = state();
+        let mut rows = vec![("user", "same ask"), ("assistant", "same reply")];
+        rows.extend([("user", "same ask"), ("assistant", "same reply")]);
+        state.load_history(refresh_messages(&rows), false);
+        state.pinned_to_bottom = false;
+        let mut output =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+        output
+            .draw(|f| {
+                render_conversation(f, &mut state, f.area());
+            })
+            .unwrap();
+        let row = state
+            .transcript_layout
+            .view()
+            .cached_screen_ranges
+            .iter()
+            .find(|(index, _, _, _)| *index == 1)
+            .unwrap()
+            .1;
+        let (first, last) = state
+            .transcript_snapshot
+            .as_ref()
+            .unwrap()
+            .row_text_bounds(row)
+            .unwrap();
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: first, row },
+            head: CellPoint { column: last, row },
+            dragged: true,
+        });
+        let selected = state.transcript_selected_text().unwrap();
+        let scroll = state.scroll_offset;
+        rows.extend([("user", "external ask"), ("assistant", "external answer")]);
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        output
+            .draw(|f| {
+                render_conversation(f, &mut state, f.area());
+            })
+            .unwrap();
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some(selected.as_str())
+        );
+        assert_eq!(state.scroll_offset, scroll);
+        assert!(!state.pinned_to_bottom);
+        assert!(overlay_text(&output, Rect::new(0, 0, 80, 14)).contains("external answer"));
+        // Browse ranges also retain the second occurrence, not the first duplicate.
+        state.transcript_selection = None;
+        state.browse_cursor = Some(3);
+        state.browse_anchor = Some(2);
+        state.browse_multi.insert(3);
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        assert_eq!(state.browse_cursor, Some(3));
+        assert_eq!(state.browse_anchor, Some(2));
+        assert_eq!(
+            state.browse_multi.iter().copied().collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_refresh_busy_error_and_stale_reads_keep_the_last_valid_view() {
+        for scenario in [
+            "busy_before",
+            "busy_after",
+            "failed",
+            "local_turn",
+            "notification",
+            "focus",
+        ] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc.clone())), PaneKind::Acp);
+            let mut prior = state();
+            prior.load_history(
+                refresh_messages(&[("user", "keep ask"), ("assistant", "keep answer")]),
+                false,
+            );
+            prior.git_branch_last_fetch = Some(Instant::now());
+            let expected = prior.entries.clone();
+            chat.phase = ChatPhase::Active(Box::new(prior));
+            chat.begin_session_refresh();
+            match scenario {
+                "busy_before" | "failed" => {
+                    let request = next_rpc_request(&mut rx, "initial read").await;
+                    assert_eq!(request["method"], method::SESSION_STATE);
+                    if scenario == "failed" {
+                        respond_err(&rpc, &request, -32000, "read unavailable");
+                    } else {
+                        respond_ok(&rpc, &request, serde_json::json!({"state": "running"}));
+                    }
+                }
+                _ => {
+                    answer_refresh(&mut rx, &rpc, serde_json::json!([
+                        {"role": "user", "content": "new ask"}, {"role": "assistant", "content": "new answer"}
+                    ]), if scenario == "busy_after" { "running" } else { "idle" }).await;
+                    match scenario {
+                        "local_turn" => {
+                            active_state(&mut chat).turn_generation += 1;
+                        }
+                        "notification" => {
+                            chat.rpc.push_notification_for_test(
+                                "session/update",
+                                serde_json::json!({
+                                    "type": "plan", "session_id": "sess-1", "entries": []
+                                }),
+                            );
+                        }
+                        "focus" => {
+                            let mut other = state_for("other-session", "other-agent");
+                            other.git_branch_last_fetch = Some(Instant::now());
+                            chat.background.push(other);
+                            chat.focus_session("other-session").await;
+                            // The old read must not become valid again after refocusing.
+                            chat.focus_session("sess-1").await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            finish_refresh(&mut chat).await;
+            assert_eq!(active_state(&mut chat).entries, expected, "{scenario}");
+            assert!(
+                rx.try_recv().is_err(),
+                "{scenario}: no cancel, retry, or prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_refresh_never_answers_pending_interactions() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut chat = Chat::new(
+            Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)))),
+            PaneKind::Acp,
+        );
+        let mut prior = state();
+        prior.pending_approval = Some(PendingApproval {
+            request_id: "keep-approval".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "pwd".into(),
+            timeout_secs: 30,
+        });
+        prior.pending_elicitation = Some(single_elicitation());
+        chat.phase = ChatPhase::Active(Box::new(prior));
+        chat.begin_session_refresh();
+        assert!(active_state(&mut chat).pending_approval.is_some());
+        assert!(active_state(&mut chat).pending_elicitation.is_some());
+        assert!(chat.session_refresh.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_refresh_missing_anchor_is_a_non_destructive_failure() {
+        let mut state = state();
+        state.load_history(
+            refresh_messages(&[("user", "keep ask"), ("assistant", "selected reply")]),
+            false,
+        );
+        state.browse_cursor = Some(1);
+        let expected = state.entries.clone();
+        assert!(
+            state
+                .refresh_history(refresh_messages(&[("user", "replacement")]), false)
+                .is_err()
+        );
+        assert_eq!(state.entries, expected);
+        assert_eq!(state.browse_cursor, Some(1));
+    }
+
+    #[test]
+    fn session_refresh_browse_range_rejects_changed_interior() {
+        for inserted in [false, true] {
+            let mut state = state();
+            state.load_history(
+                refresh_messages(&[("user", "ask"), ("assistant", "answer")]),
+                false,
+            );
+            if !inserted {
+                state
+                    .entries
+                    .insert(1, ChatEntry::AgentThought("local thought".into()));
+            }
+            state.browse_anchor = Some(0);
+            state.browse_cursor = Some(state.entries.len() - 1);
+            let expected = state.entries.clone();
+            let selected = state.current_selection_text();
+            let rows = if inserted {
+                vec![
+                    ("user", "ask"),
+                    ("assistant", "inserted"),
+                    ("assistant", "answer"),
+                ]
+            } else {
+                vec![("user", "ask"), ("assistant", "answer")]
+            };
+            assert!(
+                state
+                    .refresh_history(refresh_messages(&rows), false)
+                    .is_err()
+            );
+            assert_eq!(state.entries, expected);
+            assert_eq!(state.current_selection_text(), selected);
+        }
+    }
+
+    #[test]
+    fn session_refresh_sent_attachment_rows_keep_display_and_anchors() {
+        for (prompt, enriched) in [
+            (Some("look here"), false),
+            (None, false),
+            (Some("  look here"), true),
+            (None, true),
+        ] {
+            let mut state = state();
+            state.entries.push(ChatEntry::UserMessage {
+                text: prompt.map(Arc::from),
+                attachments: vec!["photo.png".into(), "notes.txt".into()],
+            });
+            state.entries.push(ChatEntry::AgentMessage("done".into()));
+            state.browse_cursor = Some(0);
+            state.browse_anchor = Some(1);
+            state.pinned_to_bottom = false;
+            let original = state.entries[0].clone();
+            let stored = format!(
+                "{}{}[IMAGE:/fixture/uploads/hash.png]\n[Document: earlier-name.txt] /fixture/uploads/hash.txt",
+                if enriched {
+                    "[CURRENT DATE & TIME: fixture]\n\n"
+                } else {
+                    ""
+                },
+                prompt.map(|text| format!("{text}\n")).unwrap_or_default()
+            );
+            state
+                .refresh_history(
+                    refresh_messages(&[
+                        ("user", &stored),
+                        ("assistant", "done"),
+                        ("assistant", "external answer"),
+                    ]),
+                    enriched,
+                )
+                .unwrap();
+            assert_eq!(state.entries[0], original);
+            assert_eq!(state.browse_cursor, Some(0));
+            assert_eq!(state.browse_anchor, Some(1));
+            let mut output =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            output
+                .draw(|f| {
+                    render_conversation(f, &mut state, f.area());
+                })
+                .unwrap();
+            let visible = overlay_text(&output, Rect::new(0, 0, 80, 20));
+            assert!(visible.contains("photo.png") && visible.contains("notes.txt"));
+            assert!(!visible.contains("/fixture/uploads"));
+        }
+        let ordinary = ChatEntry::UserMessage {
+            text: Some("look here".into()),
+            attachments: Vec::new(),
+        };
+        let marked = ChatEntry::UserMessage {
+            text: Some("look here\n[IMAGE:/fixture/file.png]".into()),
+            attachments: Vec::new(),
+        };
+        assert!(!ordinary.refresh_matches(&marked, false));
+    }
+
+    #[tokio::test]
+    async fn session_refresh_first_plan_keeps_visibility_and_selection() {
+        let mut chat = active_chat();
+        let state = active_state(&mut chat);
+        state.todo_tracker =
+            crate::todo_tracker::TodoTracker::new(crate::config::TodoLocation::Right, true, false);
+        state.load_history(
+            refresh_messages(&[("user", "ask"), ("assistant", "selected answer")]),
+            false,
+        );
+        state.pinned_to_bottom = false;
+        let mut output =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        output.draw(|f| chat.draw(f, f.area())).unwrap();
+        let state = active_state(&mut chat);
+        let row = state
+            .transcript_layout
+            .view()
+            .cached_screen_ranges
+            .iter()
+            .find(|(i, _, _, _)| *i == 1)
+            .unwrap()
+            .1;
+        let (first, last) = state
+            .transcript_snapshot
+            .as_ref()
+            .unwrap()
+            .row_text_bounds(row)
+            .unwrap();
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: first, row },
+            head: CellPoint { column: last, row },
+            dragged: true,
+        });
+        let selected = state.transcript_selected_text().unwrap();
+        chat.session_refresh = Some(SessionRefreshAttempt {
+            session_id: state.session_id.clone(),
+            turn_generation: state.turn_generation,
+            invalidated: false,
+        });
+        chat.session_refresh_tx
+            .try_send(Ok(SessionResyncSnapshot {
+                messages: refresh_messages(&[
+                    ("user", "ask"),
+                    ("assistant", "selected answer"),
+                    ("assistant", "external answer"),
+                ]),
+                message_count: 3,
+                plan: Some(vec![crate::wire::PlanEntry {
+                    content: "new plan".into(),
+                    status: crate::wire::PlanStatus::Pending,
+                    priority: crate::wire::PlanPriority::Medium,
+                    active_form: None,
+                }]),
+                turn_running: false,
+            }))
+            .unwrap();
+        chat.drain_session_refresh_results();
+        assert!(!chat.plan_visible());
+        assert_eq!(
+            active_state(&mut chat).todo_tracker.entries()[0].content,
+            "new plan"
+        );
+        output.draw(|f| chat.draw(f, f.area())).unwrap();
+        assert_eq!(
+            chat.transcript_selected_text_for_test().as_deref(),
+            Some(selected.as_str())
+        );
+    }
+
+    #[test]
+    fn session_refresh_append_keeps_existing_rendered_prefix() {
+        let mut state = state();
+        let contents = (0..900).map(|i| format!("message {i}")).collect::<Vec<_>>();
+        let mut rows = contents
+            .iter()
+            .map(|text| ("assistant", text.as_str()))
+            .collect::<Vec<_>>();
+        state.load_history(refresh_messages(&rows), false);
+        state.rebuild_lines(80);
+        let prefix = state.transcript_layout.view().cached_lines.clone();
+        rows.push(("assistant", "external answer"));
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        assert_eq!(
+            &state.transcript_layout.view().cached_lines[..prefix.len()],
+            prefix.as_slice()
+        );
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(state.transcript_layout.view().cached_entry_count, 901);
     }
 
     #[test]
@@ -29587,31 +30617,29 @@ mod tests {
         use crate::client::MessageEntry;
         use ratatui::{Terminal, backend::TestBackend};
         let mut s = state();
-        s.load_history(
-            vec![
-                MessageEntry {
-                    role: "user".to_string(),
-                    content: "question".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "assistant".to_string(),
-                    content: "partial answer".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "system".to_string(),
-                    content: "localized recovery notice".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "user".to_string(),
-                    content: "continue".to_string(),
-                    ..Default::default()
-                },
-            ],
-            true,
-        );
+        let mut messages = vec![
+            MessageEntry {
+                role: "user".to_string(),
+                content: "question".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "assistant".to_string(),
+                content: "partial answer".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "system".to_string(),
+                content: "localized recovery notice".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                ..Default::default()
+            },
+        ];
+        s.load_history(messages.clone(), true);
         assert!(matches!(
             s.entries.as_slice(),
             [ChatEntry::UserMessage { .. }, ChatEntry::AgentMessage(partial),
@@ -29637,6 +30665,45 @@ mod tests {
             .expect("recovery notice is visible in the final terminal cells");
         let next = text.find("continue").expect("next prompt is visible");
         assert!(partial < notice && notice < next, "{text}");
+
+        let s = active_state(&mut chat);
+        s.browse_cursor = Some(3);
+        s.browse_anchor = Some(1);
+        s.browse_multi.insert(2);
+        let prefix = s.transcript_layout.view().cached_lines.clone();
+        messages.push(MessageEntry {
+            role: "assistant".to_string(),
+            content: "external answer".to_string(),
+            ..Default::default()
+        });
+        s.refresh_history(messages.clone(), true).unwrap();
+        assert_eq!(s.browse_cursor, Some(3));
+        assert_eq!(s.browse_anchor, Some(1));
+        assert!(s.browse_multi.contains(&2));
+        assert_eq!(
+            &s.transcript_layout.view().cached_lines[..prefix.len()],
+            prefix.as_slice()
+        );
+
+        // A changed prefix also maps the unchanged notice's identity.
+        messages.insert(
+            0,
+            MessageEntry {
+                role: "user".to_string(),
+                content: "earlier prompt".to_string(),
+                ..Default::default()
+            },
+        );
+        s.refresh_history(messages, true).unwrap();
+        assert_eq!(s.browse_cursor, Some(4));
+        assert_eq!(s.browse_anchor, Some(2));
+        assert!(s.browse_multi.contains(&3));
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+            .unwrap();
+        let text = overlay_text(&terminal, area);
+        assert!(text.contains("localized recovery notice"));
+        assert!(text.contains("external answer"));
     }
 
     #[test]
