@@ -4037,6 +4037,10 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                keep_tool_context_turns: self
+                                    .config
+                                    .resolved
+                                    .keep_tool_context_turns,
                                 context_limits,
                                 context_limits_resolver: self.context_limits_resolver.clone(),
                                 knobs: &knobs,
@@ -4652,6 +4656,10 @@ impl Agent {
                                         .config
                                         .resolved
                                         .max_tool_result_chars,
+                                    keep_tool_context_turns: self
+                                        .config
+                                        .resolved
+                                        .keep_tool_context_turns,
                                     // Fallback pair for the loop when no resolver is
                                     // wired; when `context_limits_resolver` is set
                                     // the loop re-resolves per call, so seed with the

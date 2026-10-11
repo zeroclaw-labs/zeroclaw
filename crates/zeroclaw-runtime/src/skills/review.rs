@@ -161,6 +161,9 @@ pub async fn maybe_run_skill_review(
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
+                        // The fork reviews the parent's tool usage, so the
+                        // parent's tool rows must reach the reviewing model.
+                        keep_tool_context_turns: usize::MAX,
                         context_limits: full_config.zip(agent_alias).map_or_else(
                             || {
                                 zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(

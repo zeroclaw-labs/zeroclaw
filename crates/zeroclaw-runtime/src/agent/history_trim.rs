@@ -5,6 +5,23 @@ use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
+/// Prefixes of the user-role rows the tool loop itself appends mid-turn to give
+/// the model feedback on its own output (see the malformed-protocol retry in
+/// `turn/mod.rs`). They are user-role only because no `tool_call_id` exists to
+/// attach them to, and they belong to the turn they interrupt.
+pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]"];
+
+/// A user row that opens a turn for tool-context retention: a turn boundary
+/// that is not runtime feedback. Whole-turn trimming keeps its own boundary
+/// rule; retention must not let the loop's own feedback row push the running
+/// turn's tool rows out of the retained window.
+fn opens_retention_turn(msg: &ChatMessage) -> bool {
+    is_turn_boundary(msg)
+        && !RUNTIME_FEEDBACK_PREFIXES
+            .iter()
+            .any(|prefix| msg.content.starts_with(prefix))
+}
+
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
 /// a breadcrumb so the loss is never silent.
@@ -350,6 +367,129 @@ fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
 
 pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
+}
+
+/// Provider-facing population derived from a history whose older turns lost
+/// their tool context. `source_rows[i]` is the index, in the input history, of
+/// the row `messages[i]` stands for; a tool-exchange summary stands for the
+/// assistant row that issued the calls it summarises. The input is never
+/// modified, so the working history and every transcript an owner persists
+/// from it keep all their rows.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CollapsedToolContext {
+    pub messages: Vec<ChatMessage>,
+    pub source_rows: Vec<usize>,
+    /// Tool-call and tool-result rows that `messages` leaves out.
+    pub dropped_messages: usize,
+    pub collapsed_turns: usize,
+}
+
+impl CollapsedToolContext {
+    fn keep(&mut self, source_row: usize, message: ChatMessage) {
+        self.messages.push(message);
+        self.source_rows.push(source_row);
+    }
+
+    fn identity(history: &[ChatMessage]) -> Self {
+        Self {
+            messages: history.to_vec(),
+            source_rows: (0..history.len()).collect(),
+            dropped_messages: 0,
+            collapsed_turns: 0,
+        }
+    }
+}
+
+/// A closing reply is an assistant row that issued no native tool calls; an
+/// assistant row that did is a carrier whose results may never have arrived.
+fn is_closing_reply(message: &ChatMessage) -> bool {
+    message.role == "assistant"
+        && crate::agent::history_pruner::extract_assistant_tool_call_ids(&message.content).is_none()
+}
+
+fn count_tool_calls(rows: &[ChatMessage]) -> usize {
+    let from_carriers: usize = rows
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .filter_map(|m| crate::agent::history_pruner::extract_assistant_tool_call_ids(&m.content))
+        .map(|ids| ids.len())
+        .sum();
+    if from_carriers > 0 {
+        return from_carriers;
+    }
+    rows.iter()
+        .filter(|m| {
+            m.role == "tool"
+                || (m.role == "user"
+                    && m.content
+                        .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX))
+        })
+        .count()
+        .max(1)
+}
+
+/// Build the provider-facing population in which every turn older than the
+/// newest `keep_prior_turns + 1` turns keeps its user prompt and closing
+/// assistant reply but loses its tool-call and tool-result rows. The running
+/// turn is always sent whole because the model needs its own results, so `0`
+/// keeps tool context for the running turn only. Leading system messages and
+/// the breadcrumb are copied through. A turn collapses as a unit: the assistant
+/// row that issued the calls is replaced by one `[Tool exchange: …]` summary
+/// row (the marker providers already recognise) and the rows that answered it
+/// are left out, so no orphan call or result is created. A turn that ended on a
+/// call or a result keeps only its prompt and the summary.
+pub(crate) fn collapse_tool_context_older_than(
+    history: &[ChatMessage],
+    keep_prior_turns: usize,
+    crumb_present: bool,
+) -> CollapsedToolContext {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let body_start = leading_system + usize::from(crumb_present);
+    let boundaries: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(body_start)
+        .filter(|(_, m)| opens_retention_turn(m))
+        .map(|(i, _)| i)
+        .collect();
+    let protected = keep_prior_turns.saturating_add(1);
+    if boundaries.len() <= protected {
+        return CollapsedToolContext::identity(history);
+    }
+    let mut out = CollapsedToolContext::default();
+    let mut cursor = 0;
+    for turn in 0..boundaries.len() - protected {
+        let boundary = boundaries[turn];
+        for (row, message) in history.iter().enumerate().take(boundary + 1).skip(cursor) {
+            out.keep(row, message.clone());
+        }
+        let span_start = boundary + 1;
+        let span_end = boundaries[turn + 1];
+        let closing = (span_end > span_start && is_closing_reply(&history[span_end - 1]))
+            .then_some(span_end - 1);
+        let drain_end = closing.unwrap_or(span_end);
+        if drain_end > span_start {
+            let drained = &history[span_start..drain_end];
+            out.dropped_messages += drained.len();
+            out.collapsed_turns += 1;
+            if history[span_start].role == "assistant" {
+                out.keep(
+                    span_start,
+                    ChatMessage::assistant(ChatMessage::pruned_tool_exchange_summary(
+                        count_tool_calls(drained),
+                    )),
+                );
+            }
+        }
+        if let Some(row) = closing {
+            out.keep(row, history[row].clone());
+        }
+        cursor = span_end;
+    }
+    for (row, message) in history.iter().enumerate().skip(cursor) {
+        out.keep(row, message.clone());
+    }
+    out
 }
 
 /// Drop the oldest whole turn (after leading system messages and an optional
@@ -1586,5 +1726,233 @@ mod tests {
             with_marker.get(2),
             Some(m) if m.role == "user" && m.content == "newest request"
         ));
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn sys(c: &str) -> ChatMessage {
+        ChatMessage::system(c)
+    }
+    fn user(c: &str) -> ChatMessage {
+        ChatMessage::user(c)
+    }
+    fn asst(c: &str) -> ChatMessage {
+        ChatMessage::assistant(c)
+    }
+    fn tool(c: &str) -> ChatMessage {
+        ChatMessage::tool(c)
+    }
+    fn carrier(ids: &[&str]) -> ChatMessage {
+        let calls: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{{\"id\":\"{id}\"}}"))
+            .collect();
+        asst(&format!("{{\"tool_calls\":[{}]}}", calls.join(",")))
+    }
+
+    /// user → assistant(call) → tool → assistant(final)
+    fn native_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            carrier(&[&format!("call_{n}")]),
+            tool(&format!(
+                "{{\"tool_call_id\":\"call_{n}\",\"content\":\"result {n}\"}}"
+            )),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    /// user → assistant(call) → user([Tool results]) → assistant(final)
+    fn prompt_mode_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            asst(&format!("[tool_call] shell {n}")),
+            user(&format!("[Tool results]\nresult {n}")),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    fn summary(calls: usize) -> String {
+        ChatMessage::pruned_tool_exchange_summary(calls)
+    }
+
+    fn assert_identity(c: &CollapsedToolContext, history: &[ChatMessage]) {
+        assert_eq!(rows(&c.messages), rows(history));
+        assert_eq!(c.source_rows, (0..history.len()).collect::<Vec<_>>());
+        assert_eq!(c.dropped_messages, 0);
+        assert_eq!(c.collapsed_turns, 0);
+    }
+
+    #[test]
+    fn keeps_running_turn_plus_prior_turns_and_summarises_older_ones() {
+        let mut h = vec![sys("s")];
+        for n in 1..=4 {
+            h.extend(native_turn(n));
+        }
+        let before = rows(&h);
+        let c = collapse_tool_context_older_than(&h, 1, false);
+        assert_eq!(rows(&h), before, "input history is never modified");
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        let expected: Vec<(String, String)> = [
+            ("system", "s"),
+            ("user", "request 1"),
+            ("assistant", summary(1).as_str()),
+            ("assistant", "answer 1"),
+            ("user", "request 2"),
+            ("assistant", summary(1).as_str()),
+            ("assistant", "answer 2"),
+        ]
+        .iter()
+        .map(|(r, t)| (r.to_string(), t.to_string()))
+        .chain(rows(&native_turn(3)))
+        .chain(rows(&native_turn(4)))
+        .collect();
+        assert_eq!(rows(&c.messages), expected);
+        assert!(c.messages[2].is_pruned_tool_exchange_summary());
+        // Every request row maps to the history row it stands for; the summary
+        // stands for the carrier it replaced.
+        assert_eq!(
+            c.source_rows,
+            vec![0, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(c.source_rows.len(), c.messages.len());
+    }
+
+    #[test]
+    fn prompt_mode_results_carrier_is_not_a_turn_boundary() {
+        let mut h = vec![sys("s")];
+        for n in 1..=3 {
+            h.extend(prompt_mode_turn(n));
+        }
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        assert_eq!(count_turns(&c.messages), 3);
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 1")
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 3")
+        );
+        assert_eq!(c.messages[2].content, summary(1));
+    }
+
+    #[test]
+    fn zero_keeps_tool_context_for_the_running_turn_only() {
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_eq!(c.collapsed_turns, 1);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(1)),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn breadcrumb_and_system_prefix_are_copied_and_not_counted() {
+        let mut h = vec![sys("a"), sys("b"), breadcrumb()];
+        h.extend(native_turn(1));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, true);
+        assert_eq!(c.collapsed_turns, 1);
+        assert_eq!(rows(&c.messages[..3]), rows(&h[..3]));
+        assert_eq!(c.messages[3].content, "request 1");
+        assert_eq!(c.messages[4].content, summary(1));
+        assert_eq!(c.messages[5].content, "answer 1");
+        assert_eq!(&c.source_rows[..6], &[0, 1, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn aborted_turn_keeps_prompt_and_summary_but_never_a_dangling_carrier() {
+        let mut h = vec![
+            user("request 1"),
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"),
+            carrier(&["call_2", "call_3"]),
+        ];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_eq!(c.dropped_messages, 3);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(3)),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn runtime_feedback_rows_do_not_split_the_running_turn() {
+        // The running turn already holds a tool round when the loop appends
+        // its own feedback row (twice, the retry budget). With the smallest
+        // window the model must still see that round.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        h.pop();
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(1)),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result"
+        );
+    }
+
+    #[test]
+    fn text_only_turns_and_small_histories_pass_through_unchanged() {
+        let mut h = vec![
+            user("hi"),
+            asst("hello"),
+            user("again"),
+            asst("hello again"),
+        ];
+        h.extend(native_turn(3));
+        let c = collapse_tool_context_older_than(&h, 0, false);
+        assert_identity(&c, &h);
+
+        let mut h2 = native_turn(1);
+        h2.extend(native_turn(2));
+        let c2 = collapse_tool_context_older_than(&h2, 1, false);
+        assert_identity(&c2, &h2);
+
+        let mut h3 = vec![sys("s")];
+        for n in 1..=6 {
+            h3.extend(native_turn(n));
+        }
+        let c3 = collapse_tool_context_older_than(&h3, usize::MAX, false);
+        assert_identity(&c3, &h3);
     }
 }

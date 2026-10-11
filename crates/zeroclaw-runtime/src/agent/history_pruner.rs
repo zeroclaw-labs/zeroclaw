@@ -127,7 +127,7 @@ fn extract_tool_call_id(content: &str) -> Option<String> {
 /// is claiming to have invoked, if any. Returns `None` when the content
 /// does not parse as a JSON object with a `tool_calls` array — meaning the
 /// assistant has no native tool_use blocks backing any tool_results.
-fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
+pub(crate) fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     let arr = value.get("tool_calls")?.as_array()?;
     let ids: Vec<String> = arr

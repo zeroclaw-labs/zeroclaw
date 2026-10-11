@@ -5065,6 +5065,7 @@ impl DelegateTool {
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                        keep_tool_context_turns: loop_runtime.keep_tool_context_turns,
                         // Resolve from the target's provider alias and model, not the
                         // delegating agent's route.
                         context_limits: self.root_config.as_deref().map_or_else(
