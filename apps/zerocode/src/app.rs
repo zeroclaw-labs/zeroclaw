@@ -1946,6 +1946,9 @@ pub async fn run(
         chat_pane.tick_transport_events();
         let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
+        // Collect a finished plugin catalog fetch before drawing, so it shows
+        // without a keypress. Never waits on a fetch still in flight.
+        config_app.poll_background().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
         }
