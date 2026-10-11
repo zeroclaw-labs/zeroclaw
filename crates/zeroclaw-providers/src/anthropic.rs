@@ -81,9 +81,6 @@ const WRAPPED_BASE64_WIDTH_MIN: usize = 16;
 use crate::stream_guard::AbortOnDrop;
 use std::borrow::Cow;
 
-/// Maximum silence between body reads for Anthropic SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
@@ -2398,13 +2395,22 @@ impl AnthropicModelProvider {
         )
     }
 
+    /// Maximum silence between body reads on this provider's SSE streams:
+    /// the shared provider bound, raised by `timeout_secs` when set higher.
+    /// Anthropic's own API sends `ping` events while a long tool input is
+    /// still being generated, but gateways that route to other backends
+    /// (Bedrock) can stay silent for well over a minute mid-stream.
+    fn stream_idle_bound(&self) -> super::StreamIdleBound {
+        super::stream_idle_timeout(self.timeout_secs)
+    }
+
     /// Streaming requests have no whole-request deadline. Header acquisition
     /// and buffered error bodies are bounded separately, while successful SSE
     /// bodies use the shared byte-idle timeout.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(self.stream_idle_bound().duration());
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",
@@ -2425,12 +2431,17 @@ impl AnthropicModelProvider {
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
         requested_model: &str,
+        idle_bound: super::StreamIdleBound,
     ) {
         use tokio_util::io::StreamReader;
 
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
+        // Name the idle bound when a body read times out, instead of
+        // reqwest's bare "error decoding response body".
+        let byte_stream = response.bytes_stream().map(move |result| {
+            result.map_err(|error| {
+                std::io::Error::other(super::stream_idle_error_message(&error, idle_bound))
+            })
+        });
         let reader = StreamReader::new(byte_stream);
         Self::parse_anthropic_sse_from_reader(reader, tx, requested_model).await;
     }
@@ -3399,6 +3410,7 @@ impl ModelProvider for AnthropicModelProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
+        let idle_bound = self.stream_idle_bound();
         let requested_model = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
@@ -3408,7 +3420,7 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_attrs(::serde_json::json!({
-                    "idle_timeout_secs": STREAM_IDLE_TIMEOUT.as_secs(),
+                    "idle_timeout_secs": idle_bound.duration().as_secs(),
                     "channel_capacity": 64,
                 })),
             "stream: spawning detached Anthropic SSE parser task"
@@ -3480,13 +3492,13 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx, &requested_model).await;
+            Self::parse_anthropic_sse(response, &tx, &requested_model, idle_bound).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
         // exact moment the consumer drops the stream — turning a turn cancel
         // (or normal completion) into an immediate parser-task abort instead
-        // of a leaked socket that lingers until STREAM_IDLE_TIMEOUT.
+        // of a leaked socket that lingers until the stream idle bound.
         let guard = AbortOnDrop::new(parser_handle.abort_handle());
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|event| (event, (rx, guard)))
@@ -3997,7 +4009,7 @@ data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
     async fn dropping_guard_aborts_parser_without_idle_wait() {
         // The full-measure fix: dropping the consumer stream must abort the
         // detached parser immediately (turn cancel), not leak the socket until
-        // STREAM_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
+        // stream idle bound. We model the stream's lifetime with AbortOnDrop and
         // assert the task is aborted the instant the guard drops.
         let start = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
@@ -4026,7 +4038,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             "parser must still be running (parked on the stalled read) before drop"
         );
 
-        // Dropping the guard must abort the parser — no STREAM_IDLE_TIMEOUT wait.
+        // Dropping the guard must abort the parser — no idle-bound wait.
         drop(guard);
         tokio::task::yield_now().await;
         assert!(
@@ -9310,6 +9322,89 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..request
         };
         assert!(provider.supports_exact_request_replay(thinking_request, "claude-fable-5"));
+    }
+
+    #[test]
+    fn stream_idle_bound_uses_shared_floor_and_timeout_secs() {
+        let default = AnthropicModelProvider::builder("test").build();
+        assert_eq!(
+            default.stream_idle_bound(),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+            "the default bound must match the other streaming providers, not a fixed 90s"
+        );
+        let raised = AnthropicModelProvider::builder("test")
+            .timeout_secs(900)
+            .build();
+        assert_eq!(
+            raised.stream_idle_bound(),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(900))
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_read_timeout_names_idle_bound() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // A 100 ms read-idle client stands in for the real bound so the silent
+        // body trips it quickly; the message must still name the bound.
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AnthropicModelProvider::parse_anthropic_sse(
+                response,
+                &tx,
+                "claude-sonnet-4-6",
+                crate::stream_idle_timeout(120),
+            ),
+        )
+        .await
+        .expect("silent body must hit the read-idle bound");
+        drop(tx);
+        server.abort();
+        let mut message = None;
+        while let Some(item) = rx.recv().await {
+            if let Err(StreamError::Http(text)) = item {
+                message = Some(text);
+            }
+        }
+        let message = message.expect("stalled stream must yield an HTTP stream error");
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "a configurable bound names the knob: {message}"
+        );
     }
 
     #[tokio::test]
