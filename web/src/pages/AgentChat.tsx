@@ -22,6 +22,7 @@ import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
+import { chatInputFocusOwner, nextChatInputRefocus } from '@/pages/chatInputRefocus.logic';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -206,6 +207,24 @@ export function AgentChatInner({
   useEffect(() => {
     onStatus?.({ typing, messageCount: messages.length });
   }, [typing, messages.length, onStatus]);
+
+  // The message box is disabled for the whole turn, which drops the focus
+  // handleSend gave it. Give it back when the turn ends, unless this pane is
+  // hidden or the user focused something else meanwhile.
+  const refocusArmedRef = useRef(false);
+  useEffect(() => {
+    const el = inputRef.current;
+    const action = nextChatInputRefocus({
+      armed: refocusArmedRef.current,
+      typing,
+      inputEnabled: connected && hydrated,
+      inputVisible: el !== null && el.getClientRects().length > 0,
+      focusOwner: chatInputFocusOwner(document.activeElement, document.body, el),
+    });
+    if (action === 'arm') refocusArmedRef.current = true;
+    if (action === 'focus' || action === 'skip') refocusArmedRef.current = false;
+    if (action === 'focus') el?.focus();
+  }, [typing, connected, hydrated]);
 
   // Scroll to bottom on new messages / streaming.
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
