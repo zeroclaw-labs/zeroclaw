@@ -2349,6 +2349,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
+        .route(
+            "/api/openrouter/credits",
+            get(api::handle_api_openrouter_credits),
+        )
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
         .route(

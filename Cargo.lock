@@ -14321,6 +14321,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "rcgen",
+ "reqwest 0.12.28",
  "rusqlite",
  "rustls",
  "schemars 1.2.2",

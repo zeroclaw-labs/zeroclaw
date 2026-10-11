@@ -164,6 +164,25 @@ Schema-mirror env overrides win at startup. They replace the in-memory credentia
 
 `zeroclaw quickstart` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
 
+### OpenRouter dashboard balance
+
+An OpenRouter alias may also carry a separate `management_api_key`. When an
+enabled agent uses that alias, the dashboard queries OpenRouter's credits API
+through the authenticated ZeroClaw gateway and shows the remaining account
+balance. The card is omitted when the alias is inactive, either credential is
+missing, or the credits API cannot be reached.
+
+Create this credential as a Management API key in OpenRouter. It is distinct
+from the alias's inference `api_key`, is stored as a secret, and is never sent
+to the browser. For example:
+
+```toml
+[providers.models.openrouter.primary]
+api_key = "op://platform/openrouter/inference-key"
+management_api_key = "op://platform/openrouter/management-key"
+model = "openai/gpt-4o-mini"
+```
+
 ## OAuth and subscription auth
 
 Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
