@@ -2521,6 +2521,9 @@ pub async fn run(
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
+            // The shipped REPL reads stdin directly instead of going through
+            // `CliChannel::listen`, so it must own the terminal erase guard.
+            let _utf8_erase_guard = crate::cli_input::ensure_terminal_utf8_erase();
             loop {
                 print!("> ");
                 let _ = std::io::stdout().flush();
