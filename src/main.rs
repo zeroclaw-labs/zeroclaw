@@ -811,6 +811,94 @@ where
     anyhow::bail!("{}", human.into())
 }
 
+/// Rows across the keyed list sections (`plugins.entries`, `mcp.servers`,
+/// ...). `config patch` creates a missing row; the daemon's property writes
+/// never do.
+#[cfg(feature = "agent-runtime")]
+fn keyed_list_rows(config: &Config) -> usize {
+    Config::map_key_sections()
+        .into_iter()
+        .filter(|section| {
+            section.kind == zeroclaw_config::traits::MapKeyKind::List
+                && section.natural_key.is_some()
+        })
+        .filter_map(|section| config.get_map_keys(section.path))
+        .map(|keys| keys.len())
+        .sum()
+}
+
+/// Whether the daemon's config methods take the write of `value` to `path`
+/// that the CLI staged on `config`. They refuse to overwrite a secret with an
+/// empty or masked value, which the CLI's own write allows; the field info is
+/// looked up the way the daemon looks it up.
+#[cfg(feature = "agent-runtime")]
+fn daemon_replays_write(config: &Config, path: &str, value: &str) -> bool {
+    let info = config.prop_fields().into_iter().find(|f| f.name == path);
+    !zeroclaw_runtime::rpc::dispatch::refuses_secret_placeholder(info.as_ref(), path, value)
+}
+
+/// Whether the daemon can commit a `config patch` as one `config/set-many`
+/// batch: every staged write is one it can replay, and the batch is neither
+/// empty nor over its cap. The CLI saves any other patch itself.
+#[cfg(feature = "agent-runtime")]
+fn patch_batch_is_delegatable(entries: usize, replayable: bool) -> bool {
+    replayable
+        && (1..=zeroclaw_runtime::rpc::dispatch::RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES)
+            .contains(&entries)
+}
+
+/// The API error for an authorization edit that failed a `config patch`, in
+/// the daemon or before a local save: a rejection as invalid params, a
+/// refusal of the principal the daemon bound, or a policy that would not
+/// compile, is a validation verdict (no code names a permission denial, and
+/// a refusal is a verdict on this edit, not a server fault); a `test` op the
+/// running daemon's live configuration could not be checked against is an
+/// unsupported op on its path; any other rejection, and an edit whose outcome
+/// is unknown (which names the property to check), is internal.
+#[cfg(feature = "agent-runtime")]
+fn daemon_commit_api_error(err: &anyhow::Error) -> ConfigApiError {
+    use config_publication::CommitFailure;
+    #[cfg(unix)]
+    use zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS;
+
+    let message = err.to_string();
+    match err.downcast_ref::<CommitFailure>() {
+        #[cfg(unix)]
+        Some(CommitFailure::Rejected { code, .. }) if *code == i64::from(INVALID_PARAMS) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        #[cfg(unix)]
+        Some(CommitFailure::Forbidden { .. }) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        Some(CommitFailure::PolicyWouldNotCompile { .. }) => {
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+        }
+        Some(CommitFailure::UncheckableTest { path }) => {
+            ConfigApiError::new(ConfigApiCode::OpNotSupported, message).with_path(path)
+        }
+        #[cfg(unix)]
+        Some(CommitFailure::Unknown { path }) => {
+            ConfigApiError::new(ConfigApiCode::InternalError, message).with_path(path)
+        }
+        _ => ConfigApiError::new(ConfigApiCode::InternalError, message),
+    }
+}
+
+/// `envelope` with a `daemon` member saying what the running daemon did with
+/// an authorization edit, or unchanged when the daemon had no part in it.
+#[cfg(feature = "agent-runtime")]
+fn with_daemon_member(
+    mut envelope: serde_json::Value,
+    publication: &config_publication::Publication,
+) -> serde_json::Value {
+    if let (Some(members), Some(daemon)) = (envelope.as_object_mut(), publication.envelope_field())
+    {
+        members.insert("daemon".to_owned(), daemon);
+    }
+    envelope
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s
         .parse()
@@ -899,11 +987,15 @@ mod rag {
 mod browse;
 mod config;
 #[cfg(feature = "agent-runtime")]
+mod config_publication;
+#[cfg(feature = "agent-runtime")]
 mod cost;
 #[cfg(feature = "agent-runtime")]
 mod cron;
 #[cfg(feature = "agent-runtime")]
 mod daemon;
+#[cfg(feature = "agent-runtime")]
+mod daemon_rpc;
 #[cfg(feature = "agent-runtime")]
 mod doctor;
 #[cfg(feature = "gateway")]
@@ -1467,6 +1559,13 @@ Examples:
     Oidc {
         #[command(subcommand)]
         oidc_command: OidcCommands,
+    },
+
+    /// Manage the local user roster ([users.<name>]) and roster passwords
+    #[cfg(feature = "agent-runtime")]
+    User {
+        #[command(subcommand)]
+        user_command: UserCommands,
     },
 
     /// Discover and introspect USB hardware
@@ -5862,6 +5961,62 @@ enum OidcCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum UserCommands {
+    /// List roster entries and the credentials each carries (never a hash)
+    List,
+    /// Add a roster entry
+    Add {
+        /// Entry name: the password login name and, unless --principal-id pins
+        /// another, the durable principal id
+        name: String,
+        /// A [permission_profiles.<alias>] granting this user's permissions;
+        /// repeat the flag for several
+        #[arg(long = "profile", required = true)]
+        profiles: Vec<String>,
+        /// Unix uid accepted for this user on the local socket
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Durable principal id, when it should differ from the entry name
+        #[arg(long)]
+        principal_id: Option<String>,
+        /// Set a password, typed twice at a prompt
+        #[arg(long, conflicts_with = "password_stdin")]
+        password: bool,
+        /// Set a password read as one line from standard input
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Set or replace a roster entry's password
+    Passwd {
+        /// Entry name
+        name: String,
+        /// Read the password as one line from standard input instead of
+        /// prompting
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Remove the password from a roster entry that also has a uid
+    DisablePassword {
+        /// Entry name
+        name: String,
+    },
+    /// Remove a roster entry
+    Remove {
+        /// Entry name
+        name: String,
+    },
+    /// Print a password hash for config managed by other tools; the hash is
+    /// the only output on stdout
+    HashPassword {
+        /// Read the password as one line from standard input instead of
+        /// prompting
+        #[arg(long)]
+        password_stdin: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache model_provider models
@@ -6763,6 +6918,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    // `user hash-password` is stdout-only too, and needs no config: loading
+    // one could fail on an unrelated section, or create one on a host that
+    // has none.
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::User {
+        user_command: UserCommands::HashPassword { password_stdin },
+    } = &cli.command
+    {
+        return print_password_hash(*password_stdin);
+    }
+
     // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
     match &cli.command {
         Commands::MarkdownHelp => {
@@ -7125,6 +7291,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             unreachable!("matched the Oidc variant above")
         };
         return handle_oidc_command(oidc_command, &config).await;
+    }
+    // Roster edits need no startup prelude: they touch only config.toml, or
+    // the running daemon that commits it. This is their only dispatch; the
+    // match below never sees them, and `user hash-password` never gets here,
+    // since it runs before the config loads.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::User { .. }) {
+        let Commands::User { user_command } = cli.command else {
+            unreachable!("matched the User variant above")
+        };
+        return Box::pin(handle_user_command(user_command, &config)).await;
     }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
@@ -9510,6 +9687,12 @@ Add pricing to the active provider profile or supply a catalog entry."
         #[cfg(feature = "agent-runtime")]
         Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
+        // Dispatched before the startup prelude, like the commands above.
+        #[cfg(feature = "agent-runtime")]
+        Commands::User { .. } => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
+        }
+
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
         }
@@ -9957,6 +10140,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
+                // Taken before the map key is materialized: an edit that
+                // creates a roster or OIDC entry then counts as an
+                // authorization edit, and whether the policy compiled is
+                // judged without the entry's empty defaults.
+                let mut before = config_publication::AuthSnapshot::capture(&config)?;
                 if ensure_map_key_for_prop_path(&mut config, &path)? {
                     let known_paths: Vec<String> =
                         config.prop_fields().into_iter().map(|f| f.name).collect();
@@ -10104,7 +10292,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 };
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership =
+                let offline_ownership =
                     if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
                         match crate::alias_cli::route_agent_mutation(
                             &mut config,
@@ -10134,6 +10322,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 return Ok(());
                             }
                             crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                // The route reloaded `config` from disk once it
+                                // held ownership, so the snapshot is retaken from
+                                // that config before the edit is staged on it again.
+                                before = config_publication::AuthSnapshot::capture(&config)?;
                                 Some(ownership)
                             }
                         }
@@ -10148,8 +10340,45 @@ Add pricing to the active provider profile or supply a catalog entry."
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
                 config.set_prop_persistent(&path, &selected_value)?;
-                Box::pin(config.save_dirty()).await?;
-                if let Some(c) = comment.as_ref()
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
+                let publication = if daemon_replays_write(&config, &path, &selected_value) {
+                    let publication = Box::pin(config_publication::commit_set(
+                        &before,
+                        &config,
+                        &path,
+                        &selected_value,
+                        comment.as_deref(),
+                        holds_config_ownership,
+                    ))
+                    .await?;
+                    // A daemon that applied the edit has already saved
+                    // config.toml.
+                    if !matches!(publication, config_publication::Publication::Applied) {
+                        Box::pin(config.save_dirty()).await?;
+                    }
+                    publication
+                } else {
+                    // Classified before the save: while a daemon runs, an
+                    // edit that breaks a policy that compiles saves nothing.
+                    let publication = config_publication::classify_local_save(
+                        &before,
+                        &config,
+                        std::slice::from_ref(&path),
+                        config_publication::PendingReason::NotReplayable,
+                        true,
+                        holds_config_ownership,
+                    )?;
+                    Box::pin(config.save_dirty()).await?;
+                    publication
+                };
+                // Reported before the comment is written: the edit's outcome is
+                // settled, and a failed annotation must not hide it.
+                publication.report(json);
+                // A daemon that applied the edit wrote the comment with it.
+                if !matches!(publication, config_publication::Publication::Applied)
+                    && let Some(c) = comment.as_ref()
                     && !c.is_empty()
                 {
                     apply_comment_inline(&config.config_path, &path, c).await?;
@@ -10161,6 +10390,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let value_str = config.get_prop(&path).unwrap_or_default();
                         serde_json::json!({"path": path, "value": value_str})
                     };
+                    let envelope = with_daemon_member(envelope, &publication);
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else {
                     println!(
@@ -10172,7 +10402,7 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
             ConfigCommands::Init { section, json } => {
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if let Some(("agents", alias)) = section
+                let offline_ownership = if let Some(("agents", alias)) = section
                     .as_deref()
                     .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
                 {
@@ -10226,6 +10456,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     None
                 };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                let before = config_publication::AuthSnapshot::capture(&config)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
@@ -10243,11 +10474,29 @@ Add pricing to the active provider profile or supply a catalog entry."
                     mark_new_map_alias_dirty(&mut config, &created);
                     initialized.push(created);
                 }
+                // `config init` has no daemon path for a roster, profile or
+                // OIDC entry: one it creates waits for the running daemon's
+                // next reload. It is classified before the save, so while a
+                // daemon runs an entry that breaks a policy that compiles
+                // saves nothing. An offline agent route already holds the
+                // configuration's ownership lock.
+                let publication = config_publication::classify_local_save(
+                    &before,
+                    &config,
+                    &initialized,
+                    config_publication::PendingReason::OfflineCommand,
+                    true,
+                    offline_ownership.is_some(),
+                )?;
                 if !initialized.is_empty() {
                     Box::pin(config.save_dirty()).await?;
                 }
+                publication.report(json);
                 if json {
-                    let envelope = serde_json::json!({"initialized": initialized});
+                    let envelope = with_daemon_member(
+                        serde_json::json!({"initialized": initialized}),
+                        &publication,
+                    );
                     println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else if initialized.is_empty() {
                     println!(
@@ -10420,7 +10669,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
 
                 #[cfg(feature = "agent-runtime")]
-                let _offline_ownership = if ops.iter().any(|op| {
+                let offline_ownership = if ops.iter().any(|op| {
                     let op_name = op.get("op").and_then(|value| value.as_str());
                     let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
                         path.strip_prefix('/')
@@ -10448,8 +10697,22 @@ Add pricing to the active provider profile or supply a catalog entry."
                 };
 
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                // Taken before any op is staged, so an op that creates a roster,
+                // profile or OIDC entry counts as an authorization edit.
+                let before = config_publication::AuthSnapshot::capture(&config)?;
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
+                // The staged writes in order, which the daemon replays as one
+                // `config/set-many` batch when the patch writes or changes the
+                // authorization inputs. A patch it cannot replay (one that
+                // clears or masks a secret or creates a keyed list row) is
+                // saved here instead.
+                let mut sets: Vec<(String, String)> = Vec::with_capacity(ops.len());
+                let mut replayable = true;
+                // The properties the patch's `test` ops checked, on this copy
+                // of config.toml. A daemon that commits the batch applies its
+                // writes to its live configuration instead.
+                let mut tested: Vec<String> = Vec::new();
 
                 for (idx, op) in ops.iter().enumerate() {
                     let object = match op.as_object() {
@@ -10495,6 +10758,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     } else {
                         raw_path.to_string()
                     };
+                    let list_rows = keyed_list_rows(&config);
                     if matches!(op_name, "add" | "replace")
                         && config.ensure_map_or_list_key_for_path(&path)
                     {
@@ -10509,6 +10773,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         );
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
+                    replayable &= keyed_list_rows(&config) == list_rows;
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -10573,6 +10838,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     config_patch_fail_json_or_human(json, api_err, human)?;
                                 }
                             }
+                            sets.push((path.clone(), value_str.clone()));
+                            replayable &= daemon_replays_write(&config, &path, &value_str);
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -10599,6 +10866,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     config_patch_fail_json_or_human(json, api_err, human)?;
                                 }
                             }
+                            // The daemon reads an empty value as a reset to the
+                            // default, the same as the write above.
+                            sets.push((path.clone(), String::new()));
+                            replayable &= daemon_replays_write(&config, &path, "");
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -10676,6 +10947,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                                 );
                                 config_patch_fail_json_or_human(json, err, human)?;
                             }
+                            tested.push(path.clone());
                             serde_json::json!({
                                 "op": "test",
                                 "path": path,
@@ -10714,7 +10986,59 @@ Add pricing to the active provider profile or supply a catalog entry."
                     );
                     config_patch_fail_json_or_human(json, api_err, human)?;
                 }
-                Box::pin(config.save_dirty()).await?;
+                // An offline agent route already holds the configuration's
+                // ownership lock, which no daemon can hold meanwhile.
+                let holds_config_ownership = offline_ownership.is_some();
+                let publication = if patch_batch_is_delegatable(sets.len(), replayable) {
+                    let publication = match Box::pin(config_publication::commit_set_many(
+                        &before,
+                        &config,
+                        &sets,
+                        &tested,
+                        holds_config_ownership,
+                    ))
+                    .await
+                    {
+                        Ok(publication) => publication,
+                        // The daemon's verdict, or a `test` op that cannot be
+                        // checked where the daemon would apply the batch,
+                        // fails the whole patch, in the same envelope its
+                        // other failures use.
+                        Err(err) => config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?,
+                    };
+                    // A daemon that applied the batch has already saved
+                    // config.toml.
+                    if !matches!(publication, config_publication::Publication::Applied) {
+                        Box::pin(config.save_dirty()).await?;
+                    }
+                    publication
+                } else {
+                    let touched: Vec<String> = sets.iter().map(|(path, _)| path.clone()).collect();
+                    // Classified before the save: while a daemon runs, a patch
+                    // that breaks a policy that compiles fails whole, in the
+                    // envelope the delegated branch's verdict uses.
+                    let publication = match config_publication::classify_local_save(
+                        &before,
+                        &config,
+                        &touched,
+                        config_publication::PendingReason::NotReplayable,
+                        false,
+                        holds_config_ownership,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(err) => config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?,
+                    };
+                    Box::pin(config.save_dirty()).await?;
+                    publication
+                };
 
                 // Report the withheld tool when this patch is what enabled the
                 // section. The helper returns early while it stays disabled, so
@@ -10728,8 +11052,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     warn_verifiable_intent_withheld(&config);
                 }
 
+                publication.report(json);
                 if json {
-                    let body = serde_json::json!({"saved": true, "results": results});
+                    let body = with_daemon_member(
+                        serde_json::json!({"saved": true, "results": results}),
+                        &publication,
+                    );
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 } else {
                     println!(
@@ -12405,6 +12733,607 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
     }
     println!("{}", token.access_token);
     Ok(())
+}
+
+/// `zeroclaw user`: edits to the `[users]` roster. Each edit is checked as a
+/// complete authorization policy before a password is asked for and again
+/// before it is committed. While a daemon serves this configuration, the
+/// edit goes through it, which validates, saves and applies it as one step,
+/// the way `config set` hands it an authorization edit. With no daemon
+/// running, or one that refuses this caller before binding a principal, the
+/// command saves config.toml itself, which also makes these commands a
+/// repair path for a daemon that refuses everyone.
+#[cfg(feature = "agent-runtime")]
+async fn handle_user_command(user_command: UserCommands, config: &Config) -> Result<()> {
+    use zeroclaw_config::password_hash::{Decoy, hash_password};
+
+    match user_command {
+        // `main` runs this before any config is loaded, and returns.
+        UserCommands::HashPassword { .. } => {
+            bail!("`user hash-password` was not handled before the config loaded")
+        }
+        UserCommands::List => {
+            ensure_roster_loaded(config)?;
+            print_roster(config);
+            Ok(())
+        }
+        UserCommands::Add {
+            name,
+            profiles,
+            uid,
+            principal_id,
+            password,
+            password_stdin,
+        } => {
+            let mut edit = RosterEdit::begin(config)?;
+            if edit.config.users.contains_key(&name) {
+                bail!(ta(
+                    "cli-user-exists",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} already exists. Use `zeroclaw user passwd {name}` to change its password."
+                    ),
+                ));
+            }
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, false)).await?;
+            let sets_password = password || password_stdin;
+            if uid.is_none() && !sets_password {
+                bail!(ta(
+                    "cli-user-add-needs-credential",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} needs a credential: pass --uid, --password, or --password-stdin."
+                    ),
+                ));
+            }
+            // Creating the key checks the name first.
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut edit.config, "users", &name)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            let entry = roster_entry(&mut edit.config, &name)?;
+            entry.principal_id = principal_id;
+            entry.uid = uid;
+            entry.permission_profiles = profiles;
+            // Check the rest of the entry before a password is typed, with a
+            // placeholder where its hash will go.
+            entry.password_hash = sets_password.then(|| Decoy::default().as_phc().to_owned());
+            check_roster(&edit.config)?;
+            if sets_password {
+                let hash = hash_password(&read_new_password(password_stdin)?)?;
+                roster_entry(&mut edit.config, &name)?.password_hash = Some(hash);
+            }
+            mark_new_map_alias_dirty(&mut edit.config, &format!("users.{name}"));
+            let write =
+                RosterWrite::Set(entry_writes(roster_entry(&mut edit.config, &name)?, &name)?);
+            let done = ta(
+                "cli-user-added",
+                &[("name", &name)],
+                format!("Added users.{name}."),
+            );
+            Box::pin(edit.save(write, &done, sets_password)).await
+        }
+        UserCommands::Passwd {
+            name,
+            password_stdin,
+        } => {
+            let mut edit = RosterEdit::begin(config)?;
+            roster_entry(&mut edit.config, &name)?;
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, true)).await?;
+            // Check the policy as it will be once the password is set, before
+            // asking for it: a placeholder stands where the new hash goes, so
+            // an entry this command is repairing (no credential yet, or a
+            // hash outside the policy) is not refused for what it replaces.
+            roster_entry(&mut edit.config, &name)?.password_hash =
+                Some(Decoy::default().as_phc().to_owned());
+            check_roster(&edit.config)?;
+            let hash = hash_password(&read_new_password(password_stdin)?)?;
+            roster_entry(&mut edit.config, &name)?.password_hash = Some(hash.clone());
+            let path = format!("users.{name}.password_hash");
+            edit.config.mark_dirty(&path);
+            let done = ta(
+                "cli-user-password-set",
+                &[("name", &name)],
+                format!("Set the password for users.{name}."),
+            );
+            Box::pin(edit.save(RosterWrite::Set(vec![(path, hash)]), &done, true)).await
+        }
+        UserCommands::DisablePassword { name } => {
+            let mut edit = RosterEdit::begin(config)?;
+            let entry = roster_entry(&mut edit.config, &name)?;
+            if entry.password_hash.is_none() {
+                bail!(ta(
+                    "cli-user-no-password",
+                    &[("name", &name)],
+                    format!("users.{name} has no password."),
+                ));
+            }
+            if entry.uid.is_none() {
+                bail!(ta(
+                    "cli-user-password-only-credential",
+                    &[("name", &name)],
+                    format!(
+                        "users.{name} has no uid, so its password is its only credential. Remove the entry with `zeroclaw user remove {name}` instead."
+                    ),
+                ));
+            }
+            entry.password_hash = None;
+            Box::pin(edit.refuse_if_the_daemon_disagrees(&name, true)).await?;
+            let path = format!("users.{name}.password_hash");
+            edit.config.mark_dirty(&path);
+            let done = ta(
+                "cli-user-password-removed",
+                &[("name", &name)],
+                format!("Removed the password from users.{name}."),
+            );
+            Box::pin(edit.save(RosterWrite::Clear(path), &done, false)).await
+        }
+        UserCommands::Remove { name } => {
+            let mut edit = RosterEdit::begin(config)?;
+            roster_entry(&mut edit.config, &name)?;
+            edit.config
+                .delete_map_key("users", &name)
+                .map_err(anyhow::Error::msg)?;
+            edit.config.mark_dirty(&format!("users.{name}"));
+            let done = ta(
+                "cli-user-removed",
+                &[("name", &name)],
+                format!("Removed users.{name}."),
+            );
+            Box::pin(edit.save(RosterWrite::RemoveEntry(name), &done, false)).await
+        }
+    }
+}
+
+/// `user hash-password`: the hash of a new password, alone on stdout. It
+/// needs no configuration, so `main` runs it before any config is loaded.
+#[cfg(feature = "agent-runtime")]
+fn print_password_hash(from_stdin: bool) -> Result<()> {
+    let password = read_new_password(from_stdin)?;
+    println!(
+        "{}",
+        zeroclaw_config::password_hash::hash_password(&password)?
+    );
+    Ok(())
+}
+
+/// Environment overrides that a roster check would trust although the file
+/// does not hold them: any under `users` or `permission_profiles`, whose
+/// values the check reads; one under `oidc`, unless it is a secret of an
+/// entry the file defines (for a secret the check reads only whether it is
+/// set); and an alias under `agents` that the file does not define, since a
+/// profile may name it. `file` is the text of `config.toml`.
+#[cfg(feature = "agent-runtime")]
+fn overrides_the_check_would_trust<'a>(config: &'a Config, file: &[u8]) -> Vec<&'a str> {
+    let table = toml::from_str::<toml::Table>(&String::from_utf8_lossy(file)).ok();
+    let aliases_in = |section: &str| -> std::collections::HashSet<String> {
+        table
+            .as_ref()
+            .and_then(|table| table.get(section))
+            .and_then(toml::Value::as_table)
+            .map(|entries| entries.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let file_agents = aliases_in("agents");
+    let file_oidc = aliases_in("oidc");
+    let mut paths: Vec<&str> = config
+        .env_overridden_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| {
+            let mut parts = path.splitn(3, '.');
+            match (parts.next(), parts.next()) {
+                (Some("users" | "permission_profiles"), _) => true,
+                (Some("oidc"), Some(alias)) => {
+                    !file_oidc.contains(alias) || !Config::prop_is_secret(path)
+                }
+                (Some("agents"), Some(alias)) => !file_agents.contains(alias),
+                _ => false,
+            }
+        })
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// Refuse to read or edit a roster the file does not fully describe: the
+/// resilient loader resets a malformed section to its default, so a check of
+/// the loaded roster, profiles, or OIDC entries would not be a check of the
+/// file.
+#[cfg(feature = "agent-runtime")]
+fn ensure_roster_loaded(config: &Config) -> Result<()> {
+    let degraded: Vec<&str> = config
+        .degraded_security
+        .iter()
+        .map(String::as_str)
+        .filter(|section| {
+            *section == zeroclaw_config::migration::WHOLE_CONFIG_SENTINEL
+                || matches!(*section, "users" | "permission_profiles" | "oidc")
+        })
+        .collect();
+    if degraded.is_empty() {
+        return Ok(());
+    }
+    let sections = degraded.join(", ");
+    let path = config.config_path.display().to_string();
+    bail!(ta(
+        "cli-user-roster-degraded",
+        &[("sections", &sections), ("path", &path)],
+        format!(
+            "Part of {path} failed to load ({sections}), so the roster cannot be read or edited safely. Repair it by hand, then run the command again."
+        ),
+    ))
+}
+
+/// Prove the roster compiles into an authorization policy.
+#[cfg(feature = "agent-runtime")]
+fn check_roster(config: &Config) -> Result<()> {
+    zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(config)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn roster_entry<'a>(
+    config: &'a mut Config,
+    name: &str,
+) -> Result<&'a mut zeroclaw_config::schema::UserConfig> {
+    config.users.get_mut(name).ok_or_else(|| {
+        anyhow::Error::msg(ta(
+            "cli-user-not-found",
+            &[("name", name)],
+            format!("There is no [users.{name}] entry."),
+        ))
+    })
+}
+
+/// The `config/set-many` writes that author the roster entry `name` as
+/// `entry` holds it: every field it sets, as the strings `set_prop` takes.
+#[cfg(feature = "agent-runtime")]
+fn entry_writes(
+    entry: &zeroclaw_config::schema::UserConfig,
+    name: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut writes = vec![(
+        format!("users.{name}.permission_profiles"),
+        serde_json::to_string(&entry.permission_profiles)?,
+    )];
+    if let Some(uid) = entry.uid {
+        writes.push((format!("users.{name}.uid"), uid.to_string()));
+    }
+    if let Some(principal_id) = &entry.principal_id {
+        writes.push((format!("users.{name}.principal_id"), principal_id.clone()));
+    }
+    if let Some(hash) = &entry.password_hash {
+        writes.push((format!("users.{name}.password_hash"), hash.clone()));
+    }
+    Ok(writes)
+}
+
+/// How a running daemon commits a roster edit, by the config method that
+/// takes it.
+#[cfg(feature = "agent-runtime")]
+enum RosterWrite {
+    /// `config/set-many` with these property writes.
+    Set(Vec<(String, String)>),
+    /// `config/delete` of this property, the way the daemon clears a secret.
+    Clear(String),
+    /// `config/map-key-delete` of the roster entry with this name.
+    RemoveEntry(String),
+}
+
+/// One roster edit: a working copy of the loaded config, the authorization
+/// inputs the edit starts from, and the bytes of the file it will be saved
+/// over. The policy check runs against the working copy. When the command
+/// saves the file itself, a file that changed while the edit was open (a
+/// password prompt can take a while) is refused rather than merged under a
+/// check that never saw the change; the check and the save are not one step,
+/// so a change landing between them is not caught.
+#[cfg(feature = "agent-runtime")]
+struct RosterEdit {
+    config: Config,
+    before: config_publication::AuthSnapshot,
+    on_disk: Vec<u8>,
+    /// The entry name whose presence in the running daemon's roster was
+    /// checked, and whether config.toml has it, so `save` can check again.
+    daemon_premise: Option<(String, bool)>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl RosterEdit {
+    fn begin(config: &Config) -> Result<Self> {
+        ensure_roster_loaded(config)?;
+        crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+        let on_disk = std::fs::read(&config.config_path)
+            .with_context(|| format!("reading {}", config.config_path.display()))?;
+        // An override exists only in this process, so the check would pass
+        // against values the file does not hold.
+        let overridden = overrides_the_check_would_trust(config, &on_disk);
+        if !overridden.is_empty() {
+            let paths = overridden.join(", ");
+            let path = config.config_path.display().to_string();
+            bail!(ta(
+                "cli-user-env-overrides",
+                &[("paths", &paths), ("path", &path)],
+                format!(
+                    "Environment overrides change {paths}, so the roster check would not match {path}. Unset them and run the command again."
+                ),
+            ));
+        }
+        Ok(Self {
+            config: config.clone(),
+            before: config_publication::AuthSnapshot::capture(config)?,
+            on_disk,
+            daemon_premise: None,
+        })
+    }
+
+    /// Refuse an edit the running daemon would apply to a different entry:
+    /// the command decides from config.toml whether `name` exists
+    /// (`in_file`), but the daemon applies the edit to the roster it holds,
+    /// which differs from the file while a hand edit or an edit reported
+    /// pending waits for a reload. Asked before any password is typed, and
+    /// again by `save` just before the commit, since another writer can
+    /// change the daemon's roster while the prompt is open. With no daemon
+    /// running, or one that cannot be asked, there is nothing to compare, and
+    /// the commit reports what became of the edit.
+    async fn refuse_if_the_daemon_disagrees(&mut self, name: &str, in_file: bool) -> Result<()> {
+        self.daemon_premise = Some((name.to_owned(), in_file));
+        Box::pin(self.check_daemon_premise(false)).await
+    }
+
+    /// `again` is set for the check just before the commit: a disagreement
+    /// then means another writer changed the daemon's roster while this
+    /// command ran.
+    async fn check_daemon_premise(&self, again: bool) -> Result<()> {
+        let Some((name, in_file)) = &self.daemon_premise else {
+            return Ok(());
+        };
+        let Some(live) = Box::pin(config_publication::live_map_keys(&self.config, "users")).await
+        else {
+            return Ok(());
+        };
+        let live_has_it = live.iter().any(|key| key == name);
+        if live_has_it == *in_file {
+            return Ok(());
+        }
+        if again {
+            bail!(ta(
+                "cli-user-live-entry-changed",
+                &[("name", name)],
+                format!(
+                    "The running daemon's roster changed for users.{name} while this command ran, so nothing was written. Run the command again."
+                ),
+            ));
+        }
+        if live_has_it {
+            bail!(ta(
+                "cli-user-live-entry-exists",
+                &[("name", name)],
+                format!(
+                    "users.{name} is not in config.toml, but the running daemon still holds it: a change waits for a reload. Restart the daemon, then run the command again."
+                ),
+            ));
+        }
+        bail!(ta(
+            "cli-user-live-entry-missing",
+            &[("name", name)],
+            format!(
+                "users.{name} is in config.toml, but the running daemon has not loaded it: a change waits for a reload. Restart the daemon, then run the command again."
+            ),
+        ))
+    }
+
+    /// Check the edited roster, and the daemon's roster again against what
+    /// the edit assumed of it, then commit it as `write` through the daemon
+    /// serving this configuration, when one runs and takes it. Otherwise
+    /// refuse if the file changed since the edit began, and write only the
+    /// changed paths. Prints `done`, then how the running daemon took the
+    /// edit, if one runs.
+    async fn save(mut self, write: RosterWrite, done: &str, sets_password: bool) -> Result<()> {
+        check_roster(&self.config)?;
+        Box::pin(self.check_daemon_premise(true)).await?;
+        let publication = match &write {
+            RosterWrite::Set(writes) => {
+                Box::pin(config_publication::commit_set_many(
+                    &self.before,
+                    &self.config,
+                    writes,
+                    &[],
+                    false,
+                ))
+                .await?
+            }
+            RosterWrite::Clear(path) => {
+                Box::pin(config_publication::commit_delete(
+                    &self.before,
+                    &self.config,
+                    path,
+                ))
+                .await?
+            }
+            RosterWrite::RemoveEntry(name) => {
+                Box::pin(config_publication::commit_map_key_delete(
+                    &self.before,
+                    &self.config,
+                    "users",
+                    name,
+                ))
+                .await?
+            }
+        };
+        // A daemon that applied the edit has already saved config.toml.
+        if !matches!(publication, config_publication::Publication::Applied) {
+            let path = self.config.config_path.clone();
+            let current =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            if current != self.on_disk {
+                let shown = path.display().to_string();
+                bail!(ta(
+                    "cli-user-config-changed",
+                    &[("path", &shown)],
+                    format!(
+                        "{shown} changed while this command ran, so nothing was written. Run the command again."
+                    ),
+                ));
+            }
+            Box::pin(self.config.save_dirty()).await?;
+        }
+        println!("{done}");
+        publication.report(false);
+        if sets_password && !self.config.security.password_auth.enabled {
+            eprintln!(
+                "{}",
+                t(
+                    "cli-user-password-auth-off",
+                    "Password sign-in is off. Set security.password_auth.enabled = true to turn it on."
+                )
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Read a password to set: typed twice at a hidden prompt, or one line from
+/// standard input. It must pass the shared new-password rule. The buffers
+/// this function holds are scrubbed when dropped; copies made inside the
+/// terminal prompt and the stdin reader are not.
+#[cfg(feature = "agent-runtime")]
+fn read_new_password(from_stdin: bool) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::IsTerminal;
+    use zeroclaw_config::password_hash::{
+        MAX_PASSWORD_BYTES, MIN_NEW_PASSWORD_CHARS, NewPasswordError, check_new_password,
+    };
+    use zeroize::{Zeroize, Zeroizing};
+
+    let password = if from_stdin {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            bail!(t(
+                "cli-user-password-stdin-terminal",
+                "--password-stdin reads a pipe or a file; typing into a terminal here would show the password. To type it at a hidden prompt, pass --password to add, or leave --password-stdin out of passwd and hash-password."
+            ));
+        }
+        // One byte past the longest password plus a CRLF is enough to tell
+        // that input is too long, without buffering all of it. The buffer is
+        // sized up front so it never reallocates and leaves a copy behind.
+        let limit = MAX_PASSWORD_BYTES + 3;
+        let cap = u64::try_from(limit).unwrap_or(u64::MAX);
+        let mut line = Zeroizing::new(Vec::with_capacity(limit));
+        stdin.lock().take(cap).read_until(b'\n', &mut line)?;
+        let end = line
+            .iter()
+            .rposition(|byte| *byte != b'\n' && *byte != b'\r')
+            .map_or(0, |last| last + 1);
+        line.truncate(end);
+        if line.len() > MAX_PASSWORD_BYTES {
+            let max = MAX_PASSWORD_BYTES.to_string();
+            bail!(ta(
+                "cli-user-password-too-long",
+                &[("max", &max)],
+                format!("The password must be at most {max} bytes long."),
+            ));
+        }
+        let text = match String::from_utf8(std::mem::take(&mut *line)) {
+            Ok(text) => Zeroizing::new(text),
+            Err(error) => {
+                error.into_bytes().zeroize();
+                bail!(t(
+                    "cli-user-password-not-utf8",
+                    "The password is not valid UTF-8."
+                ));
+            }
+        };
+        // Blank input is refused as at the prompt, which trims the same way.
+        if text.trim().is_empty() {
+            bail!(t(
+                "cli-user-password-stdin-empty",
+                "No password was read from standard input."
+            ));
+        }
+        text
+    } else {
+        let first = Zeroizing::new(secret_prompt(
+            &t("cli-user-password-prompt", "New password"),
+            false,
+        )?);
+        let second = Zeroizing::new(secret_prompt(
+            &t("cli-user-password-confirm", "Repeat the password"),
+            false,
+        )?);
+        if *first != *second {
+            bail!(t(
+                "cli-user-password-mismatch",
+                "The two passwords do not match."
+            ));
+        }
+        first
+    };
+    match check_new_password(&password) {
+        Ok(()) => Ok(password),
+        Err(NewPasswordError::TooShort) => {
+            let min = MIN_NEW_PASSWORD_CHARS.to_string();
+            bail!(ta(
+                "cli-user-password-too-short",
+                &[("min", &min)],
+                format!("The password must be at least {min} characters long."),
+            ))
+        }
+        Err(NewPasswordError::TooLong) => {
+            let max = MAX_PASSWORD_BYTES.to_string();
+            bail!(ta(
+                "cli-user-password-too-long",
+                &[("max", &max)],
+                format!("The password must be at most {max} bytes long."),
+            ))
+        }
+        Err(NewPasswordError::Unassigned) => bail!(t(
+            "cli-user-password-unassigned",
+            "The password contains a character Unicode does not assign yet, so how it is normalized could change. Choose another character."
+        )),
+    }
+}
+
+/// One line per roster entry, never the hash itself.
+#[cfg(feature = "agent-runtime")]
+fn print_roster(config: &Config) {
+    if config.users.is_empty() {
+        println!(
+            "{}",
+            t("cli-user-list-empty", "No [users] entries are configured.")
+        );
+        return;
+    }
+    let no_uid = t("cli-user-list-no-uid", "none");
+    let no_password = t("cli-user-list-no-password", "none");
+    let set = t("cli-user-list-password-set", "set");
+    let mut names: Vec<&String> = config.users.keys().collect();
+    names.sort();
+    for name in names {
+        let user = &config.users[name];
+        let principal = user.effective_principal_id(name);
+        let uid = user
+            .uid
+            .map_or_else(|| no_uid.clone(), |uid| uid.to_string());
+        let password = if user.password_hash.is_some() {
+            set.as_str()
+        } else {
+            no_password.as_str()
+        };
+        let profiles = user.permission_profiles.join(", ");
+        println!(
+            "{}",
+            ta(
+                "cli-user-list-row",
+                &[
+                    ("name", name),
+                    ("principal", principal),
+                    ("uid", &uid),
+                    ("password", password),
+                    ("profiles", &profiles),
+                ],
+                format!(
+                    "{name}: principal {principal}, uid {uid}, password {password}, profiles {profiles}"
+                ),
+            )
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15206,6 +16135,253 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn user_add_parses_profiles_and_credential_flags() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "user",
+            "add",
+            "zeroclaw_user",
+            "--profile",
+            "operator",
+            "--profile",
+            "reader",
+            "--uid",
+            "1001",
+            "--password-stdin",
+        ])
+        .expect("user add should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::User {
+                user_command: UserCommands::Add {
+                    name,
+                    profiles,
+                    uid: Some(1001),
+                    principal_id: None,
+                    password: false,
+                    password_stdin: true,
+                }
+            } if name == "zeroclaw_user" && profiles == ["operator", "reader"]
+        ));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn roster_edit_refuses_a_file_changed_underneath_it() {
+        let dir = tempfile::tempdir().expect("temporary config directory");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 3\n").expect("write config");
+        let mut config = Config::default();
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+
+        let mut edit = RosterEdit::begin(&config).expect("begin an edit");
+        edit.config.mark_dirty("users");
+        let changed = "schema_version = 3\n# written by another process\n";
+        std::fs::write(&path, changed).expect("concurrent write");
+
+        // The edit changes no authorization input, so no daemon is looked
+        // for and the command saves the file itself.
+        let refused = Box::pin(edit.save(RosterWrite::Set(Vec::new()), "done", false)).await;
+        assert!(
+            refused.is_err(),
+            "an edit checked against the old file must not be written over the new one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            changed,
+            "the concurrent change survives"
+        );
+    }
+
+    /// Serve `config`'s endpoint with the daemon's own RPC listener, in this
+    /// process, until the returned guard drops, and record this process as
+    /// `config`'s running daemon. The directory sits under /tmp because
+    /// macOS caps a unix socket path at 104 bytes.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    async fn serve_roster_daemon(config: &Config) -> tokio_util::sync::DropGuard {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(16, queue));
+        let ctx =
+            zeroclaw_runtime::rpc::context::RpcContext::for_live_test(config.clone(), sessions);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let readiness = zeroclaw_runtime::daemon::SocketReadinessReporter::new(move || {
+            let _ = ready_tx.send(true);
+        });
+        let listener_cancel = cancel.clone();
+        zeroclaw_spawn::spawn!(async move {
+            zeroclaw_runtime::rpc::local::run_local_listener(
+                ctx,
+                listener_cancel,
+                Arc::new(AtomicUsize::new(0)),
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ready_rx.wait_for(|ready| *ready),
+        )
+        .await
+        .expect("the listener binds within 5s")
+        .expect("the listener binds its endpoint");
+        let heartbeat = zeroclaw_runtime::daemon::state_file_path(config);
+        std::fs::create_dir_all(heartbeat.parent().expect("the state file has a directory"))
+            .expect("the state directory is writable");
+        let state = serde_json::json!({
+            "pid": std::process::id(),
+            "written_at": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(heartbeat, state.to_string()).expect("the state file is writable");
+        cancel.drop_guard()
+    }
+
+    /// The daemon's roster is checked before the password prompt, and
+    /// another writer can add the same name while the prompt is open. `save`
+    /// checks again, so an `add` refuses instead of merging into that entry.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[tokio::test]
+    async fn roster_edit_refuses_an_entry_the_daemon_gained_while_it_was_open() {
+        let dir = tempfile::Builder::new()
+            .prefix("zc")
+            .tempdir_in("/tmp")
+            .expect("a scratch directory under /tmp");
+        let mut config = Config {
+            data_dir: dir.path().to_path_buf(),
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.permission_profiles.insert(
+            "operator".into(),
+            zeroclaw_config::schema::PermissionProfileConfig::default(),
+        );
+        std::fs::write(
+            &config.config_path,
+            format!(
+                "schema_version = {}\n",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("write config");
+        let _daemon = serve_roster_daemon(&config).await;
+
+        let mut edit = RosterEdit::begin(&config).expect("begin an edit");
+        Box::pin(edit.refuse_if_the_daemon_disagrees("bob", false))
+            .await
+            .expect("the daemon holds no bob yet");
+
+        // While the prompt is open, another writer adds bob through the daemon.
+        let own = std::process::id();
+        crate::daemon_rpc::call(
+            &config,
+            own,
+            "config/set-many",
+            serde_json::json!({ "sets": [
+                { "prop": "users.bob.uid", "value": "4242" },
+                { "prop": "users.bob.permission_profiles", "value": "[\"operator\"]" },
+            ]}),
+        )
+        .await
+        .expect("the daemon takes the other writer's edit");
+
+        zeroclaw_config::alias_refs::create_map_key_checked(&mut edit.config, "users", "bob")
+            .expect("the file has no bob");
+        let entry = roster_entry(&mut edit.config, "bob").expect("staged");
+        entry.uid = Some(4343);
+        entry.permission_profiles = vec!["operator".into()];
+        let writes = entry_writes(entry, "bob").expect("writes");
+        let refused = Box::pin(edit.save(RosterWrite::Set(writes), "done", false)).await;
+        let message = refused
+            .expect_err("an add that would merge into the daemon's new bob must fail")
+            .to_string();
+        assert!(message.contains("users.bob"), "{message}");
+
+        let live = crate::daemon_rpc::call(
+            &config,
+            own,
+            "config/get",
+            serde_json::json!({ "prop": "users.bob.uid" }),
+        )
+        .await
+        .expect("the daemon still holds bob");
+        assert!(
+            live["value"]
+                .as_str()
+                .is_some_and(|uid| uid.contains("4242")),
+            "the daemon's bob must be the other writer's, untouched: {live}"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn only_overrides_the_roster_check_reads_are_refused() {
+        let mut config = Config::default();
+        for path in [
+            "users.zeroclaw_user.uid",
+            "permission_profiles.operator.admin",
+            "oidc.corp.issuer",
+            "oidc.corp.client_secret",
+            "oidc.zeroclaw_ghost.client_secret",
+            "security.otp.enabled",
+            "agents.zeroclaw_defined.enabled",
+            "agents.zeroclaw_from_env.enabled",
+            "gateway.port",
+        ] {
+            config.env_overridden_paths.insert(path.to_owned());
+        }
+        let file = b"schema_version = 3\n\n[agents.zeroclaw_defined]\nenabled = true\n\n\
+                     [oidc.corp]\naudience = \"zeroclaw\"\n";
+        assert_eq!(
+            overrides_the_check_would_trust(&config, file),
+            vec![
+                "agents.zeroclaw_from_env.enabled",
+                "oidc.corp.issuer",
+                "oidc.zeroclaw_ghost.client_secret",
+                "permission_profiles.operator.admin",
+                "users.zeroclaw_user.uid",
+            ],
+            "the check reads profile, roster, and non-secret OIDC values and \
+             the agent aliases profiles may name; nothing else"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn user_add_needs_a_profile_and_takes_no_password_argument() {
+        let base = ["zeroclaw", "user", "add", "zeroclaw_user"];
+        assert!(
+            Cli::try_parse_from(base).is_err(),
+            "at least one --profile is required"
+        );
+        let with_profile = [base.as_slice(), &["--profile", "operator"]].concat();
+        assert!(
+            Cli::try_parse_from(
+                [with_profile.as_slice(), &["--password", "--password-stdin"]].concat()
+            )
+            .is_err(),
+            "one password source at a time"
+        );
+        assert!(
+            Cli::try_parse_from(
+                [
+                    with_profile.as_slice(),
+                    &["--password", "zeroclaw-test-passphrase"]
+                ]
+                .concat()
+            )
+            .is_err(),
+            "a password is never read from the command line"
+        );
+    }
+
     #[test]
     fn sop_logs_cli_parses_run_limit_and_json_output() {
         let cli = Cli::try_parse_from([
@@ -17095,6 +18271,169 @@ mod tests {
                 .bot_token
                 .as_str(),
             "test-token"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_keeps_clearing_a_secret_off_the_daemon() {
+        let mut config = Config::default();
+        assert!(
+            !config.ensure_map_key_for_path("oidc.corp.client_secret"),
+            "an OIDC entry is not a reserved alias"
+        );
+        for masked in ["", zeroclaw_config::traits::MASKED_SECRET, "****"] {
+            assert!(
+                !daemon_replays_write(&config, "oidc.corp.client_secret", masked),
+                "the daemon refuses to overwrite a secret with {masked:?}"
+            );
+        }
+        assert!(daemon_replays_write(
+            &config,
+            "oidc.corp.client_secret",
+            "rotated"
+        ));
+        assert!(
+            daemon_replays_write(&config, "users.me.permission_profiles", ""),
+            "an empty value resets a plain field on both sides"
+        );
+        assert!(
+            daemon_replays_write(&config, "oidc.corp.issuer", "****"),
+            "only a secret refuses a masked-looking value"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_reports_a_daemon_verdict_with_the_matching_api_error() {
+        #[cfg(unix)]
+        {
+            use zeroclaw_api::jsonrpc::error_codes::{INTERNAL_ERROR, INVALID_PARAMS};
+
+            let rejected = |code: i32| -> anyhow::Error {
+                config_publication::CommitFailure::Rejected {
+                    message: "users.bob.permission_profiles is required".into(),
+                    code: i64::from(code),
+                    suggest_patch: false,
+                }
+                .into()
+            };
+            let invalid = daemon_commit_api_error(&rejected(INVALID_PARAMS));
+            assert_eq!(invalid.code, ConfigApiCode::ValidationFailed);
+            assert!(
+                invalid
+                    .message
+                    .contains("users.bob.permission_profiles is required"),
+                "{}",
+                invalid.message
+            );
+            assert_eq!(invalid.path, None);
+            assert_eq!(
+                daemon_commit_api_error(&rejected(INTERNAL_ERROR)).code,
+                ConfigApiCode::InternalError,
+                "a rejection for another reason than the edit's validity is internal"
+            );
+
+            let unknown: anyhow::Error = config_publication::CommitFailure::Unknown {
+                path: "users.bob.uid".into(),
+            }
+            .into();
+            let unknown = daemon_commit_api_error(&unknown);
+            assert_eq!(unknown.code, ConfigApiCode::InternalError);
+            assert_eq!(
+                unknown.path.as_deref(),
+                Some("users.bob.uid"),
+                "an unknown outcome names the property to check"
+            );
+
+            let forbidden: anyhow::Error = config_publication::CommitFailure::Forbidden {
+                message: "Principal is not granted config:update".into(),
+            }
+            .into();
+            let forbidden = daemon_commit_api_error(&forbidden);
+            assert_eq!(
+                forbidden.code,
+                ConfigApiCode::ValidationFailed,
+                "a refusal of the bound principal is a verdict on the edit, not a server fault"
+            );
+            assert!(
+                forbidden
+                    .message
+                    .contains("Principal is not granted config:update"),
+                "{}",
+                forbidden.message
+            );
+        }
+
+        let uncheckable: anyhow::Error = config_publication::CommitFailure::UncheckableTest {
+            path: "users.bob.permission_profiles".into(),
+        }
+        .into();
+        let uncheckable = daemon_commit_api_error(&uncheckable);
+        assert_eq!(uncheckable.code, ConfigApiCode::OpNotSupported);
+        assert_eq!(
+            uncheckable.path.as_deref(),
+            Some("users.bob.permission_profiles"),
+            "the error names the `test` op's property"
+        );
+
+        let uncompilable: anyhow::Error =
+            config_publication::CommitFailure::PolicyWouldNotCompile {
+                error: "users.bob.permission_profiles is required".into(),
+                suggest_patch: false,
+            }
+            .into();
+        assert_eq!(
+            daemon_commit_api_error(&uncompilable).code,
+            ConfigApiCode::ValidationFailed
+        );
+        assert_eq!(
+            daemon_commit_api_error(&anyhow::Error::msg("encoding failed")).code,
+            ConfigApiCode::InternalError
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_delegates_only_batches_the_daemon_can_replay() {
+        let cap = zeroclaw_runtime::rpc::dispatch::RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES;
+        assert!(patch_batch_is_delegatable(1, true));
+        assert!(patch_batch_is_delegatable(cap, true));
+        assert!(
+            !patch_batch_is_delegatable(0, true),
+            "the daemon refuses an empty batch"
+        );
+        assert!(
+            !patch_batch_is_delegatable(cap + 1, true),
+            "the daemon refuses a batch over its cap"
+        );
+        assert!(
+            !patch_batch_is_delegatable(1, false),
+            "a write the daemon cannot replay keeps the whole patch local"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_counts_only_the_keyed_list_rows_it_creates() {
+        let mut config = Config::default();
+        let rows = keyed_list_rows(&config);
+
+        assert!(!config.ensure_map_or_list_key_for_path("users.alice.uid"));
+        assert_eq!(
+            keyed_list_rows(&config),
+            rows,
+            "a roster entry is a map key, which the daemon creates too"
+        );
+
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        assert!(
+            !config.ensure_map_or_list_key_for_path(&format!("plugins.entries.{key}.egress_hosts"))
+        );
+        assert_eq!(
+            keyed_list_rows(&config),
+            rows + 1,
+            "a plugin row is a keyed list row, which only the CLI creates"
         );
     }
 

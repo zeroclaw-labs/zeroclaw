@@ -138,6 +138,10 @@ tar = "0.4"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Scrub passwords typed into `zeroclaw user` once they are hashed. Already
+# built through zeroclaw-runtime, so it adds nothing to default builds.
+zeroize.workspace = true
+
 # Capability-scoped directory handles (beneath/no-follow). Used by the agent-bundle
 # export to walk a live, agent-writable workspace without re-opening paths by name.
 # Already built through zeroclaw-runtime and zeroclaw-tools, which bind their

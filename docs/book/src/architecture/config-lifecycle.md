@@ -20,10 +20,10 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Generated reference | `cargo mdbook refs` / `markdown-schema` | `docs/book/src/reference/config.md` at build time | Documentation only |
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
-| CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
+| CLI config writes | `zeroclaw config set`, `config patch`, `zeroclaw user`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load or reload unless the current command uses the new in-memory value. A running daemon may commit authorization edits at save time; see [Saved vs applied](#saved-vs-applied) |
 | RPC and TUI config writes | `config/*` RPC methods used by zerocode | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon-owned subsystems need reload |
 | Quickstart apply | Shared web, CLI, and zerocode apply path | Staged apply completed as a config commit (supervised surfaces) | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
-| Gateway config writes | Config API handlers through `persist_and_swap()` | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon subsystems apply after reload |
+| Gateway config writes | Config API handlers through `persist_and_swap()` | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately, and the authorization policy is published at save time (under the daemon, the one RPC also enforces); daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
@@ -115,6 +115,13 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 stays the same, but listeners briefly rebind.
 
 Gateway config writes call `persist_and_swap()`: save to disk inside an admitted, serialized config commit, then publish the saved config as the new published pair and set `pending_reload`. This makes the config editor reflect the write immediately, while the reload banner tells the operator that channels, providers, scheduler, or other daemon-owned components may still be running from the previous subsystem instance.
+
+Authorization sections (`[users]`, `[permission_profiles]`, `[oidc]`,
+`security.trust_daemon_uid`) are the exception: this configuration's running
+daemon commits a `zeroclaw config set` or `config patch` edit to them and
+publishes it at save time; when it does not, the CLI saves the file and
+reports the edit pending reload, or fails without saving. See
+[When authorization edits take effect](../security/authentication.md#when-authorization-edits-take-effect).
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
