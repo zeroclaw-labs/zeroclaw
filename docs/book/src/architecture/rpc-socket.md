@@ -190,6 +190,24 @@ The lifecycle operations have distinct durable meanings:
 
 Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
 
+### Chat deletion across RPC and the gateway
+
+In a supervised daemon, RPC `session/delete` shares the gateway's existing
+cancellation registry and actor queue. Chat deletion captures the gateway
+generation, signals cancellation for the authorized predecessor, and waits
+for its gateway permit after acquiring the RPC permit. It revalidates ownership
+and generation before atomically deleting the raw, `rpc_` and `gw_` Chat aliases.
+Only a successful durable deletion invalidates the captured gateway generation.
+Old WebSockets cannot recreate metadata or write into a same-ID successor;
+a newly connected successor remains usable. Failed storage deletion preserves
+the aliases, attachments and generations, although already-observed cancellation
+cannot be reversed. ACP deletion remains isolated from the Chat gateway.
+
+The shared gateway coordination lasts for one daemon generation, including
+supervised gateway restarts. A daemon reload creates fresh coordination.
+Standalone gateway construction retains its own coordination. Gateway depth
+remains eight; the separate RPC queue remains depth 32.
+
 ### Chunked uploads
 
 `file/attach` carries a whole file in one frame, which caps it well below the

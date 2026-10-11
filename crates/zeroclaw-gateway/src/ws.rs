@@ -657,6 +657,30 @@ async fn handle_socket(
     let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
     let config = state.config.read().clone();
     if let Some(ref backend) = state.session_backend {
+        // Construction is delayed until the first client frame. Deletion may
+        // have committed while this socket was idle; attribution setters can
+        // create metadata, so they need the same fence as transcript writers.
+        let _session_guard = match state.session_queue.acquire(&session_key).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string(),
+                    "code": session_queue_ws_error_code(&error)
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
+        if state.session_queue.lifecycle_generation(&session_key).await != session_generation {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Session not found",
+                "code": "SESSION_NOT_FOUND"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
         if let Some(ref name) = session_name
             && !name.is_empty()
         {
@@ -4046,6 +4070,309 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fixture.shutdown();
     }
 
+    #[cfg(unix)]
+    async fn rpc_deleted_websocket_is_fenced(
+        session_prompts_enabled: bool,
+        http_first: Option<bool>,
+    ) {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("gateway data directory");
+        config.memory.backend = "none".to_string();
+        config.channels.session_prompts_enabled = session_prompts_enabled;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: Vec::new(),
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(config.data_dir.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        for key in ["delete-race", "rpc_delete-race"] {
+            backend
+                .append(
+                    key,
+                    &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+                )
+                .unwrap();
+        }
+        let mut state =
+            crate::api::tests::test_state_with_session_backend(config.clone(), backend.clone());
+        let coordination =
+            zeroclaw_infra::gateway_session::GatewaySessionCoordination::for_gateway();
+        state.session_queue = Arc::clone(coordination.queue());
+        state.cancel_tokens = Arc::clone(coordination.cancellations());
+        let sessions = Arc::new(zeroclaw_runtime::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                32, 30, 600,
+            )),
+        ));
+        let ctx = zeroclaw_runtime::rpc::context::RpcContext::for_authority_with_session_backend(
+            &state.config_authority,
+            sessions,
+            backend.clone(),
+            Some(coordination.clone()),
+        );
+        let rpc_cancel = tokio_util::sync::CancellationToken::new();
+        let server_cancel = rpc_cancel.clone();
+        let rpc_server = zeroclaw_spawn::spawn!(async move {
+            zeroclaw_runtime::rpc::local::run_local_listener(
+                ctx,
+                server_cancel,
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                None,
+            )
+            .await
+        });
+        let rpc_path = zeroclaw_runtime::rpc::local::socket_path(&config);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !rpc_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local RPC bind");
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let request = axum::http::Uri::builder()
+            .scheme("ws")
+            .authority(address.to_string())
+            .path_and_query("/ws/chat?agent=web&session_id=delete-race")
+            .build()
+            .expect("test WebSocket URI");
+        let (mut socket, _) = connect_async(request.clone())
+            .await
+            .expect("chat WebSocket upgrade");
+        let _ = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+
+        let delete_params = serde_json::json!({"session_id": "delete-race"});
+        if let Some(http_first) = http_first {
+            use axum::{
+                extract::{Path, State},
+                response::IntoResponse,
+            };
+            let held = coordination
+                .queue()
+                .acquire("gw_delete-race")
+                .await
+                .unwrap();
+            let http_delete = crate::api::handle_api_session_delete(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                // GET /api/sessions returns the exact persisted key. A raw
+                // alias also exists here, so the display ID would target it.
+                Path("gw_delete-race".into()),
+            );
+            let rpc_delete = zeroclaw_runtime::rpc::local::call_local(
+                &config,
+                "session/delete",
+                delete_params.clone(),
+            );
+            tokio::pin!(http_delete, rpc_delete);
+            if http_first {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut http_delete)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut rpc_delete)
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut rpc_delete)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut http_delete)
+                        .await
+                        .is_err()
+                );
+            }
+            drop(held);
+            let (http_result, rpc_result) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(&mut http_delete, &mut rpc_delete)
+            })
+            .await
+            .expect("cross-surface deletion must not deadlock");
+            let status = http_result.into_response().status();
+            if http_first {
+                assert_eq!(status, axum::http::StatusCode::OK);
+                assert!(
+                    rpc_result.is_err(),
+                    "RPC must reject the HTTP-invalidated generation"
+                );
+                assert!(backend.session_exists("delete-race"));
+                assert!(backend.session_exists("rpc_delete-race"));
+                assert_eq!(
+                    zeroclaw_runtime::rpc::local::call_local(
+                        &config,
+                        "session/delete",
+                        delete_params.clone()
+                    )
+                    .await
+                    .unwrap()["deleted"],
+                    true
+                );
+            } else {
+                assert_eq!(rpc_result.unwrap()["deleted"], true);
+                assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+            }
+        } else {
+            let deleted =
+                zeroclaw_runtime::rpc::local::call_local(&config, "session/delete", delete_params)
+                    .await
+                    .expect("RPC deletion");
+            assert_eq!(deleted["deleted"], true);
+        }
+        for key in ["delete-race", "rpc_delete-race"] {
+            assert!(!backend.session_exists(key));
+        }
+        assert!(!backend.session_exists("gw_delete-race"));
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "stale idle write"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let idle_frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let idle_frame: serde_json::Value =
+            serde_json::from_str(&idle_frame.into_text().unwrap()).unwrap();
+        assert_eq!(idle_frame["code"], "SESSION_NOT_FOUND");
+        assert!(
+            !backend.session_exists("gw_delete-race"),
+            "a deleted socket must not recreate its owner"
+        );
+        // A fresh same-ID connection is a successor, not a permanently banned ID.
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        let (mut successor, _) = connect_async(request).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), successor.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        successor
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "successor turn"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("successor connection can send its frame");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let frame = successor.next().await.unwrap().unwrap();
+                let frame: serde_json::Value =
+                    serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+                if frame["type"] == "error" {
+                    // The deliberately unreachable fixture provider proves
+                    // admission reached execution, rather than the stale fence.
+                    assert_eq!(frame["code"], "PROVIDER_ERROR");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("successor turn admission");
+        server.abort();
+        rpc_cancel.cancel();
+        rpc_server.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_delete_fences_idle_websocket_with_session_prompts() {
+        rpc_deleted_websocket_is_fenced(true, None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_delete_fences_idle_websocket_without_session_prompts() {
+        rpc_deleted_websocket_is_fenced(false, None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_delete_concurrent_http_first_is_fenced_without_deadlock() {
+        rpc_deleted_websocket_is_fenced(true, Some(true)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_delete_concurrent_rpc_first_is_fenced_without_deadlock() {
+        rpc_deleted_websocket_is_fenced(true, Some(false)).await;
+    }
+
     #[tokio::test]
     async fn deleted_websocket_cannot_write_into_a_same_id_successor() {
         use axum::extract::Path;
@@ -4296,7 +4623,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .cancel_tokens
                 .lock()
                 .expect("cancel token lock")
-                .pending_deletions
+                .pending_deletions()
                 .contains_key(session_key),
             "DELETE keeps the latch until its lifecycle operation finishes"
         );
@@ -4308,7 +4635,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .cancel_tokens
                 .lock()
                 .expect("cancel token lock")
-                .pending_deletions
+                .pending_deletions()
                 .contains_key(session_key),
             "the completed DELETE must not leak its latch to a later session"
         );

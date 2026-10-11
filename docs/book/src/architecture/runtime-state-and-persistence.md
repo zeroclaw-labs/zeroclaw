@@ -66,6 +66,14 @@ new runtime state should be described in terms of `<install>/data/`,
 | Health and component status | running subsystems report component state | none | gateway health/status state | Process-local; reset/rebuilt on daemon restart or reload | `/health`, `/api/health`, and `/api/status` are current observations, not durable configuration. |
 | Queues, debouncers, watchdogs | `zeroclaw-infra` process utilities | none unless a caller stores results elsewhere | in-memory queues/debouncers/watchdogs | Process-local; used to serialize, coalesce, or detect stalls | Treat these as coordination state. Persist only the domain data they protect, not the queue itself. |
 
+The supervised gateway's actor queue and cancellation registry are created once
+per daemon generation and shared with RPC Chat deletion. Gateway restarts retain
+that coordination; daemon reload replaces it. Gateway and RPC turn queues remain
+distinct (depth eight and 32 respectively). Cross-surface deletion takes RPC
+admission before gateway admission, then invalidates the gateway generation only
+after the durable Chat alias-set deletion commits. Standalone gateways construct
+their own coordination and do not acquire a dependency on local RPC.
+
 ## Reload and restart
 
 `POST /admin/reload` sends an in-process reload signal to the daemon. The outer

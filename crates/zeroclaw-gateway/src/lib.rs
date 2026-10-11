@@ -82,36 +82,18 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
-
-/// Return the canonical persistence key for a gateway session.
-///
-/// Persistence backends apply the shared filesystem-safe normalization so
-/// their in-memory and on-disk keys remain consistent.
-pub(crate) fn gateway_session_key(session_id: &str) -> String {
-    format!(
-        "{GW_SESSION_PREFIX}{}",
-        zeroclaw_api::session_keys::sanitize_session_key(session_id)
-    )
-}
-
-/// Return the process-local cancellation key for a gateway session.
-///
-/// Unlike persistence keys, cancellation keys must preserve the accepted
-/// session id verbatim: filesystem-safe normalization is lossy and would make
-/// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
-/// another.
-pub(crate) fn gateway_cancel_key(session_id: &str) -> String {
-    format!("{GW_SESSION_PREFIX}{session_id}")
-}
+pub use zeroclaw_infra::gateway_session::GatewayCancellationRegistry;
+use zeroclaw_infra::gateway_session::GatewaySessionCoordination;
+pub(crate) use zeroclaw_infra::gateway_session::{
+    GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -792,32 +774,6 @@ pub struct AppState {
     pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
-/// Gateway turn-cancellation state guarded by one synchronous mutex.
-///
-/// The map remains the canonical active-turn lookup used by abort and status
-/// handlers. Pending deletion signals exist only while a DELETE waits for the
-/// same queue incarnation to finalize; they close the admission-registration
-/// race without letting a stale delete affect a successor generation.
-#[derive(Default)]
-pub struct GatewayCancellationRegistry {
-    tokens: HashMap<String, (u64, Arc<tokio_util::sync::CancellationToken>)>,
-    pub(crate) pending_deletions: HashMap<String, HashSet<u64>>,
-}
-
-impl Deref for GatewayCancellationRegistry {
-    type Target = HashMap<String, (u64, Arc<tokio_util::sync::CancellationToken>)>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.tokens
-    }
-}
-
-impl DerefMut for GatewayCancellationRegistry {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.tokens
-    }
-}
-
 impl AppState {
     pub(crate) fn reserve_agent_turn_at(
         &self,
@@ -843,6 +799,7 @@ impl AppState {
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
+    session_coordination: Option<GatewaySessionCoordination>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
@@ -860,12 +817,14 @@ impl GatewaySupervision {
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
         authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+        session_coordination: Option<GatewaySessionCoordination>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
             authority,
             sop_driver_handles,
+            session_coordination,
         }
     }
 }
@@ -1052,6 +1011,7 @@ pub async fn run_gateway_with_authority(
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
             authority,
             sop_driver_handles,
+            None,
         ),
     ))
     .await
@@ -1079,11 +1039,14 @@ pub async fn run_gateway_with_plugin_webhooks(
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
+        session_coordination,
         readiness,
         plugin_webhooks,
         authority,
         sop_driver_handles,
     } = supervision;
+    let session_coordination =
+        session_coordination.unwrap_or_else(GatewaySessionCoordination::for_gateway);
     let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
         Some(authority) => (
             Some(authority.pairing),
@@ -2161,13 +2124,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         node_registry,
         mdns_peer_registry,
         session_backend,
-        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        session_queue: Arc::clone(session_coordination.queue()),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
+        cancel_tokens: Arc::clone(session_coordination.cancellations()),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -2199,7 +2162,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         },
     };
 
-    // The gateway owns a separate queue from RPC. Reclaim idle actor slots
+    // Supervised gateways share this queue with RPC Chat deletion, while RPC
+    // keeps its separate depth-32 queue. Reclaim idle gateway actor slots
     // and their tombstones here; connected WebSockets retain a lifecycle
     // lease, so this cannot erase an incarnation still held by a socket.
     {
@@ -3860,53 +3824,6 @@ async fn send_sse_frame_or_cancel(
     tokio::select! {
         result = frame_tx.send(frame) => result.is_ok(),
         _ = cancel_token.cancelled() => false,
-    }
-}
-
-/// Register the current turn for a gateway session and cancel any replaced
-/// turn before returning. Both HTTP/SSE and WebSocket transports share this
-/// registry, so replacement ownership must be identical at both edges.
-pub(crate) fn register_cancel_token(
-    cancel_tokens: &Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
-    cancel_key: &str,
-    session_key: &str,
-    session_generation: u64,
-    cancel_token: Arc<tokio_util::sync::CancellationToken>,
-) {
-    let (previous_token, pending_delete) = {
-        let mut registry = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
-        let pending_delete = registry
-            .pending_deletions
-            .get(session_key)
-            .is_some_and(|generations| generations.contains(&session_generation));
-        let previous = registry.insert(
-            cancel_key.to_owned(),
-            (session_generation, Arc::clone(&cancel_token)),
-        );
-        (previous.map(|(_, token)| token), pending_delete)
-    };
-    if let Some(previous_token) = previous_token {
-        previous_token.cancel();
-    }
-    if pending_delete {
-        cancel_token.cancel();
-    }
-}
-
-/// Remove a turn's registry entry only while it still owns the session key.
-/// A late completion from a replaced WS/SSE turn must never remove the newer
-/// turn's cancellation handle.
-pub(crate) fn remove_cancel_token_if_current(
-    cancel_tokens: &Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
-    cancel_key: &str,
-    cancel_token: &Arc<tokio_util::sync::CancellationToken>,
-) {
-    let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
-    if tokens
-        .get(cancel_key)
-        .is_some_and(|(_, current)| Arc::ptr_eq(current, cancel_token))
-    {
-        tokens.remove(cancel_key);
     }
 }
 

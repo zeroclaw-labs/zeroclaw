@@ -193,6 +193,9 @@ impl ApprovalPendingMap {
 
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
+    /// Gateway lifecycle authority shared by this daemon generation. `None`
+    /// means this context runs without a supervised gateway.
+    pub gateway_sessions: Option<zeroclaw_infra::gateway_session::GatewaySessionCoordination>,
     /// Read-only live config handle: RPC readers observe the published
     /// config and its revision as one pair and cannot bypass publication
     /// with a raw write. Mutating handlers admit through
@@ -333,6 +336,27 @@ impl RpcContext {
         authority: &LiveConfigAuthority,
         sessions: Arc<SessionStore>,
     ) -> Arc<Self> {
+        Self::for_authority_inner(authority, sessions, None, None)
+    }
+
+    /// Build a cross-surface fixture using the real shared persistence owner.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_authority_with_session_backend(
+        authority: &LiveConfigAuthority,
+        sessions: Arc<SessionStore>,
+        backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        gateway_sessions: Option<zeroclaw_infra::gateway_session::GatewaySessionCoordination>,
+    ) -> Arc<Self> {
+        Self::for_authority_inner(authority, sessions, Some(backend), gateway_sessions)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn for_authority_inner(
+        authority: &LiveConfigAuthority,
+        sessions: Arc<SessionStore>,
+        session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+        gateway_sessions: Option<zeroclaw_infra::gateway_session::GatewaySessionCoordination>,
+    ) -> Arc<Self> {
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&authority.live_handle().read());
         Arc::new(Self {
             config: authority.live_handle(),
@@ -340,7 +364,8 @@ impl RpcContext {
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: None,
             sessions,
-            session_backend: None,
+            session_backend,
+            gateway_sessions,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -382,6 +407,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -414,6 +440,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -455,6 +482,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -537,6 +565,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: Some(event_tx),
@@ -573,6 +602,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -615,6 +645,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -650,6 +681,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: Some(memory),
             cost_tracker: None,
             event_tx: None,
@@ -686,6 +718,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: Some(cost_tracker),
             event_tx: None,
@@ -724,6 +757,7 @@ impl RpcContext {
             sessions,
             session_backend,
             memory: None,
+            gateway_sessions: None,
             cost_tracker: None,
             event_tx: None,
             event_history: None,
@@ -760,6 +794,7 @@ impl RpcContext {
             channel_generation_control: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,

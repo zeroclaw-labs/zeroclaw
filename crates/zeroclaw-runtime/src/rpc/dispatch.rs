@@ -8897,6 +8897,32 @@ impl RpcDispatcher {
                 "The requested session storage domain does not match the live session",
             ));
         }
+        let pre_mode = observed_mode.unwrap_or_else(|| {
+            req.chat_mode.clone().unwrap_or_else(|| {
+                if matches!(
+                    authorized
+                        .as_ref()
+                        .and_then(|record| record.durable.as_ref()),
+                    Some(DurableSession::Acp)
+                ) {
+                    ChatMode::Acp
+                } else {
+                    ChatMode::Chat
+                }
+            })
+        });
+        let gateway = self
+            .ctx
+            .gateway_sessions
+            .as_ref()
+            .filter(|_| pre_mode == ChatMode::Chat);
+        let gateway_key = zeroclaw_infra::gateway_session::gateway_cancel_key(&req.session_id);
+        // Retain the capture lease through finalization: an idle reaper must
+        // not erase the generation while this request waits for the turn.
+        let gateway_capture = match gateway {
+            Some(coordination) => Some(coordination.queue().capture_generation(&gateway_key).await),
+            None => None,
+        };
         // Keep the test-only race window used by the lifecycle suite: the
         // target incarnation is captured before deletion waits for admission,
         // and a same-ID successor must never inherit this request. This hook
@@ -8927,6 +8953,22 @@ impl RpcDispatcher {
                 self.ctx.sessions.notify_test_removal_signal_attempted();
                 None
             };
+        let gateway_owned = match (gateway, self.scoped_principal_id()) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(owner)) => self
+                .ctx
+                .session_backend
+                .as_ref()
+                .and_then(|backend| backend.get_session_metadata(&gateway_key))
+                .is_some_and(|metadata| metadata.principal_id.as_deref() == Some(owner.as_str())),
+        };
+        let _gateway_cancellation = match (gateway, gateway_capture.as_ref()) {
+            (Some(coordination), Some((generation, _))) if gateway_owned => {
+                Some(coordination.signal_deletion_at_generation(&gateway_key, *generation))
+            }
+            _ => None,
+        };
         // Deletion waits for the admitted turn to finalize before mutating
         // durable state. The cancellation guard remains live until that
         // finalization so an in-flight prompt cannot outlive the removal.
@@ -8936,6 +8978,11 @@ impl RpcDispatcher {
             requested_identity.as_ref().map(|(_, mode)| mode.clone()),
             expected_generation,
             expected_queue_generation,
+            gateway
+                .zip(gateway_capture.as_ref())
+                .map(|(coordination, (generation, _))| {
+                    (coordination, gateway_key.as_str(), *generation, pre_mode)
+                }),
         )
         .await
     }
@@ -8955,6 +9002,12 @@ impl RpcDispatcher {
         expected_mode: Option<ChatMode>,
         expected_generation: Option<u64>,
         expected_queue_generation: u64,
+        gateway: Option<(
+            &zeroclaw_infra::gateway_session::GatewaySessionCoordination,
+            &str,
+            u64,
+            ChatMode,
+        )>,
     ) -> RpcResult {
         // This is the same finalization authority used by prompt turns. Wait
         // for the captured incarnation to finish before deleting durable
@@ -8966,6 +9019,18 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // Cross-surface deletion always acquires RPC before gateway. Gateway
+        // handlers never await the RPC queue while holding their permit.
+        let _gateway_guard = match gateway.as_ref() {
+            Some((coordination, key, _, _)) => Some(
+                coordination
+                    .queue()
+                    .acquire(key)
+                    .await
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+            ),
+            None => None,
+        };
         // Ownership revalidation precedes the generation fence so a scoped
         // caller receives the same denial for an unknown or foreign successor.
         let record = match self
@@ -9066,17 +9131,34 @@ impl RpcDispatcher {
                 }
             }),
         };
+        if let Some((coordination, key, generation, pre_mode)) = gateway.as_ref()
+            && (coordination.queue().lifecycle_generation(key).await != *generation
+                || &chat_mode != pre_mode)
+        {
+            return Err(if self.scoped_principal_id().is_some() {
+                rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                )
+            } else {
+                rpc_err(
+                    SESSION_NOT_FOUND,
+                    "Session was replaced while deletion was pending",
+                )
+            });
+        }
         let scoped_owner = self.scoped_principal_id();
-        // Storage is the commit point. Do not remove the live agent or cancel
-        // its turn if durable deletion fails. Chat aliases share one SQLite
-        // transaction; ACP keeps its own store and never erases Chat aliases.
+        // Storage is the commit point for removal and generation invalidation.
+        // Pre-admission cancellation cannot be undone if storage fails, but
+        // durable rows and their generations remain intact. Chat aliases share
+        // one SQLite transaction; ACP never erases Chat aliases.
         let durable_deleted = match chat_mode {
             ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let keys = [
                         req.session_id.clone(),
                         format!("rpc_{}", req.session_id),
-                        format!("gw_{}", req.session_id),
+                        zeroclaw_infra::gateway_session::gateway_cancel_key(&req.session_id),
                     ];
                     let key_refs = [&keys[0][..], &keys[1][..], &keys[2][..]];
                     match scoped_owner.as_deref() {
@@ -9161,6 +9243,13 @@ impl RpcDispatcher {
             .session_queue
             .invalidate(&req.session_id)
             .await;
+        if durable_deleted
+            && chat_mode == ChatMode::Chat
+            && let Some((coordination, key, _, _)) = gateway
+        {
+            coordination.queue().invalidate(key).await;
+            coordination.queue().advance_generation(key);
+        }
         if live_removed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -29448,6 +29537,302 @@ mod tests {
         make_persistence_test_dispatcher_with_queue(config, data_dir, queue)
     }
 
+    async fn rpc_delete_drains_gateway_turn(register_before_delete: bool, storage_failure: bool) {
+        use zeroclaw_infra::gateway_session::{
+            GatewaySessionCoordination, register_cancel_token, remove_cancel_token_if_current,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let sid = "cross-surface-drain";
+        let gw_key = format!("gw_{sid}");
+        for key in [sid.to_string(), format!("rpc_{sid}"), gw_key.clone()] {
+            backend
+                .append(&key, &ChatMessage::user("predecessor"))
+                .unwrap();
+            backend
+                .set_session_prompt(&key, "task", "retain this task")
+                .unwrap();
+        }
+        let db = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        if storage_failure {
+            db.execute_batch(
+                "CREATE TRIGGER reject_gateway_delete BEFORE DELETE ON session_metadata
+                WHEN OLD.session_key = 'gw_cross-surface-drain'
+                BEGIN SELECT RAISE(ABORT, 'injected gateway delete failure'); END;",
+            )
+            .unwrap();
+        }
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let authority = crate::LiveConfigAuthority::new(config);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                32, 30, 600,
+            )),
+        ));
+        let ctx = RpcContext::for_authority_with_session_backend(
+            &authority,
+            sessions,
+            backend.clone(),
+            Some(coordination.clone()),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
+        let (generation, _socket_lease) = coordination.queue().capture_generation(&gw_key).await;
+        let transcript_generation = coordination.queue().transcript_generation(&gw_key);
+        let permit = coordination.queue().acquire(&gw_key).await.unwrap();
+        let token = Arc::new(CancellationToken::new());
+        if register_before_delete {
+            register_cancel_token(
+                coordination.cancellations(),
+                &gw_key,
+                &gw_key,
+                generation,
+                token.clone(),
+            );
+        }
+        let params = json!({"session_id": sid});
+        let deletion = dispatcher.handle_session_delete(&params);
+        tokio::pin!(deletion);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion)
+                .await
+                .is_err(),
+            "RPC deletion must wait for the admitted gateway turn",
+        );
+        if !register_before_delete {
+            assert!(
+                coordination
+                    .cancellations()
+                    .lock()
+                    .unwrap()
+                    .pending_deletions()
+                    .get(&gw_key)
+                    .is_some_and(|set| set.contains(&generation))
+            );
+            register_cancel_token(
+                coordination.cancellations(),
+                &gw_key,
+                &gw_key,
+                generation,
+                token.clone(),
+            );
+        }
+        assert!(
+            token.is_cancelled(),
+            "an admitted gateway turn must observe RPC deletion"
+        );
+        coordination.queue().evict_idle().await;
+        assert_eq!(
+            coordination.queue().lifecycle_generation(&gw_key).await,
+            generation
+        );
+        remove_cancel_token_if_current(coordination.cancellations(), &gw_key, &token);
+        drop(permit);
+        let result = deletion.await;
+        if storage_failure {
+            assert_eq!(result.unwrap_err().code, INTERNAL_ERROR);
+        } else {
+            assert_eq!(result.unwrap()["deleted"], true);
+        }
+        for key in [sid.to_string(), format!("rpc_{sid}"), gw_key.clone()] {
+            assert_eq!(backend.session_exists(&key), storage_failure);
+            if storage_failure {
+                assert_eq!(backend.load(&key)[0].content, "predecessor");
+                assert_eq!(backend.list_session_prompts(&key).unwrap().len(), 1);
+            }
+        }
+        if storage_failure {
+            assert_eq!(
+                coordination.queue().lifecycle_generation(&gw_key).await,
+                generation
+            );
+            assert_eq!(
+                coordination.queue().transcript_generation(&gw_key),
+                transcript_generation
+            );
+            assert!(
+                token.is_cancelled(),
+                "rollback cannot undo an observed cancellation"
+            );
+        } else {
+            assert_ne!(
+                coordination.queue().lifecycle_generation(&gw_key).await,
+                generation
+            );
+            assert!(coordination.queue().transcript_generation(&gw_key) > transcript_generation);
+        }
+        assert!(
+            coordination
+                .cancellations()
+                .lock()
+                .unwrap()
+                .pending_deletions()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_cancels_and_drains_registered_gateway_turn() {
+        rpc_delete_drains_gateway_turn(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_latches_gateway_turn_before_token_registration() {
+        rpc_delete_drains_gateway_turn(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_gateway_storage_failure_preserves_aliases_and_generations() {
+        rpc_delete_drains_gateway_turn(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_acp_does_not_cancel_or_fence_same_id_gateway() {
+        use zeroclaw_infra::gateway_session::{GatewaySessionCoordination, register_cancel_token};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _, backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let coordination = GatewaySessionCoordination::for_gateway();
+        Arc::get_mut(&mut dispatcher.ctx).unwrap().gateway_sessions = Some(coordination.clone());
+        let sid = "acp-gateway-isolation";
+        let key = format!("gw_{sid}");
+        acp_store
+            .create_session(sid, "test-agent", "/tmp", None)
+            .unwrap();
+        // A live ACP admission disambiguates an ID that later also acquires
+        // Chat history. Without it, existing RPC policy refuses mutation.
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"
+            }))
+            .await
+            .unwrap();
+        backend
+            .append(&key, &ChatMessage::user("gateway predecessor"))
+            .unwrap();
+        let (generation, _lease) = coordination.queue().capture_generation(&key).await;
+        let transcript_generation = coordination.queue().transcript_generation(&key);
+        let token = Arc::new(CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            &key,
+            &key,
+            generation,
+            token.clone(),
+        );
+        let _permit = coordination.queue().acquire(&key).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_delete(&json!({"session_id": sid, "chat_mode": "acp"})),
+        )
+        .await
+        .expect("ACP deletion must not wait on a Chat permit")
+        .unwrap();
+        assert_eq!(result["deleted"], true);
+        assert!(!token.is_cancelled());
+        assert!(backend.session_exists(&key));
+        assert!(acp_store.session_principal(sid).unwrap().is_none());
+        assert_eq!(
+            coordination.queue().lifecycle_generation(&key).await,
+            generation
+        );
+        assert_eq!(
+            coordination.queue().transcript_generation(&key),
+            transcript_generation
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_scoped_gateway_alias_requires_its_own_owner() {
+        use zeroclaw_infra::gateway_session::{GatewaySessionCoordination, register_cancel_token};
+        for gateway_owner in [Some("user:user_a"), Some("user:user_b"), None] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = two_user_config(&tmp);
+            for (_, user) in std::mem::take(&mut config.users) {
+                let name = if user.uid == Some(4242) {
+                    "user_a"
+                } else {
+                    "user_b"
+                };
+                config.users.insert(name.into(), user);
+            }
+            let data_dir = config.data_dir.clone();
+            let (mut fixture, _, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+            let coordination = GatewaySessionCoordination::for_gateway();
+            Arc::get_mut(&mut fixture.ctx).unwrap().gateway_sessions = Some(coordination.clone());
+            let sid = "scoped-gateway-delete";
+            let key = format!("gw_{sid}");
+            backend.append(sid, &ChatMessage::user("user_a")).unwrap();
+            backend.set_session_principal(sid, "user:user_a").unwrap();
+            backend.append(&key, &ChatMessage::user("gateway")).unwrap();
+            if let Some(owner) = gateway_owner {
+                backend.set_session_principal(&key, owner).unwrap();
+            }
+            let (generation, _lease) = coordination.queue().capture_generation(&key).await;
+            let transcript_generation = coordination.queue().transcript_generation(&key);
+            let token = Arc::new(CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                &key,
+                &key,
+                generation,
+                token.clone(),
+            );
+            let permit = coordination.queue().acquire(&key).await.unwrap();
+            let scoped = scoped_dispatcher(&fixture.ctx, 4242).await;
+            let params = json!({"session_id": sid});
+            let owned = gateway_owner == Some("user:user_a");
+            if !owned {
+                // Existing alias resolution rejects mixed or legacy-NULL
+                // ownership before any cross-surface cancellation or wait.
+                let error = scoped.handle_session_delete(&params).await.unwrap_err();
+                assert_eq!(error.code, FORBIDDEN);
+                assert!(!token.is_cancelled());
+                assert!(backend.session_exists(sid));
+                assert!(backend.session_exists(&key));
+                assert_eq!(
+                    coordination.queue().lifecycle_generation(&key).await,
+                    generation
+                );
+                assert_eq!(
+                    coordination.queue().transcript_generation(&key),
+                    transcript_generation
+                );
+                continue;
+            }
+            let deletion = scoped.handle_session_delete(&params);
+            tokio::pin!(deletion);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut deletion)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(token.is_cancelled(), owned);
+            drop(permit);
+            assert_eq!(deletion.await.unwrap()["deleted"], true);
+            assert!(!backend.session_exists(sid));
+            assert_eq!(backend.session_exists(&key), !owned);
+            if !owned {
+                assert_eq!(
+                    coordination.queue().lifecycle_generation(&key).await,
+                    generation
+                );
+                assert_eq!(
+                    coordination.queue().transcript_generation(&key),
+                    transcript_generation
+                );
+            }
+        }
+    }
+
     fn make_persistence_test_dispatcher_with_queue(
         config: zeroclaw_config::schema::Config,
         data_dir: &std::path::Path,
@@ -35523,6 +35908,7 @@ mod tests {
             config_commit_pause: None,
             sessions,
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -40417,6 +40803,7 @@ mod tests {
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -40470,6 +40857,7 @@ mod tests {
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,
@@ -40659,6 +41047,7 @@ mod tests {
             channel_generation_control: None,
             sessions: Arc::clone(&sessions),
             session_backend: None,
+            gateway_sessions: None,
             memory: None,
             cost_tracker: None,
             event_tx: None,

@@ -2129,94 +2129,17 @@ pub async fn handle_api_session_delete(
     }
 }
 
-/// Lifecycle signal owned by one DELETE request.
-///
-/// An unconsumed pre-registration signal is removed when DELETE fails, so a
-/// later turn cannot inherit a cancellation from a request that made no
-/// durable lifecycle change.
-pub(crate) struct GatewayDeletionCancellation<'a> {
-    state: &'a AppState,
-    session_key: &'a str,
-    session_generation: u64,
-    pending: bool,
-    pub(crate) cancelled_active_turn: bool,
-}
-
-impl Drop for GatewayDeletionCancellation<'_> {
-    fn drop(&mut self) {
-        if !self.pending {
-            return;
-        }
-        let mut cancellations = self
-            .state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(generations) = cancellations.pending_deletions.get_mut(self.session_key) {
-            generations.remove(&self.session_generation);
-            if generations.is_empty() {
-                cancellations.pending_deletions.remove(self.session_key);
-            }
-        }
-    }
-}
-
-/// Cancel an active gateway turn or atomically latch DELETE for an admitted
-/// turn that has not registered its token yet.
-///
-/// Gateway session IDs are reusable after deletion. The cancellation registry
-/// carries the same incarnation boundary as the session queue. The pending
-/// latch and token registration share one mutex, so either DELETE observes and
-/// cancels the exact active token or the later registration consumes the latch.
-pub(crate) fn signal_gateway_deletion_at_generation<'a>(
-    state: &'a AppState,
-    session_key: &'a str,
+/// Signal deletion through the shared gateway lifecycle authority.
+pub(crate) fn signal_gateway_deletion_at_generation(
+    state: &AppState,
+    session_key: &str,
     expected_generation: u64,
-) -> GatewayDeletionCancellation<'a> {
-    let mut cancellations = state
-        .cancel_tokens
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut cancelled_active_turn = false;
-    for (cancel_key, (generation, token)) in cancellations.tokens.iter() {
-        let canonical_key = gateway_session_key(
-            cancel_key
-                .strip_prefix(GW_SESSION_PREFIX)
-                .unwrap_or(cancel_key),
-        );
-        // Preserve exact legacy dotted keys as well as the current sanitized
-        // persistence key. Both may identify the raw active turn being reset.
-        if (cancel_key == session_key || canonical_key == session_key)
-            && *generation == expected_generation
-        {
-            token.cancel();
-            cancelled_active_turn = true;
-        }
-    }
-    if cancelled_active_turn {
-        return GatewayDeletionCancellation {
-            state,
-            session_key,
-            session_generation: expected_generation,
-            pending: false,
-            cancelled_active_turn: true,
-        };
-    };
-    // Retain each generation separately. A stale DELETE may arrive after a
-    // successor DELETE has latched, and replacing the successor generation
-    // would let the stale guard erase the successor's cancellation boundary.
-    let pending = cancellations
-        .pending_deletions
-        .entry(session_key.to_string())
-        .or_default()
-        .insert(expected_generation);
-    GatewayDeletionCancellation {
-        state,
+) -> zeroclaw_infra::gateway_session::GatewayDeletionCancellation {
+    zeroclaw_infra::gateway_session::signal_deletion_at_generation(
+        &state.cancel_tokens,
         session_key,
-        session_generation: expected_generation,
-        pending,
-        cancelled_active_turn: false,
-    }
+        expected_generation,
+    )
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -4057,7 +3980,7 @@ pub(crate) mod tests {
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock")
-                .pending_deletions
+                .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| generations.contains(&predecessor_generation))
         );
@@ -4069,7 +3992,7 @@ pub(crate) mod tests {
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock")
-                .pending_deletions
+                .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| {
                     generations.contains(&predecessor_generation)
@@ -4084,7 +4007,7 @@ pub(crate) mod tests {
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock")
-                .pending_deletions
+                .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| generations.contains(&successor_generation)),
             "the predecessor guard must not clear the successor latch"
@@ -4097,7 +4020,7 @@ pub(crate) mod tests {
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock")
-                .pending_deletions
+                .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| {
                     generations.contains(&predecessor_generation)
@@ -4113,7 +4036,7 @@ pub(crate) mod tests {
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock")
-                .pending_deletions
+                .pending_deletions()
                 .contains_key(session_key)
         );
     }
