@@ -189,12 +189,7 @@ pub fn session_token(base_url: &str) -> Option<String> {
     if !is_opencode_target(base_url) {
         return None;
     }
-    let scope = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-        .try_with(Clone::clone)
-        .ok()
-        .flatten()
-        .filter(|key| !key.trim().is_empty());
-    Some(match scope {
+    Some(match crate::conversation_affinity::scope() {
         Some(key) => digest_scope(&key),
         None => process_token().to_string(),
     })
