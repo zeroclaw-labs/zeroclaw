@@ -18,13 +18,43 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 ## Safety
 
-The broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` are rejected at config validation unless `allow_broad_roots` is set. Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
+When the listener starts, it refuses to watch the broad system roots `/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, and `/tmp` unless `allow_broad_roots` is set. On Linux and other Unix systems except macOS it also refuses:
+
+- each home directory in `/home` (`/home/<name>`) and the superuser's home, `/root`
+- `/mnt`, `/media`, and `/run/media`, which hold mounted filesystems such as removable media and, under WSL, the Windows drives; each user's folder of mounts in `/run/media` (`/run/media/<user>`); and `/run`, which holds `/run/media`
+- `/var/home`, each home directory in it, `/var/roothome`, and `/var/mnt`, where ostree-based systems such as Fedora Silverblue keep what `/home`, `/root`, and `/mnt` link to
+
+On these systems, repeated and trailing `/` are ignored, so `//etc` and `/home//<name>` are refused as well, and names match case-sensitively, as their file systems compare them. Mounted filesystems below those folders, such as `/mnt/<name>`, `/media/<label>`, or `/run/media/<user>/<label>`, are accepted: a path cannot tell a whole disk mounted there from a folder mounted for the listener, so check what one holds before you watch it. Under WSL, `/mnt/c` is the whole `C:` drive, including `/mnt/c/Users/<name>`, which Windows itself refuses. On Debian and Ubuntu, `/media/<user>` holds every volume that user mounts; it is accepted too, because elsewhere `/media/<name>` is often a single mounted filesystem.
+
+On macOS it also refuses:
+
+- `/Users` and each folder in it: every home directory (`/Users/<name>`) and `/Users/Shared`
+- `/Volumes` and each mounted volume in it (`/Volumes/<name>`), including the startup disk's entry, which links to `/`
+- `/private`, and `/private/etc`, `/private/tmp`, and `/private/var`, the directories that `/etc`, `/tmp`, and `/var` link to
+
+On macOS, paths match case-insensitively, as a default macOS volume resolves them, and repeated or trailing `/` are ignored, so `/TMP` and `//Users` are refused as well.
+
+On Windows it also refuses:
+
+- every drive root (`C:\`), volume root, and network share root (`\\server\share`)
+- beneath a drive root: `Windows`, `Windows\Temp`, `Users`, each user profile in `Users` (`C:\Users\<name>`), `Program Files`, `Program Files (x86)`, and `ProgramData`
+- any device path that names something other than a drive, volume, or share, such as `\\?\GLOBALROOT\Device\HarddiskVolume1\`, because it can open a whole volume
+
+The listener checks each path twice: as written, and as it resolves on disk, which follows `..` segments, symlinks, junctions, substituted drives, and short names such as `C:\PROGRA~1`. It refuses the path when either form is a broad root, refuses a path it cannot resolve, such as one that does not exist, and keeps watching the path as written.
+
+Written Windows paths match case-insensitively with either separator, ignoring repeated and trailing separators. Outside `\\?\` paths, `.` and `..` segments and trailing dots and spaces resolve as Windows resolves them. The `\\?\` and `\\.\` device spellings (`\\?\C:\`, `\\?\UNC\server\share`) match the drive or share they name. A drive-relative spelling such as `C:` or `C:Windows` is read from the drive's root, because the check cannot know that drive's current folder.
+
+The check never reads `$HOME`, so its result does not depend on the account the daemon runs as. Each platform instead rejects home directories by their location: `/home/<name>` and `/root` on Linux and other Unix systems, `/Users/<name>` on macOS, and `C:\Users\<name>` on Windows. A home directory holds private files such as SSH keys and shell history, and the daemon account's home also holds the `.zeroclaw` directory where the daemon writes its own state, so point `paths` at the folder your SOPs need, such as `/home/<name>/Inbox`, rather than a whole home directory. A home directory elsewhere, such as a service account's home under `/var/lib`, is not recognized.
+
+A relative path such as `inbox` or `.` resolves against the daemon's working directory, which for the systemd user service that `zeroclaw service install` writes on Linux is the home directory. The resolved check refuses `.` there, because it resolves to the home directory, but what a relative path names depends on how the daemon was started, so use absolute paths.
+
+Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks` opts in but still requires the canonical target to resolve inside a watched root.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Listener does not start | a broad root was rejected at validation | Narrow `paths` away from the broad roots, or set `allow_broad_roots` |
+| Listener does not start | a path names or resolves to a broad root, or cannot be resolved because it does not exist | Point `paths` at an existing folder below the broad roots, or set `allow_broad_roots` to watch a broad root |
 | Change ignored | excluded by glob, or outside `events` kinds | Check `include`, `exclude`, and `events` against the changed file |
 | SOP not starting | trigger `path` glob does not match | Verify the [trigger](../sop/fan-in/filesystem.md) `path` matches and the file is in watch scope |
 
