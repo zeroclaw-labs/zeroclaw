@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+pub mod chatgpt_plan;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -13,6 +14,9 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+#[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
+pub mod plan_test_transport;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -1597,6 +1601,22 @@ fn create_model_provider_inner(
         .map(canonicalize_v2_model_provider_name)
         .unwrap_or(name);
 
+    // Explicit plan binding precedes all API-key/global Codex resolution.
+    if let Some(entry) = config.and_then(|c| c.providers.models.find(name, alias))
+        && entry.chatgpt_plan_auth.is_some()
+    {
+        anyhow::ensure!(
+            name == "openai" && provider_kind == "chatgpt-plan",
+            "ChatGPT plan binding requires an OpenAI alias with kind = chatgpt-plan"
+        );
+        return Ok(apply_factory_leaf_metadata(
+            Box::new(chatgpt_plan::ChatGptPlanProvider::new(
+                alias, entry, api_key, api_url, options,
+            )?),
+            Some(false),
+        ));
+    }
+
     // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
     // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
     // factory callers that pass the legacy spelling expect a working
@@ -1722,6 +1742,17 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    if config
+        .providers
+        .models
+        .find(family, alias)
+        .is_some_and(|entry| entry.chatgpt_plan_auth.is_some())
+    {
+        anyhow::ensure!(
+            reliability.api_keys.is_empty(),
+            "ChatGPT plan binding cannot use reliability API-key rotation"
+        );
+    }
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 

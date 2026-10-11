@@ -497,6 +497,16 @@ pub(crate) fn fallback_auth_ready_for_alias(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> bool {
+    // New plan grants are available only through their explicit primary
+    // binding; never reinterpret an unknown kind as API-key readiness.
+    if config
+        .providers
+        .models
+        .find(family, alias)
+        .is_some_and(|entry| entry.chatgpt_plan_auth.is_some())
+    {
+        return false;
+    }
     let provider_kind = opts
         .provider_kind
         .as_deref()
@@ -1261,6 +1271,11 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         // Codex variant routing: OAuth subscription auth → Codex responses protocol.
+        if self.base.chatgpt_plan_auth.is_some() {
+            return Ok(Box::new(crate::chatgpt_plan::ChatGptPlanProvider::new(
+                alias, &self.base, key, api_url, opts,
+            )?));
+        }
         if self.base.requires_openai_auth {
             return Ok(Box::new(
                 crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key)?,
@@ -1291,6 +1306,12 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        // Explicit plan bindings are excluded from fallback materialization.
+        // Their grant is resolved at request time on the primary path; an
+        // issued client ID or unrelated API key is never plan readiness.
+        if self.base.chatgpt_plan_auth.is_some() {
+            return false;
+        }
         has_api_key(key) || self.base.requires_openai_auth
     }
 }
