@@ -222,12 +222,38 @@ impl ModelSwitchTool {
             }
         };
 
+        if !crate::agent::turn::model_switch_provider_allowed(&model_provider) {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "model_provider": model_provider,
+                }))?
+                .into(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "model-switch-provider-not-allowed",
+                    &[("provider", &model_provider)],
+                )),
+            });
+        }
+
         let model = model.trim();
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
+            });
+        }
+        if model
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("hint:"))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "model-switch-route-selector-not-allowed",
+                )),
             });
         }
 
@@ -411,7 +437,8 @@ impl ModelSwitchTool {
 mod tests {
     use super::*;
     use crate::agent::turn::{
-        ModelSwitchCallback, current_model_switch_state, scope_model_switch_state,
+        ModelSwitchCallback, current_model_switch_state, scope_model_switch_provider_allowlist,
+        scope_model_switch_state,
     };
 
     fn test_config() -> Config {
@@ -489,6 +516,53 @@ mod tests {
                 pending_switch(&state),
                 Some(("openai.default".to_string(), "gpt-4o".to_string()))
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_rejects_provider_outside_turn_allowlist() {
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let allowed = Arc::new(std::collections::HashSet::from(
+            ["custom.local".to_string()],
+        ));
+
+        let result = scope_model_switch_state(
+            Arc::clone(&state),
+            scope_model_switch_provider_allowlist(Some(allowed), async {
+                tool().handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "gpt-4o"
+                }))
+            }),
+        )
+        .await
+        .expect("set should return a tool result");
+
+        assert!(!result.success);
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "model-switch-provider-not-allowed",
+            &[("provider", "openai.default")],
+        );
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(pending_switch(&state), None);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_route_selector_as_provider_local_model() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "hint:cloud"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            let expected =
+                crate::i18n::get_required_cli_string("model-switch-route-selector-not-allowed");
+            assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+            assert_eq!(pending_switch(&state), None);
         })
         .await;
     }

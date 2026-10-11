@@ -1787,6 +1787,7 @@ mod tests {
                 &[("provider", "openai.default"), ("error", "bad key")][..],
                 ["openai.default", "bad key", "/models"].as_slice(),
             ),
+            ("channel-runtime-effort-routing-invalid", &[][..], &[][..]),
             (
                 "channel-runtime-fallback-footer",
                 &[

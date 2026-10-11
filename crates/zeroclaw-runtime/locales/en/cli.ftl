@@ -964,6 +964,8 @@ cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
 model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
+model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
+model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -1147,6 +1149,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Failed to initialize model_provider `{ $provider }`. Route unchanged.
     Details: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ Effort routing configuration is invalid. Check the configured local and cloud route hints.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
 channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
 channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.

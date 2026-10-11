@@ -1,5 +1,6 @@
 //! Turn-loop control-flow outcomes: cancellation and model-switch errors.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Callback type for checking if model has been switched during tool execution.
@@ -25,6 +26,11 @@ tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.
     static MODEL_SWITCH_REQUEST: ModelSwitchCallback;
+
+    /// Provider profiles that a model-issued switch may target in this tool
+    /// loop. This is separate from the general provider-attempt scope so
+    /// unrelated tools keep their own network and provider policies.
+    static MODEL_SWITCH_PROVIDER_ALLOWLIST: Option<Arc<HashSet<String>>>;
 }
 
 pub(crate) fn current_model_switch_state() -> anyhow::Result<ModelSwitchCallback> {
@@ -38,6 +44,26 @@ where
     F: std::future::Future,
 {
     MODEL_SWITCH_REQUEST.scope(state, future).await
+}
+
+pub(crate) fn model_switch_provider_allowed(provider_ref: &str) -> bool {
+    MODEL_SWITCH_PROVIDER_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(provider_ref))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) async fn scope_model_switch_provider_allowlist<F>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MODEL_SWITCH_PROVIDER_ALLOWLIST.scope(allowed, future).await
 }
 
 #[derive(Debug)]

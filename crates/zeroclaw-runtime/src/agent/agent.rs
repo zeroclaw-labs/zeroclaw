@@ -13,6 +13,7 @@ use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +42,11 @@ type SessionModelProvider = (
     String,
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
+
+struct TurnModelSelection {
+    selector: String,
+    allowed_provider_refs: Option<Arc<HashSet<String>>>,
+}
 
 pub fn build_session_model_provider(
     config: &Config,
@@ -518,6 +524,9 @@ pub struct Agent {
     history_has_trim_breadcrumb: bool,
     history_trim_generation: u64,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
+    /// True while the configured baseline may be replaced by automatic routing.
+    /// Explicit session and in-turn selection set this false.
+    automatic_model_routing: bool,
     /// The exact immutable route table used by `model_provider` for hint
     /// dispatch. It is replaced atomically with the provider on model switch.
     model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
@@ -1324,6 +1333,7 @@ impl AgentBuilder {
             history_has_trim_breadcrumb: false,
             history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
+            automatic_model_routing: true,
             model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
@@ -1902,6 +1912,11 @@ impl Agent {
 
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
+    }
+
+    /// Mark the current model/provider selection as an explicit runtime choice.
+    pub fn disable_automatic_model_routing(&mut self) {
+        self.automatic_model_routing = false;
     }
 
     pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
@@ -3614,7 +3629,54 @@ impl Agent {
         }
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
+    fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
+        let resolved_agent = self
+            .full_config()
+            .and_then(|config| config.resolved_agent_config(&self.agent_alias));
+        let effort_policy = resolved_agent.as_ref().map_or_else(
+            || self.config.resolved.effort_routing.as_ref(),
+            |agent| agent.resolved.effort_routing.as_ref(),
+        );
+
+        if !self.automatic_model_routing && effort_policy.is_some() {
+            return Ok(TurnModelSelection {
+                selector: self.model_name.clone(),
+                allowed_provider_refs: None,
+            });
+        }
+
+        if let Some(policy) = effort_policy {
+            let config = self.full_config().ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but the agent has no model-route config snapshot",
+                )
+            })?;
+            let selection = super::eval::resolve_effort_route(
+                policy,
+                &config.model_routes,
+                user_message,
+            )
+            .ok_or_else(|| {
+                anyhow::Error::msg(
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous",
+                )
+            })?;
+            let selector = format!("hint:{}", selection.route.hint);
+            let installed_route = self.model_route_resolver.resolve(&selector);
+            if installed_route.provider_name != selection.route.model_provider
+                || installed_route.model != selection.route.model
+            {
+                return Err(anyhow::Error::msg(
+                    "effort routing changed after this provider generation was installed; retry after the model configuration refresh completes",
+                ));
+            }
+            super::eval::log_effort_route_selection(&selection, user_message.len(), "agent");
+            return Ok(TurnModelSelection {
+                selector,
+                allowed_provider_refs: Some(Arc::new(selection.allowed_provider_refs)),
+            });
+        }
+
         if let Some(decision) =
             super::classifier::classify_with_decision(&self.classification_config, user_message)
             && self.model_route_resolver.has_hint(&decision.hint)
@@ -3624,7 +3686,10 @@ impl Agent {
                 .configured_model_for_hint(&decision.hint)
                 .unwrap_or("unknown");
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
-            return format!("hint:{}", decision.hint);
+            return Ok(TurnModelSelection {
+                selector: format!("hint:{}", decision.hint),
+                allowed_provider_refs: None,
+            });
         }
 
         // Fallback: auto-classify by complexity when no rule matched.
@@ -3634,11 +3699,17 @@ impl Agent {
                 && self.model_route_resolver.has_hint(hint)
             {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
-                return format!("hint:{hint}");
+                return Ok(TurnModelSelection {
+                    selector: format!("hint:{hint}"),
+                    allowed_provider_refs: None,
+                });
             }
         }
 
-        self.model_name.clone()
+        Ok(TurnModelSelection {
+            selector: self.model_name.clone(),
+            allowed_provider_refs: None,
+        })
     }
 
     fn replay_loop_messages(
@@ -3849,7 +3920,9 @@ impl Agent {
         // reports come from the same generation.
         self.sync_config_generation();
 
-        let effective_model = self.classify_model(user_message);
+        let model_selection = self.classify_model(user_message)?;
+        let effective_model = model_selection.selector;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let selected_route = self.model_route_resolver.resolve(&effective_model);
         let context_limits =
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
@@ -3897,15 +3970,19 @@ impl Agent {
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
+                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                        self.full_config(),
+                        self.model_provider.as_ref(),
+                        &base_provider_messages,
+                        &self.multimodal_config,
+                        &selected_route.provider_name,
+                        &selected_route.model,
+                        &effective_model,
+                        Some(self.security.as_ref()),
+                        attempt_allowlist.as_deref(),
+                    ),
                 )
                 .await
                 {
@@ -3976,6 +4053,7 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -4108,18 +4186,21 @@ impl Agent {
             turn_safeguard_fallback,
         ) = zeroclaw_providers::scope_safeguard_fallback(async {
             let (result, recovery, context_truncated) =
-                zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = crate::agent::turn::scope_tool_protocol_prompts(
-                        Arc::clone(&tool_protocol_prompts),
-                        turn_loop,
-                    )
-                    .await;
-                    (
-                        result,
-                        zeroclaw_providers::reliable::take_last_provider_fallback(),
-                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
-                    )
-                })
+                zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    zeroclaw_providers::reliable::scope_provider_fallback(async {
+                        let result = crate::agent::turn::scope_tool_protocol_prompts(
+                            Arc::clone(&tool_protocol_prompts),
+                            turn_loop,
+                        )
+                        .await;
+                        (
+                            result,
+                            zeroclaw_providers::reliable::take_last_provider_fallback(),
+                            zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                        )
+                    }),
+                )
                 .await;
             (
                 result,
@@ -4376,7 +4457,15 @@ impl Agent {
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
-        let mut effective_model = self.classify_model(user_message);
+        let model_selection =
+            self.classify_model(user_message)
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                })?;
+        let mut effective_model = model_selection.selector;
+        let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -4402,15 +4491,19 @@ impl Agent {
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
-                match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
-                    self.model_provider.as_ref(),
-                    &base_provider_messages,
-                    &self.multimodal_config,
-                    &selected_route.provider_name,
-                    &selected_route.model,
-                    &effective_model,
-                    Some(self.security.as_ref()),
+                match zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                    attempt_allowlist.clone(),
+                    crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
+                        self.full_config(),
+                        self.model_provider.as_ref(),
+                        &base_provider_messages,
+                        &self.multimodal_config,
+                        &selected_route.provider_name,
+                        &selected_route.model,
+                        &effective_model,
+                        Some(self.security.as_ref()),
+                        attempt_allowlist.as_deref(),
+                    ),
                 )
                 .await
                 {
@@ -4515,11 +4608,12 @@ impl Agent {
                 )) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
-        let knobs = crate::agent::loop_::LoopKnobs {
+        let mut knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            provider_attempt_allowlist: attempt_allowlist.clone(),
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -4553,6 +4647,7 @@ impl Agent {
         // top of the next with no await in between.
         let mut steered_continuation: Option<Vec<ChatMessage>> = None;
         for round in 0..self.config.resolved.max_tool_iterations {
+            knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -4721,19 +4816,22 @@ impl Agent {
             let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
                 zeroclaw_providers::scope_safeguard_fallback(async {
                     let (result, fallback, context_truncated) =
-                        zeroclaw_providers::reliable::scope_provider_fallback(async {
-                            let result = crate::agent::turn::scope_tool_protocol_prompts(
-                                Arc::clone(&tool_protocol_prompts),
-                                round_loop,
-                            )
-                            .await;
-                            (
-                                result,
-                                zeroclaw_providers::reliable::take_last_provider_fallback(),
-                                zeroclaw_providers::reliable::take_last_provider_context_truncation(
-                                ),
-                            )
-                        })
+                        zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                            attempt_allowlist.clone(),
+                            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                                let result = crate::agent::turn::scope_tool_protocol_prompts(
+                                    Arc::clone(&tool_protocol_prompts),
+                                    round_loop,
+                                )
+                                .await;
+                                (
+                                    result,
+                                    zeroclaw_providers::reliable::take_last_provider_fallback(),
+                                    zeroclaw_providers::reliable::take_last_provider_context_truncation(
+                                    ),
+                                )
+                            }),
+                        )
                         .await;
                     (
                         result,
@@ -5119,6 +5217,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
+    let explicit_model_selection = provider_override.is_some() || model_override.is_some();
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -5144,6 +5243,9 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    if explicit_model_selection {
+        agent.disable_automatic_model_routing();
+    }
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -7017,6 +7119,167 @@ mod tests {
         fn alias(&self) -> &str {
             "ModelCaptureModelProvider"
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct EffortRoutingProbe {
+        model: String,
+        local_allowed: bool,
+        cloud_allowed: bool,
+    }
+
+    struct EffortRoutingProbeProvider {
+        observations: Arc<Mutex<Vec<EffortRoutingProbe>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for EffortRoutingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.observations.lock().push(EffortRoutingProbe {
+                model: model.to_string(),
+                local_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.local",
+                ),
+                cloud_allowed: zeroclaw_providers::reliable::provider_ref_allowed_for_turn(
+                    "custom.cloud",
+                ),
+            });
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EffortRoutingProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "EffortRoutingProbeProvider"
+        }
+    }
+
+    fn effort_routing_test_agent(
+        cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy,
+        routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+    ) -> (Agent, Arc<Mutex<Vec<EffortRoutingProbe>>>) {
+        let policy = zeroclaw_config::scattered_types::EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation,
+        };
+        let mut config = zeroclaw_config::schema::Config {
+            model_routes: routes.clone(),
+            ..Default::default()
+        };
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(policy),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "effort-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("effort-agent")
+            .expect("effort agent must resolve");
+        let resolver_routes = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.hint.clone(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: route.model_provider.clone(),
+                        model: route.model.clone(),
+                    },
+                )
+            })
+            .collect();
+        let route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            resolver_routes,
+            "custom.local".into(),
+            "base-model".into(),
+        ));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..Default::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let config = Arc::new(config);
+        let agent = Agent::builder()
+            .model_provider(Box::new(EffortRoutingProbeProvider {
+                observations: Arc::clone(&observations),
+            }))
+            .model_provider_name("custom.local".into())
+            .model_name("base-model".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("effort-agent".into())
+            .config(agent_config)
+            .model_route_resolver(route_resolver)
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(config),
+                live_config: None,
+                live: None,
+            })
+            .build()
+            .expect("effort routing test agent must build");
+        (agent, observations)
+    }
+
+    fn effort_routing_test_routes() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
+        vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ]
     }
 
     struct TranscriptCaptureModelProvider {
@@ -9356,6 +9619,104 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_entry_points_apply_effort_route_and_attempt_boundary() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let (mut simple_agent, simple_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        assert_eq!(simple_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            simple_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut complex_agent, complex_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        assert_eq!(
+            complex_agent
+                .turn_streamed(
+                    "Please analyze and compare these architecture tradeoffs.",
+                    event_tx,
+                    None,
+                )
+                .await
+                .unwrap()
+                .0,
+            "done"
+        );
+        assert_eq!(
+            complex_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:cloud".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+
+        let (mut local_only_agent, local_only_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Never, effort_routing_test_routes());
+        assert_eq!(
+            local_only_agent
+                .turn("Please analyze and compare these architecture tradeoffs.")
+                .await
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            local_only_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "hint:local".into(),
+                local_allowed: true,
+                cloud_allowed: false,
+            }]
+        );
+
+        let (mut manual_agent, manual_observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, effort_routing_test_routes());
+        manual_agent.set_model_name("operator-model".into());
+        manual_agent.disable_automatic_model_routing();
+        assert_eq!(manual_agent.turn("hi").await.unwrap(), "done");
+        assert_eq!(
+            manual_observations.lock().as_slice(),
+            &[EffortRoutingProbe {
+                model: "operator-model".into(),
+                local_allowed: true,
+                cloud_allowed: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_effort_routing_missing_hint_fails_before_provider_dispatch() {
+        use zeroclaw_config::scattered_types::CloudEscalationPolicy;
+
+        let routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        let (mut agent, observations) =
+            effort_routing_test_agent(CloudEscalationPolicy::Auto, routes);
+
+        let error = agent
+            .turn("hi")
+            .await
+            .expect_err("a missing cloud hint must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("local/cloud hints are missing or ambiguous")
+        );
+        assert!(observations.lock().is_empty());
     }
 
     #[tokio::test]
@@ -17558,6 +17919,10 @@ model_provider = "custom.only"
         assert_eq!(
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
+        );
+        assert!(
+            agent.automatic_model_routing,
+            "a model-issued switch must preserve automatic routing for the next turn"
         );
     }
 
