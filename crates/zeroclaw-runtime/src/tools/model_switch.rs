@@ -251,10 +251,9 @@ impl ModelSwitchTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    "Model ID cannot be a route selector; provide a provider-local model ID"
-                        .to_string(),
-                ),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "model-switch-route-selector-not-allowed",
+                )),
             });
         }
 
@@ -560,10 +559,9 @@ mod tests {
                 .expect("set should return a tool result");
 
             assert!(!result.success);
-            assert_eq!(
-                result.error.as_deref(),
-                Some("Model ID cannot be a route selector; provide a provider-local model ID")
-            );
+            let expected =
+                crate::i18n::get_required_cli_string("model-switch-route-selector-not-allowed");
+            assert_eq!(result.error.as_deref(), Some(expected.as_str()));
             assert_eq!(pending_switch(&state), None);
         })
         .await;
