@@ -4144,11 +4144,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_serply_connection_refused_error_is_query_free() {
-        // Reserve the port without listening so parallel tests cannot reuse it
-        // before the request and turn connection refusal into a different error.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = socket.local_addr().unwrap();
+        // Use loopback port 1: it is below every ephemeral range, so no
+        // parallel test can be handed it, and with no listener there the
+        // kernel refuses the connect on every platform. An ephemeral port
+        // cannot give both. A released one can be taken by a parallel test
+        // before the request, and one held by a bound but non-listening socket
+        // is refused on Linux but silently dropped on macOS, where the request
+        // then times out. The trade-off is assuming nothing on the test host
+        // listens on port 1; a listener there would fail this test rather than
+        // pass it.
+        let addr = "127.0.0.1:1";
 
         let (_tmp, tool) = serply_tool_with_key("serply-test-key");
         let client = reqwest::Client::builder()
