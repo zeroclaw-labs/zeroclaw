@@ -7,8 +7,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -128,6 +128,14 @@ enum Screen {
         map_path: String,
         breadcrumb: Vec<String>,
     },
+    AliasRename {
+        section_idx: usize,
+        map_path: String,
+        breadcrumb: Vec<String>,
+        /// Capture the selected alias before entering the name editor.
+        from: String,
+        confirming: bool,
+    },
     FieldList {
         section_idx: usize,
         prefix: String,
@@ -156,6 +164,13 @@ enum FilterEditAction {
     Backspace,
     CursorUp,
     CursorDown,
+}
+
+enum PendingConfirmation {
+    DiscardKey(KeyEvent),
+    DiscardMouse(MouseEvent),
+    ExternalPersonality,
+    ExternalSkill,
 }
 
 // ── Config section sub-tabs ──────────────────────────────────────
@@ -220,6 +235,11 @@ fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
         .first()
         .map(crate::keymap::Chord::display)
         .unwrap_or_default()
+}
+
+fn editor_save_keys() -> String {
+    use crate::keymap::ConfigEditorAction as E;
+    [editor_key(E::Save), editor_key(E::Confirm)].join("/")
 }
 
 fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
@@ -430,6 +450,10 @@ pub(crate) struct App {
     // Edit state
     edit_buf: String,
     edit_cursor: usize,
+    /// Original draft identity for this edit attempt, not a second dirty flag.
+    field_draft_loaded: String,
+    pending_confirmation: Option<PendingConfirmation>,
+    confirmation_buttons: Option<(Rect, Rect)>,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -471,6 +495,8 @@ pub(crate) struct App {
     /// right-pane draws overwrite) so a click on a scrolled section list
     /// maps to the right row in any screen.
     last_section_list_offset: usize,
+    /// Segment hit areas from the actual breadcrumb renderer; separators are inert.
+    last_breadcrumb_areas: Vec<Rect>,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -503,6 +529,9 @@ impl App {
             field_cursor: 0,
             edit_buf: String::new(),
             edit_cursor: 0,
+            field_draft_loaded: String::new(),
+            pending_confirmation: None,
+            confirmation_buttons: None,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -531,6 +560,7 @@ impl App {
             last_list_offset: 0,
             last_section_rows: Vec::new(),
             last_section_list_offset: 0,
+            last_breadcrumb_areas: Vec::new(),
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -556,6 +586,7 @@ impl App {
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
+        self.last_breadcrumb_areas.clear();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -616,6 +647,19 @@ impl App {
                 let bc = breadcrumb.clone();
                 self.draw_alias_create(frame, right, &bc);
             }
+            Screen::AliasRename {
+                map_path,
+                breadcrumb,
+                from,
+                confirming,
+                ..
+            } => {
+                let path = map_path.clone();
+                let bc = breadcrumb.clone();
+                let from = from.clone();
+                let confirming = *confirming;
+                self.draw_alias_rename(frame, right, &path, &bc, &from, confirming);
+            }
             Screen::FieldList {
                 section_idx,
                 breadcrumb,
@@ -635,6 +679,175 @@ impl App {
                 self.draw_field_edit(frame, right, &bc, fi);
             }
         }
+        self.draw_confirmation(frame, body);
+    }
+
+    fn field_draft(&self) -> &str {
+        if self.is_select_edit() {
+            let idx = if self.filter.is_some() {
+                self.filtered_indices(&self.select_items)
+                    .get(self.filter_cursor)
+                    .copied()
+            } else {
+                Some(self.select_cursor)
+            };
+            idx.and_then(|idx| self.select_items.get(idx))
+                .map(String::as_str)
+                .unwrap_or_default()
+        } else {
+            &self.edit_buf
+        }
+    }
+
+    fn has_pending_edits(&self) -> bool {
+        (matches!(self.screen, Screen::FieldEdit { .. })
+            && self.field_draft() != self.field_draft_loaded)
+            || (self.personality_active_file.is_some()
+                && self.personality_content != self.personality_loaded)
+            || (self.skills_active.is_some() && self.skills_body != self.skills_body_loaded)
+    }
+
+    fn editor_owns_key(&self, key: &KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction as E;
+        let editing = match self.section {
+            ConfigSection::Zeroclaw => {
+                matches!(self.screen, Screen::FieldEdit { .. })
+                    || self.personality_active_file.is_some()
+                    || self.skills_active.is_some()
+            }
+            ConfigSection::Zerocode => self.zerocode.wants_text_input(),
+        };
+        editing && matches!(E::from_chord(key), Some(E::Save | E::Confirm | E::Cancel))
+    }
+
+    fn discard_drafts(&mut self) {
+        if matches!(self.screen, Screen::FieldEdit { .. }) {
+            if self.is_select_edit() {
+                self.select_cursor = self
+                    .select_items
+                    .iter()
+                    .position(|item| item == &self.field_draft_loaded)
+                    .unwrap_or(0);
+            } else {
+                self.edit_buf = self.field_draft_loaded.clone();
+                self.edit_cursor = self.edit_buf.len();
+            }
+        }
+        self.deactivate_filter();
+        self.personality_content = self.personality_loaded.clone();
+        self.personality_active_file = None;
+        self.skills_body = self.skills_body_loaded.clone();
+        self.skills_frontmatter = self.skills_frontmatter_loaded.clone();
+        self.skills_active = None;
+    }
+
+    fn draw_confirmation(&mut self, frame: &mut Frame, area: Rect) {
+        self.confirmation_buttons = None;
+        let Some(pending) = &self.pending_confirmation else {
+            return;
+        };
+        let external = matches!(
+            pending,
+            PendingConfirmation::ExternalPersonality | PendingConfirmation::ExternalSkill
+        );
+        let width = area.width.min(76);
+        let height = area.height.min(7);
+        let dialog = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, dialog);
+        let block = theme::panel_block(&crate::i18n::t(if external {
+            "zc-config-external-editor-title"
+        } else {
+            "zc-config-discard-title"
+        }));
+        let inner = block.inner(dialog);
+        frame.render_widget(block, dialog);
+        frame.render_widget(
+            Paragraph::new(crate::i18n::t(if external {
+                "zc-config-external-editor-explanation"
+            } else {
+                "zc-config-discard-explanation"
+            }))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        let buttons = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            inner.height.min(1),
+        );
+        let stay = Rect::new(buttons.x, buttons.y, buttons.width / 2, buttons.height);
+        let proceed = Rect::new(
+            stay.right(),
+            buttons.y,
+            buttons.width - stay.width,
+            buttons.height,
+        );
+        use crate::keymap::ConfigEditorAction as E;
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}={}",
+                editor_key(E::Cancel),
+                crate::i18n::t(if external {
+                    "zc-config-footer-action-cancel"
+                } else {
+                    "zc-config-action-stay"
+                })
+            )),
+            stay,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}={}",
+                editor_key(E::Confirm),
+                crate::i18n::t(if external {
+                    "zc-config-action-launch-editor"
+                } else {
+                    "zc-config-action-discard"
+                })
+            )),
+            proceed,
+        );
+        self.confirmation_buttons = Some((stay, proceed));
+    }
+
+    async fn handle_confirmation(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
+        use crate::keymap::ConfigEditorAction as E;
+        match E::from_chord(&key) {
+            Some(E::Cancel) => {
+                self.pending_confirmation = None;
+            }
+            Some(E::Confirm) if key.kind == KeyEventKind::Press => {
+                self.confirm_pending(term).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn confirm_pending(&mut self, term: &mut Term) -> Result<()> {
+        if let Some(pending) = self.pending_confirmation.take() {
+            match pending {
+                PendingConfirmation::DiscardKey(key) => {
+                    self.discard_drafts();
+                    Box::pin(self.handle_key(key, term)).await?;
+                }
+                PendingConfirmation::DiscardMouse(mouse) => {
+                    self.discard_drafts();
+                    Box::pin(self.handle_mouse(mouse, Rect::default(), term)).await?;
+                }
+                PendingConfirmation::ExternalPersonality => {
+                    self.launch_personality_editor(term).await?
+                }
+                PendingConfirmation::ExternalSkill => self.launch_skill_editor(term).await?,
+            }
+        }
+        Ok(())
     }
 
     fn bottom_hint(&self) -> String {
@@ -642,7 +855,29 @@ impl App {
 
         let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
 
-        match &self.screen {
+        let hint = match &self.screen {
+            Screen::AliasList { .. }
+                if self.zeroclaw_pane == ZeroclawPane::Detail && self.alias_add_selected() =>
+            {
+                format!(
+                    " {}={}  ?={}",
+                    tab_key(T::Enter),
+                    crate::i18n::t("zc-config-footer-action-add"),
+                    crate::i18n::t("zc-config-footer-action-help"),
+                )
+            }
+            Screen::AliasList { .. }
+                if self.zeroclaw_pane == ZeroclawPane::Detail
+                    && self.provider_alias_rename_available()
+                    && self.filter.is_none() =>
+            {
+                format!(
+                    " {}={}  ?={}",
+                    tab_key(T::RenameAlias),
+                    crate::i18n::t("zc-config-footer-action-rename"),
+                    crate::i18n::t("zc-config-footer-action-help"),
+                )
+            }
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
                 if self.filter.is_some() {
                     let help = crate::i18n::t("zc-config-footer-action-help");
@@ -698,6 +933,19 @@ impl App {
                     crate::i18n::t("zc-config-footer-action-cancel"),
                 )
             }
+            Screen::AliasRename { confirming, .. } => {
+                format!(
+                    " {}={}  {}={}",
+                    editor_key(E::Confirm),
+                    crate::i18n::t(if *confirming {
+                        "zc-config-footer-action-rename"
+                    } else {
+                        "zc-config-footer-action-review-rename"
+                    }),
+                    editor_key(E::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                )
+            }
             Screen::FieldEdit { field_idx, .. } => {
                 if self.is_select_edit() {
                     if self.filter.is_some() {
@@ -705,18 +953,18 @@ impl App {
                         format!(
                             " {}  {}={}  {}={}  ?={}",
                             nav_keys(),
-                            tab_key(T::Enter),
+                            editor_save_keys(),
                             crate::i18n::t("zc-config-footer-action-save"),
-                            tab_key(T::Back),
+                            editor_key(E::Cancel),
                             crate::i18n::t("zc-config-footer-action-clear-filter"),
                             help,
                         )
                     } else {
                         format!(
                             " {}={}  {}={}",
-                            tab_key(T::Enter),
+                            editor_save_keys(),
                             crate::i18n::t("zc-config-footer-action-save"),
-                            tab_key(T::Back),
+                            editor_key(E::Cancel),
                             crate::i18n::t("zc-config-footer-action-cancel"),
                         )
                     }
@@ -733,7 +981,7 @@ impl App {
                 } else {
                     format!(
                         " {}={}  {}={}",
-                        editor_key(E::Confirm),
+                        editor_save_keys(),
                         crate::i18n::t("zc-config-footer-action-save"),
                         editor_key(E::Cancel),
                         crate::i18n::t("zc-config-footer-action-cancel"),
@@ -741,6 +989,21 @@ impl App {
                 }
             }
             _ => default(),
+        };
+        if matches!(self.screen, Screen::FieldEdit { .. })
+            || self.personality_active_file.is_some()
+            || self.skills_active.is_some()
+        {
+            format!(
+                "{hint}  {}",
+                crate::i18n::t(if self.has_pending_edits() {
+                    "zc-config-draft-pending"
+                } else {
+                    "zc-config-draft-unchanged"
+                })
+            )
+        } else {
+            hint
         }
     }
 
@@ -792,12 +1055,23 @@ impl App {
     /// Handle a key event. Returns `Ok(true)` when the user wants to
     /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        if self.pending_confirmation.is_some() {
+            self.handle_confirmation(key, term).await?;
+            return Ok(false);
+        }
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+        if !self.editor_owns_key(&key)
+            && !(self.wants_text_input()
+                && matches!(key.code, KeyCode::Char(_)) // keyguard: literal text must not trigger a list navigation binding.
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT))
+            && let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key)
+        {
             use crate::keymap::ConfigTabAction;
             if action == ConfigTabAction::SectionNext {
                 self.cycle_section(1);
@@ -821,6 +1095,29 @@ impl App {
             return Ok(false);
         }
 
+        // Composite tab departures replace the active editor. Character keys
+        // remain literal input, even when the list keymap binds h/l navigation.
+        if self.filter.is_none()
+            && !self.editor_owns_key(&key)
+            && self.is_composite_tab()
+            && (self.personality_active_file.is_some() || self.skills_active.is_some())
+            && !matches!(key.code, KeyCode::Char(_)) // keyguard: printable characters belong to the multiline draft, not tab navigation.
+            && match crate::keymap::ConfigTabAction::from_chord(&key) {
+                Some(crate::keymap::ConfigTabAction::TabLeft) => true,
+                Some(crate::keymap::ConfigTabAction::TabRight) => {
+                    self.active_tab + 1 < self.tab_names.len()
+                }
+                _ => false,
+            }
+        {
+            if self.has_pending_edits() {
+                self.pending_confirmation = Some(PendingConfirmation::DiscardKey(key));
+                return Ok(false);
+            }
+            self.personality_active_file = None;
+            self.skills_active = None;
+        }
+
         // Focus on the section list: keys drive the list (which eagerly loads
         // the highlighted section into the right pane for preview). Focus on the
         // detail: keys drive whatever drill screen is loaded.
@@ -837,6 +1134,8 @@ impl App {
                 ConfigTabAction::from_chord(&key),
                 Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
             ) && self.at_section_top_level()
+                && self.filter.is_none()
+                && !self.wants_text_input()
             {
                 self.zeroclaw_pane = ZeroclawPane::Sections;
                 return Ok(false);
@@ -850,6 +1149,7 @@ impl App {
             Screen::TypeList { .. } => self.handle_type_list(key).await?,
             Screen::AliasList { .. } => self.handle_alias_list(key).await?,
             Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
+            Screen::AliasRename { .. } => self.handle_alias_rename(key).await?,
             Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
             Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
         }
@@ -864,6 +1164,7 @@ impl App {
     }
 
     fn cycle_section(&mut self, delta: isize) {
+        self.cancel_alias_rename();
         let i = CONFIG_SECTIONS
             .iter()
             .position(|s| *s == self.section)
@@ -881,6 +1182,19 @@ impl App {
     ) -> Result<()> {
         use crate::mouse;
 
+        if self.pending_confirmation.is_some() {
+            if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                && let Some((stay, proceed)) = self.confirmation_buttons
+            {
+                if mouse::in_rect(mouse.column, mouse.row, stay) {
+                    self.pending_confirmation = None;
+                } else if mouse::in_rect(mouse.column, mouse.row, proceed) {
+                    self.confirm_pending(term).await?;
+                }
+            }
+            return Ok(());
+        }
+
         // Section tab-bar click switches sub-tab in either section.
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some(bar) = self.section_tab_area
@@ -888,6 +1202,9 @@ impl App {
         {
             let labels: Vec<&str> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
             if let Some(idx) = mouse::tab_click_index(mouse.column, mouse.row, bar, &labels, 3) {
+                if self.section != CONFIG_SECTIONS[idx] {
+                    self.cancel_alias_rename();
+                }
                 self.section = CONFIG_SECTIONS[idx];
                 return Ok(());
             }
@@ -899,8 +1216,21 @@ impl App {
             return Ok(());
         }
 
+        if self.has_pending_edits() && self.mouse_replaces_draft(mouse) {
+            self.pending_confirmation = Some(PendingConfirmation::DiscardMouse(mouse));
+            return Ok(());
+        }
+
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(idx) = self
+                    .last_breadcrumb_areas
+                    .iter()
+                    .position(|&area| mouse::in_rect(mouse.column, mouse.row, area))
+                {
+                    self.open_breadcrumb(idx).await?;
+                    return Ok(());
+                }
                 // Aliases/Costs tab bar click on a cost-bearing provider list.
                 if self.alias_list_has_tabs()
                     && let Some(tab_rect) = self.last_tab_area
@@ -921,20 +1251,23 @@ impl App {
                     let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
                     if let Some(idx) =
                         mouse::tab_click_index(mouse.column, mouse.row, tab_rect, &display_refs, 3)
-                        && idx != self.alias_tab
                         && idx < labels.len()
                     {
-                        self.alias_tab = idx;
-                        self.deactivate_filter();
-                        if idx == 1 {
-                            self.load_cost_resources().await?;
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
+                        if idx != self.alias_tab {
+                            self.alias_tab = idx;
+                            self.deactivate_filter();
+                            if idx == 1 {
+                                self.load_cost_resources().await?;
+                            }
                         }
                     }
                     return Ok(());
                 }
 
                 // Tab bar click (FieldList only).
-                if let Some(tab_rect) = self.last_tab_area
+                if matches!(self.screen, Screen::FieldList { .. })
+                    && let Some(tab_rect) = self.last_tab_area
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
                 {
                     let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
@@ -956,19 +1289,22 @@ impl App {
                         tab_rect,
                         &display_refs,
                         3, // " │ " separator
-                    ) && idx != self.active_tab
-                        && idx < self.tab_names.len()
+                    ) && idx < self.tab_names.len()
                     {
-                        self.active_tab = idx;
-                        self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
-                        self.deactivate_filter();
-                        self.on_tab_switched(term).await?;
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
+                        if idx != self.active_tab {
+                            self.active_tab = idx;
+                            self.field_cursor =
+                                self.tab_field_indices().first().copied().unwrap_or(0);
+                            self.deactivate_filter();
+                            self.on_tab_switched(term).await?;
+                        }
                     }
                     return Ok(());
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and preview that section on the right. Display
+                // the left pane, and return that section to its starting view. Display
                 // rows resolve through the draw-time `last_section_rows` map so
                 // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
@@ -980,15 +1316,37 @@ impl App {
                     ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
                         self.section_cursor = orig;
+                        self.zeroclaw_pane = ZeroclawPane::Sections;
+                        self.deactivate_filter();
+                        // Lists have no field subtabs, even if a previous
+                        // field screen left its tab state behind.
+                        if matches!(
+                            self.screen,
+                            Screen::TypeList { .. } | Screen::AliasList { .. }
+                        ) {
+                            self.active_tab = 0;
+                        }
+                        if self.loaded_section == Some(orig) && !self.at_section_top_level() {
+                            self.load_section_content(orig).await?;
+                        } else {
+                            self.preview_section(orig).await?;
+                        }
+                        self.edit_buf.clear();
+                        self.edit_cursor = 0;
+                        self.active_tab = 0;
+                        self.alias_tab = 0;
+                        self.last_tab_area = None;
+                        self.last_breadcrumb_areas.clear();
+                        self.status_msg = None;
                     }
-                    self.zeroclaw_pane = ZeroclawPane::Sections;
-                    self.preview_section(self.section_cursor).await?;
-                    self.status_msg = None;
                     return Ok(());
                 }
 
                 // List area click.
-                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area)
+                    && mouse.column > self.last_main_area.x
+                    && mouse.column < self.last_main_area.right().saturating_sub(1)
+                {
                     let count = self.visible_count();
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
@@ -996,6 +1354,7 @@ impl App {
                         self.last_list_offset,
                         count,
                     ) {
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
                         let is_double = self.double_click.click(mouse.column, mouse.row);
                         self.set_visible_cursor(pos);
                         if is_double {
@@ -1047,6 +1406,72 @@ impl App {
 
     // ── Mouse helper methods ─────────────────────────────────────
 
+    fn mouse_replaces_draft(&self, mouse: MouseEvent) -> bool {
+        use crate::mouse::in_rect;
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(idx) = self
+                    .last_breadcrumb_areas
+                    .iter()
+                    .position(|&area| in_rect(mouse.column, mouse.row, area))
+                {
+                    let current = match &self.screen {
+                        Screen::FieldEdit { breadcrumb, .. } => breadcrumb.len(),
+                        Screen::FieldList { breadcrumb, .. } => breadcrumb.len().saturating_sub(1),
+                        _ => return false,
+                    };
+                    return idx < current;
+                }
+                if in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
+                    return crate::mouse::list_click_index(
+                        mouse.row,
+                        self.last_section_list_area,
+                        self.last_section_list_offset,
+                        self.last_section_rows.len(),
+                    )
+                    .and_then(|pos| self.last_section_rows.get(pos))
+                    .is_some_and(Option::is_some);
+                }
+                if matches!(self.screen, Screen::FieldList { .. })
+                    && let Some(area) = self.last_tab_area
+                    && in_rect(mouse.column, mouse.row, area)
+                {
+                    let display: Vec<String> = self
+                        .tab_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tab)| {
+                            if i == self.active_tab {
+                                format!("▸ {}", tab.label())
+                            } else {
+                                tab.label().to_string()
+                            }
+                        })
+                        .collect();
+                    let labels: Vec<&str> = display.iter().map(String::as_str).collect();
+                    return crate::mouse::tab_click_index(
+                        mouse.column,
+                        mouse.row,
+                        area,
+                        &labels,
+                        3,
+                    )
+                    .is_some_and(|idx| idx != self.active_tab);
+                }
+                false
+            }
+            MouseEventKind::ScrollUp => {
+                self.section_cursor > 0
+                    && in_rect(mouse.column, mouse.row, self.last_section_pane_area)
+            }
+            MouseEventKind::ScrollDown => {
+                self.section_cursor + 1 < self.sections.len()
+                    && in_rect(mouse.column, mouse.row, self.last_section_pane_area)
+            }
+            _ => false,
+        }
+    }
+
     /// Number of visible items for the current screen (respecting filters).
     fn visible_count(&self) -> usize {
         match &self.screen {
@@ -1071,7 +1496,7 @@ impl App {
                     }
                 }
             }
-            Screen::AliasCreate { .. } => 0,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => 0,
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1176,7 +1601,7 @@ impl App {
                     self.alias_cursor
                 }
             }
-            Screen::AliasCreate { .. } => 0,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => 0,
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1250,7 +1675,7 @@ impl App {
                     self.alias_cursor = pos.min(total.saturating_sub(1));
                 }
             }
-            Screen::AliasCreate { .. } => {}
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => {}
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1320,18 +1745,9 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.alias_list_has_tabs() && self.alias_tab == 1 {
-                    if self.cost_cursor < self.cost_resources.len() {
-                        let idx = self.cost_cursor;
-                        self.enter_cost_resource(idx).await?;
-                    }
-                } else if self.alias_cursor < self.aliases.len() {
-                    let idx = self.alias_cursor;
-                    self.enter_alias(idx).await?;
-                }
-                // If on [+ Add], double-click does nothing — use keyboard.
+                self.activate_alias_list().await?;
             }
-            Screen::AliasCreate { .. } => {}
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => {}
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     // Double-click on personality file or skill opens editor —
@@ -1517,6 +1933,25 @@ impl App {
         self.alias_list_cost_target().is_some()
     }
 
+    fn provider_alias_rename_available(&self) -> bool {
+        if let Screen::AliasList {
+            section_idx,
+            map_path,
+            ..
+        } = &self.screen
+        {
+            return self.alias_tab == 0
+                && self.alias_cursor < self.aliases.len()
+                && self.sections.get(*section_idx).is_some_and(|section| {
+                    matches!(
+                        section.key.as_str(),
+                        "providers.models" | "providers.tts" | "providers.transcription"
+                    ) && is_direct_child_path(map_path, &section.key)
+                });
+        }
+        false
+    }
+
     async fn load_cost_resources(&mut self) -> Result<()> {
         if let Some(base) = self.cost_base_path() {
             self.cost_resources = self.rpc.config_map_keys(&base).await.unwrap_or_default();
@@ -1692,9 +2127,11 @@ impl App {
         self.personality_files = result.files;
         self.personality_max_chars = result.max_chars;
         self.personality_cursor = 0;
-        self.personality_active_file = None;
-        self.personality_content.clear();
-        self.personality_loaded.clear();
+        // Refreshing list metadata must not reset an open editor or its baseline.
+        if self.personality_active_file.is_none() {
+            self.personality_content.clear();
+            self.personality_loaded.clear();
+        }
         Ok(())
     }
 
@@ -1714,11 +2151,12 @@ impl App {
         let result = self.rpc.skills_list(Some(&self.skills_bundle)).await?;
         self.skills_list = result.skills;
         self.skills_cursor = 0;
-        self.skills_active = None;
-        self.skills_body.clear();
-        self.skills_body_loaded.clear();
-        self.skills_frontmatter = Default::default();
-        self.skills_frontmatter_loaded = Default::default();
+        if self.skills_active.is_none() {
+            self.skills_body.clear();
+            self.skills_body_loaded.clear();
+            self.skills_frontmatter = Default::default();
+            self.skills_frontmatter_loaded = Default::default();
+        }
         Ok(())
     }
 
@@ -1813,7 +2251,102 @@ impl App {
         }
     }
 
+    async fn open_breadcrumb(&mut self, idx: usize) -> Result<()> {
+        let (section_idx, current_idx) = match &self.screen {
+            Screen::SectionList => return Ok(()),
+            Screen::TypeList { section_idx } => (*section_idx, 0),
+            Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            }
+            | Screen::FieldList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len().saturating_sub(1)),
+            Screen::AliasCreate {
+                section_idx,
+                breadcrumb,
+                ..
+            }
+            | Screen::FieldEdit {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len()),
+            Screen::AliasRename {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len() + 1),
+        };
+        self.zeroclaw_pane = ZeroclawPane::Detail;
+        if idx >= current_idx {
+            return Ok(());
+        }
+        if idx == 0 {
+            self.load_section_content(section_idx).await?;
+        } else {
+            match &self.screen {
+                Screen::AliasCreate {
+                    map_path,
+                    breadcrumb,
+                    ..
+                } => {
+                    self.restore_alias_list_from_create_back(
+                        section_idx,
+                        map_path.clone(),
+                        breadcrumb.clone(),
+                    )
+                    .await?;
+                }
+                Screen::AliasRename {
+                    map_path,
+                    breadcrumb,
+                    from,
+                    ..
+                } if idx == breadcrumb.len() => {
+                    let prefix = format!("{map_path}.{from}");
+                    let mut bc = breadcrumb.clone();
+                    bc.push(from.clone());
+                    self.load_fields(&prefix).await?;
+                    self.screen = Screen::FieldList {
+                        section_idx,
+                        prefix,
+                        breadcrumb: bc,
+                    };
+                }
+                Screen::AliasRename { .. } => self.cancel_alias_rename(),
+                Screen::FieldEdit { .. } => self.pop_to_field_list().await?,
+                _ => {}
+            }
+            if let Screen::FieldList { breadcrumb, .. } = &self.screen
+                && breadcrumb.len() > idx + 1
+            {
+                self.restore_alias_list_from_field_back(section_idx, breadcrumb.clone())
+                    .await?;
+            }
+            // Costs is a breadcrumb only inside a resource form. Its parent
+            // family still opens Aliases; the Costs crumb keeps the Costs tab.
+            if matches!(self.screen, Screen::AliasList { .. }) {
+                self.active_tab = 0;
+                if idx == 1 {
+                    self.alias_tab = 0;
+                }
+            }
+        }
+        self.deactivate_filter();
+        self.edit_buf.clear();
+        self.edit_cursor = 0;
+        self.last_tab_area = None;
+        self.last_breadcrumb_areas.clear();
+        self.status_msg = None;
+        Ok(())
+    }
+
     async fn preview_section(&mut self, idx: usize) -> Result<()> {
+        self.cancel_alias_rename();
         if self.loaded_section == Some(idx) {
             return Ok(());
         }
@@ -1857,6 +2390,7 @@ impl App {
     }
 
     async fn load_section_content(&mut self, idx: usize) -> Result<()> {
+        self.cancel_alias_rename();
         if let Some(section) = self.sections.get(idx) {
             let section_key = section.key.clone();
             match section.shape {
@@ -2030,7 +2564,6 @@ impl App {
             FilterAction::Passthrough => {}
         }
 
-        let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
         // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
         // it only reaches here on the leftmost tab, where it walks out like Back.
@@ -2067,25 +2600,29 @@ impl App {
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            _ if into => {
-                if has_add && self.alias_cursor == add_pos {
-                    if let Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb,
-                        ..
-                    } = &self.screen
-                    {
-                        self.edit_buf.clear();
-                        self.screen = Screen::AliasCreate {
-                            section_idx: *section_idx,
-                            map_path: map_path.clone(),
-                            breadcrumb: breadcrumb.clone(),
-                        };
-                    }
-                } else if self.alias_cursor < self.aliases.len() {
-                    self.enter_alias(self.alias_cursor).await?;
+            Some(ConfigTabAction::RenameAlias)
+                if self.provider_alias_rename_available()
+                    && self.alias_cursor < self.aliases.len() =>
+            {
+                if let Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                } = &self.screen
+                {
+                    let from = self.aliases[self.alias_cursor].clone();
+                    self.edit_buf = from.clone();
+                    self.screen = Screen::AliasRename {
+                        section_idx: *section_idx,
+                        map_path: map_path.clone(),
+                        breadcrumb: breadcrumb.clone(),
+                        from,
+                        confirming: false,
+                    };
                 }
+            }
+            _ if into => {
+                self.activate_alias_list().await?;
             }
             Some(ConfigTabAction::ToggleSecret) if self.alias_cursor < self.aliases.len() => {
                 if let Screen::AliasList { map_path, .. } = &self.screen {
@@ -2112,6 +2649,58 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn alias_add_selected(&self) -> bool {
+        if self.alias_list_has_tabs() && self.alias_tab == 1 {
+            self.cost_cursor == self.cost_resources.len()
+        } else {
+            self.filter.is_none() && self.alias_cursor == self.aliases.len()
+        }
+    }
+
+    /// Keyboard and mouse activation share the same Add and open behavior.
+    async fn activate_alias_list(&mut self) -> Result<()> {
+        if self.alias_add_selected() {
+            if let Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            } = &self.screen
+            {
+                let mut map_path = map_path.clone();
+                let mut breadcrumb = breadcrumb.clone();
+                if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    let Some(base) = self.cost_base_path() else {
+                        return Ok(());
+                    };
+                    map_path = base;
+                    breadcrumb.push(ConfigTab::Costs.label().to_string());
+                }
+                self.edit_buf.clear();
+                self.screen = Screen::AliasCreate {
+                    section_idx: *section_idx,
+                    map_path,
+                    breadcrumb,
+                };
+            }
+        } else if self.alias_list_has_tabs() && self.alias_tab == 1 {
+            if self.cost_cursor < self.cost_resources.len() {
+                self.enter_cost_resource(self.cost_cursor).await?;
+            }
+        } else {
+            let visible = self.filtered_indices(&self.aliases);
+            let cursor = if self.filter.is_some() {
+                self.filter_cursor
+            } else {
+                self.alias_cursor
+            };
+            if let Some(&idx) = visible.get(cursor) {
+                self.deactivate_filter();
+                self.enter_alias(idx).await?;
+            }
         }
         Ok(())
     }
@@ -2150,25 +2739,7 @@ impl App {
                 self.cost_cursor += 1;
             }
             Some(ConfigTabAction::Enter) => {
-                if self.cost_cursor == add_pos {
-                    if let Screen::AliasList {
-                        section_idx,
-                        breadcrumb,
-                        ..
-                    } = &self.screen
-                    {
-                        self.edit_buf.clear();
-                        let mut bc = breadcrumb.clone();
-                        bc.push(ConfigTab::Costs.label().to_string());
-                        self.screen = Screen::AliasCreate {
-                            section_idx: *section_idx,
-                            map_path: base,
-                            breadcrumb: bc,
-                        };
-                    }
-                } else if self.cost_cursor < self.cost_resources.len() {
-                    self.enter_cost_resource(self.cost_cursor).await?;
-                }
+                self.activate_alias_list().await?;
             }
             Some(ConfigTabAction::DeleteRow | ConfigTabAction::ToggleSecret)
                 if self.cost_cursor < self.cost_resources.len() =>
@@ -2399,6 +2970,130 @@ impl App {
         Ok(())
     }
 
+    fn cancel_alias_rename(&mut self) {
+        if !matches!(self.screen, Screen::AliasRename { .. }) {
+            return;
+        }
+        if let Screen::AliasRename {
+            section_idx,
+            map_path,
+            breadcrumb,
+            ..
+        } = std::mem::replace(&mut self.screen, Screen::SectionList)
+        {
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            };
+        }
+        self.edit_buf.clear();
+        self.status_msg = None;
+    }
+
+    async fn handle_alias_rename(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigEditorAction;
+        let Screen::AliasRename {
+            from, confirming, ..
+        } = &self.screen
+        else {
+            return Ok(());
+        };
+        let from = from.clone();
+        let confirming = *confirming;
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => self.cancel_alias_rename(),
+            Some(ConfigEditorAction::Confirm) if key.kind != KeyEventKind::Press => {}
+            Some(ConfigEditorAction::Confirm) if !confirming => {
+                let to = self.edit_buf.trim().to_string();
+                if to.is_empty() {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-empty"));
+                } else if to == from {
+                    self.status_msg =
+                        Some(crate::i18n::t("zc-config-status-alias-rename-unchanged"));
+                } else {
+                    self.edit_buf = to;
+                    if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                        *confirming = true;
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                let Screen::AliasRename { map_path, .. } = &self.screen else {
+                    return Ok(());
+                };
+                let map_path = map_path.clone();
+                let to = self.edit_buf.clone();
+                match self.rpc.config_map_key_rename(&map_path, &from, &to).await {
+                    Ok(result) => {
+                        let mut status = if result.renamed {
+                            // The rename has committed. Leave the editor before refreshing
+                            // so a failed read cannot cause the mutation to be retried.
+                            self.cancel_alias_rename();
+                            match self.load_aliases(&map_path).await {
+                                Ok(()) => {
+                                    self.alias_cursor = self
+                                        .aliases
+                                        .iter()
+                                        .position(|alias| alias == &to)
+                                        .unwrap_or(0);
+                                    crate::i18n::t_args(
+                                        "zc-config-status-alias-renamed",
+                                        &[("from", &from), ("to", &to)],
+                                    )
+                                }
+                                Err(e) => {
+                                    self.aliases.clear();
+                                    self.alias_enabled.clear();
+                                    self.alias_cursor = 0;
+                                    self.loaded_section = None;
+                                    crate::i18n::t_args(
+                                        "zc-config-status-alias-renamed-refresh-failed",
+                                        &[("from", &from), ("to", &to), ("err", &e.to_string())],
+                                    )
+                                }
+                            }
+                        } else {
+                            if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                                *confirming = false;
+                            }
+                            crate::i18n::t("zc-config-status-alias-rename-not-applied")
+                        };
+                        if !result.warnings.is_empty() {
+                            status.push(' ');
+                            status.push_str(&crate::i18n::t_args(
+                                "zc-config-status-alias-rename-warnings",
+                                &[("warnings", &result.warnings.join("; "))],
+                            ));
+                        }
+                        self.status_msg = Some(status);
+                    }
+                    Err(e) => {
+                        if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                            *confirming = false;
+                        }
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-alias-rename-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Backspace) if !confirming => {
+                self.edit_buf.pop();
+            }
+            None if !confirming => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // ── Field list ───────────────────────────────────────────────
 
     async fn handle_field_list(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
@@ -2597,6 +3292,52 @@ impl App {
 
     // ── Personality tab handler ──────────────────────────────────
 
+    fn offer_external_editor(&mut self, pending: PendingConfirmation) {
+        self.status_msg = None;
+        if crate::editor::editor_from_env_or_path().is_some() {
+            self.pending_confirmation = Some(pending);
+        }
+    }
+
+    async fn launch_personality_editor(&mut self, term: &mut Term) -> Result<()> {
+        let Some(filename) = self.personality_active_file.clone() else {
+            return Ok(());
+        };
+        if let Ok(edited) = edit_in_external_editor(term, &self.personality_content, &filename) {
+            self.import_personality_edit(edited, term).await?;
+        }
+        Ok(())
+    }
+
+    async fn import_personality_edit(&mut self, edited: String, term: &mut Term) -> Result<()> {
+        self.personality_content = edited;
+        if self.personality_content != self.personality_loaded {
+            self.save_personality(term).await?;
+        }
+        if self.personality_content == self.personality_loaded {
+            self.personality_active_file = None;
+        }
+        Ok(())
+    }
+
+    async fn launch_skill_editor(&mut self, term: &mut Term) -> Result<()> {
+        let Some(name) = self.skills_active.clone() else {
+            return Ok(());
+        };
+        if let Ok(edited) =
+            edit_in_external_editor(term, &self.skills_body, &format!("{name}.SKILL.md"))
+        {
+            self.skills_body = edited;
+            if self.skills_body != self.skills_body_loaded {
+                self.save_skill(term).await?;
+            }
+            if self.skills_body == self.skills_body_loaded {
+                self.skills_active = None;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_personality_tab(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
         // Two modes: file picker (no active file) or editor (active file).
         if self.personality_active_file.is_some() {
@@ -2665,48 +3406,7 @@ impl App {
                     let _ = self.draw(term);
                     match self.load_personality_file(&filename).await {
                         Ok(()) => {
-                            // Try $EDITOR first; fall back to inline editor.
-                            match edit_in_external_editor(
-                                term,
-                                &self.personality_content,
-                                &filename,
-                            ) {
-                                Ok(edited) => {
-                                    self.personality_content = edited;
-                                    if self.personality_content != self.personality_loaded {
-                                        // Auto-save after $EDITOR.
-                                        let agent = self.personality_agent.clone();
-                                        let content = self.personality_content.clone();
-                                        match self
-                                            .rpc
-                                            .personality_put(&agent, &filename, &content)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                self.personality_loaded =
-                                                    self.personality_content.clone();
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-personality-saved-file",
-                                                    &[("filename", &filename)],
-                                                ));
-                                                let _ = self.load_personality_files().await;
-                                            }
-                                            Err(e) => {
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
-                                                    &[("err", &e.to_string())],
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        self.status_msg = None;
-                                    }
-                                    self.personality_active_file = None;
-                                }
-                                Err(_) => {
-                                    self.status_msg = None;
-                                }
-                            }
+                            self.offer_external_editor(PendingConfirmation::ExternalPersonality);
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
@@ -2728,49 +3428,18 @@ impl App {
                         Ok(result) => {
                             if let Some(tmpl) = result.files.iter().find(|f| f.filename == filename)
                             {
-                                self.personality_content = tmpl.content.clone();
-                                self.personality_loaded.clear();
-                                self.personality_active_file = Some(filename.clone());
-
-                                // Try $EDITOR, fall back to inline.
-                                match edit_in_external_editor(
-                                    term,
-                                    &self.personality_content,
-                                    &filename,
-                                ) {
-                                    Ok(edited) => {
-                                        self.personality_content = edited;
-                                        if !self.personality_content.is_empty() {
-                                            let content = self.personality_content.clone();
-                                            match self
-                                                .rpc
-                                                .personality_put(&agent, &filename, &content)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    self.personality_loaded =
-                                                        self.personality_content.clone();
-                                                    self.status_msg =
-                                                        Some(format!("Saved {filename}"));
-                                                    let _ = self.load_personality_files().await;
-                                                }
-                                                Err(e) => {
-                                                    self.status_msg =
-                                                        Some(format!("Save failed: {e}"));
-                                                }
-                                            }
-                                        } else {
-                                            self.status_msg = None;
-                                        }
-                                        self.personality_active_file = None;
-                                    }
-                                    Err(_) => {
-                                        self.status_msg = Some(crate::i18n::t_args(
-                                            "zc-config-status-template-loaded",
-                                            &[("filename", &filename)],
-                                        ));
-                                    }
+                                // Load the real baseline before replacing the draft with a template.
+                                if let Err(e) = self.load_personality_file(&filename).await {
+                                    self.status_msg = Some(crate::i18n::t_args(
+                                        "zc-config-status-load-failed",
+                                        &[("err", &e.to_string())],
+                                    ));
+                                    return Ok(());
                                 }
+                                self.personality_content = tmpl.content.clone();
+                                self.offer_external_editor(
+                                    PendingConfirmation::ExternalPersonality,
+                                );
                             } else {
                                 self.status_msg = Some(crate::i18n::t_args(
                                     "zc-config-status-template-missing",
@@ -2804,40 +3473,7 @@ impl App {
                 self.personality_active_file = None;
             }
             Some(ConfigEditorAction::Save) => {
-                if let Some(filename) = &self.personality_active_file {
-                    let filename = filename.clone();
-                    let agent = self.personality_agent.clone();
-                    let content = self.personality_content.clone();
-                    if content.chars().count() > self.personality_max_chars {
-                        self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-personality-over-limit",
-                            &[("limit", &self.personality_max_chars.to_string())],
-                        ));
-                        return Ok(());
-                    }
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-personality-saving-file",
-                        &[("filename", &filename)],
-                    ));
-                    let _ = self.draw(term);
-                    match self.rpc.personality_put(&agent, &filename, &content).await {
-                        Ok(_) => {
-                            self.personality_loaded = self.personality_content.clone();
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-personality-saved-file",
-                                &[("filename", &filename)],
-                            ));
-                            let _ = self.load_personality_files().await;
-                            self.personality_active_file = Some(filename);
-                        }
-                        Err(e) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
-                                &[("err", &e.to_string())],
-                            ));
-                        }
-                    }
-                }
+                self.save_personality(term).await?;
             }
             Some(ConfigEditorAction::Confirm) => {
                 self.personality_content.push('\n');
@@ -2853,6 +3489,46 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn save_personality(&mut self, term: &mut Term) -> Result<()> {
+        let Some(filename) = self.personality_active_file.clone() else {
+            return Ok(());
+        };
+        let content = self.personality_content.clone();
+        if content.chars().count() > self.personality_max_chars {
+            self.status_msg = Some(crate::i18n::t_args(
+                "zc-config-personality-over-limit",
+                &[("limit", &self.personality_max_chars.to_string())],
+            ));
+            return Ok(());
+        }
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-personality-saving-file",
+            &[("filename", &filename)],
+        ));
+        let _ = self.draw(term);
+        match self
+            .rpc
+            .personality_put(&self.personality_agent, &filename, &content)
+            .await
+        {
+            Ok(_) => {
+                self.personality_loaded = content;
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-personality-saved-file",
+                    &[("filename", &filename)],
+                ));
+                let _ = self.load_personality_files().await;
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-save-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
         }
         Ok(())
     }
@@ -2925,43 +3601,7 @@ impl App {
                     let _ = self.draw(term);
                     match self.load_skill(&name).await {
                         Ok(()) => {
-                            let hint = format!("{name}.SKILL.md");
-                            match edit_in_external_editor(term, &self.skills_body, &hint) {
-                                Ok(edited) => {
-                                    self.skills_body = edited;
-                                    if self.skills_body != self.skills_body_loaded {
-                                        let bundle = self.skills_bundle.clone();
-                                        let fm = self.skills_frontmatter.clone();
-                                        let body = self.skills_body.clone();
-                                        match self
-                                            .rpc
-                                            .skills_write(&bundle, &name, &fm, &body)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                self.skills_body_loaded = self.skills_body.clone();
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-skill-saved",
-                                                    &[("name", &name)],
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
-                                                    &[("err", &e.to_string())],
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        self.status_msg = None;
-                                    }
-                                    self.skills_active = None;
-                                }
-                                Err(_) => {
-                                    self.status_msg = None;
-                                    // $EDITOR unavailable — falls into inline editor.
-                                }
-                            }
+                            self.offer_external_editor(PendingConfirmation::ExternalSkill);
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
@@ -3014,37 +3654,7 @@ impl App {
                 self.skills_active = None;
             }
             Some(ConfigEditorAction::Save) => {
-                if let Some(name) = &self.skills_active {
-                    let name = name.clone();
-                    let bundle = self.skills_bundle.clone();
-                    let frontmatter = self.skills_frontmatter.clone();
-                    let body = self.skills_body.clone();
-                    self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-skill-saving",
-                        &[("name", &name)],
-                    ));
-                    let _ = self.draw(term);
-                    match self
-                        .rpc
-                        .skills_write(&bundle, &name, &frontmatter, &body)
-                        .await
-                    {
-                        Ok(_) => {
-                            self.skills_body_loaded = self.skills_body.clone();
-                            self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-skill-saved",
-                                &[("name", &name)],
-                            ));
-                        }
-                        Err(e) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
-                                &[("err", &e.to_string())],
-                            ));
-                        }
-                    }
-                }
+                self.save_skill(term).await?;
             }
             Some(ConfigEditorAction::Confirm) => {
                 self.skills_body.push('\n');
@@ -3060,6 +3670,43 @@ impl App {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn save_skill(&mut self, term: &mut Term) -> Result<()> {
+        let Some(name) = self.skills_active.clone() else {
+            return Ok(());
+        };
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-skill-saving",
+            &[("name", &name)],
+        ));
+        let _ = self.draw(term);
+        match self
+            .rpc
+            .skills_write(
+                &self.skills_bundle,
+                &name,
+                &self.skills_frontmatter,
+                &self.skills_body,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.skills_body_loaded = self.skills_body.clone();
+                self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-skill-saved",
+                    &[("name", &name)],
+                ));
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-save-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
         }
         Ok(())
     }
@@ -3142,6 +3789,7 @@ impl App {
                 field_idx: idx,
             };
         }
+        self.field_draft_loaded = self.field_draft().to_string();
     }
 
     fn prepare_edit_at(&mut self, idx: usize) {
@@ -3189,6 +3837,7 @@ impl App {
             }
         }
         self.edit_cursor = self.edit_buf.len();
+        self.field_draft_loaded = self.field_draft().to_string();
     }
 
     fn is_select_edit(&self) -> bool {
@@ -3389,7 +4038,7 @@ impl App {
             Some(ConfigEditorAction::Cancel) => {
                 self.pop_to_field_list().await?;
             }
-            Some(ConfigEditorAction::Confirm) => {
+            Some(ConfigEditorAction::Confirm | ConfigEditorAction::Save) => {
                 if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
                     if let Some(status) =
@@ -3446,6 +4095,30 @@ impl App {
     async fn handle_select_edit(&mut self, key: KeyEvent) -> Result<()> {
         let visible = self.filtered_indices(&self.select_items);
 
+        use crate::keymap::ConfigEditorAction as E;
+        match E::from_chord(&key) {
+            Some(E::Cancel) => {
+                if self.filter.is_some() {
+                    self.deactivate_filter();
+                } else {
+                    self.pop_to_field_list().await?;
+                }
+                return Ok(());
+            }
+            Some(E::Save | E::Confirm) => {
+                let cursor = if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.select_cursor
+                };
+                if let Some(&orig) = visible.get(cursor) {
+                    return self.commit_select(orig).await;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
             FilterAction::Accept => {
@@ -3493,6 +4166,7 @@ impl App {
                         "zc-config-status-field-set",
                         &[("prop", &prop)],
                     ));
+                    self.deactivate_filter();
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -3699,7 +4373,8 @@ impl App {
         let r = regions(area);
         let section = &self.sections[section_idx];
 
-        render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
+        self.last_breadcrumb_areas =
+            render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
@@ -3772,7 +4447,7 @@ impl App {
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         // Aliases/Costs tab bar on cost-bearing provider types. Reuses the
         // same two-row help split the FieldList tab bar uses.
@@ -3924,7 +4599,7 @@ impl App {
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(crate::i18n::t("zc-config-breadcrumb-new"));
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -3945,6 +4620,58 @@ impl App {
         self.draw_status(frame, r);
     }
 
+    fn draw_alias_rename(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        map_path: &str,
+        breadcrumb: &[String],
+        from: &str,
+        confirming: bool,
+    ) {
+        let r = regions(area);
+        let mut bc = breadcrumb.to_vec();
+        bc.push(from.to_string());
+        bc.push(crate::i18n::t("zc-config-breadcrumb-rename"));
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                crate::i18n::t(if confirming {
+                    "zc-config-alias-rename-confirm-hint"
+                } else {
+                    "zc-config-alias-rename-input-hint"
+                }),
+                theme::dim_style(),
+            ))
+            .wrap(Wrap { trim: false }),
+            r.help,
+        );
+        let content = if confirming {
+            crate::i18n::t_args(
+                "zc-config-alias-rename-confirm-target",
+                &[("path", map_path), ("from", from), ("to", &self.edit_buf)],
+            )
+        } else {
+            format!("{}█", self.edit_buf)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(content, theme::input_style()))
+                .wrap(Wrap { trim: false })
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    crate::i18n::t(if confirming {
+                        "zc-config-alias-rename-confirm-title"
+                    } else {
+                        "zc-config-alias-rename-input-title"
+                    })
+                ))),
+            r.main,
+        );
+        self.last_main_area = r.main;
+        self.last_tab_area = None;
+        self.draw_status(frame, r);
+    }
+
     fn draw_field_list(
         &mut self,
         frame: &mut Frame,
@@ -3959,7 +4686,7 @@ impl App {
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         // When tabs are present, split the help row into tab bar + help.
         // The help area is 2 rows: use the first for tabs, second for help.
@@ -4295,7 +5022,7 @@ impl App {
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(short_name.to_string());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         if self.is_select_edit() {
             // Enum, Bool, or model select — with optional `/` filter.
@@ -4364,7 +5091,16 @@ impl App {
             } else if field.kind == PropKind::StringArray {
                 let suffix = crate::i18n::t_args(
                     "zc-config-field-type-string-array-suffix",
-                    &[("newline_chord", "Enter"), ("save_chord", "Ctrl+S")],
+                    &[
+                        (
+                            "newline_chord",
+                            &editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                        ),
+                        (
+                            "save_chord",
+                            &editor_key(crate::keymap::ConfigEditorAction::Save),
+                        ),
+                    ],
                 );
                 format!("{type_prefix} {} {suffix}", field.kind.wire_name())
             } else {
@@ -4425,12 +5161,19 @@ impl App {
 
     /// Handle a bracketed-paste payload. Routes pasted text into whichever
     /// text-input surface is currently active (filter, edit buffer, alias
-    /// create, personality/skills editor). Filters out the bracket-paste
+    /// create/rename, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) fn handle_paste(&mut self, text: &str) {
+        if self.pending_confirmation.is_some() {
+            return;
+        }
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.section == ConfigSection::Zerocode {
+            self.zerocode.handle_paste(&cleaned);
+            return;
+        }
 
         // Filter active: paste goes into the filter buffer.
         if let Some(buf) = self.filter.as_mut() {
@@ -4444,7 +5187,10 @@ impl App {
         }
 
         match &self.screen {
-            Screen::AliasCreate { .. } => {
+            Screen::AliasCreate { .. }
+            | Screen::AliasRename {
+                confirming: false, ..
+            } => {
                 // Aliases are single-line identifiers.
                 for c in cleaned.chars() {
                     if c == '\n' {
@@ -4482,8 +5228,11 @@ impl App {
         }
     }
 
-    /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).
+    /// Whether the pane owns text-input keys (filter, edit buf, alias create/rename, editors).
     pub(crate) fn wants_text_input(&self) -> bool {
+        if self.pending_confirmation.is_some() {
+            return true;
+        }
         if self.section == ConfigSection::Zerocode {
             return self.zerocode.wants_text_input();
         }
@@ -4491,7 +5240,7 @@ impl App {
             return true;
         }
         match &self.screen {
-            Screen::AliasCreate { .. } => true,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => true,
             Screen::FieldEdit { .. } if !self.is_select_edit() => true,
             Screen::FieldList { .. } => {
                 self.personality_active_file.is_some() || self.skills_active.is_some()
@@ -4629,7 +5378,7 @@ impl App {
                         help(),
                     ])
                 } else if self.alias_list_has_tabs() {
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         nav(),
                         E::new(
                             switch_tabs_keys(),
@@ -4641,10 +5390,14 @@ impl App {
                         help(),
                         E::spacer(),
                         mouse_open(),
-                    ])
+                    ];
+                    if self.provider_alias_rename_available() {
+                        entries.insert(3, k(A::RenameAlias, "zc-config-help-rename-alias"));
+                    }
+                    HelpNode::entries(entries)
                 } else {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         nav(),
                         E::new(open, crate::i18n::t("zc-config-help-open-alias")),
                         k(A::ToggleSecret, "zc-config-help-delete-alias"),
@@ -4653,13 +5406,32 @@ impl App {
                         help(),
                         E::spacer(),
                         mouse_open(),
-                    ])
+                    ];
+                    if self.provider_alias_rename_available() {
+                        entries.insert(2, k(A::RenameAlias, "zc-config-help-rename-alias"));
+                    }
+                    HelpNode::entries(entries)
                 }
             }
             Screen::AliasCreate { .. } => HelpNode::entries(vec![
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
                     crate::i18n::t("zc-config-help-create-alias"),
+                ),
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                    crate::i18n::t("zc-config-help-cancel"),
+                ),
+                help(),
+            ]),
+            Screen::AliasRename { confirming, .. } => HelpNode::entries(vec![
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                    crate::i18n::t(if *confirming {
+                        "zc-config-help-confirm-rename"
+                    } else {
+                        "zc-config-help-review-rename"
+                    }),
                 ),
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
@@ -4748,19 +5520,37 @@ impl App {
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
                 if self.is_select_edit() {
+                    let save_selection = || {
+                        E::new(
+                            vec![
+                                editor_key(crate::keymap::ConfigEditorAction::Save),
+                                editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                            ],
+                            crate::i18n::t("zc-config-help-save-selection"),
+                        )
+                    };
+                    let cancel = || {
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                            crate::i18n::t("zc-config-help-cancel"),
+                        )
+                    };
                     if self.filter.is_some() {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
-                            clear_filter(),
+                            save_selection(),
+                            E::new(
+                                vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                                crate::i18n::t("zc-config-help-clear-filter"),
+                            ),
                             help(),
                         ])
                     } else {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
+                            save_selection(),
                             filter(),
-                            k(A::Back, "zc-config-help-cancel"),
+                            cancel(),
                             help(),
                             E::spacer(),
                             E::key("Mouse", crate::i18n::t("zc-config-help-mouse-save")),
@@ -4785,7 +5575,10 @@ impl App {
                 } else {
                     HelpNode::entries(vec![
                         E::new(
-                            vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                            vec![
+                                editor_key(crate::keymap::ConfigEditorAction::Save),
+                                editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                            ],
                             crate::i18n::t("zc-config-help-save-value"),
                         ),
                         E::new(
@@ -4883,20 +5676,28 @@ fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str) {
     );
 }
 
-fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) {
+fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) -> Vec<Rect> {
+    use unicode_width::UnicodeWidthStr;
+    let mut hit_areas = Vec::with_capacity(segments.len());
+    let mut x = area.x;
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ›  ", theme::dim_style()));
+            x = x.saturating_add(5);
         }
         let style = if i == segments.len() - 1 {
             theme::accent_style().add_modifier(Modifier::BOLD)
         } else {
             theme::heading_style()
         };
+        let width = UnicodeWidthStr::width(seg.as_str()).min(u16::MAX as usize) as u16;
+        hit_areas.push(Rect::new(x, area.y, width, area.height.min(1)).intersection(area));
+        x = x.saturating_add(width);
         spans.push(Span::styled(seg.clone(), style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hit_areas
 }
 
 // ── $EDITOR helper ───────────────────────────────────────────────
@@ -5234,6 +6035,1372 @@ mod tests {
         }
     }
 
+    fn alias_rename_manager(
+        section_key: &str,
+        family: &str,
+    ) -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut manager = App::new(client, Path::new("/tmp"));
+        manager.sections = vec![typed_section(section_key)];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: format!("{section_key}.{family}"),
+            breadcrumb: vec![section_key.into(), family.into()],
+        };
+        manager.aliases = vec!["old".into(), "other".into()];
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.loaded_section = Some(0);
+        let term = Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        (manager, outbound, rx, term)
+    }
+
+    async fn config_key(manager: &mut App, term: &mut Term, code: KeyCode) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.handle_key(KeyEvent::new(code, KeyModifiers::NONE), term),
+        )
+        .await
+        .expect("config key handler must complete")
+        .unwrap();
+    }
+
+    async fn enter_alias_rename(manager: &mut App, term: &mut Term, to: &str) {
+        config_key(manager, term, KeyCode::Char('e')).await;
+        assert!(manager.wants_text_input());
+        for _ in 0..manager.edit_buf.chars().count() {
+            config_key(manager, term, KeyCode::Backspace).await;
+        }
+        manager.handle_paste(to);
+    }
+
+    async fn answer_config_request(
+        outbound: &crate::jsonrpc::RpcOutbound,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        method: &str,
+        params: serde_json::Value,
+        response: std::result::Result<serde_json::Value, &str>,
+    ) {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected config RPC request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(req["method"], method);
+        assert_eq!(req["params"], params);
+        let id = req["id"].as_str().unwrap();
+        match response {
+            Ok(result) => outbound.dispatch_response(id, Some(result), None),
+            Err(message) => outbound.dispatch_response(
+                id,
+                None,
+                Some(crate::jsonrpc::JsonRpcError {
+                    code: -32602,
+                    message: message.into(),
+                    data: None,
+                }),
+            ),
+        }
+    }
+
+    fn field_draft_manager(
+        kind: PropKind,
+    ) -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (mut manager, outbound, rx, term) = alias_rename_manager("example", "unused");
+        manager.sections[0].shape = Some(SectionShape::DirectForm);
+        let mut entry = field("example.value");
+        entry.kind = kind;
+        entry.value = Some(serde_json::json!(match kind {
+            PropKind::Bool => "true",
+            PropKind::StringArray => "[\"original\"]",
+            _ => "original",
+        }));
+        entry.populated = true;
+        manager.fields = vec![entry];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        (manager, outbound, rx, term)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_save_dispatches_scalar_choice_and_array_values_with_resolved_shortcut() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_editor",
+            "save",
+            vec![crate::keymap::Chord::key(KeyCode::F(6))],
+        );
+        for (kind, value) in [
+            (PropKind::String, serde_json::json!("literal hjkl/ text")),
+            (PropKind::Bool, serde_json::json!("false")),
+            (PropKind::StringArray, serde_json::json!(["alpha", "beta"])),
+        ] {
+            let (mut manager, outbound, mut rx, mut term) = field_draft_manager(kind);
+            if kind == PropKind::Bool {
+                manager.select_cursor = 1;
+            } else {
+                manager.edit_buf = if kind == PropKind::StringArray {
+                    "alpha\nbeta".into()
+                } else {
+                    "literal hjkl/ text".into()
+                };
+            }
+            assert!(manager.has_pending_edits());
+            assert!(
+                manager
+                    .bottom_hint()
+                    .contains(&editor_key(crate::keymap::ConfigEditorAction::Save))
+            );
+            let answers = async {
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "config/set",
+                    serde_json::json!({"prop":"example.value", "value":value}),
+                    Ok(serde_json::json!({})),
+                )
+                .await;
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "config/list",
+                    serde_json::json!({"prefix":"example"}),
+                    Ok(serde_json::json!({"entries":[]})),
+                )
+                .await;
+            };
+            let ((), ()) =
+                tokio::join!(config_key(&mut manager, &mut term, KeyCode::F(6)), answers);
+            assert!(matches!(manager.screen, Screen::FieldList { .. }));
+            assert!(!manager.has_pending_edits());
+            assert!(rx.try_recv().is_err());
+        }
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_cancel_and_mouse_discard_never_write_the_field_draft() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" pending");
+        manager.last_breadcrumb_areas = vec![Rect::new(0, 0, 7, 1), Rect::new(12, 0, 5, 1)];
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Clicking the current crumb is inert, including for a dirty draft.
+        manager
+            .handle_mouse(click(12), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.pending_confirmation.is_none());
+        manager
+            .handle_mouse(click(0), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.pending_confirmation.is_some());
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert_eq!(manager.edit_buf, "original pending");
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        manager
+            .handle_mouse(click(0), Rect::default(), &mut term)
+            .await
+            .unwrap();
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err());
+
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" canceled");
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"example"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Esc), answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_filtered_choice_cancel_clears_filter_before_canceling() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = field_draft_manager(PropKind::Bool);
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        for c in "false".chars() {
+            config_key(&mut manager, &mut term, KeyCode::Char(c)).await;
+        }
+        assert_eq!(manager.field_draft(), "false");
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.filter.is_none());
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        manager.handle_paste("false");
+        let answers = async {
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/set",
+                serde_json::json!({"prop":"example.value", "value":"false"}),
+                Ok(serde_json::json!({})),
+            )
+            .await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/list",
+                serde_json::json!({"prefix":"example"}),
+                Ok(serde_json::json!({"entries":[]})),
+            )
+            .await;
+        };
+        let save = async {
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        };
+        let ((), ()) = tokio::join!(save, answers);
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_connection_paste_and_resolved_actions_leave_parked_draft_untouched() {
+        let _env = crate::test_support::env_test_lock();
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+            manager.handle_paste(" parked");
+            manager.zerocode = crate::zerocode_pane::ZerocodePane::new(dir.path());
+            for _ in 0..5 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            for _ in 0..2 {
+                manager
+                    .zerocode
+                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            manager.section = ConfigSection::Zerocode;
+            assert!(manager.wants_text_input());
+            let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+            manager.handle_paste("ws://127.0.0.1:\r\n42617");
+            assert_eq!(manager.edit_buf, "original parked");
+            assert!(rx.try_recv().is_err());
+            let action = if cancel { "cancel" } else { "save" };
+            crate::keymap::overrides::set_row(
+                "config_editor",
+                action,
+                vec![crate::keymap::Chord::key(KeyCode::Tab)],
+            );
+            config_key(&mut manager, &mut term, KeyCode::Tab).await;
+            assert!(manager.section == ConfigSection::Zerocode);
+            assert!(!manager.wants_text_input());
+            assert_eq!(manager.edit_buf, "original parked");
+            if cancel {
+                assert_eq!(
+                    std::fs::read(crate::config::config_path(dir.path())).unwrap(),
+                    before
+                );
+            } else {
+                assert_eq!(
+                    crate::config::ensure_and_load(dir.path())
+                        .unwrap()
+                        .connection
+                        .wss
+                        .uri
+                        .as_deref(),
+                    Some("ws://127.0.0.1:42617")
+                );
+            }
+            assert!(rx.try_recv().is_err());
+            crate::keymap::overrides::reset();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_alt_section_binding_parks_scalar_draft_without_inserting_text() {
+        let _keys = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "section_next",
+            vec![crate::keymap::Chord::with(
+                KeyCode::Char('n'),
+                KeyModifiers::ALT,
+            )],
+        );
+        let (mut manager, _outbound, mut rx, mut term) = field_draft_manager(PropKind::String);
+        manager.handle_paste(" pending");
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert_eq!(manager.edit_buf, "original pending");
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    fn personality_draft_manager() -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (mut manager, outbound, rx, term) = alias_rename_manager("agents", "demo");
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents".into(), "demo".into()],
+        };
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+        manager.active_tab = 1;
+        manager.personality_agent = "demo".into();
+        manager.personality_active_file = Some("SOUL.md".into());
+        manager.personality_loaded = "original".into();
+        manager.personality_content = "draft".into();
+        (manager, outbound, rx, term)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_save_preserves_content_baseline_and_second_save() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        for _ in 0..2 {
+            let answers = async {
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "personality/put",
+                    serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"draft"}),
+                    Ok(serde_json::json!({})),
+                )
+                .await;
+                answer_config_request(
+                    &outbound,
+                    &mut rx,
+                    "personality/list",
+                    serde_json::json!({"agent":"demo"}),
+                    Ok(serde_json::json!({"files":[], "max_chars":20000})),
+                )
+                .await;
+            };
+            let save = async {
+                manager
+                    .handle_key(
+                        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                        &mut term,
+                    )
+                    .await
+                    .unwrap();
+            };
+            let ((), ()) = tokio::join!(save, answers);
+            assert_eq!(manager.personality_content, "draft");
+            assert_eq!(manager.personality_loaded, "draft");
+            assert_eq!(manager.personality_active_file.as_deref(), Some("SOUL.md"));
+            assert!(!manager.has_pending_edits());
+        }
+        manager.handle_paste("hjkl/");
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert_eq!(manager.personality_content, "drafthjkl/\n");
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(manager.personality_active_file.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_failed_external_import_keeps_draft_for_inline_retry() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        manager.pending_confirmation = Some(PendingConfirmation::ExternalPersonality);
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert!(rx.try_recv().is_err());
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "personality/put",
+            serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"external draft"}),
+            Err("write unavailable"),
+        );
+        let (result, ()) = tokio::join!(
+            manager.import_personality_edit("external draft".into(), &mut term),
+            answers
+        );
+        result.unwrap();
+        assert_eq!(manager.personality_content, "external draft");
+        assert_eq!(manager.personality_loaded, "original");
+        assert!(manager.has_pending_edits());
+        assert_eq!(manager.personality_active_file.as_deref(), Some("SOUL.md"));
+        let answers = async {
+            answer_config_request(&outbound, &mut rx, "personality/put", serde_json::json!({"agent":"demo", "filename":"SOUL.md", "content":"external draft"}), Ok(serde_json::json!({}))).await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "personality/list",
+                serde_json::json!({"agent":"demo"}),
+                Ok(serde_json::json!({"files":[], "max_chars":20000})),
+            )
+            .await;
+        };
+        let save = async {
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        };
+        let ((), ()) = tokio::join!(save, answers);
+        assert!(!manager.has_pending_edits());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn config_personality_keyboard_departure_stays_or_discards_without_writes() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) = personality_draft_manager();
+        config_key(&mut manager, &mut term, KeyCode::Char('h')).await;
+        assert_eq!(manager.personality_content, "drafth");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        assert!(manager.pending_confirmation.is_some());
+        assert!(rx.try_recv().is_err());
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        assert_eq!(manager.active_tab, 1);
+        assert_eq!(manager.personality_content, "drafth");
+        config_key(&mut manager, &mut term, KeyCode::Left).await;
+        let answers = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix":"agents.demo"}),
+            Ok(serde_json::json!({"entries":[]})),
+        );
+        let ((), ()) = tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), answers);
+        assert_eq!(manager.active_tab, 0);
+        assert!(manager.personality_active_file.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_requires_confirmation_and_refreshes_each_family() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for (section, family) in [
+            ("providers.models", "anthropic"),
+            ("providers.tts", "openai"),
+            ("providers.transcription", "groq"),
+        ] {
+            let (mut manager, outbound, mut rx, mut term) = alias_rename_manager(section, family);
+            enter_alias_rename(&mut manager, &mut term, "new\r\n").await;
+            // The alias-list cursor is no longer authoritative once editing starts.
+            manager.alias_cursor = 1;
+            assert!(rx.try_recv().is_err());
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(matches!(
+                manager.screen,
+                Screen::AliasRename {
+                    confirming: true,
+                    ..
+                }
+            ));
+            manager
+                .handle_key(
+                    KeyEvent::new_with_kind(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(rx.try_recv().is_err());
+            manager.handle_paste("ignored");
+            config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+            assert_eq!(manager.edit_buf, "new");
+
+            let path = format!("{section}.{family}");
+            let (_, ()) =
+                tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), async {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-key-rename",
+                        serde_json::json!({"path": path, "from": "old", "to": "new"}),
+                        Ok(serde_json::json!({"renamed": true, "warnings": ["synthetic warning"]})),
+                    )
+                    .await;
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-keys",
+                        serde_json::json!({"path": path}),
+                        Ok(serde_json::json!({"keys": ["other", "new"]})),
+                    )
+                    .await;
+                    for alias in ["other", "new"] {
+                        answer_config_request(
+                            &outbound,
+                            &mut rx,
+                            "config/list",
+                            serde_json::json!({"prefix": format!("{path}.{alias}.enabled")}),
+                            Ok(serde_json::json!({"entries": []})),
+                        )
+                        .await;
+                    }
+                });
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert_eq!(manager.aliases[manager.alias_cursor], "new");
+            assert!(manager.edit_buf.is_empty());
+            assert!(
+                manager
+                    .status_msg
+                    .as_deref()
+                    .unwrap()
+                    .contains("synthetic warning")
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_blank_unchanged_and_cancel_send_no_rpc() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        for to in ["   ", "old"] {
+            enter_alias_rename(&mut manager, &mut term, to).await;
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(matches!(
+                manager.screen,
+                Screen::AliasRename {
+                    confirming: false,
+                    ..
+                }
+            ));
+            assert!(manager.status_msg.is_some());
+            config_key(&mut manager, &mut term, KeyCode::Esc).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(rx.try_recv().is_err());
+        }
+        for confirm in [false, true] {
+            enter_alias_rename(&mut manager, &mut term, "new").await;
+            if confirm {
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            }
+            config_key(&mut manager, &mut term, KeyCode::Esc).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(manager.edit_buf.is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_failure_keeps_editable_name_and_requires_reconfirmation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.tts", "openai");
+        enter_alias_rename(&mut manager, &mut term, "taken").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        tokio::join!(
+            config_key(&mut manager, &mut term, KeyCode::Enter),
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.tts.openai", "from": "old", "to": "taken"}),
+                Err("alias already exists")
+            )
+        );
+        assert!(matches!(
+            manager.screen,
+            Screen::AliasRename {
+                confirming: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.edit_buf, "taken");
+        assert!(
+            manager
+                .status_msg
+                .as_deref()
+                .unwrap()
+                .contains("alias already exists")
+        );
+        config_key(&mut manager, &mut term, KeyCode::Char('2')).await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(rx.try_recv().is_err());
+        tokio::join!(
+            config_key(&mut manager, &mut term, KeyCode::Enter),
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.tts.openai", "from": "old", "to": "taken2"}),
+                Ok(serde_json::json!({"renamed": false, "warnings": ["not applied warning"]}))
+            )
+        );
+        assert!(matches!(
+            manager.screen,
+            Screen::AliasRename {
+                confirming: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.edit_buf, "taken2");
+        assert!(
+            manager
+                .status_msg
+                .as_deref()
+                .unwrap()
+                .contains("not applied warning")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_refresh_failure_does_not_retry_committed_mutation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), async {
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.models.openai", "from": "old", "to": "new"}),
+                Ok(serde_json::json!({"renamed": true, "warnings": ["saved warning"]})),
+            )
+            .await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-keys",
+                serde_json::json!({"path": "providers.models.openai"}),
+                Err("refresh unavailable"),
+            )
+            .await;
+        });
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.aliases.is_empty());
+        assert!(manager.edit_buf.is_empty());
+        assert_eq!(manager.loaded_section, None);
+        let status = manager.status_msg.as_deref().unwrap();
+        assert!(status.contains("Renamed"));
+        assert!(status.contains("refresh unavailable"));
+        assert!(status.contains("saved warning"));
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_is_rebindable_and_excludes_other_rows() {
+        use crate::keymap::{Chord, ConfigTabAction};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for section in ["channels", "agents", "skill-bundles", "knowledge_bundles"] {
+            let (mut manager, _outbound, mut rx, mut term) =
+                alias_rename_manager(section, "example");
+            if section != "channels" {
+                manager.sections[0].shape = Some(SectionShape::OneTierAliasMap);
+                manager.screen = Screen::AliasList {
+                    section_idx: 0,
+                    map_path: section.into(),
+                    breadcrumb: vec![section.into()],
+                };
+            }
+            config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(rx.try_recv().is_err());
+        }
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        manager.alias_cursor = manager.aliases.len();
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        manager.alias_cursor = 0;
+        manager.sections[0].cost_category = "models".into();
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["example-model".into()];
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        manager.alias_tab = 0;
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert_eq!(manager.filter.as_deref(), Some("e"));
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "rename_alias",
+            vec![Chord::key(KeyCode::F(6))],
+        );
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            Some(ConfigTabAction::RenameAlias)
+        );
+        assert!(manager.bottom_hint().contains("F6"));
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        config_key(&mut manager, &mut term, KeyCode::F(6)).await;
+        assert!(matches!(manager.screen, Screen::AliasRename { .. }));
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_is_cleared_when_switching_sections() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        config_key(&mut manager, &mut term, KeyCode::Tab).await;
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        config_key(&mut manager, &mut term, KeyCode::BackTab).await;
+        assert!(manager.section == ConfigSection::Zeroclaw);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        // Passive preview keeps the loaded drill level while cancelling rename.
+        manager.preview_section(0).await.unwrap();
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        manager.section_tab_area = Some(Rect::new(0, 0, 40, 1));
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 12,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::default(),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        config_key(&mut manager, &mut term, KeyCode::BackTab).await;
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        manager.sections.push(typed_section("providers.tts"));
+        manager.preview_section(1).await.unwrap();
+        assert!(matches!(
+            manager.screen,
+            Screen::TypeList { section_idx: 1 }
+        ));
+        assert!(manager.edit_buf.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_section_click_returns_to_root_without_mutation() {
+        for drill_level in 0..3 {
+            let (mut manager, outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            let breadcrumb = vec!["providers.models".into(), "openai".into(), "old".into()];
+            manager.screen = match drill_level {
+                0 => manager.screen,
+                1 => Screen::FieldList {
+                    section_idx: 0,
+                    prefix: "providers.models.openai.old".into(),
+                    breadcrumb,
+                },
+                _ => Screen::AliasRename {
+                    section_idx: 0,
+                    map_path: "providers.models.openai".into(),
+                    breadcrumb,
+                    from: "old".into(),
+                    confirming: true,
+                },
+            };
+            manager.templates = vec![ConfigTemplateEntry {
+                path: "providers.models.openai".into(),
+            }];
+            manager.filter = Some("old".into());
+            manager.edit_buf = "unsaved".into();
+            manager.edit_cursor = manager.edit_buf.len();
+            manager.active_tab = 1;
+            manager.last_tab_area = Some(Rect::new(32, 1, 40, 1));
+            manager.last_section_pane_area = Rect::new(0, 0, 30, 10);
+            manager.last_section_list_area = Rect::new(1, 1, 28, 8);
+            manager.last_section_rows = vec![None, Some(0)];
+            let mut click = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 5,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            // Group headers and empty space must not cancel the current work.
+            for row in [2, 5] {
+                click.row = row;
+                manager
+                    .handle_mouse(click, Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.edit_buf, "unsaved");
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+                assert!(rx.try_recv().is_err());
+            }
+            click.row = 3;
+            let reply = answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-keys",
+                serde_json::json!({"path": "providers.models.openai"}),
+                Ok(serde_json::json!({"keys": ["old", "other"]})),
+            );
+            let (result, ()) = tokio::join!(
+                manager.handle_mouse(click, Rect::default(), &mut term),
+                reply
+            );
+            result.unwrap();
+            assert!(matches!(
+                manager.screen,
+                Screen::TypeList { section_idx: 0 }
+            ));
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+            assert_eq!(manager.type_list_labels(0), vec!["openai"]);
+            assert_eq!(manager.type_alias_counts, vec![2]);
+            assert!(manager.filter.is_none());
+            assert!(manager.edit_buf.is_empty());
+            assert_eq!(manager.edit_cursor, 0);
+            assert_eq!(manager.active_tab, 0);
+            assert!(manager.last_tab_area.is_none());
+            // Reclicking the starting view keeps its selection and avoids a reload.
+            manager.types.push(ConfigTemplateEntry {
+                path: "providers.models.anthropic".into(),
+            });
+            manager.type_cursor = 1;
+            manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+            manager.active_tab = 1;
+            manager
+                .handle_mouse(click, Rect::default(), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.at_section_top_level());
+            assert_eq!(manager.type_cursor, 1);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    fn render_config_for_mouse(manager: &mut App) {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        Terminal::new(backend)
+            .unwrap()
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_detail_row_click_routes_keyboard_to_the_list() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for screen in 0..3 {
+            let (mut manager, _outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            match screen {
+                0 => {
+                    manager.screen = Screen::TypeList { section_idx: 0 };
+                    manager.types = vec![
+                        ConfigTemplateEntry {
+                            path: "providers.models.openai".into(),
+                        },
+                        ConfigTemplateEntry {
+                            path: "providers.models.anthropic".into(),
+                        },
+                    ];
+                }
+                1 => {}
+                _ => {
+                    manager.screen = Screen::FieldList {
+                        section_idx: 0,
+                        prefix: "providers.models.openai.old".into(),
+                        breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+                    };
+                    manager.fields = vec![
+                        field("providers.models.openai.old.model"),
+                        field("providers.models.openai.old.api_url"),
+                    ];
+                }
+            }
+            manager.zeroclaw_pane = ZeroclawPane::Sections;
+            render_config_for_mouse(&mut manager);
+            let area = manager.last_main_area;
+            let click = |row| MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: area.x + 3,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            for row in [area.y, area.y + 8] {
+                manager
+                    .handle_mouse(click(row), Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+            }
+            for column in [area.x, area.right() - 1] {
+                for _ in 0..2 {
+                    manager
+                        .handle_mouse(
+                            MouseEvent {
+                                column,
+                                ..click(area.y + 1)
+                            },
+                            Rect::default(),
+                            &mut term,
+                        )
+                        .await
+                        .unwrap();
+                }
+                assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+                assert_eq!(manager.visible_cursor(), 0);
+                assert!(rx.try_recv().is_err());
+            }
+            manager
+                .handle_mouse(click(area.y + 1), Rect::default(), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+            config_key(&mut manager, &mut term, KeyCode::Down).await;
+            assert_eq!(manager.visible_cursor(), 1);
+            assert_eq!(manager.section_cursor, 0);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_alias_rename_add_mouse_and_keyboard_open_without_mutation() {
+        use crate::keymap::Chord;
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row("config_tab", "enter", vec![Chord::key(KeyCode::F(6))]);
+        for costs in [false, true] {
+            for count in [0, 2] {
+                for keyboard in [false, true] {
+                    let (mut manager, outbound, mut rx, mut term) =
+                        alias_rename_manager("providers.tts", "openai");
+                    manager.aliases.truncate(count);
+                    if costs {
+                        manager.sections[0].cost_category = "tts".into();
+                        manager.alias_tab = 1;
+                        manager.cost_resources = manager.aliases.clone();
+                    }
+                    manager.zeroclaw_pane = ZeroclawPane::Sections;
+                    render_config_for_mouse(&mut manager);
+                    let area = manager.last_main_area;
+                    let click = MouseEvent {
+                        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        column: area.x + 3,
+                        row: area.y + 1 + count as u16,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    for column in [area.x, area.right() - 1] {
+                        for _ in 0..2 {
+                            manager
+                                .handle_mouse(
+                                    MouseEvent { column, ..click },
+                                    Rect::default(),
+                                    &mut term,
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+                        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                        assert!(rx.try_recv().is_err());
+                    }
+                    manager
+                        .handle_mouse(click, Rect::default(), &mut term)
+                        .await
+                        .unwrap();
+                    assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                    assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+                    assert!(manager.bottom_hint().contains("F6"));
+                    assert!(
+                        manager
+                            .bottom_hint()
+                            .contains(&crate::i18n::t("zc-config-footer-action-add"))
+                    );
+                    assert!(rx.try_recv().is_err());
+                    if keyboard {
+                        config_key(&mut manager, &mut term, KeyCode::F(6)).await;
+                    } else {
+                        manager
+                            .handle_mouse(click, Rect::default(), &mut term)
+                            .await
+                            .unwrap();
+                    }
+                    let expected_path = if costs {
+                        "cost.rates.providers.tts.openai"
+                    } else {
+                        "providers.tts.openai"
+                    };
+                    let Screen::AliasCreate {
+                        map_path,
+                        breadcrumb,
+                        ..
+                    } = &manager.screen
+                    else {
+                        panic!("Add must open the name form");
+                    };
+                    assert_eq!(map_path, expected_path);
+                    assert_eq!(breadcrumb.len(), if costs { 3 } else { 2 });
+                    if costs {
+                        assert_eq!(breadcrumb.last().unwrap(), ConfigTab::Costs.label());
+                    }
+                    assert!(manager.edit_buf.is_empty());
+                    manager.handle_paste("unsaved");
+                    assert!(rx.try_recv().is_err());
+                    let replies = async {
+                        answer_config_request(
+                            &outbound,
+                            &mut rx,
+                            "config/map-keys",
+                            serde_json::json!({"path": "providers.tts.openai"}),
+                            Ok(serde_json::json!({"keys": []})),
+                        )
+                        .await;
+                        if costs {
+                            answer_config_request(
+                                &outbound,
+                                &mut rx,
+                                "config/map-keys",
+                                serde_json::json!({"path": expected_path}),
+                                Ok(serde_json::json!({"keys": []})),
+                            )
+                            .await;
+                        }
+                    };
+                    let ((), ()) =
+                        tokio::join!(config_key(&mut manager, &mut term, KeyCode::Esc), replies);
+                    assert!(matches!(manager.screen, Screen::AliasList { .. }));
+                    assert_eq!(manager.alias_tab, usize::from(costs));
+                    assert!(rx.try_recv().is_err());
+                }
+            }
+        }
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_filtered_mouse_click_opens_the_visible_alias() {
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        manager.filter = Some("no-match".into());
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        render_config_for_mouse(&mut manager);
+        let area = manager.last_main_area;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + 3,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..2 {
+            manager
+                .handle_mouse(click, Rect::default(), &mut term)
+                .await
+                .unwrap();
+        }
+        assert!(manager.zeroclaw_pane == ZeroclawPane::Sections);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(rx.try_recv().is_err());
+        manager.filter = Some("other".into());
+        render_config_for_mouse(&mut manager);
+        manager
+            .handle_mouse(click, Rect::default(), &mut term)
+            .await
+            .unwrap();
+        let reply = answer_config_request(
+            &outbound,
+            &mut rx,
+            "config/list",
+            serde_json::json!({"prefix": "providers.models.openai.other"}),
+            Ok(serde_json::json!({"entries": []})),
+        );
+        let (result, ()) = tokio::join!(
+            manager.handle_mouse(click, Rect::default(), &mut term),
+            reply
+        );
+        result.unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "providers.models.openai.other")
+        );
+        assert!(manager.filter.is_none());
+        assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn field_breadcrumbs_discard_confirmed_drafts_without_saving() {
+        for target in 0..3 {
+            let (mut manager, outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            let prefix = "providers.models.openai.old";
+            manager.fields = vec![field(&format!("{prefix}.model"))];
+            manager.screen = Screen::FieldEdit {
+                section_idx: 0,
+                prefix: prefix.into(),
+                breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+                field_idx: 0,
+            };
+            manager.edit_buf = "unsaved".into();
+            manager.edit_cursor = manager.edit_buf.len();
+            render_config_for_mouse(&mut manager);
+            let areas = manager.last_breadcrumb_areas.clone();
+            let click = |column| MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row: areas[0].y,
+                modifiers: KeyModifiers::NONE,
+            };
+            // A separator and the current field only focus; neither cancels input.
+            for column in [areas[0].right(), areas[3].x] {
+                manager
+                    .handle_mouse(click(column), Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.edit_buf, "unsaved");
+                assert!(rx.try_recv().is_err());
+            }
+            manager.filter = Some("old".into());
+            let fields = manager.fields.clone();
+            let replies = async {
+                if target > 0 {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/list",
+                        serde_json::json!({"prefix": prefix}),
+                        Ok(serde_json::json!({"entries": fields})),
+                    )
+                    .await;
+                }
+                if target == 1 {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-keys",
+                        serde_json::json!({"path": "providers.models.openai"}),
+                        Ok(serde_json::json!({"keys": []})),
+                    )
+                    .await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    manager
+                        .handle_mouse(click(areas[target].x), Rect::default(), &mut term)
+                        .await?;
+                    assert!(manager.pending_confirmation.is_some());
+                    manager
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                },),
+                replies
+            );
+            result.unwrap().unwrap();
+            match target {
+                0 => assert!(matches!(
+                    manager.screen,
+                    Screen::TypeList { section_idx: 0 }
+                )),
+                1 => assert!(matches!(&manager.screen, Screen::AliasList { map_path, .. }
+                    if map_path == "providers.models.openai")),
+                _ => assert!(
+                    matches!(&manager.screen, Screen::FieldList { prefix: path, .. }
+                    if path == prefix)
+                ),
+            }
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+            assert!(manager.filter.is_none());
+            assert!(manager.edit_buf.is_empty());
+            assert!(manager.last_breadcrumb_areas.is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_field_tab_clicks_focus_the_detail_pane() {
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        let prefix = "providers.models.openai.old";
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Model, ConfigTab::Advanced];
+        manager.fields = manager
+            .tab_names
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let mut entry = field(&format!("{prefix}.field_{i}"));
+                entry.tab = *tab;
+                entry
+            })
+            .collect();
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: prefix.into(),
+            breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+        };
+        for target in [0, 1, 2, 0] {
+            manager.zeroclaw_pane = ZeroclawPane::Sections;
+            render_config_for_mouse(&mut manager);
+            let rect = manager.last_tab_area.unwrap();
+            let column = rect.x
+                + manager
+                    .tab_names
+                    .iter()
+                    .enumerate()
+                    .take(target)
+                    .map(|(i, tab)| {
+                        tab.label().len() as u16 + 3 + u16::from(i == manager.active_tab) * 2
+                    })
+                    .sum::<u16>();
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let changing = target != manager.active_tab;
+            let fields = manager.fields.clone();
+            let reply = async {
+                if changing {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/list",
+                        serde_json::json!({"prefix": prefix}),
+                        Ok(serde_json::json!({"entries": fields})),
+                    )
+                    .await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                manager.handle_mouse(click, Rect::default(), &mut term),
+                reply
+            );
+            result.unwrap();
+            assert_eq!(manager.active_tab, target);
+            assert_eq!(manager.field_cursor, target);
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     fn field(path: &str) -> ConfigFieldEntry {
         ConfigFieldEntry {
             path: path.to_string(),
@@ -5503,7 +7670,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
         let (mut manager, calls) = responding_manager();
         let mut first = field("a.first");
         first.tab = ConfigTab::Connection;

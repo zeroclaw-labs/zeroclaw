@@ -366,6 +366,17 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    /// Append normalized bracketed paste only to the active connection draft.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(edit) = self.conn_edit.as_mut() {
+            if edit.field == ConnField::SkipVerifyRoutes {
+                edit.buf.push_str(text);
+            } else {
+                edit.buf.extend(text.chars().filter(|c| *c != '\n'));
+            }
+        }
+    }
+
     // ── Draw ─────────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -745,12 +756,44 @@ impl ZerocodePane {
 
     fn draw_connection(&self, frame: &mut Frame, area: Rect) {
         if let Some(edit) = &self.conn_edit {
+            use crate::keymap::{ConfigEditorAction as A, RebindableActions};
             use ratatui::layout::{Constraint, Direction, Layout};
-            let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
+            let keys = |action: A| {
+                action
+                    .resolved()
+                    .iter()
+                    .map(Chord::display)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            let save = keys(A::Save);
+            let confirm = keys(A::Confirm);
+            let cancel = keys(A::Cancel);
+            let original = match edit.field {
+                ConnField::Uri => self.conn.uri.clone().unwrap_or_default(),
+                ConnField::SkipVerifyRoutes => self.conn.tls.skip_verify_routes.join("\n"),
+                ConnField::SkipVerify => String::new(),
+            };
+            let draft_state = crate::i18n::t(if edit.buf != original {
+                "zc-config-draft-pending"
+            } else {
+                "zc-config-draft-unchanged"
+            });
+            let title = format!(
+                " {} · {} ",
+                crate::i18n::t(edit.field.fluent_key()),
+                draft_state
+            );
             let hint = match edit.field {
                 ConnField::SkipVerify => crate::i18n::t("zc-zerocode-conn-edit-bool"),
-                ConnField::SkipVerifyRoutes => crate::i18n::t("zc-zerocode-conn-edit-routes"),
-                ConnField::Uri => crate::i18n::t("zc-zerocode-conn-edit-text"),
+                ConnField::SkipVerifyRoutes => crate::i18n::t_args(
+                    "zc-zerocode-conn-edit-routes",
+                    &[("save", &save), ("confirm", &confirm), ("cancel", &cancel)],
+                ),
+                ConnField::Uri => crate::i18n::t_args(
+                    "zc-zerocode-conn-edit-text",
+                    &[("save", &save), ("confirm", &confirm), ("cancel", &cancel)],
+                ),
             };
             let rows = Layout::default()
                 .direction(Direction::Vertical)
@@ -1311,30 +1354,46 @@ impl ZerocodePane {
     }
 
     fn commit_conn_edit(&mut self) {
-        let Some(edit) = self.conn_edit.take() else {
+        let Some(edit) = self.conn_edit.as_ref() else {
             return;
         };
-        match edit.field {
+        let field = edit.field;
+        let mut candidate = self.conn.clone();
+        let value = match field {
             ConnField::Uri => {
-                let trimmed = edit.buf.trim();
-                self.conn.uri = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
+                let uri = edit.buf.trim().to_string();
+                candidate.uri = (!uri.is_empty()).then_some(uri.clone());
+                toml::Value::String(uri)
             }
             ConnField::SkipVerifyRoutes => {
-                self.conn.tls.skip_verify_routes = edit
+                candidate.tls.skip_verify_routes = edit
                     .buf
                     .lines()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect();
+                toml::Value::Array(
+                    candidate
+                        .tls
+                        .skip_verify_routes
+                        .iter()
+                        .cloned()
+                        .map(toml::Value::String)
+                        .collect(),
+                )
             }
-            ConnField::SkipVerify => {}
+            ConnField::SkipVerify => return,
+        };
+        if let Err(error) =
+            config::persist_connection_field(&self.config_dir, field.leaf_path(), value)
+        {
+            self.set_ui_save_error(&error);
+            return;
         }
-        self.persist_conn_field(edit.field);
+        self.conn = candidate;
+        self.conn_edit = None;
+        self.status = Some(crate::i18n::t("zc-zerocode-conn-saved"));
     }
 
     fn handle_conn_edit_key(&mut self, key: KeyEvent) {
@@ -1750,8 +1809,8 @@ impl ZerocodePane {
         use crate::mouse;
         use crossterm::event::{MouseButton, MouseEventKind};
 
-        // The capture modal swallows mouse input — keyboard only.
-        if self.capture.is_some() {
+        // Keep keyboard-only drafts open until their explicit Save or Cancel.
+        if self.capture.is_some() || self.conn_edit.is_some() {
             return;
         }
 
@@ -1971,6 +2030,77 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn connection_save_failure_keeps_draft_until_retry_succeeds() {
+        let _guard = crate::test_support::env_test_lock();
+        let _keys = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.focus = Focus::Connection;
+        pane.conn_cursor = 0;
+        pane.activate_connection();
+        let original = pane.conn.uri.clone();
+        let draft = "ws://127.0.0.1:42617";
+        pane.conn_edit.as_mut().unwrap().buf = draft.to_string();
+        std::fs::write(config::config_path(dir.path()), "[broken").unwrap();
+
+        pane.handle_conn_edit_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(pane.conn_edit.as_ref().unwrap().buf, draft);
+        assert_eq!(pane.conn.uri, original);
+        assert_eq!(
+            std::fs::read_to_string(config::config_path(dir.path())).unwrap(),
+            "[broken"
+        );
+
+        std::fs::write(config::config_path(dir.path()), "").unwrap();
+        pane.handle_conn_edit_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(pane.conn_edit.is_none());
+        assert_eq!(pane.conn.uri.as_deref(), Some(draft));
+        assert_eq!(
+            config::ensure_and_load(dir.path())
+                .unwrap()
+                .connection
+                .wss
+                .uri
+                .as_deref(),
+            Some(draft)
+        );
+    }
+
+    #[test]
+    fn connection_mouse_departure_keeps_draft_and_cancel_does_not_write() {
+        let _guard = crate::test_support::env_test_lock();
+        let _keys = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let original = std::fs::read(config::config_path(dir.path())).unwrap();
+        pane.focus = Focus::Connection;
+        pane.conn_cursor = 0;
+        pane.activate_connection();
+        pane.conn_edit.as_mut().unwrap().buf = "unsaved".to_string();
+        pane.focus_area = Rect::new(0, 0, 30, 20);
+        pane.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(pane.focus, Focus::Connection);
+        assert_eq!(pane.conn_edit.as_ref().unwrap().buf, "unsaved");
+        pane.handle_conn_edit_key(key(KeyCode::Esc));
+        assert!(pane.conn_edit.is_none());
+        assert_eq!(
+            std::fs::read(config::config_path(dir.path())).unwrap(),
+            original
+        );
     }
 
     // Park the section cursor on `target` within the left section list, leaving

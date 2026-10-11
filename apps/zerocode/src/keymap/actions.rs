@@ -297,6 +297,7 @@ keyactions! {
         BeginSearch   [Chord::char('/')] => "search",
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
+        RenameAlias   [Chord::char('e')] => "rename provider alias",
         ApplyTemplate [Chord::char('t')] => "apply template",
     }
 }
