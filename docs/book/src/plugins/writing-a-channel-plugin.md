@@ -69,11 +69,22 @@ Five functions have no Rust trait default and must genuinely work
 The poll bridge deserves a note: the host runs a poll-to-push loop
 (`listen` in `wasm_channel.rs`) that calls `poll-message` with exponential
 backoff from 50ms to 500ms while the queue is empty, resetting on traffic. If
-your `poll-message` traps, the host marks the channel poll-unhealthy, logs,
-and backs off; a plugin whose poll keeps trapping reports unhealthy through
-`health_check` even if it exports no `health-check` of its own. Trapping in
-`poll-message` is therefore visible, not fatal, but it makes your channel
-useless. Keep it simple: drain the queue, translate, return.
+your `poll-message` traps, the host logs it, backs off, and reports the channel
+unhealthy in the gateway's `/health` snapshot, even if you export no
+`health-check` of your own. A trap leaves the instance unable to run any
+export, so the host discards it and the next call builds a new one, running
+`configure` again. The message the trapping poll had taken off the queue is
+lost; later messages still arrive. Any export that traps or misses the call
+deadline is replaced the same way, while an error string your export returns
+leaves the instance in place. A rebuild reconnects a gateway-style
+plugin, so the host budgets them: it rebuilds at once while failures average
+no more than one every five minutes, allowing a burst of three, and beyond
+that waits for the budget to refill, failing calls in the meantime without
+running your plugin. A missed deadline in `request-approval` or
+`request-choice`, which wait for a person to answer, does not count against
+the budget. An export that routinely needs longer than the deadline, such as
+a large upload, calls for a higher `plugins.limits.call_timeout_ms`. Keep it
+simple: drain the queue, translate, return.
 
 ## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
 
@@ -91,7 +102,7 @@ flags declaration, which is the source of truth. In summary, the groups:
 
 | Group | Flags | What implementing buys you |
 |-------|-------|---------------------------|
-| Health | `health-check` | Report platform reachability; combined with poll health by the host adapter. |
+| Health | `health-check` | Report whether the channel works. The host asks about every 30 seconds while listening and shows the answer, combined with poll health, in `/health` (see [Health checks](#health-checks)). |
 | Identity | `self-handle`, `self-addressed-mention`, `drop-self-message` | Self-loop protection (the runtime drops the bot's own messages) and correct @-mention forms in the per-channel system prompt. The host caches `self-handle` and `self-addressed-mention` at load; they are read once. |
 | Typing | `start-typing`, `stop-typing` | Composing indicators while the agent thinks. |
 | Drafts | `supports-draft-updates`, `send-draft`, `update-draft`, `update-draft-progress`, `finalize-draft`, `cancel-draft` | Progressive message editing: the runtime streams the response into an editable platform message instead of waiting for completion. Implement all six together or none. |
@@ -103,6 +114,36 @@ flags declaration, which is the source of truth. In summary, the groups:
 Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse
 than omitting it: the host will call your export and trust the answer.
+
+### Health checks
+
+While the channel listens, the host calls `health-check` on the running
+instance between polls: right after the first poll, then about every 30
+seconds. The answer becomes the channel's component in the gateway's `/health`
+snapshot, `channel:plugin.<alias>`:
+
+- `starting` until the first answer. A first answer of `false` also reads
+  `starting` until the next check, so a plugin still completing its handshake
+  is not reported as failed.
+- `ok` while the latest answer is `true`.
+- `error` when the latest answer is `false`, when the check traps or misses
+  the call deadline, when `poll-message` traps, or when no answer has arrived
+  for two intervals plus two call deadlines (two minutes with the default
+  30-second deadline).
+
+`zeroclaw channel doctor` also calls `health-check`, once, on a freshly
+configured instance.
+
+Because the check repeats, answer from state the plugin already holds: whether
+its connection is up, or how its last exchange with the platform went. A
+network request in `health-check` runs on every check and delays the next
+poll; if you verify credentials over the network, keep the last result and
+refresh it on your own schedule. A check that traps or misses the call
+deadline discards the instance, and the host rebuilds it with `configure`, so a
+gateway-style plugin loses its connection; after each such failure the host
+waits twice as long before the next check, up to ten minutes. The host also
+puts off a check while one more failure would make a rebuild wait, so a failed
+check never by itself makes one wait.
 
 ### The approval surface
 

@@ -21,7 +21,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
-- `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
+- `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"image_url"` (send declared images as `image_url` parts); set to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under both settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
@@ -481,13 +481,13 @@ cache_ttl = "1h"
 ## Image input limits
 
 `[multimodal]` bounds every image that enters the request pipeline, whatever its
-source: channel attachments, tool outputs that surface a local image path, and
-the web dashboard upload.
+source: channel attachments, the attachments a tool declares, and the web
+dashboard upload.
 
 ```toml
 [multimodal]
 max_image_size_mb = 20   # per image, decoded bytes (default: 20, clamped to 1-20)
-max_images        = 4    # images kept per request (default: 4, clamped to 1-16)
+max_images        = 4    # most images kept per request (default: 4, clamped to 1-16)
 ```
 
 `max_image_size_mb` is measured before base64 encoding, so the encoded payload
@@ -501,6 +501,15 @@ single image over 10 MB base64-encoded, about 7.5 MiB decoded, and its client
 enforces that regardless of what `max_image_size_mb` allows. Model context cost
 does not track bytes: providers rasterize images and bill by pixel dimensions,
 so a large file and a small one at the same resolution cost roughly the same.
+
+`max_images` counts every image still in the conversation, not only new ones,
+so a long session reaches it. Past the limit, the oldest images are removed in
+one batch, down to half the limit rounded up (4 to 2, 16 to 8), and the count
+then grows back to the limit before the next batch. Removing an image changes
+an earlier message, so a provider's prompt cache is rebuilt from that message
+on; batching means that happens once every `max_images / 2 + 1` new images
+rather than on every one. Right after a batch the model sees fewer older images
+than the limit allows. Raise the limit for screenshot-heavy sessions.
 
 ## Per-family knobs: worked examples
 

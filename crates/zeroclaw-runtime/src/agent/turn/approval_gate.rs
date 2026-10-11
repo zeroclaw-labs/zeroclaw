@@ -130,7 +130,10 @@ pub(crate) async fn gate_tool_approval(
             };
             (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None, false)
+            match mgr.prompt_cli(&request) {
+                Ok(decision) => (decision, None, false),
+                Err(_) => (ApprovalResponse::No, None, true),
+            }
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
@@ -191,10 +194,17 @@ pub(crate) async fn gate_tool_approval(
                         // to lobby for its own privilege expansion.
                         "denied_by_runtime": unanswerable,
                         "operator_hint": if unanswerable {
-                            Some("No operator could be asked. Check that an approval-capable \
-                                  channel is connected and that the agent's approval route names \
-                                  a registered, reachable approver. If this tool should run \
-                                  unattended, review the agent's risk profile deliberately.")
+                            if mgr.is_non_interactive() {
+                                Some("No operator could be asked. Check that an approval-capable \
+                                      channel is connected and that the agent's approval route names \
+                                      a registered, reachable approver. If this tool should run \
+                                      unattended, review the agent's risk profile deliberately.")
+                            } else {
+                                Some("CLI approval input was unavailable. Run with a controlling \
+                                      terminal or readable stdin so an operator can answer. If this \
+                                      tool should run unattended, review the agent's risk profile \
+                                      deliberately.")
+                            }
                         } else {
                             None
                         },
@@ -211,6 +221,7 @@ pub(crate) async fn gate_tool_approval(
             }
             return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
                 output: denied.clone(),
+                attachments: Vec::new(),
                 success: false,
                 error_reason: Some(denied),
                 duration: Duration::ZERO,
@@ -246,6 +257,7 @@ pub(crate) async fn gate_tool_approval(
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
                 output: crate::approval::sanitize_tool_replacement(replacement),
+                attachments: Vec::new(),
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,
@@ -323,6 +335,161 @@ mod tests {
             serving_provider_name: None,
             serving_model: None,
         }
+    }
+
+    // Re-execute this test in a new session so /dev/tty is genuinely unavailable.
+    // Only the child owns stdin and the process-global log subscriber.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_approval_input_provenance_regression_11335() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_MODE: &str = "ZEROCLAW_TEST_11335_APPROVAL_CHILD";
+        const TEST_NAME: &str =
+            "agent::turn::approval_gate::tests::cli_approval_input_provenance_regression_11335";
+
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            let mut failures = Vec::new();
+            for (mode, input) in [
+                ("no", Some("n\n")),
+                ("blank", Some("\n")),
+                ("unknown", Some("maybe\n")),
+                ("yes", Some("y\n")),
+                ("always", Some("always\n")),
+                ("eof", None),
+                ("read_error", None),
+            ] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_MODE, mode)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                // SAFETY: setsid is async-signal-safe; no Rust locks or allocations
+                // are used in the post-fork hook before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+                if mode == "read_error" {
+                    // Reading a directory as stdin produces a real I/O error.
+                    command.stdin(Stdio::from(std::fs::File::open("/").unwrap()));
+                } else if input.is_some() {
+                    command.stdin(Stdio::piped());
+                } else {
+                    command.stdin(Stdio::null());
+                }
+                let mut child = command.spawn().unwrap();
+                if let Some(input) = input {
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(input.as_bytes())
+                        .unwrap();
+                }
+                let output = child.wait_with_output().unwrap();
+                if !output.status.success() {
+                    failures.push(format!(
+                        "{mode}: {}\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                } else {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    println!("CLI approval control {mode}: passed");
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            return;
+        };
+
+        assert!(std::fs::File::open("/dev/tty").is_err());
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_events = zeroclaw_log::subscribe_or_install();
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: Vec::new(),
+            always_ask: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+        let approval = ApprovalManager::from_risk_profile(&profile);
+        assert!(approval.needs_approval("shell"));
+        let ctx = TurnCtx {
+            channel_name: "cli",
+            ..test_ctx(&observer, &pacing, Some(&approval), None)
+        };
+        let outcome = gate_tool_approval(
+            &ctx,
+            "shell",
+            &serde_json::json!({"command": "true"}),
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        )
+        .await;
+        let unavailable = mode == "eof" || mode == "read_error";
+        if mode == "yes" || mode == "always" {
+            assert!(matches!(
+                outcome,
+                ApprovalGateOutcome::Proceed { approved: true }
+            ));
+        } else {
+            let ApprovalGateOutcome::Deny(outcome) = outcome else {
+                panic!("{mode} must remain fail-closed");
+            };
+            assert!(!outcome.success);
+            if unavailable {
+                assert!(
+                    outcome
+                        .output
+                        .contains("no operator decision was available"),
+                    "{mode} was incorrectly attributed: {}",
+                    outcome.output
+                );
+                assert!(outcome.output.contains("This was not a user's decision."));
+                assert!(!outcome.output.contains("Denied by user"));
+            } else {
+                assert!(outcome.output.starts_with("Denied by user."));
+            }
+            let mut rejection = None;
+            while let Ok(event) = log_events.try_recv() {
+                if event["attributes"]["tool"] == "shell"
+                    && event["attributes"].get("denied_by_runtime").is_some()
+                {
+                    rejection = Some(event);
+                }
+            }
+            let rejection = rejection.expect("real approval rejection audit event");
+            assert_eq!(rejection["attributes"]["denied_by_runtime"], unavailable);
+            assert_eq!(
+                rejection["attributes"]["operator_hint"].is_string(),
+                unavailable
+            );
+            assert_eq!(rejection["attributes"]["result"], outcome.output);
+            println!("CLI approval observed {mode}: {}", rejection["attributes"]);
+        }
+        let expected_decision = match mode.as_str() {
+            "yes" => crate::approval::ApprovalResponse::Yes,
+            "always" => crate::approval::ApprovalResponse::Always,
+            _ => crate::approval::ApprovalResponse::No,
+        };
+        let decisions = approval.audit_log();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision, expected_decision);
+        assert_eq!(
+            approval.session_allowlist().contains("shell"),
+            mode == "always"
+        );
     }
 
     struct ApprovingChannel {

@@ -46,9 +46,18 @@ expect "mixed unrelated then config" "true" \
     "web/src/pages/AgentChat.tsx" \
     "crates/zeroclaw-config/src/schema.rs"
 
-# The root-package channel activation e2e must run the backend job. It is the
-# only piece of this job's coverage that lives outside a crate directory,
-# because it drives zeroclaw-runtime from the root `zeroclaw` package.
+# The root-package channel e2e targets must run the backend job. They are the
+# pieces of this job's coverage that live outside a crate directory, because
+# they drive zeroclaw-runtime from the root `zeroclaw` package.
+expect "root channel egress e2e" "true" \
+    "tests/channel_egress_e2e.rs"
+expect "root channel WebSocket lifecycle e2e" "true" \
+    "tests/channel_websocket_e2e.rs"
+expect "mixed unrelated then WebSocket lifecycle e2e" "true" \
+    "web/src/pages/AgentChat.tsx" \
+    "tests/channel_websocket_e2e.rs"
+expect "channel WebSocket fixture" "true" \
+    "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture/src/lib.rs"
 expect "root channel activation e2e" "true" \
     "tests/plugin_channel_runtime_e2e.rs"
 expect "mixed unrelated then activation e2e" "true" \
@@ -75,8 +84,8 @@ expect "unrelated crate changes" "false" \
     "crates/zeroclaw-providers/src/openai.rs"
 expect "other workflow changes" "false" \
     ".github/workflows/release.yml"
-# The activation e2e is matched by exact path, not by a `tests/*` wildcard, so
-# the rest of the root test suite must stay outside this job.
+# The channel e2e targets are matched by exact path, not by a `tests/*`
+# wildcard, so the rest of the root test suite must stay outside this job.
 expect "other root tests" "false" "tests/test_live.rs"
 expect "empty input" "false"
 

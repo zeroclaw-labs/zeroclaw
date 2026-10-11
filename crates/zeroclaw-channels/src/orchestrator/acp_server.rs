@@ -122,7 +122,7 @@ struct Session {
 
 enum ConfigSource {
     Standalone(Box<Config>),
-    Live(Arc<parking_lot::RwLock<Config>>),
+    Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
 pub struct AcpServer {
@@ -179,7 +179,7 @@ impl AcpServer {
     ) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
-            ConfigSource::Live(authority.config()),
+            ConfigSource::Live(authority.live_handle()),
             authority.agent_lifecycle(),
             acp_config,
             writer_tx,
@@ -252,7 +252,7 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
@@ -272,7 +272,7 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer_and_store(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
@@ -347,7 +347,7 @@ impl AcpServer {
         let Some(store) = self.store.as_ref() else {
             return if let ConfigSource::Live(live_config) = &self.config_source {
                 Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    Arc::clone(live_config),
+                    live_config.clone(),
                     agent_alias,
                     Some(workspace_dir),
                     enable_mcp,
@@ -357,7 +357,7 @@ impl AcpServer {
                     self.sop_audit.clone(),
                     self.canvas_store.clone(),
                     Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        Arc::clone(live_config),
+                        live_config.clone(),
                         self.agent_lifecycle.clone(),
                     )),
                 )
@@ -379,11 +379,11 @@ impl AcpServer {
         };
         if let ConfigSource::Live(live_config) = &self.config_source {
             let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                Arc::clone(live_config),
+                live_config.clone(),
                 self.agent_lifecycle.clone(),
             );
             Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                Arc::clone(live_config),
+                live_config.clone(),
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
@@ -6804,17 +6804,19 @@ mod tests {
     #[test]
     fn gateway_backed_server_initialize_uses_reloaded_config() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Arc::new(parking_lot::RwLock::new(make_test_config(cwd.path())));
+        // The server's live view is the read-only handle; keep the storage
+        // owner on the side so the test can publish a "reloaded" pair.
+        let live = zeroclaw_config::live::LiveConfig::new(make_test_config(cwd.path()));
         let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
         let server = AcpServer::new_with_live_config_and_writer(
-            Arc::clone(&config),
+            live.handle(),
             Default::default(),
             AcpServerConfig::default(),
             writer_tx,
         );
 
-        config
-            .write()
+        let mut reloaded = live.snapshot();
+        reloaded
             .providers
             .models
             .anthropic
@@ -6822,6 +6824,8 @@ mod tests {
             .unwrap()
             .base
             .model = Some("reloaded-model".to_string());
+        live.publish(live.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         assert_eq!(
             server.handle_initialize(&serde_json::json!({})).unwrap()["_meta"]["zeroclaw"]["defaultModel"],

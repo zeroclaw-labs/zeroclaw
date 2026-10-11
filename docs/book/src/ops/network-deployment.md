@@ -44,6 +44,25 @@ The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router c
 
 `tunnel_provider = "none"` (the default) keeps the gateway local with no tunnel. See the [Config reference](../reference/config.md#tunnel) for each provider's `[tunnel.<provider>]` fields.
 
+#### Tailscale: WSS and enrollment
+
+With `tunnel_provider = "tailscale"`, the gateway is published with `tailscale serve` (or `tailscale funnel` when `[tunnel.tailscale].funnel = true`). When `[wss]` is enabled, the daemon also publishes the WSS RPC listener on the tailnet, along with the enrollment endpoint when `[enroll]` is enabled. Each one keeps its own port:
+
+```bash
+tailscale serve --tcp <wss.port>    tcp://127.0.0.1:<wss.port>
+tailscale serve --tcp <enroll.port> tcp://127.0.0.1:<enroll.port>
+```
+
+These are **raw TCP passthrough** forwards. TLS still terminates inside the daemon, so the WSS plane stays mutually authenticated, and the enrollment short-auth-string still binds the daemon's own CA. Tailscale's HTTPS proxy is not used for them, because it would strip the client certificate. A wildcard bind (`0.0.0.0` / `::`) is forwarded to loopback; a specific bind address is forwarded to that address.
+
+Things to know:
+
+- **Tailnet-only, even with funnel.** Funnel only listens on ports 443, 8443, and 10000, and putting the mTLS plane on the public internet should be your explicit choice. It is not turned on as a side effect of funneling the gateway. To reach WSS from outside the tailnet, use `[relay]`.
+- **Certificate names are automatic.** When the WSS and enrollment listeners are reached over Tailscale, the daemon adds the node's tailnet names to its auto-generated server certificate at startup. That covers the MagicDNS name (`<node>.<tailnet>.ts.net`), its short name (`<node>`), the node's tailnet IPs, and `[tunnel.tailscale].hostname` if set. "Reached over Tailscale" means either this tunnel, or `[wss].bind` / `[enroll].bind` set directly to a tailnet address (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`), with or without a tunnel. The names are looked up once per daemon start (and on each reload) and shared by both listeners, so WSS and enrollment always present the same certificate. Only the server certificate is regenerated when the names change. The CA stays the same, so enrolled clients keep working. If tailscaled can't be reached at startup, or answers before it has received its network map (common right after boot), the daemon logs a warning and keeps every name the existing certificate already carries. New `[wss].sans` entries still apply, but removals wait until a start where tailscaled answers. On a brand-new install with tailscaled down, the certificate starts with only the names known without it (`localhost`, `127.0.0.1`, `[wss].sans`, and `[tunnel.tailscale].hostname`); restart once tailscaled is up to add the rest. A bring-your-own `cert_path` certificate is never modified.
+- **Enrollment lockout is shared.** Forwarded connections reach the enrollment endpoint from loopback. That means every tailnet enrollee shares one pairing-attempt lockout, and repeated bad codes from one tailnet peer temporarily block enrollment for the others. The lockout fails closed. It never weakens the pairing-code gate.
+- The forwards are foreground `tailscale serve` sessions owned by the gateway, so they are withdrawn when the gateway stops. If one exits on its own later, the daemon logs a `tailscale serve --tcp exited after publication` warning; restart the gateway to republish it.
+- **Enrollment follows the CA mode.** With a bring-your-own client CA (`[wss.client_auth]` enabled with `ca_cert_path`), the daemon holds no signing key and does not run the enrollment endpoint, so it is not published either.
+
 ### Option 3: Reverse proxy
 
 Run nginx / Caddy / Traefik in front of the gateway. Terminate TLS there, proxy to `localhost:42617`. Suitable for:
