@@ -114,7 +114,10 @@ environment variable, resolved in that order per `registry_url` in
 A registry entry (`PluginRegistryEntry` in
 `crates/zeroclaw-plugins/src/registry.rs`) carries: `name`, `version`,
 optional `description` and `author`, `capabilities`, the archive `url`, and
-an optional `sha256` digest of the zip.
+an optional `sha256` digest of the zip. The digest is optional only for
+`zeroclaw plugin install`, which verifies it when it is present: the Plugins
+step of `zeroclaw quickstart` refuses an entry without one, so publish a digest
+for every entry.
 
 ### The archive contract
 

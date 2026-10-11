@@ -33,7 +33,7 @@ while IFS= read -r path; do
         tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
-        src/plugins/*|src/plugin_registry.rs|src/main.rs|\
+        src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\

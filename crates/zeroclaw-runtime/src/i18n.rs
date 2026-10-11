@@ -1213,6 +1213,541 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_plugin_step_strings_format_in_every_locale() {
+        // The Quickstart Plugins step is where an operator decides what a
+        // publisher's package may reach and whether plugins activate at all.
+        // Its lines carry the literal commands that grant a withheld
+        // destination or set a property later, and the config paths that
+        // explain why an installed tool is inactive. A catalogue that drops a
+        // key ships the raw `{key}` sentinel; one that drops a placeholder or
+        // translates a path ships an instruction the operator cannot follow.
+        // Assert both, in every shipped catalogue.
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let grant = format!(
+            "zeroclaw --config-dir '/srv/zc' config set plugins.entries.{key}.egress_hosts \
+             'api.example.com'"
+        );
+        // A grant with nothing declared is completed by the operator: the
+        // command carries no placeholder host and refuses until they append
+        // their deployment's hosts.
+        let grant_to_complete = format!(
+            "zeroclaw --config-dir '/srv/zc' config set --no-interactive \
+             'plugins.entries.{key}.egress_hosts'"
+        );
+        let install_anyway =
+            "zeroclaw --config-dir '/srv/zc' plugin install weather-tool --no-verify";
+        let remove = "zeroclaw --config-dir '/srv/zc' plugin remove weather-tool";
+        let info = "zeroclaw --config-dir '/srv/zc' plugin info weather-tool";
+        // A printed command that creates a missing row grants nothing: the
+        // declared destinations are granted by a separate command.
+        let create_later = format!(
+            "printf '%s\\n' '[{{\"op\":\"add\",\"path\":\"/plugins/entries/{key}/egress_hosts\",\
+             \"value\":[]}}]' | zeroclaw --config-dir '/srv/zc' config patch -"
+        );
+        let restart = "zeroclaw --config-dir '/srv/zc' service restart";
+        let list = "zeroclaw --config-dir '/srv/zc' plugin list";
+        /// One catalogue assertion: key, the args it is formatted with, and
+        /// the substrings the rendered value must contain.
+        type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let cases: [QuickstartPluginCase<'_>; 47] = [
+            // Any failure to fetch the registry index is printed as it reads.
+            (
+                "cli-quickstart-plugins-registry-unavailable",
+                &[("error", "plugin registry returned HTTP 500")],
+                &["plugin registry returned HTTP 500"],
+            ),
+            (
+                "cli-quickstart-plugins-choice-installed-other",
+                &[
+                    ("name", "weather-tool"),
+                    ("version", "0.1.0"),
+                    ("registry_version", "0.2.0"),
+                    ("description", "Forecasts"),
+                ],
+                &["weather-tool", "0.1.0", "0.2.0", "Forecasts"],
+            ),
+            // Onboarding refuses an archive it cannot verify, and says which
+            // digest the registry entry lacks.
+            (
+                "cli-quickstart-plugins-no-integrity-hash",
+                &[("name", "weather-tool")],
+                &["weather-tool", "sha256"],
+            ),
+            // The package summary names the author as more than the
+            // publisher's own claim only under a trusted signature, shows
+            // the start of the trusted key it verified against, and names the
+            // setting that holds the trusted keys. Anything short of verified
+            // is installed only on an explicit yes.
+            (
+                "cli-quickstart-plugins-about-author-claimed",
+                &[("author", "Example Labs")],
+                &["Example Labs"],
+            ),
+            (
+                "cli-quickstart-plugins-about-signature-verified",
+                &[("key", "0123456789abcdef…")],
+                &["0123456789abcdef…"],
+            ),
+            ("cli-quickstart-plugins-about-signature-unsigned", &[], &[]),
+            (
+                "cli-quickstart-plugins-about-signature-untrusted",
+                &[],
+                &["plugins.security.trusted_publisher_keys"],
+            ),
+            ("cli-quickstart-plugins-about-signature-invalid", &[], &[]),
+            (
+                "cli-quickstart-plugins-unverified-prompt",
+                &[("name", "weather-tool")],
+                &["weather-tool"],
+            ),
+            // Quickstart has no `--no-verify`; a package that does not load
+            // names the install command that accepts it anyway, addressed to
+            // the configuration Quickstart wrote.
+            (
+                "cli-quickstart-plugins-load-check-failed",
+                &[
+                    ("name", "weather-tool"),
+                    ("error", "failed to load WASM component"),
+                    ("command", install_anyway),
+                ],
+                &["failed to load WASM component", install_anyway],
+            ),
+            // A package whose install could not be undone is still installed:
+            // the line says why it could not be configured, why undoing that
+            // failed, and gives the removal command addressed to the
+            // configuration Quickstart wrote.
+            (
+                "cli-quickstart-plugins-rollback-failed",
+                &[
+                    ("name", "weather-tool"),
+                    ("error", "config file is read-only"),
+                    ("rollback_error", "Permission denied (os error 13)"),
+                    ("command", remove),
+                ],
+                &[
+                    "weather-tool",
+                    "config file is read-only",
+                    "Permission denied (os error 13)",
+                    remove,
+                ],
+            ),
+            // Quickstart has no `--registry` flag; the default registry's
+            // missing index names the environment variable that picks another.
+            (
+                "cli-quickstart-plugins-registry-unpopulated",
+                &[],
+                &["ZEROCLAW_PLUGIN_REGISTRY_URL"],
+            ),
+            // A `[plugins]` section the loader could not read blocks the
+            // step, and the line names the section and the file to repair.
+            (
+                "cli-quickstart-plugins-section-unreadable",
+                &[("path", "/srv/zc/config.toml")],
+                &["[plugins]", "/srv/zc/config.toml"],
+            ),
+            // A withheld or missing grant hands back the exact command,
+            // because the instance key it addresses is opaque. The withheld
+            // line is the install report's, which Quickstart's tool rows
+            // reach.
+            (
+                "cli-plugin-egress-withheld",
+                &[
+                    ("name", "weather-tool"),
+                    ("count", "1"),
+                    ("command", grant.as_str()),
+                ],
+                &["weather-tool", grant.as_str()],
+            ),
+            (
+                "cli-quickstart-plugins-no-declared-hosts",
+                &[
+                    ("name", "weather-tool"),
+                    ("command", grant_to_complete.as_str()),
+                ],
+                &["weather-tool", grant_to_complete.as_str()],
+            ),
+            // Destinations declared for a transport the tool row is not
+            // seeded for are named with the command that grants them, and
+            // the line names the permission the row is seeded for.
+            (
+                "cli-quickstart-plugins-declared-hosts-not-granted",
+                &[
+                    ("name", "weather-tool"),
+                    ("hosts", "api.example.com"),
+                    ("command", grant.as_str()),
+                ],
+                &[
+                    "weather-tool",
+                    "api.example.com",
+                    "http_client",
+                    grant.as_str(),
+                ],
+            ),
+            // An installed package missing its row gets the fresh-install
+            // decision; skipping it leaves no row. The command that creates
+            // one later grants nothing, and the declared destinations get
+            // their own grant command, to run once the row exists.
+            (
+                "cli-quickstart-plugins-missing-row",
+                &[("name", "weather-tool")],
+                &["weather-tool"],
+            ),
+            (
+                "cli-quickstart-plugins-row-skipped",
+                &[("name", "weather-tool"), ("command", create_later.as_str())],
+                &["weather-tool", create_later.as_str()],
+            ),
+            (
+                "cli-quickstart-plugins-grant-declared-later",
+                &[
+                    ("name", "weather-tool"),
+                    ("count", "1"),
+                    ("command", grant.as_str()),
+                ],
+                &["weather-tool", grant.as_str()],
+            ),
+            // Settings Quickstart cannot prompt for point at the command that
+            // sets them, verbatim. Settings it could not save are followed by
+            // one command per setting, printed apart from the line.
+            (
+                "cli-quickstart-plugins-config-unsupported",
+                &[("name", "weather-tool"), ("keys", "proxy.url")],
+                &["weather-tool", "proxy.url", "`zeroclaw config set`"],
+            ),
+            // A required setting no prompt asks for leaves the schema
+            // unsatisfiable, so the line names it before the install choice.
+            (
+                "cli-quickstart-plugins-config-required-unsupported",
+                &[("name", "weather-tool"), ("keys", "proxy url, region")],
+                &["weather-tool", "proxy url, region"],
+            ),
+            (
+                "cli-quickstart-plugins-config-defaults-prompt",
+                &[("name", "weather-tool")],
+                &["weather-tool", "`zeroclaw config set`"],
+            ),
+            // A required name the schema does not declare: no config entry
+            // can satisfy it, so the question names it and offers no
+            // `config set` (asserted below).
+            (
+                "cli-quickstart-plugins-config-undeclared-prompt",
+                &[("name", "weather-tool"), ("keys", "region")],
+                &["weather-tool", "region"],
+            ),
+            // A package installed before the run that could not be set up
+            // stays installed, and the line says why.
+            (
+                "cli-quickstart-plugins-kept-not-configured",
+                &[
+                    ("name", "weather-tool"),
+                    ("error", "config file is read-only"),
+                ],
+                &["weather-tool", "config file is read-only"],
+            ),
+            (
+                "cli-quickstart-plugins-config-save-failed",
+                &[
+                    ("name", "weather-tool"),
+                    ("keys", "api_key, units"),
+                    ("error", "config file is read-only"),
+                ],
+                &["weather-tool", "api_key, units", "config file is read-only"],
+            ),
+            // The activation consent names the flags it turns on, and a
+            // channel it would wake by its config reference.
+            (
+                "cli-quickstart-plugins-activation-heading",
+                &[("settings", "plugins.enabled, plugins.auto_discover")],
+                &["plugins.enabled, plugins.auto_discover"],
+            ),
+            (
+                "cli-quickstart-plugins-activation-channel",
+                &[("alias", "ops"), ("name", "chat-bridge")],
+                &["plugin.ops", "chat-bridge"],
+            ),
+            // A preview the plugins directory could not confirm says why, so
+            // its answer defaulting to no is explained.
+            (
+                "cli-quickstart-plugins-activation-unverified",
+                &[("error", "Not a directory (os error 20)")],
+                &["Not a directory (os error 20)"],
+            ),
+            // Each readiness verdict names the instance key or the config
+            // path that holds the instance back.
+            (
+                "cli-quickstart-plugins-ready",
+                &[("name", "weather-tool"), ("key", key)],
+                &["weather-tool", key],
+            ),
+            (
+                "cli-quickstart-plugins-ready-plugins-disabled",
+                &[("name", "weather-tool")],
+                &["weather-tool", "plugins.enabled"],
+            ),
+            (
+                "cli-quickstart-plugins-ready-auto-discover-disabled",
+                &[("name", "weather-tool")],
+                &["weather-tool", "plugins.auto_discover"],
+            ),
+            (
+                "cli-quickstart-plugins-ready-ceiling",
+                &[("name", "weather-tool"), ("max", "16")],
+                &["weather-tool", "plugins.max_active_instances", "16"],
+            ),
+            // A package installed before the run that does not load is never
+            // reported active; the line gives the command that shows why.
+            (
+                "cli-quickstart-plugins-ready-does-not-load",
+                &[("name", "weather-tool"), ("command", info)],
+                &["weather-tool", info],
+            ),
+            // An instance whose row the runtime's resolver rejects is never
+            // reported active: the resolver's reason is shown, and the
+            // required settings it lacks are named.
+            (
+                "cli-quickstart-plugins-ready-rejected",
+                &[
+                    ("name", "weather-tool"),
+                    (
+                        "error",
+                        "plugin 'weather-tool' config violates config_schema at '/required'",
+                    ),
+                ],
+                &[
+                    "weather-tool",
+                    "plugin 'weather-tool' config violates config_schema at '/required'",
+                ],
+            ),
+            (
+                "cli-quickstart-plugins-ready-missing-settings",
+                &[("name", "weather-tool"), ("keys", "api_key, units")],
+                &["weather-tool", "api_key, units"],
+            ),
+            // A required setting outside the portable grammar gets no printed
+            // command; the line says how to set it instead. A required name
+            // the schema does not declare cannot be set at all.
+            (
+                "cli-quickstart-plugins-ready-missing-nonportable",
+                &[("name", "weather-tool"), ("keys", "proxy url")],
+                &["weather-tool", "proxy url", "`zeroclaw config set`", "128"],
+            ),
+            (
+                "cli-quickstart-plugins-ready-undeclared-required",
+                &[("name", "weather-tool"), ("keys", "region")],
+                &["weather-tool", "region"],
+            ),
+            // `config set` resolves only rows that exist, so an instance
+            // without the row it is owed gets the command that creates it,
+            // and a tool that owns no state is active without one.
+            (
+                "cli-quickstart-plugins-ready-no-row",
+                &[("name", "weather-tool"), ("command", create_later.as_str())],
+                &["weather-tool", create_later.as_str()],
+            ),
+            // A row keyed by the package name from before typed config stands
+            // in the instance row's place. The line names the table, that row
+            // and the key to rename it to, and gives no command that creates
+            // or grants a row (asserted below); when `plugin list` prints the
+            // update steps, it gives that command.
+            (
+                "cli-quickstart-plugins-ready-legacy-row",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key, "[[plugins.entries]]"],
+            ),
+            (
+                "cli-quickstart-plugins-ready-legacy-row-listed",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                    ("command", list),
+                ],
+                &["weather-tool", key, "[[plugins.entries]]", list],
+            ),
+            // A fresh install refused beside that row names the row to
+            // rename and its key, and no command that needs the package.
+            (
+                "cli-quickstart-plugins-legacy-row-refused",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key, "[[plugins.entries]]", "Quickstart"],
+            ),
+            (
+                "cli-quickstart-plugins-ready-no-entry-needed",
+                &[("name", "weather-tool")],
+                &["weather-tool"],
+            ),
+            (
+                "cli-quickstart-plugins-apply-failed-state-activated",
+                &[("names", "weather-tool, notes-tool")],
+                &["weather-tool, notes-tool"],
+            ),
+            // A failed agent step after the plugin step changed the machine
+            // reports what stays instead of claiming nothing on disk changed.
+            ("cli-quickstart-plugins-agent-not-created", &[], &[]),
+            ("cli-quickstart-plugins-remove-heading", &[], &[]),
+            ("cli-quickstart-plugins-fix-and-rerun", &[], &[]),
+            // Quickstart never signals a running daemon. The note names the
+            // command that restarts the installed service and the one-shot
+            // command that reads the new configuration on its next start.
+            (
+                "cli-quickstart-plugins-restart-note",
+                &[("command", restart)],
+                &[restart, "`zeroclaw agent`"],
+            ),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key_name, args, must_contain) in &cases {
+            let english = format_ftl_message(english_source, "en", key_name, args)
+                .unwrap_or_else(|| panic!("{key_name} should format in en"));
+            for (source, locale) in committed_locale_sources() {
+                let value = format_ftl_message(source, locale, key_name, args)
+                    .unwrap_or_else(|| panic!("{key_name} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key_name} must not be empty in {locale}"
+                );
+                for needle in *must_contain {
+                    assert!(
+                        value.contains(needle),
+                        "{key_name} in {locale} must inline {needle:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key_name} in {locale} is the English string verbatim, so that \
+                         catalogue was never translated"
+                    );
+                }
+            }
+        }
+
+        // No `config set` can satisfy a schema that requires a name it does
+        // not declare, so the question about such a plugin must not offer one.
+        for (source, locale) in committed_locale_sources() {
+            let unusable = format_ftl_message(
+                source,
+                locale,
+                "cli-quickstart-plugins-config-undeclared-prompt",
+                &[("name", "weather-tool"), ("keys", "region")],
+            )
+            .unwrap_or_else(|| {
+                panic!("cli-quickstart-plugins-config-undeclared-prompt should format in {locale}")
+            });
+            assert!(
+                !unusable.contains("config set"),
+                "cli-quickstart-plugins-config-undeclared-prompt in {locale} must not offer \
+                 `config set`; got: {unusable:?}"
+            );
+
+            // Beside a row from before typed config, a created row would share
+            // its key once that row is renamed, so neither legacy-row line may
+            // offer a command that creates or grants a row.
+            for (key_name, args) in [
+                (
+                    "cli-quickstart-plugins-ready-legacy-row",
+                    &[
+                        ("name", "weather-tool"),
+                        ("legacy", "weather-tool"),
+                        ("key", key),
+                    ][..],
+                ),
+                (
+                    "cli-quickstart-plugins-ready-legacy-row-listed",
+                    &[
+                        ("name", "weather-tool"),
+                        ("legacy", "weather-tool"),
+                        ("key", key),
+                        ("command", list),
+                    ][..],
+                ),
+            ] {
+                let rename = format_ftl_message(source, locale, key_name, args)
+                    .unwrap_or_else(|| panic!("{key_name} should format in {locale}"));
+                assert!(
+                    !rename.contains("config set") && !rename.contains("config patch"),
+                    "{key_name} in {locale} must not offer a command that creates or grants \
+                     a row; got: {rename:?}"
+                );
+            }
+        }
+
+        // Every key of the step, not only the cases above, is defined in every
+        // catalogue and interpolates exactly the arguments English does. Each
+        // argument is a distinct sentinel, so a catalogue that drops or
+        // renames a placeholder fails here by name.
+        const SENTINELS: [(&str, &str); 21] = [
+            ("alias", "@@alias@@"),
+            ("author", "@@author@@"),
+            ("command", "@@command@@"),
+            ("count", "@@count@@"),
+            ("description", "@@description@@"),
+            ("error", "@@error@@"),
+            ("glyph", "@@glyph@@"),
+            ("hosts", "@@hosts@@"),
+            ("key", "@@key@@"),
+            ("keys", "@@keys@@"),
+            ("legacy", "@@legacy@@"),
+            ("list", "@@list@@"),
+            ("max", "@@max@@"),
+            ("name", "@@name@@"),
+            ("names", "@@names@@"),
+            ("path", "@@path@@"),
+            ("registry_version", "@@registry_version@@"),
+            ("rollback_error", "@@rollback_error@@"),
+            ("settings", "@@settings@@"),
+            ("summary", "@@summary@@"),
+            ("version", "@@version@@"),
+        ];
+        fn interpolated(value: &str) -> Vec<&'static str> {
+            SENTINELS
+                .iter()
+                .map(|(_, sentinel)| *sentinel)
+                .filter(|sentinel| value.contains(sentinel))
+                .collect()
+        }
+
+        let family: Vec<&str> = english_source
+            .lines()
+            .filter_map(|line| line.split_once(" = ").map(|(id, _)| id))
+            .filter(|id| {
+                *id == "cli-quickstart-row-plugins"
+                    || *id == "cli-plugin-egress-withheld"
+                    || id.starts_with("cli-quickstart-plugins-")
+            })
+            .collect();
+        for (key_name, _, _) in &cases {
+            assert!(
+                family.contains(key_name),
+                "{key_name} is not a key of the Quickstart plugin step"
+            );
+        }
+        for key_name in &family {
+            let english = format_ftl_message(english_source, "en", key_name, &SENTINELS)
+                .unwrap_or_else(|| panic!("{key_name} should format in en"));
+            for (source, locale) in committed_locale_sources() {
+                let value = format_ftl_message(source, locale, key_name, &SENTINELS)
+                    .unwrap_or_else(|| panic!("{key_name} should format in {locale}"));
+                assert_eq!(
+                    interpolated(&value),
+                    interpolated(&english),
+                    "{key_name} in {locale} must interpolate the arguments en does; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
         // This warning is what tells an operator why a stranger's reply to a
         // group approval token will bounce, so a catalogue that omits it ships
@@ -1473,6 +2008,345 @@ mod tests {
                 .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
             assert!(value.contains("Tool"));
             assert!(value.contains("zpi1_fixture"));
+        }
+    }
+
+    /// The channel instance lines of `plugin info`, `plugin remove`,
+    /// `plugin bind` and `plugin install --channel-alias`: the binding
+    /// ceremony's outcome and refusals, and the readiness report.
+    ///
+    /// Every one names a `[channels.plugin.<alias>]` binding, a config path,
+    /// a flag or a command the operator has to find or run, so every
+    /// catalogue must keep those literal: the binding in its config spelling,
+    /// `plugin.<alias>`, the `[channels.plugin.<alias>]` table and the
+    /// `[[plugins.entries]]` row, the `--egress` flags, the config paths, the
+    /// `ALIAS` word a printed `plugin bind` command carries until the operator
+    /// replaces it, and the printed command whole. A catalogue that omits a
+    /// key ships the raw `{key}` sentinel, and one that copies English ships
+    /// an untranslated line; both fail here.
+    #[test]
+    fn plugin_channel_instance_cli_strings_are_translated_in_every_locale() {
+        const ALIAS: &str = "operations";
+        const KEY: &str = "zpi1_fixture";
+        const PACKAGE: &str = "chat-bridge";
+        const OWNER: &str = "other-bridge";
+        const BINDING: &str = "plugin.operations";
+        const TABLE: &str = "[channels.plugin.operations]";
+        const ROW: &str = "[[plugins.entries]]";
+        const GRANTS: &str = "api.example.com; private: 10.0.0.5";
+        const HOSTS: &str = "api.example.com, irc.example.net";
+        const PERMISSIONS: &str = "http_client, config_read";
+        const PROPERTY: &str = "api_token";
+        const REASON: &str = "alias 'Ops' must start with a lowercase letter or digit";
+        const ERROR: &str = "plugin 'chat-bridge' config violates config_schema at '/required'";
+        const COMMAND: &str = "zeroclaw --config-dir '/srv/zc' config set 'plugins.enabled' 'true'";
+        const PLACEHOLDER: &str = "ALIAS";
+
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [ParityCase; 40] = [
+            (
+                "cli-plugin-config-entry-key-channel",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY],
+            ),
+            (
+                "cli-plugin-removed-binding-kept",
+                &[("name", PACKAGE), ("alias", ALIAS), ("table", TABLE)],
+                &[BINDING, TABLE, PACKAGE],
+            ),
+            (
+                "cli-plugin-removed-channel-grant-kept",
+                &[
+                    ("name", PACKAGE),
+                    ("alias", ALIAS),
+                    ("key", KEY),
+                    ("grants", GRANTS),
+                ],
+                &[BINDING, KEY, GRANTS, PACKAGE, ROW],
+            ),
+            (
+                "cli-plugin-channel-bound",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-binding-kept",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-not-provided",
+                &[("name", PACKAGE), ("alias", ALIAS)],
+                &[PACKAGE, BINDING],
+            ),
+            (
+                "cli-plugin-channel-invalid-alias",
+                &[("alias", "Ops"), ("reason", REASON)],
+                &["Ops", REASON],
+            ),
+            (
+                "cli-plugin-channel-alias-owned",
+                &[("alias", ALIAS), ("owner", OWNER), ("name", PACKAGE)],
+                &[BINDING, OWNER, PACKAGE, TABLE],
+            ),
+            (
+                "cli-plugin-channel-config-degraded",
+                &[("alias", ALIAS), ("section", "channels.plugin")],
+                &[BINDING, "[channels.plugin]"],
+            ),
+            (
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", PACKAGE),
+                    ("alias", ALIAS),
+                    ("count", "2"),
+                    ("hosts", HOSTS),
+                ],
+                &[
+                    PACKAGE,
+                    BINDING,
+                    "2",
+                    HOSTS,
+                    "`--egress declared`",
+                    "`--egress none`",
+                ],
+            ),
+            (
+                "cli-plugin-channel-egress-withheld",
+                &[("alias", ALIAS), ("hosts", HOSTS), ("command", COMMAND)],
+                &[BINDING, "--egress none", HOSTS, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-egress-nothing-declared",
+                &[("name", PACKAGE), ("alias", ALIAS), ("command", COMMAND)],
+                &[PACKAGE, BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-egress-flag-ignored",
+                &[("alias", ALIAS)],
+                &["--egress", BINDING],
+            ),
+            (
+                "cli-plugin-channel-permissions",
+                &[("alias", ALIAS), ("permissions", PERMISSIONS)],
+                &[BINDING, PERMISSIONS],
+            ),
+            (
+                "cli-plugin-channel-permissions-none",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-row-missing",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-row-missing-declared",
+                &[("alias", ALIAS), ("hosts", HOSTS)],
+                &[BINDING, HOSTS, "`--egress declared`", "`--egress none`"],
+            ),
+            (
+                "cli-plugin-channel-row-missing-invalid-alias",
+                &[
+                    ("alias", "ops-team"),
+                    ("reason", REASON),
+                    ("table", "[channels.plugin.ops-team]"),
+                ],
+                &[
+                    "plugin.ops-team",
+                    "[channels.plugin.ops-team]",
+                    "`plugin bind`",
+                    REASON,
+                ],
+            ),
+            (
+                "cli-plugin-channel-alias-unkeyed",
+                &[
+                    ("alias", "op\\u{1b}s"),
+                    ("name", PACKAGE),
+                    ("reason", REASON),
+                    ("table", "[channels.plugin.\"op\\u{1b}s\"]"),
+                ],
+                &[
+                    "plugin.op\\u{1b}s",
+                    "[channels.plugin.\"op\\u{1b}s\"]",
+                    PACKAGE,
+                    REASON,
+                ],
+            ),
+            (
+                "cli-plugin-channel-required-config",
+                &[("alias", ALIAS), ("count", "3")],
+                &[BINDING, "3"],
+            ),
+            (
+                "cli-plugin-channel-required-key-set",
+                &[("key", PROPERTY)],
+                &[PROPERTY],
+            ),
+            (
+                "cli-plugin-channel-required-key-missing",
+                &[("key", PROPERTY), ("command", COMMAND)],
+                &[PROPERTY, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-required-secret-missing",
+                &[("key", PROPERTY), ("command", COMMAND)],
+                &[PROPERTY, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-required-key-unaddressable",
+                &[("key", "$(id)"), ("row", KEY)],
+                &["$(id)", KEY, ROW],
+            ),
+            (
+                "cli-plugin-channel-config-invalid",
+                &[("alias", ALIAS), ("error", ERROR)],
+                &[BINDING, ERROR],
+            ),
+            (
+                "cli-plugin-channel-retained-row",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY, ROW],
+            ),
+            (
+                "cli-plugin-channel-retained-values",
+                &[("alias", ALIAS), ("key", KEY)],
+                &[BINDING, KEY, ROW, "`config`"],
+            ),
+            (
+                "cli-plugin-channel-config-valid",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-activation-ready",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, "plugins.enabled", COMMAND],
+            ),
+            (
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", ALIAS), ("command", COMMAND)],
+                &[BINDING, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-activation-binding-disabled-manual",
+                &[("alias", "a.b"), ("table", "[channels.plugin.\"a.b\"]")],
+                &[
+                    "plugin.a.b",
+                    "[channels.plugin.\"a.b\"]",
+                    "`enabled = true`",
+                    "`config set`",
+                ],
+            ),
+            (
+                "cli-plugin-channel-activation-no-owner",
+                &[("alias", ALIAS)],
+                &[BINDING, "`channels`", "agents.<agent>.channels"],
+            ),
+            (
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", ALIAS)],
+                &[BINDING, "plugins.max_active_instances"],
+            ),
+            (
+                "cli-plugin-channel-activation-package-missing",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-activation-not-a-channel",
+                &[("alias", ALIAS), ("name", PACKAGE)],
+                &[BINDING, PACKAGE],
+            ),
+            (
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", ALIAS), ("error", ERROR)],
+                &[BINDING, ERROR],
+            ),
+            (
+                "cli-plugin-channel-restart-note",
+                &[("alias", ALIAS)],
+                &[BINDING],
+            ),
+            (
+                "cli-plugin-channel-bind-hint",
+                &[("name", PACKAGE), ("command", COMMAND)],
+                &[PACKAGE, PLACEHOLDER, COMMAND],
+            ),
+            (
+                "cli-plugin-channel-bind-hint-egress",
+                &[("name", PACKAGE), ("hosts", HOSTS)],
+                &[
+                    PACKAGE,
+                    HOSTS,
+                    PLACEHOLDER,
+                    "`--egress declared`",
+                    "`--egress none`",
+                ],
+            ),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args, expected_parts) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+            assert!(
+                !english.trim().is_empty(),
+                "{key} must not be empty in en; got {english:?}"
+            );
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                // The decision commands print `--egress none` first, so a
+                // block pasted whole fails closed, and the line introducing
+                // them names the flags in that order.
+                if matches!(
+                    key,
+                    "cli-plugin-channel-row-missing-declared"
+                        | "cli-plugin-channel-bind-hint-egress"
+                ) {
+                    assert!(
+                        value.find("`--egress none`") < value.find("`--egress declared`"),
+                        "{key} in {locale} should name `--egress none` first; got: {value:?}"
+                    );
+                }
+                // The removal line names the binding on its own, not only
+                // inside the table it says to delete.
+                if key == "cli-plugin-removed-binding-kept" {
+                    assert!(
+                        value.replace(TABLE, "").contains(BINDING),
+                        "{key} in {locale} should name {BINDING:?} outside {TABLE:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
         }
     }
 

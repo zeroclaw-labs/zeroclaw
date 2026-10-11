@@ -67,8 +67,8 @@ one.
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
-   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
-   `auto_discover` gate.
+   `[channels.plugin.<alias>]`, by hand or with `zeroclaw plugin bind`, still
+   activate. The skill loader applies the same `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -172,6 +172,17 @@ it is `false` by default, so `enabled = true` alone activates only the channels
 you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
 host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
+
+A channel binding lives outside `plugins.*`, under `[channels.plugin.<alias>]`.
+You can write that table by hand, or let `zeroclaw plugin bind <package>
+--channel-alias <alias>` write it for an installed channel package. The command
+also seeds the instance's `[[plugins.entries]]` row, requires an explicit
+`--egress declared` or `--egress none` flag before it creates that row from a
+manifest that declares destinations and holds a transport that can reach them
+(`http_client`, `websocket_client`, or `socket_client`), and reports what the
+instance still needs before it can start. It never sets `plugins.enabled` and
+never edits an agent's `channels`. See
+[Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
 
 ## What a plugin still cannot do
 

@@ -22,6 +22,9 @@ pub struct PluginHost {
 
 struct LoadedPlugin {
     manifest: PluginManifest,
+    /// The manifest text `manifest` was parsed from and its signature was
+    /// checked against.
+    manifest_toml: String,
     plugin_dir: PathBuf,
     /// Exact executable bytes accepted with this manifest. `None` for
     /// skill-only plugins.
@@ -85,6 +88,14 @@ impl AdmittedSource {
     #[must_use]
     pub fn manifest(&self) -> &PluginManifest {
         &self.manifest
+    }
+
+    /// The manifest text admission parsed and checked against the signature
+    /// policy. [`PluginHost::install_admitted`] writes these bytes, so a
+    /// signature checked against them is checked against what gets installed.
+    #[must_use]
+    pub fn manifest_toml(&self) -> &str {
+        &self.manifest_toml
     }
 
     /// The admitted component to load-check, or `None` for a package that
@@ -249,6 +260,7 @@ impl PluginHost {
                                 manifest.name.clone(),
                                 LoadedPlugin {
                                     manifest,
+                                    manifest_toml,
                                     plugin_dir: path.clone(),
                                     component,
                                 },
@@ -316,6 +328,16 @@ impl PluginHost {
     #[must_use]
     pub fn manifest(&self, name: &str) -> Option<&PluginManifest> {
         self.loaded.get(name).map(|plugin| &plugin.manifest)
+    }
+
+    /// The manifest text an installed plugin's [`Self::manifest`] was parsed
+    /// from and its signature was checked against: the bytes this host
+    /// loaded, not the file as it may read now.
+    #[must_use]
+    pub fn manifest_toml(&self, name: &str) -> Option<&str> {
+        self.loaded
+            .get(name)
+            .map(|plugin| plugin.manifest_toml.as_str())
     }
 
     /// The exact component bytes admitted for an installed plugin: the bytes
@@ -456,6 +478,7 @@ impl PluginHost {
             manifest.name.clone(),
             LoadedPlugin {
                 manifest,
+                manifest_toml,
                 plugin_dir: dest_dir,
                 component,
             },
@@ -2044,6 +2067,32 @@ capabilities = ["tool"]
             .admit_source(source.path().to_str().unwrap())
             .expect_err("strict policy must reject an unsigned source before load verification");
         assert!(matches!(err, PluginError::UnsignedPlugin(_)));
+    }
+
+    /// A signature is checked against manifest text, so the text an admitted
+    /// source and a loaded plugin report is the text admission read, byte for
+    /// byte, comments and spacing included.
+    #[test]
+    fn admitted_and_loaded_manifest_text_is_the_text_admission_read() {
+        let text = "# Published by the test suite.\nname = \"text-plugin\"\nversion   = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n";
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("manifest.toml"), text).unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let admitted = host.admit_source(source.path().to_str().unwrap()).unwrap();
+        assert_eq!(admitted.manifest_toml(), text);
+        host.install_admitted(admitted).unwrap();
+        assert_eq!(host.manifest_toml("text-plugin"), Some(text));
+
+        let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(
+            rediscovered.manifest_toml("text-plugin"),
+            Some(text),
+            "discovery keeps the text it read from the plugins directory"
+        );
+        assert_eq!(rediscovered.manifest_toml("missing-plugin"), None);
     }
 
     #[test]

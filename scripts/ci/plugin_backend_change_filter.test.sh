@@ -24,6 +24,8 @@ expect "plugin crate source" "true" \
     "crates/zeroclaw-plugins/src/wasm_tool.rs"
 expect "plugin crate tests" "true" \
     "crates/zeroclaw-plugins/tests/reference_plugin_e2e.rs"
+expect "root quickstart plugin step" "true" \
+    "src/quickstart_plugins/mod.rs"
 
 # Runtime-only changes must run the backend job: it carries the
 # feature-gated live-config regression that protects the Agent
