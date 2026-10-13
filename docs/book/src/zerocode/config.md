@@ -28,6 +28,112 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
   from the backend registry, so the options you see are exactly the ones this
   build supports.
 
+## Plugins sub-tab
+
+The Config pane has three sub-tabs: `zeroclaw` for the daemon's settings,
+`zerocode` for zerocode's own settings, and `plugins`. `Tab` moves to the
+next sub-tab by default, and clicking a sub-tab name selects it.
+
+The `plugins` sub-tab shows the connected daemon's plugin catalog, the same
+package catalog the dashboard's Plugins page shows, and the plugin channel
+instances configured for each package. It lists
+installed packages and packages in the daemon's cached registry, one row per
+package, in the order the daemon returns them. A filled dot marks a package
+with an installed record and a hollow dot marks one that is only in the cached
+registry. The filters on the left show all packages, only installed ones, or
+only ones in the registry. When the daemon cannot read a catalog source, the
+pane shows that source's facts as unknown rather than absent: a package with no
+installed record gets a neutral `?` marker instead of the hollow dot, its
+detail says the source could not be read, the filter for that source shows
+`(?)` instead of a count, and the total reads as a lower bound, such as
+`All (3+)`.
+
+- **Installed and registry records stay separate.** When a package is
+  installed at one version and listed in the registry at another, its row
+  names both versions. Press `Enter` on a package to open its detail: the
+  installed record and the registry record each get their own section with
+  their own version, description, and capabilities, plus the requested
+  permissions of the installed record and the `name@version` identity of the
+  registry record. The two capability lists are never merged, and the pane
+  never says which version is newer.
+- **No runtime status.** Appearing in the catalog does not mean a plugin is
+  loaded, running, or healthy, and the pane never claims any of those.
+  `[plugins] enabled in config` reports the `plugins.enabled` setting, which
+  is configuration intent.
+- **Channel instances.** A plugin channel instance is a
+  `[channels.plugin.<alias>]` table that names a package and has an `enabled`
+  setting. The detail of an installed package that provides a channel, or of
+  any package an instance names, lists those instances sorted by alias. Each
+  row shows `enabled in config`, `disabled in config`, or `unknown` when the
+  daemon reports no readable value. An instance only appears under the
+  package whose name matches its `package` value exactly, so an instance that
+  names a package missing from the catalog is not shown here.
+- **One write: the instance toggle.** The only change the sub-tab makes is
+  `channels.plugin.<alias>.enabled`, on an instance it has just reread. It
+  never installs or removes anything and never touches `plugins.*` settings
+  (see the toggle steps below for the one narrow case where the daemon
+  re-creates an instance). Declare instances under
+  `channels` in the `zeroclaw` sub-tab, change `plugins.*` settings there, and
+  manage packages with `zeroclaw plugin`.
+
+The sub-tab needs a daemon that serves the `plugins/list` RPC method and was
+built with WASM plugin support. A daemon without the method shows a message
+saying it does not provide the catalog. A daemon built without WASM plugin
+support shows that as its own state, not as an empty catalog. The connection
+also needs the `plugins:read` grant; when the daemon refuses the request, the
+pane shows the reason the daemon gave. When the daemon cannot read a catalog
+source (the installed plugin directory or the cached registry), the left
+column names the source and the details are in the daemon log.
+
+The catalog loads the first time you open the sub-tab, and the channel
+instances load right after it. Press `r` to refresh both. The previous rows
+stay on screen, marked as refreshing, until the new result arrives; if the
+refresh fails, the error replaces them. Refreshing rereads what the daemon has
+on disk and does not download the registry: `zeroclaw plugin search` updates
+the cached registry. Reading the instances needs the `config:read` grant. When
+the daemon refuses or fails that read, the catalog still shows and the
+instance block of each installed channel package shows the reason.
+
+### Enable or disable a channel instance
+
+Open a package's detail and press `Enter` or `Right` to move into its
+instance list, pick an instance with the arrow keys, and press `Enter` to flip
+its `enabled` setting. Only `Enter` toggles, and a mouse click only selects.
+`Esc` returns to the detail. The toggle:
+
+1. Rereads the instance. If it was removed, now names another package, or
+   holds a different value than the one shown, nothing is written and the
+   pane asks you to refresh. The daemon creates a missing instance instead of
+   refusing the write, so this check keeps a toggle from re-creating one that
+   was removed before the toggle started. The daemon has no conditional
+   write, so a removal that lands between this reread and the write is still
+   re-created, without a package.
+2. Writes the opposite value with `config/set`. This needs the
+   `config:update` grant and write access to that path; a refusal is shown
+   with the daemon's reason and the value stays as it was.
+3. Rereads the instance and shows the value the daemon stored.
+
+The line under the list reports the result, for example `Saved: ops is now
+disabled in config`. A saved change is configuration only: plugin channels
+start when the daemon loads its channels, so it takes effect after a daemon
+reload (the reload-daemon key, `Ctrl+R` or `Cmd+R` by default) or a restart,
+and the reload restarts every channel listener. An enabled instance starts
+only if the daemon was built with WASM plugin support, `[plugins] enabled` is
+on, the package is installed, and an enabled agent lists `plugin.<alias>` in
+its `channels`. The pane never says that a channel started, stopped, or is
+running.
+
+One toggle runs at a time. While it runs, `r` does nothing and `Enter` in the
+instance list does nothing, so a refresh never lands on top of a write; the
+same holds the other way while a refresh runs. An instance whose value is
+`unknown` has nothing to flip, so `Enter` on it writes nothing and asks you to
+refresh. An alias outside the alias grammar, which only a hand-edited config
+can hold, is never written: the daemon would resolve the write by the alias's
+first segment and create a second instance.
+When the daemon does not answer the write in time, the pane says the change
+may or may not have been saved and shows the value as unknown until you
+refresh.
+
 ## Local UI settings (`zerocode-config.toml`)
 
 Some settings describe how *zerocode itself* draws its panes rather than how the

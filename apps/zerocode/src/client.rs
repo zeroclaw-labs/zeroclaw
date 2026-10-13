@@ -16,13 +16,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
+use crate::wire::{
+    ConfigFieldEntry, DoctorRunResult, FsListDirResponse, PluginsListResult, SectionShape,
+};
 
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTBOUND_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The catalog scan admits and verifies every installed WASM component, so it
+/// gets the same budget as the model catalog rather than the 5 s default.
+const PLUGINS_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// ONE absolute budget for the entire client-side relay setup: the TCP connect,
 /// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
@@ -159,6 +164,8 @@ pub mod method {
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
     pub const SOPS_TRIGGER_SOURCES: &str = "sops/trigger-sources";
+    // Plugins
+    pub const PLUGINS_LIST: &str = "plugins/list";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -584,6 +591,45 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A JSON-RPC error response to a call made through [`RpcClient::call`] or
+/// [`RpcClient::call_with_timeout`]. Carrying the code lets a caller branch on
+/// it by downcasting instead of matching the rendered message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcCallError {
+    pub method: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl fmt::Display for RpcCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RPC {}: {} ({})", self.method, self.message, self.code)
+    }
+}
+
+impl std::error::Error for RpcCallError {}
+
+/// A call made through [`RpcClient::call_with_timeout`] that got no response
+/// within its budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcCallTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl fmt::Display for RpcCallTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RPC {}: timed out after {}s",
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RpcCallTimeout {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -2172,12 +2218,18 @@ impl RpcClient {
         let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
             .await
             .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "RPC {method}: timed out after {}s",
-                    timeout.as_secs()
-                ))
+                anyhow::Error::new(RpcCallTimeout {
+                    method: method.to_string(),
+                    timeout,
+                })
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                anyhow::Error::new(RpcCallError {
+                    method: method.to_string(),
+                    code: e.code,
+                    message: e.message,
+                })
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2876,6 +2928,17 @@ impl RpcClient {
         self.call(method::HEALTH, serde_json::json!({})).await
     }
 
+    /// The daemon's read-only plugin catalog (the body `GET /api/plugins`
+    /// serves). The daemon ignores params; `{}` matches its own tests.
+    pub async fn plugins_list(&self) -> Result<PluginsListResult> {
+        self.call_with_timeout(
+            method::PLUGINS_LIST,
+            serde_json::json!({}),
+            PLUGINS_LIST_TIMEOUT,
+        )
+        .await
+    }
+
     pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
         self.call_with_timeout(
             method::DOCTOR_RUN,
@@ -3274,6 +3337,149 @@ mod initialize_timeout_tests {
 
         assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
         receiver.abort();
+    }
+}
+
+#[cfg(test)]
+mod plugins_method_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    async fn next_request(rx: &mut mpsc::Receiver<String>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the client must send a wire request")
+            .expect("the writer channel must stay open");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn plugins_list_sends_the_catalog_method_with_empty_params() {
+        let (rpc, mut rx) = make_rpc();
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move { client.plugins_list().await });
+
+        let req = next_request(&mut rx).await;
+        assert_eq!(req["method"], method::PLUGINS_LIST);
+        assert_eq!(req["method"], "plugins/list");
+        assert_eq!(req["params"], json!({}));
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "plugins_enabled": true,
+                "wasm_plugins_available": true,
+                "plugins_dir": "plugins",
+                "plugins": [],
+                "issues": []
+            })),
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("plugins_list must resolve after the response")
+            .unwrap()
+            .expect("a well-formed catalog body must parse");
+        assert!(result.plugins_enabled);
+        assert!(result.plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_error_downcasts_to_a_typed_error_with_unchanged_text() {
+        let (rpc, mut rx) = make_rpc();
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move { client.plugins_list().await });
+
+        let req = next_request(&mut rx).await;
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            None,
+            Some(JsonRpcError {
+                code: -32601,
+                message: "Unknown method: plugins/list".to_string(),
+                data: None,
+            }),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("plugins_list must resolve after the error")
+            .unwrap()
+            .expect_err("an RPC error response must surface as an error");
+
+        let typed = err
+            .downcast_ref::<RpcCallError>()
+            .expect("RPC errors must downcast to RpcCallError");
+        assert_eq!(typed.method, "plugins/list");
+        assert_eq!(typed.code, -32601);
+        assert_eq!(typed.message, "Unknown method: plugins/list");
+        assert_eq!(
+            err.to_string(),
+            "RPC plugins/list: Unknown method: plugins/list (-32601)",
+            "the rendered text every existing caller sees must not change"
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "RPC plugins/list: Unknown method: plugins/list (-32601)"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_downcasts_to_a_typed_error_with_unchanged_text() {
+        let (rpc, mut rx) = make_rpc();
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move {
+            client
+                .call_with_timeout::<Value>(
+                    method::PLUGINS_LIST,
+                    json!({}),
+                    Duration::from_millis(20),
+                )
+                .await
+        });
+        let _req = next_request(&mut rx).await;
+
+        let err = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the call must give up after its timeout")
+            .unwrap()
+            .expect_err("an unanswered call must time out");
+        let typed = err
+            .downcast_ref::<RpcCallTimeout>()
+            .expect("timeouts must downcast to RpcCallTimeout");
+        assert_eq!(typed.method, "plugins/list");
+        assert!(err.downcast_ref::<RpcCallError>().is_none());
+        assert_eq!(err.to_string(), "RPC plugins/list: timed out after 0s");
+    }
+
+    /// `plugins_list` goes through the 20 s budget, not the 5 s default of
+    /// `call`: the daemon verifies every installed WASM component per scan.
+    #[tokio::test(start_paused = true)]
+    async fn plugins_list_gives_up_after_its_own_twenty_second_budget() {
+        assert_eq!(PLUGINS_LIST_TIMEOUT, Duration::from_secs(20));
+        let (rpc, mut rx) = make_rpc();
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { client.plugins_list().await });
+        let req = next_request(&mut rx).await;
+        assert_eq!(req["method"], "plugins/list");
+
+        let err = task
+            .await
+            .unwrap()
+            .expect_err("an unanswered plugins/list must time out");
+        let typed = err
+            .downcast_ref::<RpcCallTimeout>()
+            .expect("the timeout must downcast to RpcCallTimeout");
+        assert_eq!(typed.timeout, Duration::from_secs(20));
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert_eq!(err.to_string(), "RPC plugins/list: timed out after 20s");
     }
 }
 

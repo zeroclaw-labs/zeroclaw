@@ -298,6 +298,7 @@ keyactions! {
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
         ApplyTemplate [Chord::char('t')] => "apply template",
+        Refresh       [Chord::char('r')] => "refresh",
     }
 }
 

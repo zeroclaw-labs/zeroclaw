@@ -339,6 +339,314 @@ pub enum SectionShape {
     BackendPicker,
 }
 
+// ── Plugin catalog shapes ──────────────────────────────────────
+
+/// Result of `plugins/list`. Mirrors the daemon's plugin catalog body, which
+/// is the same body `GET /api/plugins` serves.
+///
+/// Every field is required: a body missing one is malformed and fails the
+/// parse instead of reading as `false` or an empty catalog. Unknown fields
+/// are tolerated because the catalog contract allows additive fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginsListResult {
+    /// Canonical `[plugins].enabled` config value. Configuration intent, not
+    /// evidence that any plugin is loaded or healthy.
+    pub plugins_enabled: bool,
+    /// Whether the daemon was built with WASM plugin support. `false` is a
+    /// build limitation, distinct from an empty catalog.
+    pub wasm_plugins_available: bool,
+    /// Configured plugin directory, before path expansion.
+    pub plugins_dir: String,
+    /// One row per package name, in the daemon's order.
+    pub plugins: Vec<PluginCatalogEntry>,
+    /// Catalog sources that could not be read, distinct from an empty catalog.
+    pub issues: Vec<PluginCatalogIssue>,
+}
+
+/// One package row of the `plugins/list` body. The installed record and the
+/// cached-registry record stay separate because their versions and metadata
+/// can legitimately differ.
+///
+/// Every field is required, the optional ones included: the daemon always
+/// sends `installed` and `available`, as `null` when the record is absent. A
+/// row missing either key is malformed and fails the parse instead of reading
+/// as "not installed" or "not in the registry".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCatalogEntry {
+    pub name: String,
+    // Key required; only an explicit null means no installed record.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub installed: Option<InstalledPluginPackage>,
+    // Key required; only an explicit null means no registry record.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub available: Option<AvailablePluginPackage>,
+}
+
+/// Host-admitted metadata of an installed package, as the daemon's
+/// `plugins/list` body reports it. Every field is required; `description` is
+/// `null` when the manifest has none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledPluginPackage {
+    pub version: String,
+    // Key required; only an explicit null means no description.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub description: Option<String>,
+    pub capabilities: Vec<String>,
+    pub permissions: Vec<String>,
+}
+
+/// Cached-registry metadata of a package, as the daemon's `plugins/list`
+/// body reports it. Every field is required; `description` is `null` when
+/// the registry entry has none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AvailablePluginPackage {
+    pub version: String,
+    // Key required; only an explicit null means no description.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub description: Option<String>,
+    pub capabilities: Vec<String>,
+    /// Inert `name@version` identity. The daemon never sends registry URLs.
+    pub install_source: String,
+}
+
+/// A catalog source the daemon could not read. Details stay in the daemon
+/// log; the wire carries only these stable codes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCatalogIssue {
+    pub source: PluginCatalogIssueSource,
+    pub code: PluginCatalogIssueCode,
+}
+
+/// Which catalog source an issue is about. A source a newer daemon adds
+/// parses as `Unknown` instead of failing the whole body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCatalogIssueSource {
+    Installed,
+    Registry,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Stable issue code. A code a newer daemon adds parses as `Unknown` instead
+/// of failing the whole body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCatalogIssueCode {
+    DiscoveryFailed,
+    CacheReadFailed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod plugin_catalog_wire_tests {
+    use super::*;
+
+    /// The daemon's canonical catalog fixture: one package installed at one
+    /// version and listed in the cached registry at another.
+    fn canonical_body() -> Value {
+        serde_json::json!({
+            "plugins_enabled": false,
+            "wasm_plugins_available": true,
+            "plugins_dir": "/tmp/.tmpXXXX/plugins",
+            "plugins": [
+                {
+                    "name": "calendar",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": "installed description",
+                        "capabilities": ["tool"],
+                        "permissions": ["file_read"]
+                    },
+                    "available": {
+                        "version": "0.2.0",
+                        "description": "registry description",
+                        "capabilities": ["tool", "skill"],
+                        "install_source": "calendar@0.2.0"
+                    }
+                }
+            ],
+            "issues": []
+        })
+    }
+
+    #[test]
+    fn canonical_body_round_trips() {
+        let body = canonical_body();
+        let parsed: PluginsListResult = serde_json::from_value(body.clone()).unwrap();
+
+        assert!(!parsed.plugins_enabled);
+        assert!(parsed.wasm_plugins_available);
+        assert_eq!(parsed.plugins.len(), 1);
+        let entry = &parsed.plugins[0];
+        assert_eq!(entry.name, "calendar");
+        let installed = entry.installed.as_ref().unwrap();
+        assert_eq!(installed.version, "0.1.0");
+        assert_eq!(installed.capabilities, vec!["tool"]);
+        assert_eq!(installed.permissions, vec!["file_read"]);
+        let available = entry.available.as_ref().unwrap();
+        assert_eq!(available.version, "0.2.0");
+        assert_eq!(available.capabilities, vec!["tool", "skill"]);
+        assert_eq!(available.install_source, "calendar@0.2.0");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+    }
+
+    #[test]
+    fn registry_only_row_and_null_descriptions_parse() {
+        let body = serde_json::json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": true,
+            "plugins_dir": "~/.zeroclaw/plugins",
+            "plugins": [{
+                "name": "mail",
+                "installed": null,
+                "available": {
+                    "version": "1.2.3",
+                    "description": null,
+                    "capabilities": ["channel"],
+                    "install_source": "mail@1.2.3"
+                }
+            }],
+            "issues": []
+        });
+        let parsed: PluginsListResult = serde_json::from_value(body).unwrap();
+        let entry = &parsed.plugins[0];
+        assert!(entry.installed.is_none());
+        assert_eq!(entry.available.as_ref().unwrap().description, None);
+    }
+
+    #[test]
+    fn body_without_wasm_support_parses_as_its_own_state() {
+        let body = serde_json::json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": false,
+            "plugins_dir": "~/.zeroclaw/plugins",
+            "plugins": [],
+            "issues": []
+        });
+        let parsed: PluginsListResult = serde_json::from_value(body).unwrap();
+        assert!(!parsed.wasm_plugins_available);
+        assert!(parsed.plugins_enabled);
+        assert!(parsed.plugins.is_empty());
+        assert!(parsed.issues.is_empty());
+    }
+
+    #[test]
+    fn known_issue_codes_parse() {
+        let body = serde_json::json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": true,
+            "plugins_dir": "plugins",
+            "plugins": [],
+            "issues": [
+                { "source": "installed", "code": "discovery_failed" },
+                { "source": "registry", "code": "cache_read_failed" }
+            ]
+        });
+        let parsed: PluginsListResult = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            parsed.issues,
+            vec![
+                PluginCatalogIssue {
+                    source: PluginCatalogIssueSource::Installed,
+                    code: PluginCatalogIssueCode::DiscoveryFailed,
+                },
+                PluginCatalogIssue {
+                    source: PluginCatalogIssueSource::Registry,
+                    code: PluginCatalogIssueCode::CacheReadFailed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_issue_source_and_code_degrade_to_unknown() {
+        let body = serde_json::json!({
+            "plugins_enabled": true,
+            "wasm_plugins_available": true,
+            "plugins_dir": "plugins",
+            "plugins": [],
+            "issues": [{ "source": "mirror", "code": "signature_expired" }]
+        });
+        let parsed: PluginsListResult = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            parsed.issues,
+            vec![PluginCatalogIssue {
+                source: PluginCatalogIssueSource::Unknown,
+                code: PluginCatalogIssueCode::Unknown,
+            }]
+        );
+    }
+
+    #[test]
+    fn unknown_extra_fields_are_tolerated() {
+        let mut body = canonical_body();
+        body["generated_at"] = serde_json::json!("2026-09-29T00:00:00Z");
+        body["plugins"][0]["publisher"] = serde_json::json!("example");
+        body["plugins"][0]["installed"]["admission"] = serde_json::json!({ "revision": 3 });
+        body["plugins"][0]["available"]["homepage"] = serde_json::json!("inert");
+        body["issues"] = serde_json::json!([
+            { "source": "registry", "code": "cache_read_failed", "detail_id": 7 }
+        ]);
+
+        let parsed: PluginsListResult = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.plugins[0].name, "calendar");
+        assert_eq!(
+            parsed.issues[0].code,
+            PluginCatalogIssueCode::CacheReadFailed
+        );
+    }
+
+    #[test]
+    fn a_missing_required_field_is_an_error() {
+        for field in [
+            "plugins_enabled",
+            "wasm_plugins_available",
+            "plugins_dir",
+            "plugins",
+            "issues",
+        ] {
+            let mut body = canonical_body();
+            body.as_object_mut().unwrap().remove(field);
+            let err = serde_json::from_value::<PluginsListResult>(body)
+                .expect_err("a body without a required field must not parse");
+            assert!(
+                err.to_string().contains(field),
+                "error for missing `{field}` should name it, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_nested_key_is_an_error_but_an_explicit_null_is_absent() {
+        for (record, key) in [
+            ("/plugins/0", "installed"),
+            ("/plugins/0", "available"),
+            ("/plugins/0/installed", "description"),
+            ("/plugins/0/available", "description"),
+        ] {
+            let mut missing = canonical_body();
+            let removed = missing
+                .pointer_mut(record)
+                .and_then(Value::as_object_mut)
+                .and_then(|map| map.remove(key));
+            assert!(removed.is_some(), "{record}/{key}");
+            let err = serde_json::from_value::<PluginsListResult>(missing)
+                .expect_err("a record without a required key must not parse");
+            assert!(
+                err.to_string().contains(key),
+                "error for missing `{record}/{key}` should name it, got: {err}"
+            );
+
+            let mut null = canonical_body();
+            null.pointer_mut(record).unwrap()[key] = Value::Null;
+            serde_json::from_value::<PluginsListResult>(null)
+                .unwrap_or_else(|err| panic!("an explicit null `{record}/{key}` parses: {err}"));
+        }
+    }
+}
+
 // ── Filesystem RPC shapes ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
