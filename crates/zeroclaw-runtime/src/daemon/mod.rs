@@ -2597,16 +2597,14 @@ async fn run_heartbeat_worker(
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
             };
-            let temp: Option<f64> = config
-                .model_provider_for_agent(&agent_alias)
-                .and_then(|e| e.temperature);
+
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 &agent_alias,
                 Some(prompt),
                 None,
                 None,
-                temp,
+                None,
                 vec![],
                 false,
                 None,

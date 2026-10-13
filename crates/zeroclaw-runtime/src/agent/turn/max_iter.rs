@@ -74,7 +74,8 @@ pub(crate) async fn finish_after_max_iterations(
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_providers::temperature::Temperature> + Send,
+    fallback_temperature: Option<f64>,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     limit: CompletionLimit,
@@ -95,6 +96,7 @@ pub(crate) async fn finish_after_max_iterations(
     reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
+    let temperature = temperature.into();
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
@@ -365,16 +367,22 @@ pub(crate) async fn finish_after_max_iterations(
                 } else {
                     &selected_model
                 },
-                temperature,
+                // Only unconfigured routes use the admitted entrance scalar.
+                // The call scope retains original invocation provenance for
+                // every configured leaf, including a direct vision provider.
+                temperature: fallback_temperature.into(),
             };
             // Route the graceful-summary call through the metered provider seam. This
             // was the one tool-loop provider call that skipped the budget check and
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            access
-                .run_model_query(summary_request, &mut summary_attempts)
-                .await
+            zeroclaw_providers::temperature::with_temperature(
+                config,
+                temperature,
+                access.run_model_query(summary_request, &mut summary_attempts),
+            )
+            .await
         };
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -591,6 +599,86 @@ mod graceful_summary_metering_tests {
         }
     }
 
+    #[tokio::test]
+    async fn graceful_vision_summary_resolves_selected_sampling_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        use zeroclaw_providers::temperature::Temperature;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "vision summary"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let text = config.providers.models.ensure("custom", "text").unwrap();
+        text.uri = Some(server.uri());
+        text.model = Some("text-id".into());
+        text.temperature = Some(0.2);
+        text.vision = Some(false);
+        let vision = config.providers.models.ensure("custom", "vision").unwrap();
+        vision.uri = Some(server.uri());
+        vision.temperature = Some(0.7);
+        vision.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("vision-id".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
+        let primary =
+            zeroclaw_providers::create_model_provider_from_ref(&config, "custom.text").unwrap();
+        for (input, expected) in [
+            (Temperature::from(None), 0.8),
+            (Temperature::from(Some(0.2)), 0.2),
+            (Temperature::adjusted(None, 0.1), 0.9),
+        ] {
+            let mut history = vec![ChatMessage::user(
+                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+            )];
+            let out = finish_after_max_iterations(
+                &mut None,
+                primary.as_ref(),
+                &mut history,
+                "custom.text",
+                "text-id",
+                "text-id",
+                input,
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::LocalIterations(2),
+                String::new(),
+                "vision-sampling-summary",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                Some(&config),
+                &config.multimodal,
+                None,
+                None,
+                None,
+                None,
+                |_, _| ResolvedContextLimits::legacy_fallback(0),
+                &mut false,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await
+            .unwrap();
+            assert!(out.contains("vision summary"));
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], "vision-id");
+            assert!((body["temperature"].as_f64().unwrap() - expected).abs() < 1e-9);
+        }
+    }
+
     async fn run_summary_with_events(
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
@@ -608,6 +696,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -926,6 +1015,7 @@ mod graceful_summary_metering_tests {
                 "original-model",
                 "hint:original-model",
                 None,
+                None,
                 &PacingConfig::default(),
                 None,
                 CompletionLimit::ExecutionTree,
@@ -1075,6 +1165,7 @@ mod graceful_summary_metering_tests {
                 "original-model",
                 "original-model",
                 None,
+                None,
                 &PacingConfig::default(),
                 None,
                 CompletionLimit::LocalIterations(2),
@@ -1148,6 +1239,7 @@ mod graceful_summary_metering_tests {
                 "custom",
                 "test-model",
                 "test-model",
+                None,
                 None,
                 &PacingConfig::default(),
                 None,
@@ -1244,6 +1336,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1326,6 +1419,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1425,6 +1519,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1505,6 +1600,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1596,6 +1692,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1649,6 +1746,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1735,6 +1833,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,
@@ -1824,6 +1923,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             "test-model",
+            None,
             None,
             &pacing,
             None,

@@ -29,7 +29,8 @@ pub struct ResolvedModelAccess<'a> {
     /// Selector sent to `model_provider`. Routed providers may require a
     /// `hint:<name>` selector even though `model` records the resolved model.
     pub dispatch_model: &'a str,
-    pub temperature: Option<f64>,
+    /// Explicit invocation override plus thinking adjustment; Config owns defaults.
+    pub temperature: zeroclaw_providers::temperature::Temperature,
 }
 
 /// Owned per-attempt usage summary for a finished `run_model_query` call.
@@ -109,7 +110,14 @@ impl ResolvedModelAccess<'_> {
             .scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
-                dispatcher.chat(request, self.dispatch_model, self.temperature),
+                dispatcher.chat(
+                    request,
+                    self.dispatch_model,
+                    zeroclaw_providers::temperature::temperature_for_dispatch(
+                        self.provider_name,
+                        self.temperature.override_value,
+                    ),
+                ),
             ))
             .await;
         if result.is_ok() {
@@ -470,7 +478,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -480,7 +488,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -564,7 +572,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {
@@ -625,7 +633,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {

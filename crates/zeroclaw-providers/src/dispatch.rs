@@ -145,6 +145,9 @@ impl RejectedAttempt {
 /// Immutable actual route of a transport-successful Reliable completion.
 #[derive(Debug, Clone)]
 pub struct AcceptedRoute {
+    // Construction selection, distinct from the physical billing identity.
+    // Capacity and other policy are resolved from Config by the consumer.
+    selection_ref: Option<String>,
     provider_ref: String,
     model: String,
     fallback: Option<crate::reliable::ProviderFallbackAttribution>,
@@ -157,10 +160,22 @@ impl AcceptedRoute {
         fallback: Option<crate::reliable::ProviderFallbackAttribution>,
     ) -> Self {
         Self {
+            selection_ref: None,
             provider_ref,
             model,
             fallback,
         }
+    }
+
+    pub(crate) fn with_selection_ref(mut self, selection_ref: Option<&str>) -> Self {
+        self.selection_ref = selection_ref.map(str::to_owned);
+        self
+    }
+
+    /// Full configured selection used to construct the accepted candidate.
+    #[must_use]
+    pub fn selection_ref(&self) -> Option<&str> {
+        self.selection_ref.as_deref()
     }
 
     #[must_use]
@@ -190,6 +205,9 @@ impl AcceptedRoute {
     }
 
     pub(crate) fn with_identity(mut self, provider_ref: String, model: String) -> Self {
+        if self.provider_ref != provider_ref || self.model != model {
+            self.selection_ref = None;
+        }
         self.provider_ref = provider_ref;
         self.model = model;
         self

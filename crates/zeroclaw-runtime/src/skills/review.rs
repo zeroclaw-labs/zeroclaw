@@ -129,7 +129,7 @@ pub async fn maybe_run_skill_review(
                         provider_name,
                         model: model_name,
                         dispatch_model: model_name,
-                        temperature: Some(0.3),
+                        temperature: Some(0.3).into(),
                     },
                     crate::agent::loop_::ResolvedIo {
                         tools_registry: &tools,

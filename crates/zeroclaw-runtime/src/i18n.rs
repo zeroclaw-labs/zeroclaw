@@ -1249,6 +1249,30 @@ mod tests {
     }
 
     #[test]
+    fn nested_model_doctor_temperature_formats_in_all_locales() {
+        let key = "cli-doctor-temperature-out-of-range";
+        let args = [("provider_ref", "custom.gw.chosen"), ("temperature", "3.0")];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let message = format_ftl_message(source, locale, key, &args)
+                .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+            assert!(message.contains("custom.gw.chosen"), "{locale}: {message}");
+            assert!(message.contains("3.0"), "{locale}: {message}");
+            assert!(message.contains("0.0–2.0"), "{locale}: {message}");
+            assert!(!message.contains('{'), "{locale}: {message}");
+        }
+        assert_eq!(
+            get_english_cli_string_with_args(key, &args),
+            "custom.gw.chosen: temperature 3.0 is out of range (expected 0.0–2.0)"
+        );
+    }
+
+    #[test]
     fn daemon_startup_cli_strings_format_in_all_locales() {
         let url = "http://127.0.0.1:42617";
         let path = "/tmp/zeroclaw-test/daemon.sock";
@@ -1454,6 +1478,51 @@ mod tests {
                         key,
                         locale.code
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_model_diagnostics_format_in_every_builtin_locale() {
+        let args = [
+            ("provider_ref", "openai.fixture.fast"),
+            ("family", "openai"),
+            ("alias", "fixture"),
+            ("model_alias", "fast"),
+            ("model", "fixture-model"),
+            ("available", "openai.fixture"),
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in [
+                "cli-model-switch-invalid-reference",
+                "cli-model-switch-no-profiles",
+                "cli-model-switch-profile-missing",
+                "cli-model-switch-model-id-missing",
+                "cli-model-switch-entry-missing",
+                "cli-model-switch-model-required",
+                "cli-doctor-nested-model",
+                "cli-doctor-nested-model-id-missing",
+            ] {
+                let value = format_ftl_message(source, locale, key, &args)
+                    .unwrap_or_else(|| panic!("{key} must format in {locale}"));
+                assert!(!value.is_empty());
+                assert!(!value.contains("{ $"), "unformatted value: {value}");
+                if key == "cli-doctor-nested-model" {
+                    assert!(value.contains("fixture-model"));
+                    assert!(value.contains("openai.fixture.fast"));
+                }
+                if locale != "en" {
+                    let english =
+                        format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, &args)
+                            .unwrap();
+                    assert_ne!(value, english, "{key} should be translated in {locale}");
                 }
             }
         }

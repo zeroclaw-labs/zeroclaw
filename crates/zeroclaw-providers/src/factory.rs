@@ -1413,9 +1413,9 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
                 i32::try_from(value).unwrap_or(i32::MAX)
             });
         let tuning = crate::ollama::OllamaTuning {
-            num_ctx: self
-                .base
-                .context_window
+            num_ctx: opts
+                .provider_context_window
+                .or(self.base.context_window)
                 .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
                 .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
             num_predict: max_tokens,

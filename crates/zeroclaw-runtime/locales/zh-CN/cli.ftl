@@ -748,6 +748,7 @@ cli-status-config = 配置：      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}模型：         {$model}
+cli-status-model-entry = {"   "}模型 [{$alias}]：{$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
@@ -1212,3 +1213,14 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider 必须是 `<type>.<alias>` 或 `<type>.<alias>.<model>` 格式的提供商配置引用，当前为 `{ $provider_ref }`
+cli-model-switch-no-profiles = 未配置提供商配置
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` 不是已配置的提供商配置。请添加 [providers.models.{ $family }.{ $alias }]，或使用：{ $available }
+cli-model-switch-model-id-missing = 模型条目 `{ $provider_ref }` 未设置 `id`，其提供商配置也未设置 `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` 引用了模型 `{ $model_alias }`，但尚未配置 [providers.models.{ $family }.{ $alias }.models.{ $model_alias }]
+cli-model-switch-model-required = 'set' 操作缺少 'model' 参数（也可使用 `<type>.<alias>.<model>` 格式的 model_provider 引用）
+cli-doctor-nested-model = { $provider_ref }：模型：{ $model }（条目 { $model_alias }）
+cli-doctor-nested-model-id-missing = { $provider_ref }：条目 { $model_alias } 缺少模型 ID（请设置其 `id` 或提供商配置的 `model`）
+cli-doctor-temperature-out-of-range = { $provider_ref }：temperature { $temperature } 超出范围（应为 0.0–2.0）

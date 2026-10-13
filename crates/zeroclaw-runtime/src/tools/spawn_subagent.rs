@@ -241,9 +241,6 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = config
-            .model_provider_for_agent(&self.parent_alias)
-            .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
         let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
@@ -285,7 +282,7 @@ impl Tool for SpawnSubagentTool {
                 Some(prompt),
                 None,
                 None,
-                temperature,
+                None,
                 vec![],
                 false,
                 Some(session_path),

@@ -585,7 +585,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             crate::agent::loop_::ResolvedIo {
                 tools_registry: &tools_registry,
@@ -1000,7 +1000,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         provider_name: "mock",
                         model: "mock-model",
                         dispatch_model: "mock-model",
-                        temperature: None,
+                        temperature: None.into(),
                     },
                     crate::agent::loop_::ResolvedIo {
                         tools_registry: &tools_registry,
@@ -2815,7 +2815,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             crate::agent::loop_::ResolvedIo {
                 tools_registry: &tools_registry,
@@ -4016,7 +4016,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             ResolvedIo {
                 tools_registry: &tools_registry,

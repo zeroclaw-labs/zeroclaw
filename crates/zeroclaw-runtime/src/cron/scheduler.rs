@@ -1171,9 +1171,7 @@ async fn run_agent_job(
                     Some(prefixed_prompt),
                     None,
                     model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
+                    None,
                     vec![],
                     false,
                     Some(session_path.clone()),

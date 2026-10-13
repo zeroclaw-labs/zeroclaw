@@ -32,76 +32,58 @@ pub use zeroclaw_api::agent::TurnEvent;
 /// type (see `crate::agent::turn::ContextLimitsResolver`).
 use crate::agent::loop_::ContextLimitsResolver;
 
-/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
-/// and the route resolver bound to that provider — the four values a session
-/// needs to swap a model provider while keeping route-aware limits correct.
-type SessionModelProvider = (
-    Box<dyn ModelProvider>,
-    String,
-    String,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-);
-
 pub fn build_session_model_provider(
     config: &Config,
+    agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
-        .split_once('.')
-        .map(|(t, a)| (t.to_string(), a.to_string()))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
-            ))
-        })?;
-
-    let entry = config
-        .providers
-        .models
-        .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            entry
-                .and_then(|e| e.model.as_deref())
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
-
-    let (model_provider, model_route_resolver) =
-        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-            config,
-            model_provider_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &model_provider_runtime_options,
-        )?;
-
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    // RPC-surface contract: an override ref must name a profile. The bare
+    // family form is a CLI `--provider` legacy that only the headless driver
+    // accepts.
+    if !model_provider_ref.contains('.') {
+        return Err(anyhow::Error::msg(format!(
+            "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
+        )));
+    }
+    let rt = build_model(config, agent_alias, model_provider_ref, model_override)?;
     Ok((
-        model_provider,
-        model_provider_ref.to_string(),
-        model_name,
-        model_route_resolver,
+        rt.model.provider,
+        rt.model.provider_name,
+        rt.model.model_name,
     ))
+}
+
+/// The complete model runtime produced by one [`build_model`] call — ready to
+/// commit wholesale, nothing here needs per-call-site post-processing.
+pub struct ModelRuntime {
+    pub model: zeroclaw_providers::model::BuiltModel,
+    pub tool_dispatcher: Box<dyn ToolDispatcher>,
+}
+
+/// Adapt the providers-owned model construction to the agent's existing
+/// dispatcher boundary. Selection, connection and tuning stay providers-owned.
+pub fn build_model(
+    config: &Config,
+    agent_alias: &str,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<ModelRuntime> {
+    let model = zeroclaw_providers::model::build_model(
+        config,
+        agent_alias,
+        model_provider_ref,
+        model_override,
+    )?;
+    let agent_cfg = config
+        .resolved_agent_config(agent_alias)
+        .unwrap_or_default();
+    let tool_dispatcher =
+        tool_dispatcher_for_provider(&agent_cfg, model.provider.as_ref(), &model.model_name);
+    Ok(ModelRuntime {
+        model,
+        tool_dispatcher,
+    })
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -499,6 +481,10 @@ pub struct Agent {
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
+    /// Identity of the currently running model selection — the
+    /// "did the model change" key for in-session switches. `None` on
+    /// builder-constructed agents that never resolved a selection.
+    model_identity: Option<zeroclaw_config::schema::ModelIdentity>,
     temperature: Option<f64>,
     workspace_dir: std::path::PathBuf,
     /// Per-agent persona workspace (`<install>/agents/<alias>/workspace/`).
@@ -756,6 +742,7 @@ pub struct AgentBuilder {
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
+    model_identity: Option<zeroclaw_config::schema::ModelIdentity>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     agent_workspace_dir: Option<std::path::PathBuf>,
@@ -821,6 +808,7 @@ impl AgentBuilder {
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
+            model_identity: None,
             temperature: None,
             workspace_dir: None,
             agent_workspace_dir: None,
@@ -954,6 +942,33 @@ impl AgentBuilder {
 
     pub fn model_provider_name(mut self, name: String) -> Self {
         self.model_provider_name = Some(name);
+        self
+    }
+
+    pub fn model_identity(mut self, identity: zeroclaw_config::schema::ModelIdentity) -> Self {
+        self.model_identity = Some(identity);
+        self
+    }
+
+    /// Install one factory-produced model binding during construction.
+    pub fn model_runtime(mut self, runtime: ModelRuntime) -> Self {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let zeroclaw_providers::model::BuiltModel {
+            provider,
+            provider_name,
+            model_name,
+            identity,
+            model_route_resolver,
+        } = model;
+        self.model_provider = Some(provider);
+        self.model_provider_name = Some(provider_name);
+        self.model_name = Some(model_name);
+        self.model_identity = Some(identity);
+        self.model_route_resolver = Some(model_route_resolver);
+        self.tool_dispatcher = Some(tool_dispatcher);
         self
     }
 
@@ -1299,6 +1314,7 @@ impl AgentBuilder {
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
             model_provider_name,
+            model_identity: self.model_identity,
             temperature: self.temperature,
             // Default for test callers that don't call workspace_dir().
             workspace_dir: self
@@ -1669,11 +1685,20 @@ impl Agent {
         )
     }
 
+    /// Full provider/model reference for rebuilding the active selection.
+    #[must_use]
+    pub fn selected_model_provider_ref(&self) -> String {
+        self.model_identity.as_ref().map_or_else(
+            || self.model_provider_name.clone(),
+            zeroclaw_config::schema::ModelIdentity::provider_ref,
+        )
+    }
+
     /// Capacity and proactive-trim budget for the currently selected route.
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
     pub fn context_limits(&self) -> zeroclaw_config::schema::ResolvedContextLimits {
-        self.context_limits_for_route(&self.model_provider_name, &self.model_name)
+        self.context_limits_for_route(&self.selected_model_provider_ref(), &self.model_name)
     }
 
     /// Build a limits resolver bound to a config generation CELL. Kept next to
@@ -1730,7 +1755,16 @@ impl Agent {
     ) -> zeroclaw_config::schema::ResolvedContextLimits {
         self.context_limits_resolver.as_ref().map_or_else(
             || self.config.resolved.context_limits(),
-            |resolve| resolve(provider_name, model),
+            |resolve| {
+                // External reporting may pass the normalized billing name.
+                // Derive the selected reference from the existing identity;
+                // explicit hint routes continue to resolve their own entries.
+                if provider_name == self.model_provider_name && model == self.model_name {
+                    resolve(&self.selected_model_provider_ref(), model)
+                } else {
+                    resolve(provider_name, model)
+                }
+            },
         )
     }
 
@@ -1789,7 +1823,7 @@ impl Agent {
         // Bypass the cache when a per-turn memory preamble the key cannot see
         // will be injected downstream (see `memory_injection_active`), or when
         // hooks/tools can change the final provider request after this point.
-        if self.temperature != Some(0.0)
+        if self.effective_temperature() != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -1817,14 +1851,41 @@ impl Agent {
         }
 
         let transcript = Self::encode_response_cache_transcript(messages);
+        // Resolve at use time: full selection and all provider configuration
+        // affect the request, even when two entries share a wire model ID.
+        // Hash the canonical config without persisting connection credentials.
+        // Serialization failure bypasses caching rather than reusing a weak key.
+        let selected = self.model_route_resolver.resolve(effective_model);
+        let config_fingerprint = if let Some(config) = self.full_config() {
+            use sha2::{Digest, Sha256};
+            let agent_options =
+                zeroclaw_providers::provider_runtime_options_for_agent(config, &self.agent_alias);
+            let options = zeroclaw_providers::options_for_provider_ref(
+                config,
+                &selected.provider_name,
+                &agent_options,
+            );
+            // Include shared construction defaults (reasoning, multimodal,
+            // secrets directory) through the existing options materializer.
+            let mut provider_config =
+                serde_json::to_value((&config.providers.models, options)).ok()?;
+            provider_config.sort_all_objects();
+            let bytes = serde_json::to_vec(&provider_config).ok()?;
+            format!("{:x}", Sha256::digest(bytes))
+        } else {
+            String::new()
+        };
         let provider_model_identity = format!(
-            "provider={}:{};alias={}:{};model={}:{}",
+            "provider={}:{};alias={}:{};model={}:{};selection={}:{};config={}",
             self.model_provider_name.len(),
             self.model_provider_name,
             self.model_provider.alias().len(),
             self.model_provider.alias(),
             effective_model.len(),
             effective_model,
+            selected.provider_name.len(),
+            selected.provider_name,
+            config_fingerprint,
         );
 
         Some(zeroclaw_memory::response_cache::ResponseCache::cache_key(
@@ -1875,6 +1936,33 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Replace the complete binding under the owner's existing Agent lock.
+    pub fn install_model_runtime(&mut self, runtime: ModelRuntime) {
+        let ModelRuntime {
+            model,
+            tool_dispatcher,
+        } = runtime;
+        let zeroclaw_providers::model::BuiltModel {
+            provider,
+            provider_name,
+            model_name,
+            identity,
+            model_route_resolver,
+        } = model;
+        self.model_provider = provider;
+        self.model_provider_name = provider_name;
+        self.model_name = model_name;
+        self.model_identity = Some(identity);
+        self.model_route_resolver = model_route_resolver;
+        self.tool_dispatcher = tool_dispatcher;
+    }
+
+    fn effective_temperature(&self) -> Option<f64> {
+        let selected = self.model_route_resolver.resolve(&self.model_name);
+        zeroclaw_providers::temperature::Temperature::from(self.temperature)
+            .resolve(self.full_config(), &selected.provider_name)
+    }
+
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
@@ -1892,7 +1980,7 @@ impl Agent {
 
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
-        self.temperature
+        self.effective_temperature()
     }
 
     #[cfg(test)]
@@ -1910,6 +1998,10 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    pub fn set_model_identity(&mut self, identity: zeroclaw_config::schema::ModelIdentity) {
+        self.model_identity = Some(identity);
     }
 
     /// Refreshes the `[multimodal]` policy snapshot alongside a live provider
@@ -2852,7 +2944,11 @@ impl Agent {
             policy
         });
 
-        let (provider_name, provider_alias, agent_model_provider) =
+        // The provider resolution here is a guard: it proves the agent's ref
+        // names a configured profile before anything is built (the model
+        // runtime itself is built from the raw ref further below). Only the
+        // profile entry survives — the memory backend wants its api_key.
+        let (_, _, agent_model_provider) =
             match config.resolved_model_provider_for_agent(agent_alias) {
                 Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
                 None => {
@@ -2860,14 +2956,14 @@ impl Agent {
                     if !agent_ref.is_empty() {
                         anyhow::bail!(
                             "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not \
-                             resolve to a configured [providers.models.<type>.<alias>] entry"
+                         resolve to a configured [providers.models.<type>.<alias>] entry"
                         );
                     }
                     // V3 schema requires every agent to set model_provider.
                     // Empty is a config error rather than a silent fallback.
                     anyhow::bail!(
                         "agents.{agent_alias}.model_provider is empty — set it to a \
-                         configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
+                     configured \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
                     );
                 }
             };
@@ -3024,40 +3120,14 @@ impl Agent {
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;
 
-        let model_name = match agent_model_provider
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => anyhow::bail!(
-                "agents.{agent_alias}.model_provider resolves to a model_provider entry \
-                 with no `model` set. Configure [providers.models.{provider_name}.<alias>] \
-                 model = \"...\".",
-            ),
-        };
-
-        let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-            config,
-            provider_name,
-            provider_alias,
-        );
-
-        let (model_provider, model_route_resolver) =
-            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
-
-        let tool_dispatcher =
-            tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
+        // Build the complete model runtime from the agent's configured ref —
+        // the same constructor every other path uses (switches, live
+        // refresh, session overrides). The raw ref reaches the construction
+        // chain so a three-segment agent ref carries the selected entry's
+        // tuning. Credentials always come from the selected target profile or
+        // its configured route.
+        let entry_rt = build_model(config, agent_alias, agent_cfg.model_provider.as_str(), None)
+            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
 
         let response_cache = if config.memory.response_cache_enabled {
             zeroclaw_memory::response_cache::ResponseCache::with_hot_cache(
@@ -3127,14 +3197,13 @@ impl Agent {
         #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
-            .model_provider(model_provider)
+            .model_runtime(entry_rt)
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
-            .tool_dispatcher(tool_dispatcher)
             .memory_inject_cfg(
                 crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
@@ -3152,18 +3221,9 @@ impl Agent {
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
-            .model_name(model_name)
-            // Store the full "type.alias" ref so the live provider identity
-            // (attribution_fields().1) carries the same key the config
-            // provider registry is keyed by, and wire-emission paths can
-            // resolve model_context_window / cost pricing for the provider
-            // that actually served the call.
-            .model_provider_name(provider_ref.clone())
-            .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
-            .model_route_resolver(model_route_resolver)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
@@ -3535,15 +3595,43 @@ impl Agent {
         Ok(())
     }
 
+    /// Apply an in-session model switch requested through the `model_switch`
+    /// tool: rebuild the complete model runtime from the agent's captured
+    /// config and commit it wholesale.
+    ///
+    /// Only the ref and model arrive from the request; target profile and route
+    /// credentials, the entry overlay, temperature, dispatcher, and identity
+    /// are all derived by [`build_model`]. A switch whose resolved identity
+    /// equals the current one is a no-op — two-segment and three-segment refs
+    /// naming the same model do not rebuild. Returns the effective model id
+    /// when the runtime changed.
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
         new_model_provider: String,
         new_model: String,
     ) -> Option<String> {
-        // Same-provider, same-model: nothing to do. The request is owned by
-        // the completed tool-loop scope, so there is no persistent slot to clear.
-        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
+        let Some(full_config) = self.full_config() else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "model_switch requested but agent has no provider_switch_config; \
+                 cannot rebuild provider safely"
+            );
+            return None;
+        };
+
+        // Identity-keyed no-op: a switch to the model that is already
+        // running — however the ref spells it — leaves the runtime untouched.
+        // The request is owned by the completed tool-loop scope, so there is
+        // no persistent slot to clear.
+        let next_identity = full_config
+            .resolve_model_selection(&new_model_provider)
+            .map(|s| s.identity(Some(&new_model)));
+        if let Some(current) = &self.model_identity
+            && Some(current) == next_identity.as_ref()
+        {
             return None;
         }
 
@@ -3556,70 +3644,16 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<(
-            Box<dyn ModelProvider>,
-            Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        )> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let target_entry = new_model_provider
-                    .split_once('.')
-                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
-                // A dotted target profile is the canonical source of endpoint
-                // and credentials. Falling back to the current agent profile is
-                // only retained for legacy bare-family switch requests.
-                let current_agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let target_or_current = target_entry.or(current_agent_entry);
-                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options =
-                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
-
-                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
-                 cannot rebuild provider safely",
-            )),
-        };
-
-        match switch_outcome {
-            Ok((new_prov, new_route_resolver)) => {
-                // Commit state only after the provider was built
-                // successfully.
-                self.model_provider = new_prov;
-                self.model_route_resolver = new_route_resolver;
-                self.model_provider_name = new_model_provider;
-                self.model_name = new_model.clone();
-                Some(new_model)
+        match build_model(
+            full_config,
+            &self.agent_alias,
+            &new_model_provider,
+            Some(&new_model),
+        ) {
+            Ok(rt) => {
+                let model_name = rt.model.model_name.clone();
+                self.install_model_runtime(rt);
+                Some(model_name)
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -4030,7 +4064,7 @@ impl Agent {
                                 provider_name: &selected_route.provider_name,
                                 model: &selected_route.model,
                                 dispatch_model: &effective_model,
-                                temperature: self.temperature,
+                                temperature: self.temperature.into(),
                             },
                             crate::agent::loop_::ResolvedIo {
                                 tools_registry: &self.tools,
@@ -4633,7 +4667,7 @@ impl Agent {
                                     provider_name: &selected_route.provider_name,
                                     model: &selected_route.model,
                                     dispatch_model: &effective_model,
-                                    temperature: self.temperature,
+                                    temperature: self.temperature.into(),
                                 },
                                 crate::agent::loop_::ResolvedIo {
                                     tools_registry: &self.tools,
@@ -5118,30 +5152,6 @@ impl Agent {
     }
 }
 
-/// Runtime options for the provider a live model switch rebuilds.
-///
-/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
-/// a bare family reference has no entry, and must take the config-owned
-/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
-/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
-/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
-/// on defaults would re-normalize already-prepared history under narrower
-/// caps than the operator configured and silently drop images.
-///
-/// A free function so a regression can pin the switch path's options
-/// directly — the rebuilt provider box is opaque to the runtime's tests.
-fn switch_runtime_options(
-    config: &zeroclaw_config::schema::Config,
-    new_model_provider: &str,
-) -> zeroclaw_providers::ModelProviderRuntimeOptions {
-    match new_model_provider.split_once('.') {
-        Some((family, alias)) => {
-            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
-        }
-        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
-    }
-}
-
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -5153,28 +5163,30 @@ pub async fn run(
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
-        // in models and update the agent's model_provider to reference it.
-        let (type_key, alias_key) = p.split_once('.').unwrap_or((p.as_str(), agent_alias));
+        // in models and update the agent's model_provider to reference it. The
+        // override may be three-segment (`<type>.<alias>.<model>`); key the
+        // profile off the first two segments and preserve the whole ref.
+        let (type_key, alias_key) = effective_config
+            .providers
+            .models
+            .profile_ref(p)
+            .map(|(family, alias)| (family.to_string(), alias.to_string()))
+            .unwrap_or_else(|| (p.clone(), agent_alias.to_string()));
         effective_config
             .providers
             .models
-            .ensure(type_key, alias_key);
+            .ensure(&type_key, &alias_key);
         if let Some(agent_cfg) = effective_config.agents.get_mut(agent_alias) {
-            agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+            agent_cfg.model_provider = p.as_str().into();
         }
     }
-    // Apply model/temperature overrides to the agent's resolved provider entry.
-    if let Some(agent_cfg) = effective_config.agents.get(agent_alias)
-        && let Some((fam, ali)) = agent_cfg.model_provider.split_once('.')
-        && let Some(entry) = effective_config.providers.models.ensure(fam, ali)
-    {
-        if let Some(m) = model_override {
-            entry.model = Some(m);
-        }
-        entry.temperature = temperature;
-    }
-
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+    if let Some(model) = model_override.as_deref() {
+        let provider_ref = agent.selected_model_provider_ref();
+        let runtime = build_model(&effective_config, agent_alias, &provider_ref, Some(model))?;
+        agent.install_model_runtime(runtime);
+    }
+    agent.set_temperature(temperature);
 
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
@@ -5217,7 +5229,7 @@ mod tests {
     #[test]
     fn build_session_model_provider_rejects_undotted_ref() {
         let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
+        let err = match build_session_model_provider(&config, "tester", "anthropic", Some("m")) {
             Ok(_) => panic!("undotted ref must error"),
             Err(e) => e,
         };
@@ -5228,7 +5240,7 @@ mod tests {
     fn build_session_model_provider_requires_a_model() {
         // No configured entry and no override → cannot resolve a model name.
         let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+        let err = match build_session_model_provider(&config, "tester", "anthropic.default", None) {
             Ok(_) => panic!("missing model must error"),
             Err(e) => e,
         };
@@ -5236,6 +5248,52 @@ mod tests {
             err.to_string().contains("no `model` configured"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_model_dotted_alias_keeps_model_credentials_and_endpoint_together() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+        let selected = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer dotted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "dotted response"}}]
+            })))
+            .expect(1)
+            .mount(&selected)
+            .await;
+        let sibling = MockServer::start().await;
+        let mut config = Config::default();
+        let prefix = config.providers.models.ensure("custom", "edge").unwrap();
+        prefix.api_key = Some("sibling-key".into());
+        prefix.uri = Some(sibling.uri());
+        prefix.model = Some("sibling-model".into());
+        let entry = config.providers.models.ensure("custom", "edge.v2").unwrap();
+        entry.api_key = Some("dotted-key".into());
+        entry.uri = Some(selected.uri());
+        entry.model = Some("dotted-model".into());
+        let runtime = build_model(&config, "worker", "custom.edge.v2", None).unwrap();
+        assert_eq!(runtime.model.provider_name, "custom.edge.v2");
+        let response =
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider.as_ref())
+                .simple_chat(
+                    "hello",
+                    &runtime.model.model_name,
+                    config
+                        .resolve_model_selection(&runtime.model.identity.provider_ref())
+                        .and_then(|s| s.temperature()),
+                )
+                .await
+                .unwrap();
+        assert_eq!(response, "dotted response");
+        assert_eq!(selected.received_requests().await.unwrap().len(), 1);
+        assert!(sibling.received_requests().await.unwrap().is_empty());
+        let body: serde_json::Value =
+            serde_json::from_slice(&selected.received_requests().await.unwrap()[0].body).unwrap();
+        assert_eq!(body["model"], "dotted-model");
     }
 
     #[test]
@@ -5254,11 +5312,1022 @@ mod tests {
             },
         );
 
-        let (_provider, provider_ref, model, _route_resolver) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
+        let (_provider, provider_ref, model) =
+            build_session_model_provider(&config, "tester", "openai.fast", None).unwrap();
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn bare_family_inherits_agent_model_key_and_endpoint() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer fixture-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("openai", "gw").unwrap();
+        profile.api_key = Some("fixture-key".into());
+        profile.uri = Some(server.uri());
+        profile.model = Some("legacy-id".into());
+        profile.models.insert(
+            "default".into(),
+            ModelEntryConfig {
+                id: Some("nested-id".into()),
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.gw".into(),
+                ..Default::default()
+            },
+        );
+        for (override_model, expected) in
+            [(None, "nested-id"), (Some("explicit-id"), "explicit-id")]
+        {
+            let runtime = build_model(&config, "worker", "openai", override_model).unwrap();
+            assert_eq!(runtime.model.provider_name, "openai");
+            assert_eq!(runtime.model.identity.provider_ref(), "openai");
+            zeroclaw_providers::ProviderDispatch::from_ref(runtime.model.provider.as_ref())
+                .simple_chat(
+                    "hello",
+                    &runtime.model.model_name,
+                    config
+                        .agent("worker")
+                        .and_then(|agent| config.resolve_model_selection(&agent.model_provider))
+                        .and_then(|s| s.temperature()),
+                )
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["model"], expected);
+            assert_eq!(body["temperature"], 0.25);
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_family_turn_capacity_inherits_selection_without_changing_billing() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            }).mount(&server).await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.context_window = Some(128_000);
+        profile.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("selected-id".into()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.selected".into(),
+                ..Default::default()
+            },
+        );
+        for override_model in [None, Some("different-id")] {
+            for streamed in [false, true] {
+                let limits_config = config.clone();
+                let mut agent = Agent::builder()
+                    .agent_alias("worker".into())
+                    .model_runtime(
+                        build_model(&config, "worker", "custom", override_model).unwrap(),
+                    )
+                    .context_limits_resolver(Arc::new(move |provider, model| {
+                        limits_config.resolved_context_limits_for_route("worker", provider, model)
+                    }))
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let expected_window = if override_model.is_none() {
+                    8_000
+                } else {
+                    zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+                };
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+                assert_eq!(agent.attribution_fields().1, "custom");
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    let outcome = agent
+                        .turn_streamed_with_steering_state("hello", tx, None, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.response, "done");
+                    assert_eq!(
+                        outcome.final_context_limits.unwrap().model_context_window,
+                        expected_window
+                    );
+                } else {
+                    assert_eq!(agent.turn("hello").await.unwrap(), "done");
+                }
+                assert_eq!(agent.context_limits().model_context_window, expected_window);
+            }
+        }
+        // Capacity follows the canonical selection after a config edit too.
+        config
+            .providers
+            .models
+            .ensure("custom", "gw")
+            .unwrap()
+            .models
+            .get_mut("selected")
+            .unwrap()
+            .context_window = Some(16_000);
+        assert_eq!(
+            config
+                .resolved_context_limits_for_route("worker", "custom", "selected-id")
+                .model_context_window,
+            16_000
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_temperature_follows_hint_fallback_and_explicit_override_on_wire() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        let primary = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("fixture failure"))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&target).await;
+        Mock::given(method("POST"))
+            .and(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["stream"] != true
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&target)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        let profile = config.providers.models.ensure("custom", "primary").unwrap();
+        profile.uri = Some(primary.uri());
+        profile.api_key = Some("primary-fixture-key".into());
+        profile.model = Some("primary-id".into());
+        profile.temperature = Some(0.2);
+        profile.fallback = vec!["custom.target.selected".into()];
+        let profile = config.providers.models.ensure("custom", "target").unwrap();
+        profile.uri = Some(target.uri());
+        profile.api_key = Some("target-fixture-key".into());
+        profile.temperature = Some(0.9);
+        profile.max_tokens = Some(999);
+        profile.provider_extra = Some(serde_json::json!({"profile_only": true}));
+        profile.chat_template_kwargs = Some(serde_json::json!({"profile_only": true}));
+        profile.models = HashMap::from([
+            (
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.4),
+                    context_window: Some(128_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.8),
+                    context_window: Some(8_000),
+                    max_tokens: Some(77),
+                    provider_extra: Some(serde_json::json!({"selected_only": true})),
+                    chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+                    vision: Some(false),
+                    native_tools: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.primary".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "target".into(),
+            model_provider: "custom.target.selected".into(),
+            model: "shared-id".into(),
+            ..Default::default()
+        }];
+        // The explicit value deliberately equals the primary's default. Its
+        // provenance, not numerical equality, determines whether it survives.
+        for override_value in [None, Some(0.2)] {
+            for selector in ["primary-id", "hint:target"] {
+                for streamed in [false, true] {
+                    let rt = build_model(&config, "worker", "custom.primary", None).unwrap();
+                    let limits_config = config.clone();
+                    let mut agent = Agent::builder()
+                        .model_runtime(rt)
+                        .agent_alias("worker".into())
+                        .context_limits_resolver(Arc::new(move |provider, model| {
+                            limits_config
+                                .resolved_context_limits_for_route("worker", provider, model)
+                        }))
+                        .temperature(override_value)
+                        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                            Vec::new(),
+                        ))
+                        .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                        .observer(Arc::new(crate::observability::NoopObserver))
+                        .provider_switch_config(ProviderSwitchConfig {
+                            config: Some(Arc::new(config.clone())),
+                            live_config: None,
+                            live: None,
+                        })
+                        .build()
+                        .unwrap();
+                    agent.model_name = selector.into();
+                    if streamed {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+                        let outcome = agent
+                            .turn_streamed_with_steering_state("hello", tx, None, None)
+                            .await
+                            .unwrap();
+                        assert!(outcome.response.starts_with("done"));
+                        assert_eq!(
+                            outcome.final_context_limits.unwrap().model_context_window,
+                            8_000
+                        );
+                        let mut reported = Vec::new();
+                        while let Ok(event) = rx.try_recv() {
+                            if let TurnEvent::Usage {
+                                model_context_window: Some(window),
+                                ..
+                            } = event
+                            {
+                                reported.push(window);
+                            }
+                        }
+                        assert!(!reported.is_empty());
+                        assert!(reported.iter().all(|window| *window == 8_000));
+                    } else {
+                        assert!(agent.turn("hello").await.unwrap().starts_with("done"));
+                    }
+                    let requests = target.received_requests().await.unwrap();
+                    let request = requests.last().unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["model"], "shared-id");
+                    assert_eq!(
+                        body["temperature"],
+                        override_value.unwrap_or(0.8),
+                        "{selector}, streamed={streamed}"
+                    );
+                    assert_eq!(body["max_tokens"], 77);
+                    assert_eq!(body["selected_only"], true);
+                    assert_eq!(
+                        body["chat_template_kwargs"],
+                        serde_json::json!({"enable_thinking": false})
+                    );
+                    assert!(
+                        body.get("profile_only").is_none(),
+                        "JSON fields replace the profile's field as a whole"
+                    );
+                    assert_eq!(
+                        request.headers["authorization"],
+                        "Bearer target-fixture-key"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_vision_route_resolves_selected_temperature_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if body["stream"] == true {
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "done"}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let mut config = Config::default();
+        let text = config.providers.models.ensure("custom", "text").unwrap();
+        text.uri = Some(server.uri());
+        text.model = Some("text-id".into());
+        text.temperature = Some(0.2);
+        text.vision = Some(false);
+        let vision = config.providers.models.ensure("custom", "vision").unwrap();
+        vision.uri = Some(server.uri());
+        vision.temperature = Some(0.7);
+        vision.models.insert(
+            "selected".into(),
+            ModelEntryConfig {
+                id: Some("vision-id".into()),
+                temperature: Some(0.8),
+                ..Default::default()
+            },
+        );
+        config.multimodal.vision_model_provider = Some("custom.vision.selected".into());
+        for override_value in [None, Some(0.2)] {
+            for streamed in [false, true] {
+                let mut agent = Agent::builder()
+                    .model_runtime(build_model(&config, "worker", "custom.text", None).unwrap())
+                    .temperature(override_value)
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        Vec::new(),
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::NoopObserver))
+                    .multimodal_config(config.multimodal.clone())
+                    .provider_switch_config(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live_config: None,
+                        live: None,
+                    })
+                    .build()
+                    .unwrap();
+                let message = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
+                if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    assert_eq!(
+                        agent.turn_streamed(message, tx, None).await.unwrap().0,
+                        "done"
+                    );
+                } else {
+                    assert_eq!(agent.turn(message).await.unwrap(), "done");
+                }
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(body["model"], "vision-id");
+                assert_eq!(body["temperature"], override_value.unwrap_or(0.8));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_cache_separates_same_id_selections_and_reloaded_tuning_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let mut answer = format!("tokens-{}", body["max_tokens"]);
+                if let Some(effort) = body["reasoning_effort"].as_str() {
+                    answer.push_str(&format!("-{effort}"));
+                }
+                if body["stream"] == true {
+                    let event = serde_json::json!({"choices": [{"delta": {"content": answer}, "finish_reason": "stop"}]});
+                    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {event}\n\ndata: [DONE]\n\n"))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": answer}}]
+                    }))
+                }
+            })
+            .mount(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(temp.path(), 60, 100).unwrap(),
+        );
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "cache").unwrap();
+        profile.uri = Some(server.uri());
+        profile.reasoning_effort_passthrough = true;
+        for (name, max_tokens) in [("first", 11), ("second", 77)] {
+            profile.models.insert(
+                name.into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    temperature: Some(0.0),
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+            );
+        }
+        let build = |config: &Config, reference: &str| {
+            Agent::builder()
+                .model_runtime(build_model(config, "worker", reference, None).unwrap())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .response_cache(Some(Arc::clone(&cache)))
+                .workspace_dir(temp.path().to_path_buf())
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap()
+        };
+        for streamed in [false, true] {
+            let message = format!("same cache request streamed={streamed}");
+            let before = server.received_requests().await.unwrap().len();
+            let mut current_config = config.clone();
+            let mut agent = build(&current_config, "custom.cache.first");
+            for (reference, tokens, reload, effort) in [
+                ("custom.cache.first", 11, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 77, false, None),
+                ("custom.cache.second", 99, true, None),
+                ("custom.cache.second", 99, false, None),
+                ("custom.cache.second", 99, false, Some("high")),
+                ("custom.cache.second", 99, false, Some("high")),
+            ] {
+                if reload {
+                    current_config
+                        .providers
+                        .models
+                        .ensure("custom", "cache")
+                        .unwrap()
+                        .models
+                        .get_mut("second")
+                        .unwrap()
+                        .max_tokens = Some(tokens);
+                }
+                current_config.runtime.reasoning_effort = effort.map(str::to_string);
+                agent.install_model_runtime(
+                    build_model(&current_config, "worker", reference, None).unwrap(),
+                );
+                agent.set_config_generation(Arc::new(current_config.clone()));
+                agent.history.clear();
+                let answer = if streamed {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    agent.turn_streamed(&message, tx, None).await.unwrap().0
+                } else {
+                    agent.turn(&message).await.unwrap()
+                };
+                let expected = effort.map_or_else(
+                    || format!("tokens-{tokens}"),
+                    |value| format!("tokens-{tokens}-{value}"),
+                );
+                assert_eq!(answer, expected);
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len() - before,
+                4,
+                "unchanged selections must still reuse the cache"
+            );
+            let tokens: Vec<_> = requests[before..]
+                .iter()
+                .map(|request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    body["max_tokens"].as_u64().unwrap()
+                })
+                .collect();
+            assert_eq!(tokens, [11, 77, 99, 99]);
+            let final_body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(final_body["reasoning_effort"], "high");
+        }
+    }
+
+    #[tokio::test]
+    async fn profiles_sharing_endpoint_keep_their_system_message_policy_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.model = Some("fixture-model".into());
+            profile.merge_system_into_user = merge;
+        }
+        for (alias, merge) in [("plain", false), ("merged", true)] {
+            let rt = build_model(&config, "worker", &format!("custom.{alias}"), None).unwrap();
+            zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider.as_ref())
+                .chat_with_system(Some("fixture system"), "hello", &rt.model.model_name, None)
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "system"),
+                !merge
+            );
+            assert!(body.to_string().contains("fixture system"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_install_preserves_override_and_unset_temperature_inherits_profile_on_wire() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.temperature = Some(0.9);
+        profile.models = HashMap::from([
+            (
+                "first".into(),
+                ModelEntryConfig {
+                    id: Some("first-id".into()),
+                    temperature: Some(0.2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "second".into(),
+                ModelEntryConfig {
+                    id: Some("second-id".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        for override_value in [None, Some(0.42)] {
+            let rt = build_model(&config, "worker", "custom.gw.first", None).unwrap();
+            let mut agent = Agent::builder()
+                .model_runtime(rt)
+                .temperature(override_value)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            agent.turn("hello").await.unwrap();
+            agent.install_model_runtime(
+                build_model(&config, "worker", "custom.gw.second", None).unwrap(),
+            );
+            agent.turn("hello again").await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let bodies: Vec<serde_json::Value> = requests
+                .iter()
+                .rev()
+                .take(2)
+                .map(|request| serde_json::from_slice(&request.body).unwrap())
+                .collect();
+            assert_eq!(bodies[1]["temperature"], override_value.unwrap_or(0.2));
+            assert_eq!(bodies[0]["temperature"], override_value.unwrap_or(0.9));
+            assert_eq!(bodies[0]["model"], "second-id");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_same_id_capacity_survives_real_turn_and_default_route() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig, ModelRouteConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1,\"total_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n",
+                )))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "gw").unwrap();
+        profile.uri = Some(server.uri());
+        profile.models = HashMap::from([
+            (
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(128_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "small".into(),
+                ModelEntryConfig {
+                    id: Some("shared-id".into()),
+                    context_window: Some(8_000),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.gw.small".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.configured_model_context_window("worker"),
+            Some(8_000)
+        );
+        // Exercise the no-router reliable primary and the routed path, including
+        // a hint back to the default entry with the identical provider-local ID.
+        for routed in [false, true] {
+            config.model_routes = if routed {
+                vec![ModelRouteConfig {
+                    hint: "large".into(),
+                    model_provider: "custom.gw".into(),
+                    model: "shared-id".into(),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let rt = build_model(&config, "worker", "custom.gw.small", None).unwrap();
+            let limits_config = config.clone();
+            let mut agent = Agent::builder()
+                .model_provider(rt.model.provider)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver))
+                .model_provider_name(rt.model.provider_name)
+                .model_name(rt.model.model_name)
+                .model_identity(rt.model.identity)
+                .model_route_resolver(rt.model.model_route_resolver)
+                .tool_dispatcher(rt.tool_dispatcher)
+                .context_limits_resolver(Arc::new(move |provider, model| {
+                    limits_config.resolved_context_limits_for_route("worker", provider, model)
+                }))
+                .provider_switch_config(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    live_config: None,
+                    live: None,
+                })
+                .build()
+                .unwrap();
+            assert_eq!(agent.context_limits().model_context_window, 8_000);
+            for (model, expected_window) in if routed {
+                vec![("shared-id", 8_000), ("hint:large", 128_000)]
+            } else {
+                vec![("shared-id", 8_000)]
+            } {
+                agent.model_name = model.into();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let outcome = agent
+                    .turn_streamed_with_steering_state("hello", tx, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.final_context_limits.unwrap().model_context_window,
+                    expected_window
+                );
+                let mut reported = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    if let TurnEvent::Usage {
+                        model_context_window: Some(window),
+                        ..
+                    } = event
+                    {
+                        reported.push(window);
+                    }
+                }
+                assert!(!reported.is_empty());
+                assert!(
+                    reported
+                        .iter()
+                        .all(|window| *window == expected_window as u64),
+                    "{reported:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_model_resolves_derived_values_from_the_selected_entry() {
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        // The profile carries one temperature/window; the entries carry
+        // their own. What the runtime derives must follow the selected
+        // entry, not the profile defaults.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                temperature: Some(0.2),
+                context_window: Some(8_000),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    temperature: Some(0.9),
+                    context_window: Some(100_000),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Three-segment ref: the selected entry's tuning wins.
+        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
+        assert_eq!(
+            config
+                .resolve_model_selection(&rt.model.identity.provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.2),
+            "entry temperature beats profile"
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
+            8_000,
+            "entry context window beats profile"
+        );
+
+        // Two-segment ref: the profile's values (default entry sets none).
+        let rt = build_model(&config, "tester", "openai.gw", None).unwrap();
+        assert_eq!(
+            config
+                .resolve_model_selection(&rt.model.identity.provider_ref())
+                .and_then(|s| s.temperature()),
+            Some(0.9)
+        );
+        assert_eq!(
+            config.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
+            100_000
+        );
+
+        // Unconfigured window falls back to the shared stub.
+        let mut bare = Config::default();
+        bare.providers.models.openai.insert(
+            "minimal".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("m".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let rt = build_model(&bare, "tester", "openai.minimal", None).unwrap();
+        assert_eq!(
+            bare.effective_model_context_window_for_route(
+                &rt.model.identity.provider_ref(),
+                &rt.model.model_name
+            ),
+            zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+    }
+
+    #[test]
+    fn build_model_keeps_selected_entry_tuning_over_default_entry() {
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        // `default` carries a tuning field; a three-segment ref selecting
+        // `cheap` must not have that field clobbered by the default entry.
+        // Before build_model passed the raw ref through, the providers chain
+        // re-resolved the normalised two-segment name, picked `models.default`,
+        // and overlaid ITS tuning on top of the selected entry's.
+        let mut config = Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o".to_string()),
+                vision: Some(false),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                vision: Some(true),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://gw.internal/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let rt = build_model(&config, "tester", "openai.gw.cheap", None).unwrap();
+
+        assert_eq!(rt.model.provider_name, "openai.gw");
+        assert_eq!(rt.model.model_name, "gpt-4o-mini");
+        assert!(
+            rt.model
+                .provider
+                .capabilities_for_model(&rt.model.model_name)
+                .vision,
+            "the selected entry's vision tuning must survive construction; a clobber by \
+             `models.default` (vision=false) means the raw ref did not reach the providers chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_model_switch_uses_only_target_profile_endpoint_and_credentials() {
+        use wiremock::{Mock, MockServer, matchers::method};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "from target"}}]
+                })),
+            )
+            .expect(2)
+            .mount(&target)
+            .await;
+
+        let mut config = Config::default();
+        {
+            let source_entry = config
+                .providers
+                .models
+                .ensure("custom", "source")
+                .expect("custom source profile");
+            source_entry.uri = Some(source.uri());
+            source_entry.api_key = Some("source-secret".into());
+            source_entry.model = Some("source-model".into());
+        }
+        {
+            let target_entry = config
+                .providers
+                .models
+                .ensure("custom", "target")
+                .expect("custom target profile");
+            target_entry.uri = Some(target.uri());
+            target_entry.api_key = Some("target-secret".into());
+            target_entry.models.insert(
+                "cheap".into(),
+                ModelEntryConfig {
+                    id: Some("target-model".into()),
+                    max_tokens: Some(123),
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "tester".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.source".into(),
+                ..Default::default()
+            },
+        );
+
+        let rt = build_model(&config, "tester", "custom.target.cheap", None)
+            .expect("target profile builds");
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(rt.model.provider.as_ref())
+            .simple_chat(
+                "hello",
+                &rt.model.model_name,
+                config
+                    .resolve_model_selection(&rt.model.identity.provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
+            .await
+            .expect("target profile responds");
+        assert_eq!(response, "from target");
+
+        config
+            .providers
+            .models
+            .ensure("custom", "target")
+            .expect("custom target profile")
+            .api_key = None;
+        let keyless_rt = build_model(&config, "tester", "custom.target.cheap", None)
+            .expect("keyless target profile builds");
+        zeroclaw_providers::ProviderDispatch::from_ref(keyless_rt.model.provider.as_ref())
+            .simple_chat(
+                "hello again",
+                &keyless_rt.model.model_name,
+                config
+                    .resolve_model_selection(&keyless_rt.model.identity.provider_ref())
+                    .and_then(|s| s.temperature()),
+            )
+            .await
+            .expect("keyless target profile responds");
+
+        assert!(source.received_requests().await.unwrap().is_empty());
+        let requests = target.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_auth = requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(first_auth, Some("Bearer target-secret"));
+        let second_auth = requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_ne!(second_auth, Some("Bearer source-secret"));
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "target-model");
+            assert_eq!(body["max_tokens"], 123);
+        }
     }
 
     /// Regression: trim write-back must never persist the provider-only
@@ -9943,6 +11012,121 @@ mod tests {
         );
         let summary = tracker.get_summary().unwrap();
         assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
+    }
+
+    /// Same-family pricing regression at the turn level: two `custom.*`
+    /// aliases with distinct rates, the agent bound to one of them, and a
+    /// real `Agent::turn` driven against a mock endpoint. The recorded cost
+    /// must come from the selected alias's pricing slot — a bare-family
+    /// lookup would be ambiguous here and record zero.
+    #[tokio::test]
+    async fn turn_bills_selected_same_family_alias_rate() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing,
+        };
+        use crate::cost::CostTracker;
+        use axum::{Json, Router, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        // OpenAI-compatible mock returning a fixed completion with exact
+        // usage: 1M input + 1M output tokens.
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "hello from mock"}}],
+                    "usage": {"prompt_tokens": 1_000_000_u64, "completion_tokens": 1_000_000_u64}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        {
+            let cheap = config
+                .providers
+                .models
+                .ensure("custom", "cheap")
+                .expect("custom cheap slot");
+            cheap.api_key = Some("test-key".to_string());
+            cheap.model = Some("cheap-model".to_string());
+            cheap.uri = Some(format!("http://{mock_addr}"));
+            cheap.pricing = HashMap::from([
+                ("cheap-model.input".to_string(), 0.15),
+                ("cheap-model.output".to_string(), 0.60),
+            ]);
+        }
+        {
+            let premium = config
+                .providers
+                .models
+                .ensure("custom", "premium")
+                .expect("custom premium slot");
+            premium.api_key = Some("test-key".to_string());
+            premium.model = Some("premium-model".to_string());
+            premium.uri = Some(format!("http://{mock_addr}"));
+            premium.pricing = HashMap::from([
+                ("premium-model.input".to_string(), 2.50),
+                ("premium-model.output".to_string(), 10.00),
+            ]);
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.premium".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent from config");
+        assert_eq!(agent.model_provider_name, "custom.premium");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), agent.turn("hello"))
+            .await
+            .expect("agent turn");
+
+        assert_eq!(response, "hello from mock");
+        // 1M input @ $2.50/Mtok + 1M output @ $10.00/Mtok = $12.50 from the
+        // selected `custom.premium` slot. The sibling alias would bill $0.75
+        // and a bare-family lookup (ambiguous between two aliases) zero.
+        let summary = tracker.get_summary().unwrap();
+        assert!(
+            (summary.daily_cost_usd - 12.50).abs() < 1e-12,
+            "turn must bill the selected alias's rates, got {}",
+            summary.daily_cost_usd
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -17466,13 +18650,128 @@ model_provider = "custom.only"
 
     #[test]
     fn try_apply_model_switch_noop_when_identical_to_current() {
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        // A switch to the model that is already running — however the ref
+        // spells it: the two-segment ref and the three-segment ref naming the
+        // selected entry are the same model — must not rebuild.
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    models: HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("gpt-4o-mini".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        let identity = config
+            .resolve_model_selection("openai.default")
+            .unwrap()
+            .identity(None);
+
+        let mut agent = build_test_agent(
+            "openai.default",
+            "gpt-4o-mini",
+            Some(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(config)),
+                live: None,
+                live_config: None,
+            }),
+        );
+        agent.model_identity = Some(identity);
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
-            "openai".to_string(),
+            "openai.default.default".to_string(),
             "gpt-4o-mini".to_string(),
         );
-        assert_eq!(result, None, "same-provider/same-model is a no-op");
+        assert_eq!(
+            result, None,
+            "a switch to the already-running model (2-seg vs 3-seg spelling) is a no-op"
+        );
+    }
+
+    #[test]
+    fn try_apply_model_switch_rebuilds_between_entries_of_one_profile() {
+        // Two entries under one profile sharing a model id are different
+        // models: once provider names normalise to two segments, the entry
+        // name is the only thing distinguishing them, so the switch must
+        // rebuild (and pick up the entry's own tuning) rather than no-op.
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "default".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                ..Default::default()
+            },
+        );
+        entries.insert(
+            "cheap".to_string(),
+            ModelEntryConfig {
+                id: Some("gpt-4o-mini".to_string()),
+                temperature: Some(0.4),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1".to_string()),
+                    models: entries,
+                    ..Default::default()
+                },
+            },
+        );
+        let identity = config
+            .resolve_model_selection("openai.gw.default")
+            .unwrap()
+            .identity(None);
+
+        let mut agent = build_test_agent(
+            "openai.gw",
+            "gpt-4o-mini",
+            Some(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(config)),
+                live: None,
+                live_config: None,
+            }),
+        );
+        agent.model_identity = Some(identity);
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai.gw.cheap".to_string(),
+            "gpt-4o-mini".to_string(),
+        );
+
+        assert_eq!(
+            result.as_deref(),
+            Some("gpt-4o-mini"),
+            "switching between entries of one profile is a real switch"
+        );
+        assert_eq!(
+            agent.model_provider_name, "openai.gw",
+            "the committed name is the normalised two-segment billing key"
+        );
+        assert_eq!(
+            agent.effective_temperature(),
+            Some(0.4),
+            "the selected entry's temperature moves with the switch"
+        );
     }
 
     #[test]
@@ -17628,9 +18927,12 @@ model_provider = "custom.only"
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result =
-            agent.try_apply_model_switch("gpt-4o-mini", "ollama".to_string(), "llama3".to_string());
+        let mut agent = build_test_agent("openai.default", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama.local".to_string(),
+            "llama3".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -17638,7 +18940,7 @@ model_provider = "custom.only"
             "successful switch must return the new effective model"
         );
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.local",
             "provider_name must reflect the switched provider after success"
         );
         assert_eq!(
@@ -17715,10 +19017,10 @@ model_provider = "custom.only"
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
+        let mut agent = build_test_agent("openai.first", "shared-name", Some(switch_cfg));
         let result = agent.try_apply_model_switch(
             "shared-name",
-            "ollama".to_string(),
+            "ollama.second".to_string(),
             "shared-name".to_string(),
         );
 
@@ -17728,7 +19030,7 @@ model_provider = "custom.only"
             "provider-only switch must also be treated as a successful switch"
         );
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.second",
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
@@ -17747,7 +19049,11 @@ model_provider = "custom.only"
         config.multimodal.max_images = 8;
         config.multimodal.max_image_size_mb = 10;
 
-        let options = switch_runtime_options(&config, "ollama");
+        let options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            "ollama",
+            &zeroclaw_providers::provider_runtime_options_for_bare_family(&config),
+        );
 
         assert_eq!(
             options.multimodal.max_images, 8,
@@ -17815,7 +19121,7 @@ model_provider = "custom.only"
     #[test]
     fn try_apply_model_switch_prefers_route_api_key() {
         let route = zeroclaw_config::schema::ModelRouteConfig {
-            model_provider: "ollama".to_string(),
+            model_provider: "ollama.local".to_string(),
             model: "tinyllama".to_string(),
             hint: "fast".to_string(),
             api_key: Some("route-specific-key".to_string()),
@@ -17831,10 +19137,10 @@ model_provider = "custom.only"
             live: None,
         };
 
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        let mut agent = build_test_agent("openai.default", "gpt-4o-mini", Some(switch_cfg));
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
-            "ollama".to_string(),
+            "ollama.local".to_string(),
             "tinyllama".to_string(),
         );
 
@@ -17843,7 +19149,7 @@ model_provider = "custom.only"
             Some("tinyllama"),
             "switch must succeed when a model_routes entry matches the target"
         );
-        assert_eq!(agent.model_provider_name, "ollama");
+        assert_eq!(agent.model_provider_name, "ollama.local");
     }
 
     /// Streamed mock whose first call emits a tool call (queuing a model
@@ -18014,15 +19320,27 @@ model_provider = "custom.only"
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
 
-        let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+        let switch_config = {
+            let mut cfg = zeroclaw_config::schema::Config {
                 reliability: zeroclaw_config::schema::ReliabilityConfig {
                     provider_retries: 0,
                     provider_backoff_ms: 0,
                     ..zeroclaw_config::schema::ReliabilityConfig::default()
                 },
                 ..zeroclaw_config::schema::Config::default()
-            })),
+            };
+            let provider = cfg
+                .providers
+                .models
+                .ensure("ollama", "local")
+                .expect("ollama provider slot exists");
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.model = Some("llama3".into());
+            provider.temperature = Some(0.55);
+            cfg
+        };
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(switch_config)),
             live_config: None,
             live: None,
         };
@@ -18051,7 +19369,7 @@ model_provider = "custom.only"
             .model_provider(provider)
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
                 vec![Box::new(ModelSwitchTriggerTool {
-                    target_provider: "ollama".to_string(),
+                    target_provider: "ollama.local".to_string(),
                     target_model: "llama3".to_string(),
                 })],
             ))
@@ -18086,12 +19404,18 @@ model_provider = "custom.only"
         // `turn_streamed` itself must have consumed the pending switch and
         // committed the rebuilt provider/model via `ProviderSwitchConfig`.
         assert_eq!(
-            agent.model_provider_name, "ollama",
+            agent.model_provider_name, "ollama.local",
             "turn_streamed must commit the switched provider after the tool result"
         );
         assert_eq!(
             agent.model_name, "llama3",
             "turn_streamed must commit the switched model after the tool result"
+        );
+        assert_eq!(
+            agent.effective_temperature(),
+            Some(0.55),
+            "turn_streamed must move the temperature to the switched profile's — \
+             this value is what the post-switch request in the same turn sends"
         );
         let prompt = match agent.history.first() {
             Some(ConversationMessage::Chat(message)) if message.role == "system" => {
@@ -18121,13 +19445,13 @@ model_provider = "custom.only"
             matches!(
                 e,
                 ObserverEvent::LlmRequest { model_provider, model, .. }
-                    if model_provider == "ollama" && model == "llama3"
+                    if model_provider == "ollama.local" && model == "llama3"
             )
         });
         assert!(
             switched_request,
             "turn_streamed must issue the next provider call against the switched \
-             provider/model (ollama/llama3); captured events: {events:?}"
+             provider/model (ollama.local/llama3); captured events: {events:?}"
         );
         drop(events);
     }

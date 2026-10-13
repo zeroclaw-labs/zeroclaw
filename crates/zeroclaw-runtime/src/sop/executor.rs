@@ -1034,9 +1034,7 @@ async fn drive_headless_run(
                                 Some(context),
                                 None,
                                 None,
-                                effective_config
-                                    .model_provider_for_agent(&agent_alias)
-                                    .and_then(|e| e.temperature),
+                                None,
                                 vec![],
                                 false,
                                 Some(session_path),

@@ -1,7 +1,6 @@
 //! RPC session state.
 
 use crate::agent::agent::{Agent, TurnEvent};
-use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +8,6 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
-use zeroclaw_providers::ModelProvider;
 
 /// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
 #[derive(Debug)]
@@ -18,20 +16,6 @@ pub(crate) enum WaitForProviderUpdateError {
     SessionNotFound,
     /// The update lock was not released within the requested timeout.
     Timeout,
-}
-
-/// One transient, generation-bound provider publication. Every field is
-/// derived from the same config snapshot and committed under the session
-/// generation fence; this is a transfer object, not another source of truth.
-pub(crate) struct ModelProviderUpdate {
-    pub model_provider: Box<dyn ModelProvider>,
-    pub model_provider_name: String,
-    pub model_name: String,
-    pub model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
-    pub tool_dispatcher: Box<dyn ToolDispatcher>,
-    pub config_generation: Arc<zeroclaw_config::schema::Config>,
-    pub temperature: Option<Option<f64>>,
-    pub multimodal_config: zeroclaw_config::schema::MultimodalConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1336,9 +1320,10 @@ impl SessionStore {
         Some(merged)
     }
 
-    /// Swap a freshly built `ModelProvider` box (and its name) onto the
-    /// session's agent. Called by the dispatcher after it constructs the
-    /// box from config, keeping model_provider-build logic out of the store.
+    /// Commit a freshly built [`ModelRuntime`](crate::agent::agent::ModelRuntime)
+    /// wholesale onto the session's agent. Called by the dispatcher after it
+    /// builds the runtime from config, keeping model-construction logic out of
+    /// the store.
     /// The route resolver is installed in the SAME state transition as the
     /// provider box: it holds the hint→route table bound to that provider set,
     /// so leaving the old resolver would resolve routed hints through the
@@ -1361,20 +1346,17 @@ impl SessionStore {
     /// same session". Live same-ID `session/new` requests resume the existing
     /// incarnation rather than replacing it.
     ///
-    /// When `temperature` is `Some(v)`, the captured agent's temperature is
-    /// set to `v` (which may be `None`, clearing a prior profile temperature).
-    /// When `temperature` is `None`, the agent's temperature is left unchanged
-    /// — used by `session/configure` where temperature is already committed
-    /// via `set_overrides_gated`.
-    ///
-    /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
-    /// caller built the provider box from, so the agent-side preparation pass
-    /// and the provider boundary stay on one policy after a live refresh.
-    pub(crate) async fn apply_model_provider(
+    /// `temperature_override` is the session-level explicit temperature; it
+    /// is overlaid on the runtime's config-derived temperature (`entry ∨
+    /// profile`) here — the single place session overrides meet model state,
+    /// so refresh and configure cannot diverge on the composition.
+    pub async fn apply_model_provider(
         &self,
         id: &str,
         generation: u64,
-        update: ModelProviderUpdate,
+        rt: crate::agent::agent::ModelRuntime,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
+        temperature_override: Option<f64>,
     ) -> bool {
         let done = self.wait_test_gate().await;
         let agent = {
@@ -1392,16 +1374,10 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(update.model_provider);
-        guard.set_model_provider_name(update.model_provider_name);
-        guard.set_model_name(update.model_name);
-        guard.set_model_route_resolver(update.model_route_resolver);
-        guard.set_tool_dispatcher(update.tool_dispatcher);
-        guard.set_multimodal_config(update.multimodal_config);
-        guard.set_config_generation(update.config_generation);
-        if let Some(t) = update.temperature {
-            guard.set_temperature(t);
-        }
+        guard.install_model_runtime(rt);
+        guard.set_multimodal_config(config_generation.multimodal.clone());
+        guard.set_config_generation(config_generation);
+        guard.set_temperature(temperature_override);
         self.signal_test_gate_done(done);
         true
     }
@@ -3433,25 +3409,32 @@ mod tests {
         assert_eq!(overrides.temperature, Some(0.7));
     }
 
-    fn test_model_provider_update(
+    /// Minimal [`crate::agent::agent::ModelRuntime`] for store tests: the
+    /// fields the assertions below read, with stub provider/dispatcher boxes.
+    fn test_model_runtime(
         provider_name: &str,
         model_name: &str,
-        temperature: Option<Option<f64>>,
-        multimodal_config: zeroclaw_config::schema::MultimodalConfig,
-    ) -> ModelProviderUpdate {
-        ModelProviderUpdate {
-            model_provider: Box::new(StubProvider),
-            model_provider_name: provider_name.into(),
-            model_name: model_name.into(),
-            model_route_resolver: Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
-                Vec::new(),
-                provider_name.into(),
-                model_name.into(),
-            )),
+    ) -> crate::agent::agent::ModelRuntime {
+        crate::agent::agent::ModelRuntime {
             tool_dispatcher: Box::new(NativeToolDispatcher),
-            config_generation: Arc::new(zeroclaw_config::schema::Config::default()),
-            temperature,
-            multimodal_config,
+            model: zeroclaw_providers::model::BuiltModel {
+                provider: Box::new(StubProvider),
+                provider_name: provider_name.to_string(),
+                model_name: model_name.to_string(),
+                identity: zeroclaw_config::schema::ModelIdentity {
+                    family: "test".to_string(),
+                    alias: provider_name.to_string(),
+                    entry_alias: None,
+                    model_id: model_name.to_string(),
+                },
+                model_route_resolver: Arc::new(
+                    zeroclaw_providers::router::ModelRouteResolver::new(
+                        Vec::new(),
+                        provider_name.to_string(),
+                        model_name.to_string(),
+                    ),
+                ),
+            },
         }
     }
 
@@ -3480,12 +3463,9 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update(
-                    "stale-provider",
-                    "stale-model",
-                    Some(Some(0.99)),
-                    zeroclaw_config::schema::MultimodalConfig::default(),
-                ),
+                test_model_runtime("stale-provider", "stale-model"),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Some(0.99),
             )
             .await;
         assert!(
@@ -3615,12 +3595,9 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update(
-                    "new-provider",
-                    "new-model",
-                    Some(Some(0.42)),
-                    zeroclaw_config::schema::MultimodalConfig::default(),
-                ),
+                test_model_runtime("new-provider", "new-model"),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Some(0.42),
             )
             .await;
         assert!(applied, "current generation must be accepted");
@@ -3664,7 +3641,12 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update("new-provider", "new-model", None, refreshed),
+                test_model_runtime("new-provider", "new-model"),
+                Arc::new(zeroclaw_config::schema::Config {
+                    multimodal: refreshed,
+                    ..Default::default()
+                }),
+                None,
             )
             .await;
         assert!(applied, "current generation must be accepted");

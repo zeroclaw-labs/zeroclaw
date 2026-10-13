@@ -2633,14 +2633,12 @@ struct ChannelThinkingResolution {
     effective_content: String,
     level: ThinkingLevel,
     params: zeroclaw_runtime::agent::thinking::ThinkingParams,
-    effective_temperature: Option<f64>,
 }
 
 fn resolve_channel_thinking(
     content: &str,
     session_override: Option<ThinkingLevel>,
     config: &ThinkingConfig,
-    base_temperature: Option<f64>,
 ) -> ChannelThinkingResolution {
     let (directive, effective_content) =
         match zeroclaw_runtime::agent::thinking::parse_thinking_directive(content) {
@@ -2653,17 +2651,10 @@ fn resolve_channel_thinking(
         config,
     );
     let params = zeroclaw_runtime::agent::thinking::apply_thinking_level_with_config(level, config);
-    let effective_temperature = base_temperature.map(|temperature| {
-        zeroclaw_runtime::agent::thinking::clamp_temperature(
-            temperature + params.temperature_adjustment,
-        )
-    });
-
     ChannelThinkingResolution {
         effective_content,
         level,
         params,
-        effective_temperature,
     }
 }
 
@@ -2780,7 +2771,7 @@ fn resolve_models_command(
     raw: &str,
 ) -> ModelsCommandResolution {
     let candidate = raw.trim();
-    if let Some((family, alias)) = candidate.split_once('.') {
+    if let Some((family, alias)) = config.providers.models.profile_ref(candidate) {
         return match config.providers.models.find(family, alias) {
             Some(_) => ModelsCommandResolution::Resolved(format!("{family}.{alias}")),
             None => ModelsCommandResolution::NoAlias(candidate.to_string()),
@@ -2856,7 +2847,10 @@ fn model_provider_entry_for_ref<'a>(
         anyhow::bail!("model_provider reference must not be empty");
     }
 
-    let Some((provider_type, provider_alias)) = trimmed.split_once('.') else {
+    // Accept both `<type>.<alias>` and `<type>.<alias>.<model>`. The provider
+    // profile is keyed by the first two segments, while the complete reference
+    // remains the identity of the selected model for reload and routing.
+    let Some((provider_type, provider_alias)) = config.providers.models.profile_ref(trimmed) else {
         anyhow::bail!("model_provider `{trimmed}` must use `<type>.<alias>` form");
     };
     let Some(entry) = config.providers.models.find(provider_type, provider_alias) else {
@@ -2873,12 +2867,16 @@ fn runtime_defaults_from_config(
     model_provider: &str,
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
     let (default_model_provider, entry) = model_provider_entry_for_ref(config, model_provider)?;
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
+    // Resolve the (possibly three-segment) selection so a
+    // `<type>.<alias>.<model>` ref picks the model entry's `id` and per-model
+    // temperature; a two-segment ref falls back to the profile's `model`.
+    let selection = config.resolve_model_selection(model_provider.trim());
+    let model = selection
+        .as_ref()
+        .and_then(|s| s.model_id.clone())
+        .or_else(|| entry.model.clone())
+        .map(|m| m.trim().to_string())
         .filter(|model| !model.is_empty())
-        .map(ToString::to_string)
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2896,10 +2894,14 @@ fn runtime_defaults_from_config(
                  fallback entry."
             ))
         })?;
+    let temperature = selection
+        .as_ref()
+        .and_then(|s| s.temperature())
+        .or(entry.temperature);
     Ok(ChannelRuntimeDefaults {
         default_model_provider,
         model,
-        temperature: entry.temperature,
+        temperature,
         api_key: entry.api_key.clone(),
         api_url: entry.uri.clone(),
         reliability: config.reliability.clone(),
@@ -3002,10 +3004,22 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
-    let next_options = zeroclaw_providers::options_for_provider_ref(
+    let mut next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
         &ctx.provider_runtime_options,
+    );
+    // `options_for_provider_ref` resolves profile-level options only; overlay
+    // the per-model tuning for the selected model entry. The reload defaults
+    // keep the agent's complete reference (`<type>.<alias>` or
+    // `<type>.<alias>.<model>`), so resolving from it preserves a non-default
+    // nested model across hot reloads.
+    zeroclaw_providers::apply_model_entry_options(
+        &mut next_options,
+        next_config
+            .resolve_model_selection(&next_defaults.default_model_provider)
+            .as_ref()
+            .and_then(|s| s.model_entry),
     );
     let model_provider_instance = zeroclaw_providers::create_resilient_model_provider_from_ref(
         next_config.as_ref(),
@@ -3140,6 +3154,7 @@ fn set_route_selection(
 
 fn apply_model_ref(
     sel: &mut ChannelRouteSelection,
+    config: &zeroclaw_config::schema::Config,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     model: &str,
 ) {
@@ -3148,7 +3163,10 @@ fn apply_model_ref(
         .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
     {
         sel.model_provider = route.model_provider.clone();
-        sel.model = route.model.clone();
+        // An unset route model resolves through the selection contract so a
+        // three-segment route ref keeps the named model entry's id instead of
+        // dispatching with an empty model string.
+        sel.model = route.effective_model(config);
         sel.api_key = route.api_key.clone();
     } else {
         sel.model = model.to_string();
@@ -4444,7 +4462,7 @@ fn provider_credentials_for_ref(
     config: &zeroclaw_config::schema::Config,
     provider_ref: &str,
 ) -> (Option<String>, Option<String>) {
-    let Some((type_key, alias_key)) = provider_ref.trim().split_once('.') else {
+    let Some((type_key, alias_key)) = config.providers.models.profile_ref(provider_ref) else {
         return (None, None);
     };
     config
@@ -4493,12 +4511,18 @@ async fn get_or_create_provider(
     let effective_api_key = route_api_key.map(ToString::to_string).or(entry_api_key);
 
     let model_provider = create_resilient_model_provider_nonblocking(
-        config,
+        Arc::clone(&config),
         provider_name,
         effective_api_key,
         entry_api_url,
         defaults.reliability,
         ctx.provider_runtime_options.clone(),
+        // Resolve the ref's selected model entry: default-route selections
+        // carry the agent's complete reference, and route refs may name a
+        // nested model directly.
+        config
+            .resolve_model_selection(provider_name)
+            .and_then(|s| s.model_entry.cloned()),
     )
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
@@ -4529,14 +4553,18 @@ async fn create_resilient_model_provider_nonblocking(
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    model_entry: Option<zeroclaw_config::schema::ModelEntryConfig>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        let options = zeroclaw_providers::options_for_provider_ref(
+        let mut options = zeroclaw_providers::options_for_provider_ref(
             &config,
             &provider_name,
             &provider_runtime_options,
         );
+        // `options_for_provider_ref` re-derives base options from the profile
+        // for a dotted ref, so overlay the selected model entry's tuning here.
+        zeroclaw_providers::apply_model_entry_options(&mut options, model_entry.as_ref());
         zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
             &provider_name,
@@ -5075,7 +5103,12 @@ async fn handle_runtime_command_for_delivery(
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
-                apply_model_ref(&mut next, &ctx.model_routes, &model);
+                apply_model_ref(
+                    &mut next,
+                    defaults_snapshot.config.as_ref(),
+                    &ctx.model_routes,
+                    &model,
+                );
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
                 if scope == OverrideScope::Agent {
                     let channel_alias =
@@ -5138,12 +5171,22 @@ async fn handle_runtime_command_for_delivery(
                 #[cfg(feature = "channel-telegram")]
                 let picker_applied =
                     crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
-                        apply_model_ref(&mut current, &ctx.model_routes, &model);
+                        apply_model_ref(
+                            &mut current,
+                            defaults_snapshot.config.as_ref(),
+                            &ctx.model_routes,
+                            &model,
+                        );
                         set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
                     });
                 #[cfg(not(feature = "channel-telegram"))]
                 {
-                    apply_model_ref(&mut current, &ctx.model_routes, &model);
+                    apply_model_ref(
+                        &mut current,
+                        defaults_snapshot.config.as_ref(),
+                        &ctx.model_routes,
+                        &model,
+                    );
                     set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
                 }
                 #[cfg(feature = "channel-telegram")]
@@ -5435,6 +5478,7 @@ impl AssistantChannelOutcome {
 }
 
 async fn classify_channel_reply_intent(
+    config: &Config,
     model_provider: &dyn ModelProvider,
     system_prompt: &str,
     history: &[ChatMessage],
@@ -5479,9 +5523,20 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
-        .await?;
+    // The scalar is a compatibility default for unconfigured/bare providers,
+    // never an invocation override. Each configured reliable candidate resolves
+    // its own temperature from this admitted generation.
+    let response = zeroclaw_providers::temperature::with_temperature(
+        Some(config),
+        None.into(),
+        ProviderDispatch::from_ref(model_provider).chat_with_system(
+            Some(system_prompt),
+            &convo,
+            model,
+            temperature,
+        ),
+    )
+    .await?;
     Ok(parse_reply_intent(&response))
 }
 
@@ -5533,7 +5588,12 @@ async fn resolve_classifier_route(
         return None;
     }
 
-    let (type_key, alias_key) = match provider_str.split_once('.') {
+    let (type_key, alias_key) = match defaults_snapshot
+        .config
+        .providers
+        .models
+        .profile_ref(provider_str)
+    {
         Some(parts) => parts,
         None => {
             ::zeroclaw_log::record!(
@@ -5566,8 +5626,20 @@ async fn resolve_classifier_route(
         }
     };
 
-    let model = model_cfg.model.clone().unwrap_or_default();
-    let temperature = model_cfg.temperature;
+    // Resolve the (possibly three-segment) selection so a
+    // `<type>.<alias>.<model>` classifier ref picks the model entry's id/temp.
+    let selection = defaults_snapshot
+        .config
+        .resolve_model_selection(provider_str.trim());
+    let model = selection
+        .as_ref()
+        .and_then(|s| s.model_id.clone())
+        .or_else(|| model_cfg.model.clone())
+        .unwrap_or_default();
+    let temperature = selection
+        .as_ref()
+        .and_then(|s| s.temperature())
+        .or(model_cfg.temperature);
     if model.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -5581,6 +5653,9 @@ async fn resolve_classifier_route(
 
     let provider = match get_or_create_provider(
         ctx,
+        // Pass the complete (possibly three-segment) ref so the provider
+        // cache keys on the named model entry and its per-model tuning is
+        // resolved, matching the id/temperature pair derived above.
         provider_str,
         model_cfg.api_key.as_deref(),
         defaults_snapshot,
@@ -9041,7 +9116,6 @@ async fn process_channel_message_body(
         &msg.content,
         thinking_override,
         &ctx.agent_cfg.resolved.thinking,
-        runtime_defaults_snapshot(ctx.as_ref()).defaults.temperature,
     );
     if thinking.effective_content != msg.content {
         ::zeroclaw_log::record!(
@@ -9145,10 +9219,14 @@ async fn process_channel_message_body(
             .iter()
             .find(|r| r.hint.eq_ignore_ascii_case(&hint))
     {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": matched_route.model.as_str()})), "Channel message classified — overriding route");
+        // An unset route model resolves through the selection contract so a
+        // three-segment route ref dispatches to the named model entry instead
+        // of carrying an empty model string into the turn.
+        let route_model = matched_route.effective_model(runtime_defaults.config.as_ref());
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": route_model.as_str()})), "Channel message classified — overriding route");
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
-            model: matched_route.model.clone(),
+            model: route_model,
             api_key: matched_route.api_key.clone(),
         };
     }
@@ -9481,17 +9559,19 @@ async fn process_channel_message_body(
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
-                        None,
+                        runtime_defaults.config.resolve_model_selection(&route.model_provider)
+                            .map_or(runtime_defaults.defaults.temperature, |selection| selection.temperature()),
                     )
                 });
 
                 let started = Instant::now();
                 let precheck_future = classify_channel_reply_intent(
+                    runtime_defaults.config.as_ref(),
                     classifier_provider_arc.as_ref(),
                     history[0].content.as_str(),
                     &history,
                     classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                    classifier_temperature,
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
@@ -9997,7 +10077,7 @@ async fn process_channel_message_body(
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
                         dispatch_model: route.model.as_str(),
-                        temperature: thinking.effective_temperature,
+                        temperature: zeroclaw_providers::temperature::Temperature::adjusted(None, thinking.params.temperature_adjustment),
                     },
                     ResolvedIo {
                         tools_registry: ctx.tools_registry.as_ref(),
@@ -10010,9 +10090,9 @@ async fn process_channel_message_body(
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
-                        // same canonical `prompt_config` snapshot this path already
-                        // uses for provider construction.
-                        config: Some(ctx.prompt_config.as_ref()),
+                        // same generation used for this route's provider cache,
+                        // including a hot-reloaded model profile.
+                        config: Some(runtime_defaults.config.as_ref()),
                         hooks: ctx.hooks.as_deref(),
                         activated_tools: ctx.activated_tools.as_ref(),
                         model_switch_callback: None,
@@ -16601,6 +16681,11 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         let provider_reliability = runtime_defaults.reliability.clone();
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
+        // Per-model tuning for the agent's selected entry is applied inside the
+        // builder (which re-derives base options from the profile).
+        let model_entry_options = config
+            .resolve_model_selection(agent.model_provider.as_str())
+            .and_then(|s| s.model_entry.cloned());
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
@@ -16609,6 +16694,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 provider_api_url.clone(),
                 provider_reliability.clone(),
                 provider_runtime_options.clone(),
+                model_entry_options.clone(),
             )
             .await?,
         );
@@ -17118,11 +17204,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 &config.data_dir,
             )
             .map(|tracker| {
-                let by_type =
-                    zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
+                let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
                 ChannelCostTrackingState {
                     tracker,
-                    model_provider_pricing: Arc::new(by_type),
+                    model_provider_pricing: Arc::new(pricing),
                     agent_alias: Arc::new(agent_alias.clone()),
                 }
             }),
@@ -22032,6 +22117,167 @@ temperature = 0.3
         );
     }
 
+    #[tokio::test]
+    async fn classifier_fallback_resolves_sampling_from_admitted_config() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+
+        let primary = MockServer::start().await;
+        let backup = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "NO_REPLY[INFO]: ambient chatter"}}]
+            })))
+            .mount(&backup)
+            .await;
+        let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        for (alias, server, temperature) in
+            [("classifier", &primary, 0.2), ("backup", &backup, 0.8)]
+        {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some(server.uri());
+            profile.temperature = Some(0.9);
+            profile.models.insert(
+                "chosen".into(),
+                ModelEntryConfig {
+                    id: Some(format!("{alias}-id")),
+                    temperature: Some(temperature),
+                    ..Default::default()
+                },
+            );
+        }
+        config
+            .providers
+            .models
+            .ensure("custom", "classifier")
+            .unwrap()
+            .fallback = vec!["custom.backup.chosen".into()];
+        let ctx = ChannelRuntimeContext {
+            prompt_config: Arc::new(config.clone()),
+            ..(*router_test_ctx()).clone()
+        };
+        let reference = "custom.classifier.chosen".into();
+        let (provider, model, temperature) =
+            resolve_classifier_route(&ctx, &reference, &runtime_defaults_snapshot(&ctx))
+                .await
+                .unwrap();
+        // Reuse the handle with another admitted generation: sampling is read
+        // at call time, rather than snapshotted during provider construction.
+        for expected in [0.8, 0.6] {
+            config
+                .providers
+                .models
+                .ensure("custom", "backup")
+                .unwrap()
+                .models
+                .get_mut("chosen")
+                .unwrap()
+                .temperature = Some(expected);
+            let outcome = classify_channel_reply_intent(
+                &config,
+                provider.as_ref(),
+                "system",
+                &[ChatMessage::user("hello")],
+                &model,
+                temperature,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                AssistantChannelOutcome::NoReply {
+                    kind: NoReplyKind::Informational,
+                    ..
+                }
+            ));
+            let requests = backup.received_requests().await.unwrap();
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| !request.body.is_empty())
+                .expect("classifier request body");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "backup-id");
+            assert_eq!(body["temperature"], expected);
+        }
+        let requests = primary.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| !request.body.is_empty())
+            .expect("primary classifier request body");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn classifier_without_temperature_does_not_inherit_main_agent_sampling() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::ModelEntryConfig;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "NO_REPLY[INFO]: ambient chatter"}}]
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "classifier")
+            .unwrap();
+        profile.uri = Some(server.uri());
+        profile.models.insert(
+            "chosen".into(),
+            ModelEntryConfig {
+                id: Some("classifier-id".into()),
+                ..Default::default()
+            },
+        );
+        let channel = Arc::new(RecordingChannel::default());
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            classifier_provider: "custom.classifier.chosen".into(),
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            Arc::new(DummyModelProvider),
+            config,
+            agent,
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx).unwrap().temperature = Some(0.9);
+        process_channel_message(
+            ctx,
+            channel_message("test-channel", None),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(channel.sent_messages.lock().await.is_empty());
+        // Provider construction may issue an empty warmup request;
+        // only the request carrying conversation JSON is a classification call.
+        let requests = server.received_requests().await.unwrap();
+        let classifier_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| !request.body.is_empty())
+            .collect();
+        assert_eq!(classifier_requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&classifier_requests[0].body).unwrap();
+        assert_eq!(body["model"], "classifier-id");
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
     #[test]
     fn agent_router_multi_routes_each_alias_to_its_owning_agent() {
         let clamps_ctx = router_test_ctx();
@@ -22605,6 +22851,148 @@ api_key = "cold-key"
             Some("https://hot.example.test/v1")
         );
         assert_eq!(defaults.temperature, Some(0.2));
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_preserves_nested_model_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[agents.agent_a]
+model_provider = "openrouter.hot.reasoning"
+
+[providers.models.openrouter.hot]
+api_key = "hot-key"
+uri = "https://hot.example.test/v1"
+
+[providers.models.openrouter.hot.models.reasoning]
+id = "or-reasoning-model"
+temperature = 0.1
+"#,
+        )
+        .await
+        .unwrap();
+
+        let (config, defaults) = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .unwrap();
+
+        // The complete three-segment ref survives the reload — collapsing it
+        // to `openrouter.hot` would fall back to the profile's default/legacy
+        // model on the rebuild path.
+        assert_eq!(defaults.default_model_provider, "openrouter.hot.reasoning");
+        assert_eq!(defaults.model, "or-reasoning-model");
+        assert_eq!(defaults.api_key.as_deref(), Some("hot-key"));
+        assert_eq!(defaults.temperature, Some(0.1));
+        // The selected nested entry resolves for the per-model tuning overlay.
+        let selection = config
+            .resolve_model_selection(&defaults.default_model_provider)
+            .expect("nested model selection resolves after reload");
+        assert_eq!(selection.model_id.as_deref(), Some("or-reasoning-model"));
+        assert!(selection.model_entry.is_some());
+    }
+
+    #[tokio::test]
+    async fn resilient_channel_provider_pins_selected_nested_model_over_legacy_model() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_config::schema::{
+            Config, ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
+        };
+        use zeroclaw_providers::ChatRequest;
+
+        type Capture = Arc<StdMutex<Option<Value>>>;
+
+        async fn capture_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            *capture.lock().unwrap() = Some(body);
+            Json(json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        }
+
+        let capture: Capture = Arc::new(StdMutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock model endpoint");
+        let address = listener.local_addr().expect("mock endpoint address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_request))
+            .with_state(Arc::clone(&capture));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock model endpoint");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "channel".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("legacy-channel-model".to_string()),
+                    api_key: Some("sk-test".to_string()),
+                    uri: Some(format!("http://{address}/v1")),
+                    wire_api: Some(WireApi::ChatCompletions),
+                    models: HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("nested-channel-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        let model_entry = config
+            .resolve_model_selection("openai.channel.fast")
+            .and_then(|selection| selection.model_entry.cloned());
+        let provider = create_resilient_model_provider_nonblocking(
+            Arc::new(config.clone()),
+            "openai.channel.fast",
+            Some("sk-test".to_string()),
+            Some(format!("http://{address}/v1")),
+            config.reliability.clone(),
+            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            model_entry,
+        )
+        .await
+        .expect("channel provider should construct");
+        let messages = [ChatMessage::user("hello")];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "nested-channel-model",
+                None,
+            )
+            .await
+            .expect("channel provider should reach configured endpoint");
+
+        let body = capture
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mock endpoint was called");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("nested-channel-model")
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -43818,16 +44206,20 @@ BTC is currently around $65,000 based on latest tool output."#
             default_level: ThinkingLevel::Low,
             ..ThinkingConfig::default()
         };
-        let resolved = resolve_channel_thinking(
-            "explain the tradeoff",
-            Some(ThinkingLevel::High),
-            &config,
-            Some(0.5),
-        );
+        let resolved =
+            resolve_channel_thinking("explain the tradeoff", Some(ThinkingLevel::High), &config);
 
         assert_eq!(resolved.effective_content, "explain the tradeoff");
         assert_eq!(resolved.level, ThinkingLevel::High);
-        assert!(resolved.effective_temperature.unwrap() > 0.5);
+        assert!(
+            zeroclaw_providers::temperature::Temperature::adjusted(
+                Some(0.5),
+                resolved.params.temperature_adjustment
+            )
+            .resolve(None, "test")
+            .unwrap()
+                > 0.5
+        );
     }
 
     #[test]
@@ -43840,12 +44232,19 @@ BTC is currently around $65,000 based on latest tool output."#
             "/think:off explain briefly",
             Some(ThinkingLevel::Max),
             &config,
-            Some(0.5),
         );
 
         assert_eq!(resolved.effective_content, "explain briefly");
         assert_eq!(resolved.level, ThinkingLevel::Off);
-        assert!(resolved.effective_temperature.unwrap() < 0.5);
+        assert!(
+            zeroclaw_providers::temperature::Temperature::adjusted(
+                Some(0.5),
+                resolved.params.temperature_adjustment
+            )
+            .resolve(None, "test")
+            .unwrap()
+                < 0.5
+        );
     }
 
     #[test]
@@ -43854,12 +44253,8 @@ BTC is currently around $65,000 based on latest tool output."#
             default_level: ThinkingLevel::Low,
             ..ThinkingConfig::default()
         };
-        let resolved = resolve_channel_thinking(
-            "/think:max summarize https://example.com",
-            None,
-            &config,
-            Some(0.5),
-        );
+        let resolved =
+            resolve_channel_thinking("/think:max summarize https://example.com", None, &config);
 
         assert_eq!(resolved.effective_content, "summarize https://example.com");
         assert_eq!(resolved.level, ThinkingLevel::Max);

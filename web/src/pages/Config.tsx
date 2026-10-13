@@ -18,6 +18,7 @@ import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Check, ChevronRight, MessageSquare, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import {
   ApiError,
+  createMapKey,
   deleteMapKey,
   getDeletePlan,
   getDrift,
@@ -88,11 +89,19 @@ export default function Config() {
   //   :section              → section overview
   //   :section/:type        → alias list (providers/channels) or picker (others)
   //   :section/:type/:alias → field form
+  //   :section/:type/:alias/:sub → nested subtable entry field form
+  //                                (providers.models model entries)
   const {
     section: sectionParam,
     type: typeParam,
     alias: aliasParam,
-  } = useParams<{ section?: string; type?: string; alias?: string }>();
+    sub: subParam,
+  } = useParams<{
+    section?: string;
+    type?: string;
+    alias?: string;
+    sub?: string;
+  }>();
   const location = useLocation();
   const navigate = useNavigate();
   const lockedSection = location.pathname.startsWith("/setup/")
@@ -161,6 +170,11 @@ export default function Config() {
   // Bust FieldForm's per-provider model catalog cache on section change so a
   // model alias just added under e.g. `providers.models.anthropic` shows up
   // the next time the user opens an agent form, without a hard refresh.
+  // Bust FieldForm's per-provider model catalog cache on section change so a
+  // model alias just added under e.g. `providers.models.anthropic` shows up
+  // the next time the user opens an agent form, without a hard refresh.
+  // Keyed on section/type/alias only — navigating between a profile's model
+  // sub-entries (subParam) stays within the same provider and needs no bust.
   useEffect(() => {
     clearFieldFormCatalogCaches();
   }, [sectionParam, typeParam, aliasParam]);
@@ -253,6 +267,42 @@ export default function Config() {
       );
     }
 
+    // /config/providers.models/:type/:alias/:sub — a model-entry field form
+    // for one entry in a provider profile's `models` subtable.
+    if (
+      typeParam &&
+      aliasParam &&
+      subParam &&
+      activeSection.key === "providers.models"
+    ) {
+      const subPrefix = `providers.models.${typeParam}.${aliasParam}.models.${subParam}`;
+      return (
+        <div className="flex flex-col gap-3 flex-1 min-h-0">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() =>
+              navigate(
+                `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(aliasParam)}?tab=models`,
+              )
+            }
+            className="self-start"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {t("common.back")}
+          </Button>
+          <WireTabForm
+            key={`${reloadKey}-${subPrefix}`}
+            prefix={subPrefix}
+            title={`${typeParam} / ${aliasParam} / ${subParam}`}
+            reloadKey={reloadKey}
+            onSaved={fetchDrift}
+            drift={drifted}
+          />
+        </div>
+      );
+    }
+
     // /config/:section/:type/:alias — field form
     if (typeParam && aliasParam) {
       const fieldsPrefix = needsAliasTier
@@ -261,14 +311,16 @@ export default function Config() {
           : `${activeSection.key}.${typeParam}.${aliasParam}`
         : typeParam;
 
-      // Pre-scoped operator-bind tab on a pairing channel's own page, so you
-      // can authorize a user (no /bind message) right where you configured it.
-      const channelExtraTabs: SectionTabSpec[] = [];
+      // Extra tabs alongside the wire-driven field tabs for this alias page.
+      // Channels get a pre-scoped operator-bind tab (authorize a user right
+      // where you configured the channel, no /bind message); provider profiles
+      // get a Models subtable-CRUD tab (added below).
+      const aliasExtraTabs: SectionTabSpec[] = [];
       if (
         activeSection.key === "channels" &&
         ["telegram", "wechat", "line"].includes(typeParam)
       ) {
-        channelExtraTabs.push({
+        aliasExtraTabs.push({
           key: "bind",
           label: "Bind identity",
           render: () => (
@@ -277,6 +329,37 @@ export default function Config() {
               channelType={typeParam}
               alias={aliasParam}
               onBound={fetchDrift}
+            />
+          ),
+        });
+      }
+
+      // Multi-model provider profiles host a `models` subtable; expose CRUD for
+      // its entries as a tab that reuses the generic alias list/create/delete
+      // machinery, keyed at `providers.models.<type>.<alias>.models`.
+      if (activeSection.key === "providers.models") {
+        const modelsMapPath = `providers.models.${typeParam}.${aliasParam}.models`;
+        aliasExtraTabs.push({
+          key: "models",
+          label: t("config.tab_models"),
+          render: () => (
+            <AliasListView
+              key={`${reloadKey}-${modelsMapPath}`}
+              sectionKey={modelsMapPath}
+              sectionHelp={t("config.models_subtable_help")}
+              onSelectAlias={async (modelAlias) => {
+                // Idempotent for an existing row (create returns false); creates
+                // the entry when the operator adds a new one via the inline row.
+                await createMapKey(modelsMapPath, modelAlias);
+                navigate(
+                  `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(aliasParam)}/${encodeURIComponent(modelAlias)}`,
+                );
+              }}
+              onBack={() =>
+                navigate(
+                  `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}`,
+                )
+              }
             />
           ),
         });
@@ -301,7 +384,7 @@ export default function Config() {
             onSaved={fetchDrift}
             drift={drifted}
             extraTabs={
-              channelExtraTabs.length > 0 ? channelExtraTabs : undefined
+              aliasExtraTabs.length > 0 ? aliasExtraTabs : undefined
             }
           />
         </div>
