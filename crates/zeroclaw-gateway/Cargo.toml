@@ -11,6 +11,7 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-a2a = { workspace = true, features = ["a2a-server"] }
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true

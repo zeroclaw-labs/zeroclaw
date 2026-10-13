@@ -65,6 +65,18 @@ All channels implement the `Channel` trait from `zeroclaw-api`. Each is feature-
 
 The `orchestrator/` submodule handles message streaming, draft updates, multi-message splits, and the ACP server.
 
+### `zeroclaw-a2a`
+
+A2A (Agent2Agent) protocol core: the v1.0 wire model, the outbound HTTP client, and the inbound JSON-RPC server surface, split out of `zeroclaw-api` / `zeroclaw-tools` / `zeroclaw-gateway` so one crate owns the protocol.
+
+Structure mirrors the official `a2a-rs` SDK:
+
+- `a2a/a2a_wire.rs`: A2A v1.0 wire types (`AgentCard`, `Task`, `Message`, `Part`, `SendMessageResponse`, …)
+- `a2a_client/`: outbound client plus its protocol-layer config and `A2aPeerSource` seam
+- `a2a_server/`: `A2aServerState`, `a2a_router`, the `A2aExecutor` / `AgentCardProducer` host seams, and spec error shapes
+
+Host-coupled glue stays in the host crates: the four `a2a_*` tools and the live `A2aPeerSource` implementation in `zeroclaw-tools`, and card building plus auth in `zeroclaw-gateway`. Streaming and inbound task management are not part of this crate yet.
+
 ### `zeroclaw-gateway`
 
 HTTP/WebSocket gateway. Exposes the runtime over:
