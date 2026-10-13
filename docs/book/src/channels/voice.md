@@ -68,6 +68,19 @@ agent's workspace; it never falls back to or reads `AGENTS.md`.
 > transport (mic in / speaker out) lands in a follow-up release, so the
 > channel stays inert even when enabled until that lands.
 
+**One call, one conversation.** Each call on an alias gets its own identity,
+so two callers in a row do not share a conversation history, and a reply the
+agent settles after a call has ended is dropped rather than spoken to whoever
+is on the line next.
+
+**When the connection drops.** The provider link reconnects transparently and
+anything queued meanwhile is discarded by the transport. Audio is lossy by
+design. A settled reply the model never confirmed is spoken again on the
+reopened connection. If the provider resumed the turn server-side, it may
+already have been heard, so the loss is reported instead of repeated. A
+function acknowledgement is never replayed, because the call it answers ended
+with the connection; its loss is logged with the call id.
+
 **Privacy & cost.** A live session streams caller audio, and the transcripts
 and prompts derived from it, to the speech backend provider (Google Gemini
 Live). That provider may retain the audio, transcripts, and prompts it

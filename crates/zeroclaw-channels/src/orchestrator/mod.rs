@@ -52783,6 +52783,8 @@ This is an example JSON object for profile settings."#;
     fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
         let config_arc = zeroclaw_config::live::LiveConfig::new(Config::default()).handle();
         let intentionally_unsupported = HashSet::from([
+            "speech-to-speech",
+            "speech_to_speech",
             "nextcloud",
             "feishu",
             "nostr",
@@ -57558,6 +57560,8 @@ Done."#;
             .expect("announcement dispatch boundary must remain identifiable")
             .0;
         let intentionally_unsupported = HashSet::from([
+            "speech-to-speech",
+            "speech_to_speech",
             "mattermost",
             "imessage",
             "matrix",
