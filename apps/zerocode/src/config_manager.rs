@@ -170,20 +170,29 @@ enum ZeroclawPane {
 }
 
 /// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
-/// the local client config (`zerocode`) second.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// the local client config (`zerocode`) second, and the read-only daemon
+/// plugin catalog (`plugins`) third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
     Zeroclaw,
     Zerocode,
+    Plugins,
 }
 
-const CONFIG_SECTIONS: [ConfigSection; 2] = [ConfigSection::Zeroclaw, ConfigSection::Zerocode];
+const CONFIG_SECTIONS: [ConfigSection; 3] = [
+    ConfigSection::Zeroclaw,
+    ConfigSection::Zerocode,
+    ConfigSection::Plugins,
+];
 
 impl ConfigSection {
-    fn label(self) -> &'static str {
+    /// Tab-bar label. The draw path and the mouse hit test both read it, so a
+    /// click always measures the text the bar printed.
+    fn label(self) -> String {
         match self {
-            Self::Zeroclaw => "zeroclaw",
-            Self::Zerocode => "zerocode",
+            Self::Zeroclaw => "zeroclaw".to_string(),
+            Self::Zerocode => "zerocode".to_string(),
+            Self::Plugins => crate::i18n::t("zc-plugins-tab-label"),
         }
     }
 }
@@ -400,6 +409,9 @@ pub(crate) struct App {
     config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
+    /// Read-only plugin catalog. It holds no client: the manager passes its
+    /// own at fetch time.
+    plugins: crate::plugins_pane::PluginsPane,
     section_tab_area: Option<Rect>,
     screen: Screen,
     zeroclaw_pane: ZeroclawPane,
@@ -482,6 +494,7 @@ impl App {
             config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
+            plugins: crate::plugins_pane::PluginsPane::new(),
             section_tab_area: None,
             screen: Screen::SectionList,
             zeroclaw_pane: ZeroclawPane::Sections,
@@ -552,8 +565,15 @@ impl App {
         Ok(())
     }
 
+    /// Apply finished background work without blocking. The app loop calls
+    /// this every frame so a completed plugin catalog fetch renders without a
+    /// keypress.
+    pub(crate) async fn poll_background(&mut self) {
+        self.plugins.poll_refresh().await;
+    }
+
     /// Draw the current screen into the given area, beneath the Config
-    /// section sub-tab bar (`zeroclaw` / `zerocode`).
+    /// section sub-tab bar (`zeroclaw` / `zerocode` / `plugins`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::default()
@@ -570,6 +590,15 @@ impl App {
 
         if self.section == ConfigSection::Zerocode {
             self.zerocode.draw(frame, body);
+            return;
+        }
+
+        if self.section == ConfigSection::Plugins {
+            self.plugins.draw(frame, body);
+            frame.render_widget(
+                Paragraph::new(Span::styled(self.plugins.footer_hint(), theme::dim_style())),
+                chunks[2],
+            );
             return;
         }
 
@@ -794,9 +823,9 @@ impl App {
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
         self.status_msg = None;
 
-        // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
-        // zerocode) from anywhere — neither is bound inside the daemon
-        // editor or the zerocode pane, so there is no shadowing.
+        // Tab / Shift+Tab cycle the outer Config section (zeroclaw →
+        // zerocode → plugins) from anywhere — neither is bound inside the
+        // daemon editor or the sub-tab panes, so there is no shadowing.
         if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
             use crate::keymap::ConfigTabAction;
             if action == ConfigTabAction::SectionNext {
@@ -818,6 +847,22 @@ impl App {
                 self.cycle_section(-1);
             }
             self.sync_zerocode_locales().await;
+            return Ok(false);
+        }
+
+        if self.section == ConfigSection::Plugins {
+            use crate::plugins_pane::PluginsKeyOutcome;
+            match self.plugins.handle_key(key) {
+                PluginsKeyOutcome::Consumed => {}
+                PluginsKeyOutcome::RefreshRequested => self.plugins.refresh(&self.rpc),
+                PluginsKeyOutcome::NotConsumed => {
+                    // Left/Back at the filter list crosses to the previous
+                    // (zerocode) sub-tab, the way the zerocode pane crosses
+                    // back to zeroclaw.
+                    self.cycle_section(-1);
+                    self.sync_zerocode_locales().await;
+                }
+            }
             return Ok(false);
         }
 
@@ -869,7 +914,16 @@ impl App {
             .position(|s| *s == self.section)
             .unwrap_or(0) as isize;
         let n = CONFIG_SECTIONS.len() as isize;
-        self.section = CONFIG_SECTIONS[(((i + delta) % n + n) % n) as usize];
+        self.set_section(CONFIG_SECTIONS[(((i + delta) % n + n) % n) as usize]);
+    }
+
+    /// Every path that changes the sub-tab goes through here, so entering
+    /// the plugins sub-tab always starts its first catalog fetch.
+    fn set_section(&mut self, section: ConfigSection) {
+        self.section = section;
+        if section == ConfigSection::Plugins {
+            self.plugins.refresh_if_inactive(&self.rpc);
+        }
     }
 
     /// Handle a mouse event forwarded from the app event loop.
@@ -881,14 +935,15 @@ impl App {
     ) -> Result<()> {
         use crate::mouse;
 
-        // Section tab-bar click switches sub-tab in either section.
+        // Section tab-bar click switches sub-tab from any section.
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some(bar) = self.section_tab_area
             && mouse::in_rect(mouse.column, mouse.row, bar)
         {
-            let labels: Vec<&str> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
+            let labels: Vec<String> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
             if let Some(idx) = mouse::tab_click_index(mouse.column, mouse.row, bar, &labels, 3) {
-                self.section = CONFIG_SECTIONS[idx];
+                self.set_section(CONFIG_SECTIONS[idx]);
                 return Ok(());
             }
         }
@@ -896,6 +951,11 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
+            return Ok(());
+        }
+
+        if self.section == ConfigSection::Plugins {
+            self.plugins.handle_mouse(mouse);
             return Ok(());
         }
 
@@ -4428,6 +4488,11 @@ impl App {
     /// create, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) fn handle_paste(&mut self, text: &str) {
+        // The plugin catalog is read-only and has no text surface; a paste
+        // there must not reach hidden zeroclaw editor state.
+        if self.section == ConfigSection::Plugins {
+            return;
+        }
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -4487,6 +4552,11 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             return self.zerocode.wants_text_input();
         }
+        // Read-only: stale zeroclaw filter or edit state must not make the
+        // plugins sub-tab swallow global keys.
+        if self.section == ConfigSection::Plugins {
+            return false;
+        }
         if self.filter.is_some() {
             return true;
         }
@@ -4537,13 +4607,18 @@ impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
-        // Section switch is available in either sub-tab.
+        // Section switch is available in every sub-tab.
         let section_nav = E::new(
             [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
             crate::i18n::t("zc-config-help-switch-section"),
         );
         if self.section == ConfigSection::Zerocode {
             let mut node = self.zerocode.help_context();
+            node.entries.insert(0, section_nav);
+            return node;
+        }
+        if self.section == ConfigSection::Plugins {
+            let mut node = self.plugins.help_context();
             node.entries.insert(0, section_nav);
             return node;
         }
@@ -5747,5 +5822,737 @@ mod tests {
             1,
             "a save outside composite sections must not drop the personality files"
         );
+    }
+
+    // ── plugins sub-tab ──────────────────────────────────────────
+
+    /// A catalog with one row per record case: installed and listed at
+    /// different versions, registry only, and installed only.
+    fn plugins_body() -> serde_json::Value {
+        serde_json::json!({
+            "plugins_enabled": false,
+            "wasm_plugins_available": true,
+            "plugins_dir": "~/.zeroclaw/plugins",
+            "plugins": [
+                {
+                    "name": "calendar",
+                    "installed": {
+                        "version": "0.1.0",
+                        "description": "installed description",
+                        "capabilities": ["tool"],
+                        "permissions": ["file_read"]
+                    },
+                    "available": {
+                        "version": "0.2.0",
+                        "description": "registry description",
+                        "capabilities": ["tool", "skill"],
+                        "install_source": "calendar@0.2.0"
+                    }
+                },
+                {
+                    "name": "mail",
+                    "installed": null,
+                    "available": {
+                        "version": "1.2.3",
+                        "description": "Mail integration",
+                        "capabilities": ["channel"],
+                        "install_source": "mail@1.2.3"
+                    }
+                },
+                {
+                    "name": "notes",
+                    "installed": {
+                        "version": "0.3.0",
+                        "description": null,
+                        "capabilities": ["memory"],
+                        "permissions": []
+                    },
+                    "available": null
+                }
+            ],
+            "issues": []
+        })
+    }
+
+    /// Manager wired to a responder task that records every request method
+    /// and answers each one with `reply`.
+    fn plugins_manager(
+        reply: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
+    ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let manager = App::new(rpc, std::path::Path::new("/tmp"));
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_task = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Some(raw) = writer_rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                calls_for_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(req["method"].as_str().unwrap_or_default().to_string());
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                match &reply {
+                    Ok(body) => outbound.dispatch_response(&id, Some(body.clone()), None),
+                    Err(error) => outbound.dispatch_response(&id, None, Some(error.clone())),
+                }
+            }
+        });
+        (manager, calls)
+    }
+
+    /// Manager whose requests the test answers by hand, so a request can be
+    /// held in flight while keys are pressed.
+    fn wired_plugins_manager() -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let manager = App::new(rpc, std::path::Path::new("/tmp"));
+        (manager, outbound, writer_rx)
+    }
+
+    /// Receive the next request, assert it is `plugins/list`, return its id.
+    async fn next_plugins_request(rx: &mut tokio::sync::mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a plugins/list request should be sent")
+            .expect("the RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::PLUGINS_LIST);
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    /// Give any spawned fetch time to reach the wire, then assert none did.
+    async fn assert_no_request(rx: &mut tokio::sync::mpsc::Receiver<String>, why: &str) {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(next.is_err(), "{why}: {next:?}");
+    }
+
+    /// A real `Term` over a fixed viewport: the plugins paths never draw
+    /// through it, so nothing reaches stdout.
+    fn test_term() -> Term {
+        ratatui::Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Hold the keymap test guard with no overrides installed, so key
+    /// resolution sees the default bindings.
+    fn default_keymap() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        guard
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Drive the app loop's per-frame poll until the plugin fetch lands.
+    async fn settle_plugins(manager: &mut App) {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            manager.poll_background().await;
+            if !manager.plugins.is_loading() {
+                return;
+            }
+        }
+        panic!("the plugin catalog fetch never finished");
+    }
+
+    fn recorded(calls: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn render_manager(manager: &mut App, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|frame| manager.draw_into(frame, Rect::new(0, 0, w, h)))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_row(rows: &[String], needle: &str) {
+        assert!(
+            rows.iter().any(|row| row.contains(needle)),
+            "no row contains {needle:?}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    async fn plugins_tab_with(
+        reply: std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>,
+    ) -> App {
+        let (mut manager, calls) = plugins_manager(reply);
+        manager.set_section(ConfigSection::Plugins);
+        settle_plugins(&mut manager).await;
+        assert_eq!(recorded(&calls), ["plugins/list"]);
+        manager
+    }
+
+    #[tokio::test]
+    async fn constructing_the_manager_sends_no_plugin_request() {
+        let (manager, calls) = plugins_manager(Ok(plugins_body()));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recorded(&calls).is_empty(),
+            "App::new must not issue any RPC"
+        );
+        assert!(!manager.plugins.is_loading());
+        assert_eq!(manager.section, ConfigSection::Zeroclaw);
+    }
+
+    #[tokio::test]
+    async fn init_sends_no_plugin_request() {
+        // One reply every init() call can read: each result type takes its
+        // own field and ignores the rest.
+        let mut body = plugins_body();
+        body["sections"] = serde_json::json!([]);
+        body["templates"] = serde_json::json!([]);
+        let (mut manager, calls) = plugins_manager(Ok(body));
+        manager.init().await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            manager.poll_background().await;
+        }
+        assert_eq!(
+            recorded(&calls),
+            [
+                crate::client::method::CONFIG_SECTIONS,
+                crate::client::method::CONFIG_TEMPLATES,
+            ],
+            "init() loads the zeroclaw sections only; the catalog waits for the sub-tab"
+        );
+        assert!(!manager.plugins.is_loading());
+        assert_eq!(manager.section, ConfigSection::Zeroclaw);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn section_keys_cycle_through_three_sub_tabs_and_wrap() {
+        let _keymap = default_keymap();
+        let (mut manager, calls) = plugins_manager(Ok(plugins_body()));
+        let mut term = test_term();
+
+        let mut seen = vec![manager.section];
+        for _ in 0..3 {
+            manager
+                .handle_key(key(KeyCode::Tab), &mut term)
+                .await
+                .unwrap();
+            seen.push(manager.section);
+        }
+        assert_eq!(
+            seen,
+            [
+                ConfigSection::Zeroclaw,
+                ConfigSection::Zerocode,
+                ConfigSection::Plugins,
+                ConfigSection::Zeroclaw,
+            ]
+        );
+        settle_plugins(&mut manager).await;
+
+        let mut seen = vec![manager.section];
+        for _ in 0..3 {
+            manager
+                .handle_key(key(KeyCode::BackTab), &mut term)
+                .await
+                .unwrap();
+            seen.push(manager.section);
+        }
+        assert_eq!(
+            seen,
+            [
+                ConfigSection::Zeroclaw,
+                ConfigSection::Plugins,
+                ConfigSection::Zerocode,
+                ConfigSection::Zeroclaw,
+            ]
+        );
+        settle_plugins(&mut manager).await;
+        assert_eq!(
+            recorded(&calls),
+            ["plugins/list"],
+            "the first entry fetches once; re-entering a loaded catalog does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_bar_click_selects_plugins_and_starts_the_fetch() {
+        let (mut manager, calls) = plugins_manager(Ok(plugins_body()));
+        let mut term = test_term();
+        let rows = render_manager(&mut manager, 80, 24);
+        assert!(
+            rows[0].starts_with("zeroclaw │ zerocode │ plugins"),
+            "{:?}",
+            rows[0]
+        );
+
+        // "zeroclaw │ zerocode │ " is 22 cells wide.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 24,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        manager
+            .handle_mouse(click, Rect::new(0, 0, 80, 24), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Plugins);
+        assert!(manager.plugins.is_loading(), "the click starts the fetch");
+        settle_plugins(&mut manager).await;
+        assert_eq!(recorded(&calls), ["plugins/list"]);
+
+        let rows = render_manager(&mut manager, 80, 24);
+        assert_row(&rows, "calendar");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plugins_keys_refresh_and_cross_back_to_zerocode() {
+        let _keymap = default_keymap();
+        let (mut manager, outbound, mut rx) = wired_plugins_manager();
+        let mut term = test_term();
+        manager.set_section(ConfigSection::Plugins);
+        let id = next_plugins_request(&mut rx).await;
+        outbound.dispatch_response(&id, Some(plugins_body()), None);
+        settle_plugins(&mut manager).await;
+
+        manager
+            .handle_key(key(KeyCode::Char('r')), &mut term)
+            .await
+            .unwrap();
+        let id = next_plugins_request(&mut rx).await;
+        // The refresh is on the wire and unanswered: a second r is ignored
+        // rather than restarting the fetch.
+        manager
+            .handle_key(key(KeyCode::Char('r')), &mut term)
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            manager.poll_background().await;
+        }
+        assert_no_request(&mut rx, "a second r while loading is ignored").await;
+        assert!(manager.plugins.is_loading());
+        assert_eq!(outbound.pending_count(), 1, "the refresh stays pending");
+        outbound.dispatch_response(&id, Some(plugins_body()), None);
+        settle_plugins(&mut manager).await;
+
+        // Right, Enter, Back, Back walks Filters -> Packages -> Detail and
+        // back; a final Back at the filters crosses to the zerocode sub-tab.
+        for code in [KeyCode::Right, KeyCode::Enter, KeyCode::Esc, KeyCode::Esc] {
+            manager.handle_key(key(code), &mut term).await.unwrap();
+            assert_eq!(manager.section, ConfigSection::Plugins);
+        }
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Zerocode);
+        assert_no_request(&mut rx, "navigation sends nothing").await;
+    }
+
+    #[tokio::test]
+    async fn poll_background_applies_a_finished_fetch_without_a_key() {
+        let (mut manager, _calls) = plugins_manager(Ok(plugins_body()));
+        manager.set_section(ConfigSection::Plugins);
+        let rows = render_manager(&mut manager, 80, 24);
+        assert_row(&rows, "Loading the plugin catalog…");
+
+        settle_plugins(&mut manager).await;
+        let rows = render_manager(&mut manager, 80, 24);
+        assert_row(&rows, "calendar");
+    }
+
+    #[tokio::test]
+    async fn plugins_sub_tab_takes_no_text_input_and_ignores_paste() {
+        // Stale zeroclaw state that takes text and claims navigation.
+        let mut manager = test_manager();
+        manager.filter = Some("stale".into());
+        manager.fields = vec![field("example.name")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        assert!(
+            manager.claims_pane_navigation(&word_left),
+            "the fixture must claim navigation on the zeroclaw sub-tab"
+        );
+
+        manager.section = ConfigSection::Plugins;
+        assert!(!manager.wants_text_input());
+        manager.handle_paste("pasted");
+        assert_eq!(manager.filter.as_deref(), Some("stale"));
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.section = ConfigSection::Zeroclaw;
+        assert!(
+            manager.wants_text_input(),
+            "the stale zeroclaw state is untouched"
+        );
+        assert!(manager.claims_pane_navigation(&word_left));
+    }
+
+    #[tokio::test]
+    async fn plugins_help_puts_the_section_switch_first() {
+        let manager = plugins_tab_with(Ok(plugins_body())).await;
+        let _keymap = default_keymap();
+        let node = crate::widgets::HelpContext::help_context(&manager);
+        let actions: Vec<&str> = node.entries.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            [
+                crate::i18n::t("zc-config-help-switch-section").as_str(),
+                "Choose a filter",
+                "Show the packages",
+                "Previous sub-tab",
+                "Refresh the catalog",
+                "This help",
+                "",
+                crate::i18n::t("zc-config-help-mouse-open").as_str(),
+            ]
+        );
+    }
+
+    /// The Config pane's share of a real terminal: the app's mode bar and
+    /// status bar take one row each, so an 80x24 terminal leaves 80x22.
+    const IN_APP_CHROME_ROWS: u16 = 2;
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plugins_sub_tab_renders_every_state_at_both_sizes() {
+        use crate::jsonrpc::JsonRpcError;
+        let _keymap = default_keymap();
+        for (w, h) in [
+            (80, 24 - IN_APP_CHROME_ROWS),
+            (120, 40 - IN_APP_CHROME_ROWS),
+        ] {
+            // Loaded list.
+            let mut manager = plugins_tab_with(Ok(plugins_body())).await;
+            let rows = render_manager(&mut manager, w, h);
+            assert!(rows[0].starts_with("zeroclaw │ zerocode │ plugins"));
+            assert_row(&rows, "All (3)");
+            assert_row(&rows, "Installed (2)");
+            assert_row(&rows, "In registry (2)");
+            assert_row(&rows, "WASM plugin support");
+            assert_row(&rows, "  built in");
+            // The value on the row under its label, in the left column.
+            let left: Vec<String> = rows
+                .iter()
+                .map(|row| row.chars().take(30).collect::<String>())
+                .collect();
+            let enabled = left
+                .iter()
+                .position(|row| {
+                    row.trim_matches(|c: char| c == '│' || c.is_whitespace())
+                        == "[plugins] enabled in config"
+                })
+                .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+            assert_eq!(
+                left[enabled + 1]
+                    .trim_start_matches('│')
+                    .trim_end_matches(['│', ' ']),
+                "  no",
+                "{}",
+                rows.join("\n")
+            );
+            assert_row(&rows, "~/.zeroclaw/plugins");
+            assert_row(&rows, "● calendar  v0.1.0 installed, registry v0.2.0");
+            assert_row(&rows, "○ mail  v1.2.3 in registry");
+            assert_row(&rows, "● notes  v0.3.0 installed");
+            let footer = &rows[usize::from(h) - 1];
+            assert!(footer.starts_with(" ?=help"), "{footer:?}");
+            assert!(footer.contains("r=refresh"), "{footer:?}");
+            for word in ["active", "running", "loaded", "healthy", "enabled"] {
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row.contains(word) && !row.contains("enabled in config")),
+                    "the list must make no runtime claim ({word}):\n{}",
+                    rows.join("\n")
+                );
+            }
+
+            // Detail view of the first package.
+            manager.plugins.handle_key(key(KeyCode::Right));
+            manager.plugins.handle_key(key(KeyCode::Enter));
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "Name: calendar");
+            // Only the right pane: the filter row "Installed (2)" would
+            // match a plain search.
+            let right: Vec<String> = rows
+                .iter()
+                .map(|row| row.chars().skip(30).collect::<String>())
+                .collect();
+            assert!(
+                right.iter().any(|row| {
+                    row.trim_matches(|c: char| c == '│' || c.is_whitespace()) == "Installed"
+                }),
+                "{}",
+                rows.join("\n")
+            );
+            assert_row(&rows, "  Version: 0.1.0");
+            assert_row(&rows, "  Description: installed description");
+            assert_row(&rows, "  Capabilities: tool");
+            assert_row(&rows, "  Requested permissions: file_read");
+            assert_row(&rows, "Cached registry");
+            assert_row(&rows, "  Version: 0.2.0");
+            assert_row(&rows, "  Capabilities: tool, skill");
+            assert_row(&rows, "  Package identity: calendar@0.2.0");
+            assert_row(&rows, "Catalog presence does not show");
+
+            // Empty catalog.
+            let mut body = plugins_body();
+            body["plugins"] = serde_json::json!([]);
+            let mut manager = plugins_tab_with(Ok(body.clone())).await;
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "All (0)");
+            assert_row(&rows, "No installed packages and no");
+
+            // Source issues, with and without rows.
+            body["issues"] = serde_json::json!([
+                { "source": "installed", "code": "discovery_failed" },
+                { "source": "registry", "code": "cache_read_failed" }
+            ]);
+            let mut manager = plugins_tab_with(Ok(body.clone())).await;
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "Could not read installed");
+            assert_row(&rows, "Could not read the cached");
+            assert_row(&rows, "No packages to list");
+            let mut with_rows = plugins_body();
+            with_rows["issues"] = body["issues"].clone();
+            let mut manager = plugins_tab_with(Ok(with_rows)).await;
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "Could not read installed");
+            assert_row(&rows, "● calendar");
+
+            // Daemon built without WASM plugin support.
+            let mut no_wasm = plugins_body();
+            no_wasm["wasm_plugins_available"] = serde_json::json!(false);
+            no_wasm["plugins"] = serde_json::json!([]);
+            let mut manager = plugins_tab_with(Ok(no_wasm)).await;
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "  not built in");
+            assert_row(&rows, "This daemon was built without");
+            assert!(!rows.iter().any(|row| row.contains("No installed packages")));
+            assert!(
+                !rows.iter().any(|row| row.contains("All (")),
+                "no catalog, so no counts:\n{}",
+                rows.join("\n")
+            );
+
+            // Failed fetch.
+            let mut manager = plugins_tab_with(Err(JsonRpcError {
+                code: -32601,
+                message: "Unknown method: plugins/list".to_string(),
+                data: None,
+            }))
+            .await;
+            let rows = render_manager(&mut manager, w, h);
+            assert_row(&rows, "This daemon does not provide the plugin");
+            assert_row(&rows, "Press r to retry.");
+            assert!(!rows.iter().any(|row| row.contains("All (")));
+        }
+    }
+
+    /// A source the daemon could not read is unknown, never absent: a
+    /// package missing from it is not shown as "not installed" or "not in
+    /// the registry", and that source's filter shows no exact count.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_unreadable_source_renders_as_unknown_not_absent() {
+        let _keymap = default_keymap();
+        let rows_of = |body: &serde_json::Value, keep: &str| {
+            let mut body = body.clone();
+            body["plugins"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["name"] == keep);
+            body
+        };
+        for (w, h) in [
+            (80, 24 - IN_APP_CHROME_ROWS),
+            (120, 40 - IN_APP_CHROME_ROWS),
+        ] {
+            // Installed packages unreadable, one registry-only row.
+            let mut body = rows_of(&plugins_body(), "mail");
+            body["issues"] =
+                serde_json::json!([{ "source": "installed", "code": "discovery_failed" }]);
+            let mut manager = plugins_tab_with(Ok(body)).await;
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Could not read installed");
+            assert_row(&rows, "? mail  v1.2.3 in registry");
+            assert!(!all.contains("○ mail"), "{all}");
+            assert_row(&rows, "All (1+)");
+            assert_row(&rows, "Installed (?)");
+            assert_row(&rows, "In registry (1)");
+            assert!(!all.contains("Installed (0)"), "{all}");
+
+            manager.plugins.handle_key(key(KeyCode::Right));
+            manager.plugins.handle_key(key(KeyCode::Enter));
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Name: mail");
+            assert_row(&rows, "Unknown: installed packages could not");
+            assert!(!all.contains("Not installed"), "{all}");
+
+            // The Installed filter over the unreadable source.
+            manager.plugins.handle_key(key(KeyCode::Esc));
+            manager.plugins.handle_key(key(KeyCode::Esc));
+            manager.plugins.handle_key(key(KeyCode::Down));
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Cannot tell which packages match");
+            assert!(!all.contains("No packages match this filter"), "{all}");
+            assert!(!all.contains("Installed (0)"), "{all}");
+
+            // Cached registry unreadable, one installed-only row.
+            let mut body = rows_of(&plugins_body(), "notes");
+            body["issues"] =
+                serde_json::json!([{ "source": "registry", "code": "cache_read_failed" }]);
+            let mut manager = plugins_tab_with(Ok(body)).await;
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "● notes  v0.3.0 installed");
+            assert_row(&rows, "Installed (1)");
+            assert_row(&rows, "In registry (?)");
+            assert!(!all.contains("In registry (0)"), "{all}");
+            manager.plugins.handle_key(key(KeyCode::Right));
+            manager.plugins.handle_key(key(KeyCode::Enter));
+            let rows = render_manager(&mut manager, w, h);
+            let all = rows.join("\n");
+            assert_row(&rows, "Unknown: the cached registry could not");
+            assert!(!all.contains("Not in the cached registry"), "{all}");
+        }
+    }
+
+    /// Both source issues stay readable in full at the in-app content
+    /// heights, even beside a long absolute plugin directory: the host block
+    /// does not scroll, so a clipped line would hide an issue the right pane
+    /// points at ("See the notes on the left").
+    #[tokio::test]
+    async fn source_issues_stay_fully_visible_at_in_app_heights() {
+        let mut body = plugins_body();
+        body["plugins_dir"] = serde_json::json!("/Users/someone/.zeroclaw/plugins/dir");
+        body["issues"] = serde_json::json!([
+            { "source": "installed", "code": "discovery_failed" },
+            { "source": "registry", "code": "cache_read_failed" }
+        ]);
+        let mut empty = body.clone();
+        empty["plugins"] = serde_json::json!([]);
+        for reply in [body, empty] {
+            let mut manager = plugins_tab_with(Ok(reply)).await;
+            for (w, h) in [(80, 24 - IN_APP_CHROME_ROWS), (80, 18)] {
+                let rows = render_manager(&mut manager, w, h);
+                let left: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.chars().take(30).collect::<String>())
+                    .collect();
+                for fragment in [
+                    "Could not read installed",
+                    "packages; see daemon log.",
+                    "Could not read the cached",
+                    "registry; see daemon log.",
+                ] {
+                    assert_row(&left, fragment);
+                }
+                assert_eq!(
+                    left.iter()
+                        .filter(|row| row.contains("see daemon log."))
+                        .count(),
+                    2,
+                    "{w}x{h}:\n{}",
+                    rows.join("\n")
+                );
+            }
+        }
+    }
+
+    /// Mouse events inside the plugins body go to the pane, never to the
+    /// zeroclaw handlers whose hit areas are left over from an earlier draw.
+    #[tokio::test]
+    async fn body_mouse_events_reach_the_plugins_pane_only() {
+        let (mut manager, calls) = plugins_manager(Ok(plugins_body()));
+        let mut term = test_term();
+        let area = Rect::new(0, 0, 100, 30);
+        let _ = render_manager(&mut manager, 100, 30);
+        manager.set_section(ConfigSection::Plugins);
+        settle_plugins(&mut manager).await;
+        let rows = render_manager(&mut manager, 100, 30);
+        assert_row(&rows, "○ mail");
+
+        let event = |kind: MouseEventKind, column: u16, row: u16| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let left = MouseEventKind::Down(crossterm::event::MouseButton::Left);
+        // Row 0 is the sub-tab bar; the filter list's border is row 1, so
+        // "Installed" is row 3 and the first package row is row 2.
+        manager
+            .handle_mouse(event(left, 5, 3), area, &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Plugins);
+        let rows = render_manager(&mut manager, 100, 30);
+        assert_row(&rows, "● calendar");
+        assert_row(&rows, "● notes");
+        assert!(
+            !rows.iter().any(|row| row.contains("○ mail")),
+            "the Installed filter hides the registry-only row:\n{}",
+            rows.join("\n")
+        );
+
+        for _ in 0..2 {
+            manager
+                .handle_mouse(event(left, 40, 2), area, &mut term)
+                .await
+                .unwrap();
+            assert_eq!(manager.section, ConfigSection::Plugins);
+        }
+        let rows = render_manager(&mut manager, 100, 30);
+        assert_row(&rows, "Name: calendar");
+        assert_row(&rows, "Package identity: calendar@0.2.0");
+        manager
+            .handle_mouse(event(MouseEventKind::ScrollDown, 40, 5), area, &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Plugins);
+        assert_eq!(recorded(&calls), ["plugins/list"]);
     }
 }
