@@ -117,7 +117,7 @@ pub enum ChannelKind {
     Telegram,
     Twitch,
     Twitter,
-    VoiceBroker,
+    SpeechToSpeech,
     VoiceCall,
     VoiceWake,
     /// Retained after the WATI channel was removed so historical
@@ -475,8 +475,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn voice_broker_channel_kind_as_wire() {
-        assert_eq!(ChannelKind::VoiceBroker.as_wire(), "voice_broker");
+    fn speech_to_speech_channel_kind_as_wire() {
+        assert_eq!(ChannelKind::SpeechToSpeech.as_wire(), "speech_to_speech");
     }
 
     #[test]
