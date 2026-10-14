@@ -179,6 +179,48 @@ pub struct PeerGroupConfig {
     /// duplicate sender list.
     #[serde(default)]
     pub admin_for_agent_scope: bool,
+    /// Sender role: the `[risk_profiles.<alias>]` that narrows turns this
+    /// group's `external_peers` start on the agents this group lists (every
+    /// agent bound to `channel` when `agents` is empty). `None` (default)
+    /// gives the group no role, and its members run under the agent's own
+    /// profile.
+    ///
+    /// A role only narrows. For the turn it adds the role profile's
+    /// `excluded_tools` and `always_ask`, keeps only the `auto_approve`
+    /// entries both profiles share, and sends approval prompts to the role
+    /// profile's `approval_route` when it sets one. Every other field of the
+    /// role profile must equal the agent's own profile; config validation
+    /// rejects one that differs, because those settings are fixed when the
+    /// agent's tools are built and cannot change per turn.
+    ///
+    /// A sender listed by name outranks a `"*"` entry. A sender matching two
+    /// role groups of the same rank that name different profiles is refused
+    /// rather than guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_profile: Option<String>,
+    /// Sender-role action budget: the `[runtime_profiles.<alias>]` whose
+    /// `max_actions_per_hour` caps the actions each sender in this group's
+    /// role may take per hour on the agents the role applies to. Each sender
+    /// has their own budget, charged on top of the agent's own budget, so an
+    /// action runs only when both allow it. Requires `risk_profile`, which
+    /// may name the agent's own risk profile when the group only needs a
+    /// budget. Without one, config validation rejects the group, and a
+    /// sender it would place is refused rather than run without the budget.
+    /// `None` (default) adds no budget.
+    ///
+    /// The named profile may differ from each agent's own runtime profile
+    /// (the built-in defaults for an agent that names none) only in
+    /// `max_actions_per_hour`. Config validation rejects any other
+    /// difference, because those settings are fixed when the agent is built
+    /// and would otherwise be ignored silently. A cap above an agent's own is
+    /// accepted: the agent's own limit still applies to every action, and
+    /// the budget adds a per-sender limit beside it.
+    ///
+    /// Role groups of the same rank that match a sender must agree on this
+    /// field as well as on `risk_profile`: when one names a different budget,
+    /// or names one while the other names none, the sender is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_profile: Option<String>,
 }
 
 /// Inbound A2A discovery server configuration.

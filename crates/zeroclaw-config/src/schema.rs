@@ -13816,7 +13816,95 @@ fn default_always_ask() -> Vec<String> {
     vec![]
 }
 
+/// Top-level serialized fields where a sender role's profile (`role`)
+/// differs from its agent's own profile (`agent`), sorted, leaving out the
+/// fields named in `may_differ`. The risk and runtime profile checks for
+/// sender roles share it so both compare fields the same way.
+fn sender_role_field_mismatches<T: Serialize>(
+    agent: &T,
+    role: &T,
+    may_differ: &[&str],
+) -> Vec<String> {
+    let fields = |profile: &T| match serde_json::to_value(profile) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let agent = fields(agent);
+    let role = fields(role);
+    let mut keys: Vec<&String> = agent.keys().chain(role.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|key| !may_differ.contains(&key.as_str()))
+        .filter(|key| agent.get(*key) != role.get(*key))
+        .cloned()
+        .collect()
+}
+
 impl RiskProfileConfig {
+    /// Fields a sender role (`[peer_groups.<name>] risk_profile`) may set
+    /// differently from its agent's own profile. The channel orchestrator
+    /// applies these per turn; every other field is fixed when the agent's
+    /// tools and security policy are built, so a role cannot change it.
+    pub const SENDER_ROLE_TURN_FIELDS: [&'static str; 4] = [
+        "excluded_tools",
+        "always_ask",
+        "auto_approve",
+        "approval_route",
+    ];
+
+    /// Fields where `role` differs from this (agent) profile outside
+    /// [`Self::SENDER_ROLE_TURN_FIELDS`], sorted. Non-empty means `role`
+    /// cannot be applied per turn as written.
+    #[must_use]
+    pub fn sender_role_fixed_field_mismatches(&self, role: &RiskProfileConfig) -> Vec<String> {
+        sender_role_field_mismatches(self, role, &Self::SENDER_ROLE_TURN_FIELDS)
+    }
+
+    /// This (agent) profile narrowed by a sender role's profile, for one turn.
+    ///
+    /// Only [`Self::SENDER_ROLE_TURN_FIELDS`] move, and only toward less
+    /// authority: `excluded_tools` and `always_ask` are unions,
+    /// `auto_approve` keeps the entries both profiles allow (`"*"` on one
+    /// side defers to the other side's list), and `approval_route` is the
+    /// role's own, or the agent's when the role sets none. A role without a
+    /// route therefore sends its prompts where the agent's turns send theirs,
+    /// never to a looser approver.
+    #[must_use]
+    pub fn narrowed_for_sender_role(&self, role: &RiskProfileConfig) -> RiskProfileConfig {
+        fn union(base: &[String], extra: &[String]) -> Vec<String> {
+            let mut out = base.to_vec();
+            for item in extra {
+                if !out.contains(item) {
+                    out.push(item.clone());
+                }
+            }
+            out
+        }
+        let wildcard = |list: &[String]| list.iter().any(|t| t.trim() == "*");
+        let auto_approve = if wildcard(&self.auto_approve) {
+            role.auto_approve.clone()
+        } else if wildcard(&role.auto_approve) {
+            self.auto_approve.clone()
+        } else {
+            self.auto_approve
+                .iter()
+                .filter(|tool| role.auto_approve.contains(tool))
+                .cloned()
+                .collect()
+        };
+        RiskProfileConfig {
+            excluded_tools: union(&self.excluded_tools, &role.excluded_tools),
+            always_ask: union(&self.always_ask, &role.always_ask),
+            auto_approve,
+            approval_route: role
+                .approval_route
+                .clone()
+                .or_else(|| self.approval_route.clone()),
+            ..self.clone()
+        }
+    }
+
     /// Legacy serialized marker used by older operators to represent an
     /// explicit deny-all profile before `deny_all_tools` existed.
     pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
@@ -14797,6 +14885,24 @@ impl Default for RuntimeProfileConfig {
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
         }
+    }
+}
+
+impl RuntimeProfileConfig {
+    /// Fields a sender-role budget (`[peer_groups.<name>] runtime_profile`)
+    /// may set differently from its agent's own runtime profile. A role
+    /// applies only the hourly action cap of the profile it names; every
+    /// other field is fixed when the agent is built, so a role cannot change
+    /// it. The daily cost cap is deliberately not listed: nothing enforces a
+    /// per-sender cost ceiling, so a role value for it would be ignored.
+    pub const SENDER_ROLE_BUDGET_FIELDS: [&'static str; 1] = ["max_actions_per_hour"];
+
+    /// Fields where `role` differs from this (agent) runtime profile outside
+    /// [`Self::SENDER_ROLE_BUDGET_FIELDS`], sorted. Non-empty means `role`
+    /// cannot serve as a sender-role budget as written.
+    #[must_use]
+    pub fn sender_role_fixed_field_mismatches(&self, role: &RuntimeProfileConfig) -> Vec<String> {
+        sender_role_field_mismatches(self, role, &Self::SENDER_ROLE_BUDGET_FIELDS)
     }
 }
 
@@ -22027,6 +22133,54 @@ enum PeerGroupChannelRef {
     },
 }
 
+/// The sender role a channel message resolved to: the peer group that
+/// granted it, the risk profile that narrows the sender's turns, and the
+/// runtime profile that budgets the sender's actions, if any. See
+/// [`Config::channel_sender_role`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderRole {
+    /// The `[peer_groups.<name>]` entry the sender matched.
+    pub group: String,
+    /// The `[risk_profiles.<alias>]` that entry names.
+    pub risk_profile: String,
+    /// The `[runtime_profiles.<alias>]` that entry names as the sender's
+    /// action budget, or `None` when it names none.
+    pub runtime_profile: Option<String>,
+}
+
+/// A sender matched role groups of equal rank that disagree: they name
+/// different risk profiles, different budget runtime profiles, or a budget
+/// on one side and none on the other. Callers refuse the turn instead of
+/// choosing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderRoleConflict {
+    /// The matching groups, sorted.
+    pub groups: Vec<String>,
+    /// The distinct risk profiles they name, sorted.
+    pub risk_profiles: Vec<String>,
+    /// The distinct budget runtime profiles they name, sorted. `None` stands
+    /// for groups that name no budget and sorts first.
+    pub runtime_profiles: Vec<Option<String>>,
+}
+
+/// Why a sender could not be placed in a sender role. Callers refuse the
+/// turn instead of falling back to the agent's own profile and budget. See
+/// [`Config::channel_sender_role`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SenderRoleError {
+    /// The best matches disagree on the role.
+    Conflict(SenderRoleConflict),
+    /// A best match names a budget (`runtime_profile`) but no role
+    /// (`risk_profile`). Validation rejects such a group; one that reaches
+    /// the resolver anyway must not let its senders run without the budget.
+    BudgetWithoutRole {
+        /// The best-match groups that name a budget and no role, sorted.
+        groups: Vec<String>,
+        /// The distinct budget runtime profiles those groups name, sorted.
+        runtime_profiles: Vec<String>,
+    },
+}
+
 /// Test-only coordination for the config save's post-atomic-rename
 /// visibility window (see the pause call inside the save path). `arm(target)`
 /// returns a handle whose `wait_paused` resolves once a save of that exact
@@ -22417,6 +22571,177 @@ impl Config {
         }
         out.sort();
         out
+    }
+
+    /// The sender role for a message on `<channel_type>.<alias>` handled by
+    /// `agent_alias`: which `[peer_groups.<name>]` carrying a `risk_profile`
+    /// or a `runtime_profile` the sender belongs to.
+    ///
+    /// Identity comparison belongs to the channel, so the caller passes
+    /// `is_sender`, which answers whether one configured peer entry names
+    /// this sender. `"*"` entries are handled here and never reach it.
+    ///
+    /// A group applies when its `channel` matches (type-wide or dotted) and
+    /// its `agents` list is empty or names `agent_alias`. A group whose
+    /// `ignore` names the sender (or is `"*"`) does not apply to them. A
+    /// by-name `external_peers` match outranks a `"*"` match. The role
+    /// carries the group's `runtime_profile`, the sender's action budget,
+    /// when it names one.
+    ///
+    /// The sender cannot be placed, and callers must refuse rather than
+    /// resolve, when the best matches disagree on the risk profile or on the
+    /// budget (a budget on one side and none on the other also disagree):
+    /// [`SenderRoleError::Conflict`]. A group that names a budget but no
+    /// risk profile applies like a role group, and when it is among the best
+    /// matches the result is [`SenderRoleError::BudgetWithoutRole`], so its
+    /// senders are never run without the budget. A group that names neither
+    /// places nobody. `Ok(None)` means no role: the agent's own profile
+    /// applies.
+    ///
+    /// Reads `self.peer_groups` directly, with no cache.
+    pub fn channel_sender_role(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        agent_alias: &str,
+        is_sender: impl Fn(&str) -> bool,
+    ) -> std::result::Result<Option<SenderRole>, SenderRoleError> {
+        // A profile alias, or `None` when it is unset or blank.
+        fn named(alias: Option<&str>) -> Option<&str> {
+            alias.map(str::trim).filter(|alias| !alias.is_empty())
+        }
+        let is_wildcard = |peer: &str| peer.trim() == "*";
+        let mut names: Vec<&String> = self.peer_groups.keys().collect();
+        names.sort();
+        let mut best_rank = 0u8;
+        // Each best match: its group, its role's risk profile (`None` for a
+        // group that names only a budget) and its budget.
+        let mut best: Vec<(&String, Option<&str>, Option<&str>)> = Vec::new();
+        for name in names {
+            let group = &self.peer_groups[name];
+            let risk_profile = named(group.risk_profile.as_deref());
+            let runtime_profile = named(group.runtime_profile.as_deref());
+            if risk_profile.is_none() && runtime_profile.is_none() {
+                continue;
+            }
+            let channel_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !channel_matches {
+                continue;
+            }
+            if !group.agents.is_empty() && !group.agents.iter().any(|a| a.as_str() == agent_alias) {
+                continue;
+            }
+            if group
+                .ignore
+                .iter()
+                .any(|peer| is_wildcard(peer.as_str()) || is_sender(peer.as_str()))
+            {
+                continue;
+            }
+            let rank = if group
+                .external_peers
+                .iter()
+                .any(|peer| !is_wildcard(peer.as_str()) && is_sender(peer.as_str()))
+            {
+                2
+            } else if group
+                .external_peers
+                .iter()
+                .any(|peer| is_wildcard(peer.as_str()))
+            {
+                1
+            } else {
+                continue;
+            };
+            if rank > best_rank {
+                best_rank = rank;
+                best.clear();
+            }
+            if rank == best_rank {
+                best.push((name, risk_profile, runtime_profile));
+            }
+        }
+        // A budget with no role cannot place the sender: the budget belongs
+        // to a role, and dropping it would run the sender uncapped.
+        let mut roles: Vec<SenderRole> = Vec::with_capacity(best.len());
+        let mut budget_only_groups: Vec<String> = Vec::new();
+        let mut budget_only_profiles: Vec<String> = Vec::new();
+        for (group, risk_profile, runtime_profile) in best {
+            match risk_profile {
+                Some(risk_profile) => roles.push(SenderRole {
+                    group: group.clone(),
+                    risk_profile: risk_profile.to_string(),
+                    runtime_profile: runtime_profile.map(str::to_string),
+                }),
+                None => {
+                    budget_only_groups.push(group.clone());
+                    budget_only_profiles.extend(runtime_profile.map(str::to_string));
+                }
+            }
+        }
+        if !budget_only_groups.is_empty() {
+            budget_only_profiles.sort();
+            budget_only_profiles.dedup();
+            return Err(SenderRoleError::BudgetWithoutRole {
+                groups: budget_only_groups,
+                runtime_profiles: budget_only_profiles,
+            });
+        }
+        let mut profiles: Vec<String> = roles.iter().map(|r| r.risk_profile.clone()).collect();
+        profiles.sort();
+        profiles.dedup();
+        let mut budgets: Vec<Option<String>> =
+            roles.iter().map(|r| r.runtime_profile.clone()).collect();
+        budgets.sort();
+        budgets.dedup();
+        // The best matches agree only when every one names the same risk
+        // profile and the same budget, so more than one distinct value on
+        // either side is ambiguous.
+        if profiles.len() > 1 || budgets.len() > 1 {
+            return Err(SenderRoleError::Conflict(SenderRoleConflict {
+                groups: roles.into_iter().map(|r| r.group).collect(),
+                risk_profiles: profiles,
+                runtime_profiles: budgets,
+            }));
+        }
+        Ok(roles.into_iter().next())
+    }
+
+    /// The agents a sender role on `group` applies to, sorted: the group's
+    /// `agents` list, or every agent with a channel that the group's
+    /// `channel` covers when that list is empty. The load-time sender-role
+    /// checks walk this one set.
+    fn sender_role_agents<'a>(
+        &'a self,
+        group: &'a crate::multi_agent::PeerGroupConfig,
+    ) -> Vec<&'a str> {
+        let group_channel = group.channel.trim();
+        let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
+            Some((ty, al)) => (ty, Some(al)),
+            None => (group_channel, None),
+        };
+        let mut applies_to: Vec<&str> = if group.agents.is_empty() {
+            self.agents
+                .iter()
+                .filter(|(_, agent)| {
+                    agent.channels.iter().any(|ch| {
+                        let ch_str = ch.as_str();
+                        match group_channel_alias {
+                            Some(alias) => ch_str == format!("{group_channel_type}.{alias}"),
+                            None => ch_str.starts_with(&format!("{group_channel_type}.")),
+                        }
+                    })
+                })
+                .map(|(alias, _)| alias.as_str())
+                .collect()
+        } else {
+            group.agents.iter().map(|a| a.as_str()).collect()
+        };
+        applies_to.sort_unstable();
+        applies_to
     }
 
     /// Collect the `IntegrationDescriptor` from every nested config that
@@ -25695,6 +26020,102 @@ impl Config {
                     );
                 }
             }
+            // An action budget belongs to a sender role, so a group that names
+            // one must also name the role's risk profile. The error points at
+            // the budget, the field that needs the role.
+            let budget_alias = group
+                .runtime_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty());
+            if budget_alias.is_some()
+                && group
+                    .risk_profile
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+            {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("peer_groups.{group_name}.runtime_profile"),
+                    "peer_groups.{group_name}.risk_profile is required when peer_groups.{group_name}.runtime_profile is set: a sender-role budget needs a sender role, and risk_profile may name the agent's own risk profile to add only the budget",
+                );
+            }
+            // A sender role must name a real profile, and that profile may
+            // differ from each agent it applies to only in the fields the
+            // orchestrator narrows per turn. Anything else would be silently
+            // ignored at runtime, so refuse it here.
+            if let Some(role_alias) = group.risk_profile.as_deref().map(str::trim) {
+                let Some(role_profile) = self.risk_profiles.get(role_alias) else {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("peer_groups.{group_name}.risk_profile"),
+                        "peer_groups.{group_name}.risk_profile = {role_alias:?} but risk_profiles.{role_alias} is not configured",
+                    );
+                };
+                for agent_alias in self.sender_role_agents(group) {
+                    let Some(agent_profile) = self.risk_profile_for_agent(agent_alias) else {
+                        continue;
+                    };
+                    let mismatched = agent_profile.sender_role_fixed_field_mismatches(role_profile);
+                    if !mismatched.is_empty() {
+                        let agent_profile_alias = self
+                            .agents
+                            .get(agent_alias)
+                            .map(|agent| agent.risk_profile.trim().to_string())
+                            .unwrap_or_default();
+                        let mismatched = mismatched.join(", ");
+                        let turn_fields = RiskProfileConfig::SENDER_ROLE_TURN_FIELDS.join(", ");
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("peer_groups.{group_name}.risk_profile"),
+                            "peer_groups.{group_name}.risk_profile = {role_alias:?} differs from agents.{agent_alias}'s profile {agent_profile_alias:?} in {mismatched}; a sender role may only change {turn_fields}",
+                        );
+                    }
+                }
+            }
+            // A sender-role budget takes only the hourly action cap from the
+            // runtime profile it names. Every other runtime setting is fixed
+            // when the agent is built, so the profile must match each agent's
+            // own runtime profile (the defaults, for an agent that names
+            // none) everywhere else, or those settings would be silently
+            // ignored.
+            if let Some(budget_alias) = budget_alias {
+                let Some(budget_profile) = self.runtime_profiles.get(budget_alias) else {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("peer_groups.{group_name}.runtime_profile"),
+                        "peer_groups.{group_name}.runtime_profile = {budget_alias:?} but runtime_profiles.{budget_alias} is not configured",
+                    );
+                };
+                let default_runtime_profile = RuntimeProfileConfig::default();
+                for agent_alias in self.sender_role_agents(group) {
+                    let agent_profile = self
+                        .runtime_profile_for_agent(agent_alias)
+                        .unwrap_or(&default_runtime_profile);
+                    let mismatched =
+                        agent_profile.sender_role_fixed_field_mismatches(budget_profile);
+                    if !mismatched.is_empty() {
+                        let agent_profile_label = match self
+                            .agents
+                            .get(agent_alias)
+                            .map(|agent| agent.runtime_profile.trim())
+                            .filter(|alias| !alias.is_empty())
+                        {
+                            Some(alias) => format!("{alias:?}"),
+                            None => "(none set, so the built-in defaults)".to_string(),
+                        };
+                        let mismatched = mismatched.join(", ");
+                        let budget_fields =
+                            RuntimeProfileConfig::SENDER_ROLE_BUDGET_FIELDS.join(", ");
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("peer_groups.{group_name}.runtime_profile"),
+                            "peer_groups.{group_name}.runtime_profile = {budget_alias:?} differs from agents.{agent_alias}'s runtime profile {agent_profile_label} in {mismatched}; a sender-role budget may only change {budget_fields}",
+                        );
+                    }
+                }
+            }
         }
 
         if self.plugins.max_active_instances == 0 {
@@ -28102,6 +28523,587 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    fn sender_role_config() -> super::Config {
+        toml::from_str(
+            r#"
+            [peer_groups.everyone]
+            channel = "discord"
+            external_peers = ["*"]
+            risk_profile = "guest"
+
+            [peer_groups.owners]
+            channel = "discord.main"
+            external_peers = ["alice"]
+            risk_profile = "owner"
+
+            [peer_groups.plain]
+            channel = "discord"
+            external_peers = ["bob"]
+            "#,
+        )
+        .expect("sender-role config should parse")
+    }
+
+    fn role(group: &str, profile: &str) -> super::SenderRole {
+        super::SenderRole {
+            group: group.to_string(),
+            risk_profile: profile.to_string(),
+            runtime_profile: None,
+        }
+    }
+
+    fn budget_role(group: &str, profile: &str, budget: &str) -> super::SenderRole {
+        super::SenderRole {
+            runtime_profile: Some(budget.to_string()),
+            ..role(group, profile)
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_prefers_a_named_member_over_the_wildcard() {
+        let config = sender_role_config();
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("owners", "owner")))
+        );
+        // Everyone else falls through to the wildcard group, including a
+        // sender another group lists without a role.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // The dotted owners group does not reach another alias.
+        assert_eq!(
+            config.channel_sender_role("discord", "other", "bot", |p| p == "alice"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // No role group on the channel: the agent's own profile applies.
+        assert_eq!(
+            config.channel_sender_role("telegram", "main", "bot", |p| p == "alice"),
+            Ok(None)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_never_hands_the_wildcard_to_the_matcher() {
+        let config = sender_role_config();
+        let resolved = config.channel_sender_role("discord", "main", "bot", |p| {
+            assert_ne!(p.trim(), "*", "the resolver owns wildcard semantics");
+            false
+        });
+        assert_eq!(resolved, Ok(Some(role("everyone", "guest"))));
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_refuses_equal_rank_groups_with_different_profiles() {
+        let mut config = sender_role_config();
+        config.peer_groups.insert(
+            "helpers".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "discord".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("alice")],
+                risk_profile: Some("helper".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Err(super::SenderRoleError::Conflict(
+                super::SenderRoleConflict {
+                    groups: vec!["helpers".to_string(), "owners".to_string()],
+                    risk_profiles: vec!["helper".to_string(), "owner".to_string()],
+                    runtime_profiles: vec![None],
+                }
+            ))
+        );
+        // Two groups naming the same profile agree, so there is no conflict.
+        config
+            .peer_groups
+            .get_mut("helpers")
+            .expect("helpers group")
+            .risk_profile = Some("owner".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("helpers", "owner")))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_honors_ignore_and_the_agents_list() {
+        let mut config = sender_role_config();
+        {
+            let owners = config.peer_groups.get_mut("owners").expect("owners group");
+            owners.agents = vec![crate::multi_agent::AgentAlias::new("bot")];
+        }
+        // Scoped to `bot`: another agent on the same channel sees only the
+        // wildcard group.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "other_bot", |p| p == "alice"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // A group's own ignore list takes its members out of the role.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .ignore = vec![crate::multi_agent::PeerUsername::new("mallory")];
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "mallory"),
+            Ok(None)
+        );
+        // A blank profile name is no role at all.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .risk_profile = Some("  ".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "carol"),
+            Ok(None)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn narrowed_for_sender_role_keeps_the_agents_route_when_the_role_sets_none() {
+        let agent_route = crate::autonomy::ApprovalRoute {
+            approver_channel: "discord.ops".into(),
+            approver_recipient: Some("42".into()),
+            ..Default::default()
+        };
+        let agent = super::RiskProfileConfig {
+            approval_route: Some(agent_route),
+            ..Default::default()
+        };
+        let routeless = super::RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent
+                .narrowed_for_sender_role(&routeless)
+                .approval_route
+                .map(|route| route.approver_channel),
+            Some("discord.ops".to_string()),
+            "a role without a route must not ask a looser approver than the agent"
+        );
+        let own_route = super::RiskProfileConfig {
+            approval_route: Some(crate::autonomy::ApprovalRoute {
+                approver_channel: "telegram.admins".into(),
+                approver_recipient: Some("-100123".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            agent
+                .narrowed_for_sender_role(&own_route)
+                .approval_route
+                .map(|route| route.approver_channel),
+            Some("telegram.admins".to_string()),
+            "a role's own route replaces the agent's"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn peer_group_runtime_profile_parses_and_round_trips_through_toml() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.everyone]
+            channel = "discord.main"
+            external_peers = ["*"]
+            risk_profile = "guest"
+            runtime_profile = "guest"
+
+            [peer_groups.owners]
+            channel = "discord.main"
+            external_peers = ["alice"]
+            risk_profile = "owner"
+            "#,
+        )
+        .expect("a peer group budget should parse");
+        let everyone = &config.peer_groups["everyone"];
+        assert_eq!(everyone.runtime_profile.as_deref(), Some("guest"));
+        // An absent budget reads as none.
+        let owners = &config.peer_groups["owners"];
+        assert_eq!(owners.runtime_profile, None);
+
+        let written = toml::to_string(everyone).expect("a peer group should serialize");
+        let reread: crate::multi_agent::PeerGroupConfig =
+            toml::from_str(&written).expect("a serialized peer group should parse");
+        assert_eq!(reread.runtime_profile.as_deref(), Some("guest"));
+        assert_eq!(reread.risk_profile.as_deref(), Some("guest"));
+        // A group without a budget writes no key for it, and reads back
+        // without one.
+        let written = toml::to_string(owners).expect("a peer group should serialize");
+        assert!(!written.contains("runtime_profile"), "got: {written}");
+        let reread: crate::multi_agent::PeerGroupConfig =
+            toml::from_str(&written).expect("a serialized peer group should parse");
+        assert_eq!(reread.runtime_profile, None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_carries_the_budget_of_the_group_it_resolves_to() {
+        let mut config = sender_role_config();
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .runtime_profile = Some("guest_budget".to_string());
+        config
+            .peer_groups
+            .get_mut("owners")
+            .expect("owners group")
+            .runtime_profile = Some(" owner_budget ".to_string());
+        // The named member outranks the wildcard and takes that group's
+        // budget, trimmed; everyone else takes the wildcard group's.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(budget_role("owners", "owner", "owner_budget")))
+        );
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Ok(Some(budget_role("everyone", "guest", "guest_budget")))
+        );
+        // A budget on a group with no role cannot place bob, whom `plain`
+        // names: he is refused rather than left to the wildcard group or run
+        // without that budget.
+        config
+            .peer_groups
+            .get_mut("plain")
+            .expect("plain group")
+            .runtime_profile = Some("plain_budget".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Err(super::SenderRoleError::BudgetWithoutRole {
+                groups: vec!["plain".to_string()],
+                runtime_profiles: vec!["plain_budget".to_string()],
+            })
+        );
+        // Scoping the owners group to `bot` leaves another agent on the
+        // wildcard group's role and budget.
+        config
+            .peer_groups
+            .get_mut("owners")
+            .expect("owners group")
+            .agents = vec![crate::multi_agent::AgentAlias::new("bot")];
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "other_bot", |p| p == "alice"),
+            Ok(Some(budget_role("everyone", "guest", "guest_budget")))
+        );
+        // A group's ignore list takes a sender out of its role and budget.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .ignore = vec![crate::multi_agent::PeerUsername::new("mallory")];
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "mallory"),
+            Ok(None)
+        );
+        // A blank budget name is no budget.
+        config
+            .peer_groups
+            .get_mut("owners")
+            .expect("owners group")
+            .runtime_profile = Some("  ".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("owners", "owner")))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_refuses_equal_rank_groups_with_different_budgets() {
+        let mut config = sender_role_config();
+        config
+            .peer_groups
+            .get_mut("owners")
+            .expect("owners group")
+            .runtime_profile = Some("owner_budget".to_string());
+        config.peer_groups.insert(
+            "helpers".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "discord".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("alice")],
+                risk_profile: Some("owner".to_string()),
+                runtime_profile: Some("helper_budget".to_string()),
+                ..Default::default()
+            },
+        );
+        // The same risk profile with different budgets is ambiguous.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Err(super::SenderRoleError::Conflict(
+                super::SenderRoleConflict {
+                    groups: vec!["helpers".to_string(), "owners".to_string()],
+                    risk_profiles: vec!["owner".to_string()],
+                    runtime_profiles: vec![
+                        Some("helper_budget".to_string()),
+                        Some("owner_budget".to_string()),
+                    ],
+                }
+            ))
+        );
+        // So is a budget on one side and none on the other; the missing
+        // budget stays visible in the conflict.
+        config
+            .peer_groups
+            .get_mut("helpers")
+            .expect("helpers group")
+            .runtime_profile = None;
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Err(super::SenderRoleError::Conflict(
+                super::SenderRoleConflict {
+                    groups: vec!["helpers".to_string(), "owners".to_string()],
+                    risk_profiles: vec!["owner".to_string()],
+                    runtime_profiles: vec![None, Some("owner_budget".to_string())],
+                }
+            ))
+        );
+        // Disagreeing on both reports both.
+        {
+            let helpers = config
+                .peer_groups
+                .get_mut("helpers")
+                .expect("helpers group");
+            helpers.risk_profile = Some("helper".to_string());
+            helpers.runtime_profile = Some("helper_budget".to_string());
+        }
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Err(super::SenderRoleError::Conflict(
+                super::SenderRoleConflict {
+                    groups: vec!["helpers".to_string(), "owners".to_string()],
+                    risk_profiles: vec!["helper".to_string(), "owner".to_string()],
+                    runtime_profiles: vec![
+                        Some("helper_budget".to_string()),
+                        Some("owner_budget".to_string()),
+                    ],
+                }
+            ))
+        );
+        // Two groups naming the same pair agree, whatever the whitespace.
+        {
+            let helpers = config
+                .peer_groups
+                .get_mut("helpers")
+                .expect("helpers group");
+            helpers.risk_profile = Some("owner".to_string());
+            helpers.runtime_profile = Some(" owner_budget".to_string());
+        }
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(budget_role("helpers", "owner", "owner_budget")))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_refuses_a_best_match_with_a_budget_and_no_role() {
+        let mut config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.visitors]
+            channel = "discord"
+            external_peers = ["*"]
+            runtime_profile = "visitor_budget"
+
+            [peer_groups.owners]
+            channel = "discord.main"
+            external_peers = ["alice"]
+            risk_profile = "owner"
+            "#,
+        )
+        .expect("sender-role config should parse");
+        let refused: std::result::Result<Option<super::SenderRole>, super::SenderRoleError> =
+            Err(super::SenderRoleError::BudgetWithoutRole {
+                groups: vec!["visitors".to_string()],
+                runtime_profiles: vec!["visitor_budget".to_string()],
+            });
+        // A wildcard group with a budget and no role refuses everyone it
+        // would place, rather than letting them run uncapped.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            refused
+        );
+        // A named role group outranks it, as it outranks any wildcard group.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("owners", "owner")))
+        );
+        // A role group of the same rank does not place the sender either.
+        config.peer_groups.insert(
+            "everyone".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "discord".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("*")],
+                risk_profile: Some("guest".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            refused
+        );
+        // Like a role group, it does not apply to a sender its ignore list
+        // names.
+        config
+            .peer_groups
+            .get_mut("visitors")
+            .expect("visitors group")
+            .ignore = vec![crate::multi_agent::PeerUsername::new("bob")];
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // A group whose budget is blank names neither, and places nobody.
+        {
+            let visitors = config
+                .peer_groups
+                .get_mut("visitors")
+                .expect("visitors group");
+            visitors.ignore.clear();
+            visitors.runtime_profile = Some("  ".to_string());
+        }
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Ok(Some(role("everyone", "guest")))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn narrowed_for_sender_role_only_removes_authority() {
+        let agent = super::RiskProfileConfig {
+            excluded_tools: vec!["browser_open".into()],
+            always_ask: vec!["file_write".into()],
+            auto_approve: vec!["file_read".into(), "memory_recall".into()],
+            allowed_commands: vec!["git".into()],
+            ..Default::default()
+        };
+        let route = crate::autonomy::ApprovalRoute {
+            approver_channel: "discord.ops".into(),
+            approver_recipient: Some("42".into()),
+            ..Default::default()
+        };
+        let guest = super::RiskProfileConfig {
+            excluded_tools: vec!["shell".into(), "browser_open".into()],
+            always_ask: vec!["http_request".into()],
+            auto_approve: vec!["memory_recall".into(), "shell".into()],
+            allowed_commands: vec!["rm".into()],
+            approval_route: Some(route),
+            ..Default::default()
+        };
+        let turn = agent.narrowed_for_sender_role(&guest);
+        assert_eq!(turn.excluded_tools, vec!["browser_open", "shell"]);
+        assert_eq!(turn.always_ask, vec!["file_write", "http_request"]);
+        // Only what both sides auto-approve survives; the role cannot add
+        // `shell` to the agent's list.
+        assert_eq!(turn.auto_approve, vec!["memory_recall"]);
+        assert_eq!(
+            turn.approval_route
+                .as_ref()
+                .map(|r| r.approver_channel.as_str()),
+            Some("discord.ops")
+        );
+        // Fields outside the turn set stay the agent's.
+        assert_eq!(turn.allowed_commands, vec!["git"]);
+
+        // A wildcard on one side defers to the other side's list.
+        let open_agent = super::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            open_agent.narrowed_for_sender_role(&guest).auto_approve,
+            vec!["memory_recall", "shell"]
+        );
+        let open_role = super::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent.narrowed_for_sender_role(&open_role).auto_approve,
+            vec!["file_read", "memory_recall"]
+        );
+        // A role without a route keeps the agent's: the agent's own channel
+        // turns ask that approver, so a role asking the room would widen who
+        // may approve.
+        let routed_agent = super::RiskProfileConfig {
+            approval_route: guest.approval_route.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            routed_agent
+                .narrowed_for_sender_role(&super::RiskProfileConfig::default())
+                .approval_route
+                .map(|route| route.approver_channel),
+            Some("discord.ops".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn sender_role_fixed_field_mismatches_ignores_only_turn_fields() {
+        let agent = super::RiskProfileConfig::default();
+        let narrowing = super::RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            always_ask: vec!["*".into()],
+            auto_approve: vec![],
+            approval_route: Some(crate::autonomy::ApprovalRoute::default()),
+            ..Default::default()
+        };
+        assert!(
+            agent
+                .sender_role_fixed_field_mismatches(&narrowing)
+                .is_empty()
+        );
+
+        let widening = super::RiskProfileConfig {
+            level: crate::autonomy::AutonomyLevel::Full,
+            allowed_commands: vec!["rm".into()],
+            ..narrowing
+        };
+        assert_eq!(
+            agent.sender_role_fixed_field_mismatches(&widening),
+            vec!["allowed_commands".to_string(), "level".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn runtime_sender_role_fixed_field_mismatches_ignores_only_the_action_cap() {
+        let agent = super::RuntimeProfileConfig::default();
+        let budget = super::RuntimeProfileConfig {
+            max_actions_per_hour: 5,
+            ..Default::default()
+        };
+        assert!(agent.sender_role_fixed_field_mismatches(&budget).is_empty());
+
+        // The daily cost cap is fixed like every other field.
+        let widening = super::RuntimeProfileConfig {
+            max_cost_per_day_cents: 10_000,
+            max_tool_iterations: 50,
+            ..budget.clone()
+        };
+        assert_eq!(
+            agent.sender_role_fixed_field_mismatches(&widening),
+            vec![
+                "max_cost_per_day_cents".to_string(),
+                "max_tool_iterations".to_string()
+            ]
+        );
+
+        // A nested setting is reported by its top-level field.
+        let nested = super::RuntimeProfileConfig {
+            thinking: crate::scattered_types::ThinkingConfig {
+                native_thinking: true,
+                ..Default::default()
+            },
+            ..budget
+        };
+        assert_eq!(
+            agent.sender_role_fixed_field_mismatches(&nested),
+            vec!["thinking".to_string()]
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
@@ -46831,6 +47833,307 @@ allowed_users = []
             err.to_string().contains("peer_groups.team_chat.agents[1]"),
             "expected indexed field path, got: {err}"
         );
+    }
+
+    fn sender_role_test_config(role: RiskProfileConfig) -> Config {
+        let mut config = multi_agent_test_config();
+        config.risk_profiles.insert("guest".to_string(), role);
+        config.peer_groups.insert(
+            "everyone".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("*")],
+                risk_profile: Some("guest".to_string()),
+                ..crate::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn validate_accepts_a_sender_role_that_only_narrows_turn_fields() {
+        let config = sender_role_test_config(RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            always_ask: vec!["file_write".into()],
+            approval_route: Some(crate::autonomy::ApprovalRoute {
+                approver_channel: "telegram.draft".into(),
+                approver_recipient: Some("-100123".into()),
+                ..Default::default()
+            }),
+            ..RiskProfileConfig::default()
+        });
+        config
+            .validate()
+            .expect("a role that differs only in turn fields must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_naming_a_missing_profile() {
+        let mut config = sender_role_test_config(RiskProfileConfig::default());
+        config.risk_profiles.remove("guest");
+        let err = config
+            .validate()
+            .expect_err("a dangling role profile must fail validation");
+        assert!(
+            err.to_string()
+                .contains("peer_groups.everyone.risk_profile = \"guest\" but risk_profiles.guest is not configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_that_changes_fixed_fields() {
+        let config = sender_role_test_config(RiskProfileConfig {
+            level: crate::autonomy::AutonomyLevel::Full,
+            excluded_tools: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        let err = config
+            .validate()
+            .expect_err("a role that changes a fixed field must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("differs from agents.alpha's profile \"default\" in level;"),
+            "only the fixed field is reported, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_checks_a_sender_role_against_every_agent_on_its_channel() {
+        let mut config = sender_role_test_config(RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        config.risk_profiles.insert(
+            "strict".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["git".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "strict".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let err = config
+            .validate()
+            .expect_err("an unscoped role must fit every agent on the channel");
+        assert!(
+            err.to_string()
+                .contains("differs from agents.beta's profile \"strict\" in allowed_commands;"),
+            "got: {err}"
+        );
+
+        // Scoping the group to alpha leaves beta out of the role.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .agents = vec![crate::multi_agent::AgentAlias::new("alpha")];
+        config
+            .validate()
+            .expect("a role scoped to alpha is checked only against alpha");
+    }
+
+    /// `sender_role_test_config` whose `everyone` role only adds a budget:
+    /// the role's risk profile equals the agent's, and the group names
+    /// `runtime_profiles.guest`, set to `budget`. Agent `alpha` names no
+    /// runtime profile, so it runs on the built-in defaults.
+    fn sender_role_budget_test_config(budget: RuntimeProfileConfig) -> Config {
+        let mut config = sender_role_test_config(RiskProfileConfig::default());
+        config.runtime_profiles.insert("guest".to_string(), budget);
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .runtime_profile = Some("guest".to_string());
+        config
+    }
+
+    fn capped_runtime_profile(max_actions_per_hour: u32) -> RuntimeProfileConfig {
+        RuntimeProfileConfig {
+            max_actions_per_hour,
+            ..RuntimeProfileConfig::default()
+        }
+    }
+
+    fn assert_validation_error(
+        err: &anyhow::Error,
+        code: crate::api_error::ConfigApiCode,
+        path: &str,
+        message: &str,
+    ) {
+        let api = err
+            .downcast_ref::<crate::api_error::ConfigApiError>()
+            .unwrap_or_else(|| panic!("expected a structured validation error, got: {err}"));
+        assert_eq!(api.code, code, "got: {err}");
+        assert_eq!(api.path.as_deref(), Some(path), "got: {err}");
+        assert!(api.message.contains(message), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_accepts_a_sender_role_budget_that_only_changes_the_action_cap() {
+        // Compared with the built-in defaults alpha runs on.
+        let mut config = sender_role_budget_test_config(capped_runtime_profile(5));
+        config
+            .validate()
+            .expect("a budget that differs from the defaults only in its cap must validate");
+
+        // Compared with the agent's own runtime profile once it names one.
+        let fast = RuntimeProfileConfig {
+            max_tool_iterations: 40,
+            ..RuntimeProfileConfig::default()
+        };
+        config.runtime_profiles.insert(
+            "guest".to_string(),
+            RuntimeProfileConfig {
+                max_actions_per_hour: 5,
+                ..fast.clone()
+            },
+        );
+        config.runtime_profiles.insert("fast".to_string(), fast);
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("alpha agent")
+            .runtime_profile = "fast".into();
+        config
+            .validate()
+            .expect("a budget that differs from the agent's profile only in its cap must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_budget_naming_a_missing_profile() {
+        let mut config = sender_role_budget_test_config(capped_runtime_profile(5));
+        config.runtime_profiles.remove("guest");
+        let err = config
+            .validate()
+            .expect_err("a dangling budget profile must fail validation");
+        assert_validation_error(
+            &err,
+            crate::api_error::ConfigApiCode::DanglingReference,
+            "peer_groups.everyone.runtime_profile",
+            "peer_groups.everyone.runtime_profile = \"guest\" but runtime_profiles.guest is not configured",
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_budget_without_a_risk_profile() {
+        let mut config = sender_role_budget_test_config(capped_runtime_profile(5));
+        for risk_profile in [None, Some("  ".to_string())] {
+            config
+                .peer_groups
+                .get_mut("everyone")
+                .expect("everyone group")
+                .risk_profile = risk_profile;
+            let err = config
+                .validate()
+                .expect_err("a budget without a sender role must fail validation");
+            assert_validation_error(
+                &err,
+                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                "peer_groups.everyone.runtime_profile",
+                "peer_groups.everyone.risk_profile is required when peer_groups.everyone.runtime_profile is set",
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_budget_that_changes_fixed_fields() {
+        // alpha names no runtime profile, so the defaults are the reference,
+        // and the daily cost cap is one of the fixed fields.
+        let config = sender_role_budget_test_config(RuntimeProfileConfig {
+            max_cost_per_day_cents: 50_000,
+            ..capped_runtime_profile(5)
+        });
+        let err = config
+            .validate()
+            .expect_err("a budget that changes a fixed field must fail validation");
+        assert_validation_error(
+            &err,
+            crate::api_error::ConfigApiCode::InvalidFormat,
+            "peer_groups.everyone.runtime_profile",
+            "peer_groups.everyone.runtime_profile = \"guest\" differs from agents.alpha's runtime profile (none set, so the built-in defaults) in max_cost_per_day_cents; a sender-role budget may only change max_actions_per_hour",
+        );
+
+        // Once alpha names its own runtime profile, a budget built on the
+        // defaults no longer fits it.
+        let mut config = sender_role_budget_test_config(capped_runtime_profile(5));
+        config.runtime_profiles.insert(
+            "fast".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 40,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("alpha agent")
+            .runtime_profile = "fast".into();
+        let err = config
+            .validate()
+            .expect_err("a budget must match the agent's own runtime profile");
+        assert_validation_error(
+            &err,
+            crate::api_error::ConfigApiCode::InvalidFormat,
+            "peer_groups.everyone.runtime_profile",
+            "differs from agents.alpha's runtime profile \"fast\" in max_tool_iterations;",
+        );
+    }
+
+    #[test]
+    async fn validate_checks_a_sender_role_budget_against_every_agent_on_its_channel() {
+        let mut config = sender_role_budget_test_config(capped_runtime_profile(5));
+        config.runtime_profiles.insert(
+            "strict".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 10,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            runtime_profile: "strict".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let err = config
+            .validate()
+            .expect_err("an unscoped budget must fit every agent on the channel");
+        assert_validation_error(
+            &err,
+            crate::api_error::ConfigApiCode::InvalidFormat,
+            "peer_groups.everyone.runtime_profile",
+            "differs from agents.beta's runtime profile \"strict\" in max_tool_iterations;",
+        );
+
+        // Scoping the group to alpha leaves beta out of the budget.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .agents = vec![crate::multi_agent::AgentAlias::new("alpha")];
+        config
+            .validate()
+            .expect("a budget scoped to alpha is checked only against alpha");
+    }
+
+    #[test]
+    async fn validate_accepts_a_sender_role_budget_above_the_agent_limit() {
+        // alpha runs on the defaults, which allow 20 actions per hour. A
+        // higher per-sender cap is a valid setup: the agent's own limit
+        // still applies to every action, and the role bucket is keyed by
+        // sender, so both can bind.
+        let config = sender_role_budget_test_config(capped_runtime_profile(50));
+        config
+            .validate()
+            .expect("a budget above the agent's limit is valid");
     }
 
     #[test]

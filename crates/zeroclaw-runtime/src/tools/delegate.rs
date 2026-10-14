@@ -5210,6 +5210,10 @@ impl Tool for ToolArcRef {
         self.inner.requires_unrestricted_principal()
     }
 
+    fn wrapped_tool(&self) -> Option<&dyn Tool> {
+        self.inner.wrapped_tool()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

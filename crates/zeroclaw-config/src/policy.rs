@@ -162,11 +162,114 @@ impl Clone for ActionTracker {
     }
 }
 
-/// Per-sender sliding-window rate limiter. The bucket map is Arc-shared
+/// Action buckets by key.
+type BucketMap = HashMap<String, ActionTracker>;
+
+/// Keyed action buckets, shared by every clone of one [`PerSenderTracker`].
+type ActionBuckets = std::sync::Arc<parking_lot::Mutex<BucketMap>>;
+
+/// Role buckets, shared by every clone of one [`PerSenderTracker`].
+type SharedRoleBuckets = std::sync::Arc<parking_lot::Mutex<RoleBuckets>>;
+
+/// Role-bucket count at which adding another role bucket first sweeps the
+/// idle ones. Sender keys are unbounded under a wildcard peer group, so the
+/// role map must not keep one bucket per sender ever seen.
+const ROLE_BUCKET_SWEEP_THRESHOLD: usize = 1024;
+
+/// Drop buckets with no committed action inside the window and nothing in
+/// flight. A bucket that holds an in-flight slot always survives, so an
+/// owned reservation's bucket exists until it commits or releases.
+fn sweep_idle_buckets(buckets: &mut BucketMap, now: Instant) {
+    buckets.retain(|_, tracker| tracker.used_at(now) > 0);
+}
+
+/// Whether bucket `key` is at `max`, dropping the bucket once it is empty.
+fn bucket_exhausted_at(buckets: &mut BucketMap, key: &str, max: u32, now: Instant) -> bool {
+    let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
+    if used == 0 {
+        buckets.remove(key);
+    }
+    max == 0 || used >= max as usize
+}
+
+/// Reserve one slot in bucket `key`, creating the bucket when it is absent;
+/// `before_insert` runs on the map just before a new bucket is added. The
+/// agent and role maps both admit through here, so the two admission paths
+/// cannot drift apart. A cap of zero reserves nothing and adds no bucket.
+fn reserve_in_bucket(
+    buckets: &mut BucketMap,
+    key: &str,
+    max: u32,
+    before_insert: impl FnOnce(&mut BucketMap),
+) -> bool {
+    if max == 0 {
+        return false;
+    }
+    if let Some(tracker) = buckets.get(key) {
+        return tracker.reserve(max);
+    }
+    before_insert(buckets);
+    let tracker = ActionTracker::new();
+    let admitted = tracker.reserve(max);
+    buckets.insert(key.to_owned(), tracker);
+    admitted
+}
+
+/// The role buckets and the size at which adding another one next sweeps
+/// the idle ones, behind one lock so the two always agree.
+struct RoleBuckets {
+    buckets: BucketMap,
+    /// Starts at [`ROLE_BUCKET_SWEEP_THRESHOLD`]. Each sweep moves it to
+    /// twice the buckets the sweep kept, never below the threshold, so a
+    /// burst of new senders costs amortized constant time per sender rather
+    /// than a full sweep each.
+    sweep_at: usize,
+}
+
+impl std::fmt::Debug for RoleBuckets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Role-bucket keys identify senders, so debug output carries only
+        // how many buckets there are.
+        f.debug_struct("RoleBuckets")
+            .field("bucket_count", &self.buckets.len())
+            .field("sweep_at", &self.sweep_at)
+            .finish()
+    }
+}
+
+impl RoleBuckets {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            sweep_at: ROLE_BUCKET_SWEEP_THRESHOLD,
+        }
+    }
+
+    /// Reserve one slot in role bucket `key`. Adding a bucket to a map that
+    /// has reached `sweep_at` first sweeps the idle buckets.
+    fn reserve(&mut self, key: &str, max: u32) -> bool {
+        let Self { buckets, sweep_at } = self;
+        reserve_in_bucket(buckets, key, max, |buckets| {
+            if buckets.len() >= *sweep_at {
+                sweep_idle_buckets(buckets, Instant::now());
+                *sweep_at = buckets
+                    .len()
+                    .saturating_mul(2)
+                    .max(ROLE_BUCKET_SWEEP_THRESHOLD);
+            }
+        })
+    }
+}
+
+/// Per-sender sliding-window rate limiter. The bucket maps are Arc-shared
 /// so cloned policies (SubAgents) consume from the same budgets.
 #[derive(Debug)]
 pub struct PerSenderTracker {
-    buckets: std::sync::Arc<parking_lot::Mutex<HashMap<String, ActionTracker>>>,
+    buckets: ActionBuckets,
+    /// Buckets charged through a scoped [`SenderRoleActionBudget`]. A map of
+    /// their own, so a role key can never name a thread bucket, whatever
+    /// string a channel supplies for either.
+    role_buckets: SharedRoleBuckets,
 }
 
 impl PerSenderTracker {
@@ -177,6 +280,7 @@ impl PerSenderTracker {
     pub fn new() -> Self {
         Self {
             buckets: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            role_buckets: std::sync::Arc::new(parking_lot::Mutex::new(RoleBuckets::new())),
         }
     }
 
@@ -214,46 +318,31 @@ impl PerSenderTracker {
     }
 
     fn reserve_within(&self, key: String, max: u32) -> Option<ActionReservation> {
-        if max == 0 {
+        if !reserve_in_bucket(&mut self.buckets.lock(), &key, max, |_| {}) {
             return None;
         }
-        {
-            let mut buckets = self.buckets.lock();
-            let admitted = match buckets.get(&key) {
-                Some(tracker) => tracker.reserve(max),
-                None => {
-                    let tracker = ActionTracker::new();
-                    let admitted = tracker.reserve(max);
-                    buckets.insert(key.clone(), tracker);
-                    admitted
-                }
-            };
-            if !admitted {
-                return None;
-            }
-        }
         Some(ActionReservation {
-            tracker: self.clone(),
-            key,
+            agent: ReservedSlot {
+                map: SlotMap::Agent(std::sync::Arc::clone(&self.buckets)),
+                key,
+            },
+            role: None,
             finished: false,
         })
     }
 
-    fn commit_reservation(&self, key: &str) -> bool {
-        let buckets = self.buckets.lock();
-        buckets.get(key).is_some_and(ActionTracker::commit)
-    }
-
-    fn release_reservation(&self, key: &str) -> bool {
-        let mut buckets = self.buckets.lock();
-        let Some(tracker) = buckets.get(key) else {
-            return false;
-        };
-        let (released, remove_bucket) = tracker.release();
-        if remove_bucket {
-            buckets.remove(key);
+    /// Atomically reserve one slot in role bucket `key` through
+    /// [`RoleBuckets::reserve`], which admits through the shared
+    /// [`reserve_in_bucket`] helper and sweeps the role map's idle buckets
+    /// as it grows.
+    fn reserve_role(&self, key: &str, max: u32) -> Option<ReservedSlot> {
+        if !self.role_buckets.lock().reserve(key, max) {
+            return None;
         }
-        released
+        Some(ReservedSlot {
+            map: SlotMap::Role(std::sync::Arc::clone(&self.role_buckets)),
+            key: key.to_owned(),
+        })
     }
 
     /// Check if the current sender is at or over the limit (without recording).
@@ -267,30 +356,88 @@ impl PerSenderTracker {
     }
 
     fn is_exhausted_at(&self, key: &str, max: u32, now: Instant) -> bool {
-        let mut buckets = self.buckets.lock();
-        let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
-        if used == 0 {
-            buckets.remove(key);
-        }
-        max == 0 || used >= max as usize
+        bucket_exhausted_at(&mut self.buckets.lock(), key, max, now)
+    }
+
+    /// Role-map counterpart of [`Self::is_exhausted`].
+    fn is_role_exhausted(&self, key: &str, max: u32) -> bool {
+        bucket_exhausted_at(
+            &mut self.role_buckets.lock().buckets,
+            key,
+            max,
+            Instant::now(),
+        )
     }
 }
 
-/// One sender-scoped in-flight action slot.
+/// The bucket map an in-flight slot is held in.
+enum SlotMap {
+    Agent(ActionBuckets),
+    Role(SharedRoleBuckets),
+}
+
+impl SlotMap {
+    /// Run `f` on the locked bucket map.
+    fn with_buckets<R>(&self, f: impl FnOnce(&mut BucketMap) -> R) -> R {
+        match self {
+            Self::Agent(buckets) => f(&mut buckets.lock()),
+            Self::Role(roles) => f(&mut roles.lock().buckets),
+        }
+    }
+}
+
+/// One in-flight slot: the bucket map that holds it and its key there.
+struct ReservedSlot {
+    map: SlotMap,
+    key: String,
+}
+
+impl ReservedSlot {
+    fn commit(&self) -> bool {
+        self.map
+            .with_buckets(|buckets| buckets.get(&self.key).is_some_and(ActionTracker::commit))
+    }
+
+    fn release(&self) -> bool {
+        self.map.with_buckets(|buckets| {
+            let Some(tracker) = buckets.get(&self.key) else {
+                return false;
+            };
+            let (released, remove_bucket) = tracker.release();
+            if remove_bucket {
+                buckets.remove(&self.key);
+            }
+            released
+        })
+    }
+}
+
+/// One sender-scoped in-flight action slot, linked to a slot in the
+/// sender's role bucket when a [`SenderRoleActionBudget`] was in scope at
+/// admission.
 ///
-/// Dropping an uncommitted reservation releases only this invocation's slot.
+/// Dropping an uncommitted reservation releases only this invocation's
+/// slots.
 #[must_use = "dropping the reservation releases the action slot"]
 pub struct ActionReservation {
-    tracker: PerSenderTracker,
-    key: String,
+    agent: ReservedSlot,
+    role: Option<ReservedSlot>,
     finished: bool,
 }
 
 impl ActionReservation {
-    /// Convert this in-flight slot into one committed action.
+    /// Convert this in-flight slot, and its linked role slot, into one
+    /// committed action in each bucket.
     pub fn commit(mut self) {
-        let committed = self.tracker.commit_reservation(&self.key);
-        assert!(committed, "owned action reservation must still exist");
+        // No path removes a bucket that holds an in-flight slot (release,
+        // the exhaustion read and the role sweep all keep it), so both
+        // owned slots still exist here.
+        let committed = self.agent.commit();
+        let role_committed = self.role.as_ref().is_none_or(ReservedSlot::commit);
+        assert!(
+            committed && role_committed,
+            "owned action reservation must still exist"
+        );
         self.finished = true;
     }
 }
@@ -298,7 +445,10 @@ impl ActionReservation {
 impl Drop for ActionReservation {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.tracker.release_reservation(&self.key);
+            let _ = self.agent.release();
+            if let Some(role) = &self.role {
+                let _ = role.release();
+            }
         }
     }
 }
@@ -307,6 +457,7 @@ impl Clone for PerSenderTracker {
     fn clone(&self) -> Self {
         Self {
             buckets: std::sync::Arc::clone(&self.buckets),
+            role_buckets: std::sync::Arc::clone(&self.role_buckets),
         }
     }
 }
@@ -314,6 +465,125 @@ impl Clone for PerSenderTracker {
 impl Default for PerSenderTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+tokio::task_local! {
+    /// The running turn's sender-role action budget. Reached only through
+    /// [`SenderRoleActionBudget::current`] and [`SenderRoleActionBudget::scope`].
+    static SENDER_ROLE_ACTION_BUDGET: Option<SenderRoleActionBudget>;
+}
+
+/// A sender role's action budget for the running turn.
+///
+/// While a budget is in scope, [`SecurityPolicy`] admits an action only when
+/// it fits both the agent's own bucket and this budget's role bucket. Dual
+/// admission only narrows: nothing the agent's budget refuses is admitted,
+/// and the agent's bucket is charged exactly as without a budget.
+///
+/// The role bucket lives in the tracker this budget carries (the originating
+/// agent's), not in the tracker of whichever policy admits the action, so
+/// every policy that admits an action inside the turn charges that one
+/// bucket.
+#[derive(Clone)]
+pub struct SenderRoleActionBudget {
+    /// The originating agent's tracker, which holds the role bucket.
+    tracker: PerSenderTracker,
+    /// Sender-scoped role bucket key, opaque to this type.
+    key: String,
+    max_actions_per_hour: u32,
+    /// Role name for logs.
+    label: String,
+}
+
+impl std::fmt::Debug for SenderRoleActionBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The key identifies a sender and the tracker holds every bucket, so
+        // debug output carries the role and its limit only.
+        f.debug_struct("SenderRoleActionBudget")
+            .field("label", &self.label)
+            .field("max_actions_per_hour", &self.max_actions_per_hour)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SenderRoleActionBudget {
+    /// A budget of `max_actions_per_hour` actions per window for role bucket
+    /// `key` in `tracker`. `label` names the role in logs; the key never
+    /// appears there.
+    pub fn new(
+        tracker: &PerSenderTracker,
+        key: impl Into<String>,
+        max_actions_per_hour: u32,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            tracker: tracker.clone(),
+            key: key.into(),
+            max_actions_per_hour,
+            label: label.into(),
+        }
+    }
+
+    pub fn max_actions_per_hour(&self) -> u32 {
+        self.max_actions_per_hour
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The budget scoped around the running task, if any. Spawned tasks
+    /// start without one, so a spawn that keeps work inside the turn
+    /// captures the budget here and restores it with [`Self::scope`].
+    pub fn current() -> Option<Self> {
+        SENDER_ROLE_ACTION_BUDGET
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+    }
+
+    /// Run `future` with `budget` as the running turn's sender-role budget.
+    /// `None` runs it with no role budget, even inside an outer scope.
+    ///
+    /// The returned future is the task-local scope itself, not an `async fn`
+    /// around it, so wrapping a deep future adds no frame of its own to each
+    /// poll of that future.
+    pub fn scope<F: Future>(budget: Option<Self>, future: F) -> impl Future<Output = F::Output> {
+        SENDER_ROLE_ACTION_BUDGET.scope(budget, future)
+    }
+
+    /// Whether the role bucket is at the role cap. A cap of zero is always
+    /// exhausted.
+    pub fn is_exhausted(&self) -> bool {
+        self.tracker
+            .is_role_exhausted(&self.key, self.max_actions_per_hour)
+    }
+
+    /// Reserve one slot in the role bucket, recording a refusal.
+    fn reserve(&self) -> Option<ReservedSlot> {
+        let slot = self
+            .tracker
+            .reserve_role(&self.key, self.max_actions_per_hour);
+        if slot.is_none() {
+            self.record_denial();
+        }
+        slot
+    }
+
+    /// Record one action refused by this budget. The event names the role
+    /// and its limit, never the sender key.
+    fn record_denial(&self) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "sender_role": self.label,
+                    "max_actions_per_hour": self.max_actions_per_hour,
+                })),
+            "action refused: sender-role action budget exhausted"
+        );
     }
 }
 
@@ -4482,20 +4752,77 @@ impl SecurityPolicy {
     }
 
     /// Atomically reserve one action slot for a production-wrapped invocation.
+    ///
+    /// With a [`SenderRoleActionBudget`] in scope the action must also fit
+    /// the sender's role bucket, and the reservation holds both slots.
     pub fn reserve_action(&self) -> Option<ActionReservation> {
-        self.tracker.reserve_for_current(self.max_actions_per_hour)
+        self.reserve_action_within(SenderRoleActionBudget::current().as_ref())
     }
 
     /// Record an action for the current sender and check if rate-limited.
     /// Returns `true` if allowed, `false` if budget exhausted.
+    ///
+    /// With a [`SenderRoleActionBudget`] in scope both slots are reserved
+    /// before either is committed, so a refused attempt is recorded in
+    /// neither bucket.
     pub fn record_action(&self) -> bool {
-        self.tracker.record_for_current(self.max_actions_per_hour)
+        let Some(budget) = SenderRoleActionBudget::current() else {
+            return self.tracker.record_for_current(self.max_actions_per_hour);
+        };
+        match self.reserve_action_within(Some(&budget)) {
+            Some(reservation) => {
+                reservation.commit();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Check if the current sender would be rate-limited without recording.
+    /// With a [`SenderRoleActionBudget`] in scope, an exhausted role bucket
+    /// limits the sender too.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker
+        if self
+            .tracker
             .is_limited_for_current(self.max_actions_per_hour)
+        {
+            return true;
+        }
+        let Some(budget) = SenderRoleActionBudget::current() else {
+            return false;
+        };
+        let exhausted = budget.is_exhausted();
+        if exhausted {
+            // Callers refuse the action on `true`, so this is a role denial.
+            budget.record_denial();
+        }
+        exhausted
+    }
+
+    /// Reserve the role slot of `budget` when present, then the agent slot.
+    ///
+    /// The role slot comes first, so a sender whose role budget is spent
+    /// never holds a slot in the agent's bucket, even for an instant: other
+    /// senders can share that bucket.
+    fn reserve_action_within(
+        &self,
+        budget: Option<&SenderRoleActionBudget>,
+    ) -> Option<ActionReservation> {
+        let role = match budget {
+            Some(budget) => Some(budget.reserve()?),
+            None => None,
+        };
+        let Some(mut reservation) = self.tracker.reserve_for_current(self.max_actions_per_hour)
+        else {
+            // A refused agent slot gives the role slot back: a refused
+            // action is charged to neither bucket.
+            if let Some(role) = role {
+                let _ = role.release();
+            }
+            return None;
+        };
+        reservation.role = role;
+        Some(reservation)
     }
 
     pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
@@ -8387,6 +8714,535 @@ mod tests {
 
         assert!(!tracker.is_exhausted_at("expired-sender", 1, after_window));
         assert!(!tracker.buckets.lock().contains_key("expired-sender"));
+    }
+
+    // ── Sender-role action budget ────────────────────────────
+
+    /// `(committed, in_flight)` of bucket `key`, or `None` when it is absent.
+    fn bucket_usage(buckets: &BucketMap, key: &str) -> Option<(usize, usize)> {
+        let tracker = buckets.get(key)?;
+        let state = tracker.state.lock();
+        Some((state.committed.len(), state.in_flight))
+    }
+
+    /// [`bucket_usage`] of agent bucket `key` in `tracker`.
+    fn agent_usage(tracker: &PerSenderTracker, key: &str) -> Option<(usize, usize)> {
+        bucket_usage(&tracker.buckets.lock(), key)
+    }
+
+    /// [`bucket_usage`] of role bucket `key` in `tracker`.
+    fn role_usage(tracker: &PerSenderTracker, key: &str) -> Option<(usize, usize)> {
+        bucket_usage(&tracker.role_buckets.lock().buckets, key)
+    }
+
+    fn role_budget(tracker: &PerSenderTracker, key: &str, max: u32) -> SenderRoleActionBudget {
+        SenderRoleActionBudget::new(tracker, key, max, "everyone/guest")
+    }
+
+    #[test]
+    fn unscoped_reserve_action_uses_only_the_agent_bucket() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        };
+        assert!(SenderRoleActionBudget::current().is_none());
+
+        let first = p.reserve_action().expect("first slot");
+        let second = p.reserve_action().expect("second slot");
+        assert!(
+            p.reserve_action().is_none(),
+            "both agent slots are in flight"
+        );
+        first.commit();
+        drop(second);
+
+        assert_eq!(
+            agent_usage(&p.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((1, 0))
+        );
+        assert!(p.tracker.role_buckets.lock().buckets.is_empty());
+    }
+
+    #[test]
+    fn unscoped_record_action_uses_only_the_agent_bucket() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.record_action());
+        assert!(p.record_action());
+        assert!(!p.record_action(), "the agent cap binds");
+
+        assert_eq!(
+            agent_usage(&p.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((2, 0))
+        );
+        assert!(p.tracker.role_buckets.lock().buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unscoped_is_rate_limited_ignores_role_buckets() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "role:sender-a", 1);
+        SenderRoleActionBudget::scope(Some(budget.clone()), async {
+            assert!(p.record_action());
+            assert!(p.is_rate_limited(), "the role bucket is at its cap");
+            let unscoped = SenderRoleActionBudget::scope(None, async { p.is_rate_limited() });
+            assert!(!unscoped.await, "a None scope lifts the outer budget");
+        })
+        .await;
+        assert!(budget.is_exhausted());
+
+        assert!(
+            !p.is_rate_limited(),
+            "an exhausted role bucket binds only inside its scope"
+        );
+        assert!(p.record_action());
+        assert!(p.is_rate_limited(), "the agent cap binds");
+    }
+
+    #[tokio::test]
+    async fn role_budget_refusal_charges_neither_bucket() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "role:sender-a", 1);
+
+        SenderRoleActionBudget::scope(Some(budget.clone()), async {
+            let scoped = SenderRoleActionBudget::current().expect("budget in scope");
+            assert_eq!(scoped.max_actions_per_hour(), 1);
+            assert_eq!(scoped.label(), "everyone/guest");
+            assert!(p.record_action(), "the first action fits both buckets");
+            assert!(
+                !p.record_action(),
+                "the role bucket refuses a second record"
+            );
+            assert!(p.reserve_action().is_none(), "and a second reservation");
+            assert!(p.is_rate_limited());
+        })
+        .await;
+
+        assert!(budget.is_exhausted());
+        assert!(
+            !p.tracker.is_exhausted(PerSenderTracker::GLOBAL_KEY, 2),
+            "the agent bucket holds exactly one action"
+        );
+        assert_eq!(
+            agent_usage(&p.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((1, 0)),
+            "refused attempts hold no agent slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_budget_still_binds_under_a_looser_role_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "role:sender-a", 100);
+
+        SenderRoleActionBudget::scope(Some(budget), async {
+            assert!(p.record_action());
+            assert!(p.is_rate_limited(), "the agent bucket is at its cap");
+            assert!(!p.record_action());
+            assert!(p.reserve_action().is_none());
+        })
+        .await;
+
+        assert_eq!(
+            role_usage(&p.tracker, "role:sender-a"),
+            Some((1, 0)),
+            "an agent refusal gives its role slot back"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_budgets_with_distinct_keys_are_independent() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let sender_a = role_budget(&p.tracker, "role:sender-a", 1);
+        let sender_b = role_budget(&p.tracker, "role:sender-b", 1);
+
+        SenderRoleActionBudget::scope(Some(sender_a.clone()), async {
+            assert!(p.record_action());
+            assert!(!p.record_action());
+        })
+        .await;
+        assert!(sender_a.is_exhausted());
+        assert!(!sender_b.is_exhausted(), "sender B's bucket is untouched");
+
+        SenderRoleActionBudget::scope(Some(sender_b.clone()), async {
+            assert!(p.record_action(), "sender B has a slot of its own");
+        })
+        .await;
+        assert!(sender_b.is_exhausted());
+    }
+
+    #[tokio::test]
+    async fn zero_role_budget_refuses_every_action_without_a_bucket() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "role:sender-a", 0);
+
+        SenderRoleActionBudget::scope(Some(budget.clone()), async {
+            assert!(p.is_rate_limited());
+            assert!(!p.record_action());
+            assert!(p.reserve_action().is_none());
+        })
+        .await;
+
+        assert!(budget.is_exhausted());
+        assert!(
+            p.tracker.role_buckets.lock().buckets.is_empty(),
+            "a zero cap creates no role bucket"
+        );
+        assert!(
+            p.tracker.buckets.lock().is_empty(),
+            "a refused role slot never reaches the agent bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_reservation_releases_or_commits_both_slots() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "role:sender-a", 100);
+        let agent_key = PerSenderTracker::GLOBAL_KEY;
+
+        SenderRoleActionBudget::scope(Some(budget), async {
+            let reservation = p.reserve_action().expect("both buckets admit");
+            assert_eq!(agent_usage(&p.tracker, agent_key), Some((0, 1)));
+            assert_eq!(role_usage(&p.tracker, "role:sender-a"), Some((0, 1)));
+
+            drop(reservation);
+            assert_eq!(agent_usage(&p.tracker, agent_key), None);
+            assert_eq!(role_usage(&p.tracker, "role:sender-a"), None);
+
+            p.reserve_action()
+                .expect("both buckets admit again")
+                .commit();
+            assert_eq!(agent_usage(&p.tracker, agent_key), Some((1, 0)));
+            assert_eq!(role_usage(&p.tracker, "role:sender-a"), Some((1, 0)));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_reservations_never_overbook_the_role_bucket() {
+        const ROLE_CAP: u32 = 8;
+        const RACERS: usize = 32;
+        let p = std::sync::Arc::new(SecurityPolicy {
+            max_actions_per_hour: 1000,
+            ..SecurityPolicy::default()
+        });
+        let budget = role_budget(&p.tracker, "role:sender-a", ROLE_CAP);
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+        let settle = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+
+        let mut racers = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let p = std::sync::Arc::clone(&p);
+            let start = std::sync::Arc::clone(&start);
+            let settle = std::sync::Arc::clone(&settle);
+            // Spawned tasks start without task-locals, so each racer scopes
+            // its own clone of the budget.
+            let racer = SenderRoleActionBudget::scope(Some(budget.clone()), async move {
+                start.wait().await;
+                let reservation = p.reserve_action();
+                // Every admitted slot stays in flight until all racers have
+                // tried, so none is admitted against a freed slot.
+                settle.wait().await;
+                let admitted = reservation.is_some();
+                if let Some(reservation) = reservation {
+                    reservation.commit();
+                }
+                admitted
+            });
+            racers.push(zeroclaw_spawn::spawn!(racer));
+        }
+        let mut admitted = 0;
+        for racer in racers {
+            if racer.await.expect("racer task") {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(admitted, ROLE_CAP as usize, "the role cap admits exactly N");
+        assert_eq!(
+            role_usage(&p.tracker, "role:sender-a"),
+            Some((ROLE_CAP as usize, 0))
+        );
+        assert_eq!(
+            agent_usage(&p.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((ROLE_CAP as usize, 0)),
+            "refused racers hold no agent slot"
+        );
+    }
+
+    #[test]
+    fn exhausted_role_budget_never_touches_the_agent_bucket() {
+        let p = std::sync::Arc::new(SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        let budget = role_budget(&p.tracker, "role:sender-a", 1);
+        p.reserve_action_within(Some(&budget))
+            .expect("the first action fits both buckets")
+            .commit();
+
+        // While the agent map is locked, any attempt that reaches the agent
+        // bucket blocks. A role refusal must return without one.
+        let agent_buckets = p.tracker.buckets.lock();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = {
+            let p = std::sync::Arc::clone(&p);
+            std::thread::spawn(move || {
+                let _ = sender.send(p.reserve_action_within(Some(&budget)).is_none());
+            })
+        };
+        let refused = receiver.recv_timeout(Duration::from_secs(5));
+        drop(agent_buckets);
+        worker.join().expect("worker thread");
+
+        assert_eq!(
+            refused,
+            Ok(true),
+            "the role refusal must not wait on the agent bucket"
+        );
+        assert_eq!(
+            agent_usage(&p.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((1, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn role_key_equal_to_a_thread_key_names_a_separate_bucket() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&p.tracker, "shared-key", 1);
+
+        let admitted = zeroclaw_api::TOOL_LOOP_THREAD_ID
+            .scope(
+                Some("shared-key".to_string()),
+                SenderRoleActionBudget::scope(Some(budget), async { p.record_action() }),
+            )
+            .await;
+
+        assert!(
+            admitted,
+            "one shared bucket would refuse the role slot behind the agent slot"
+        );
+        assert_eq!(agent_usage(&p.tracker, "shared-key"), Some((1, 0)));
+        assert_eq!(role_usage(&p.tracker, "shared-key"), Some((1, 0)));
+    }
+
+    #[tokio::test]
+    async fn policies_with_distinct_trackers_charge_one_role_bucket() {
+        // A second policy with a tracker of its own admits an action inside
+        // the turn; the role bucket stays in the originating agent's tracker.
+        let caller = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let other = SecurityPolicy {
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        };
+        let budget = role_budget(&caller.tracker, "role:sender-a", 2);
+
+        SenderRoleActionBudget::scope(Some(budget), async {
+            assert!(caller.record_action());
+            assert!(other.record_action());
+            assert!(
+                caller.is_rate_limited(),
+                "the other policy's action counts against the caller's role bucket"
+            );
+            assert!(other.is_rate_limited());
+            assert!(!caller.record_action());
+            assert!(other.reserve_action().is_none());
+        })
+        .await;
+
+        assert_eq!(role_usage(&caller.tracker, "role:sender-a"), Some((2, 0)));
+        assert!(
+            other.tracker.role_buckets.lock().buckets.is_empty(),
+            "the other policy's own tracker holds no role bucket"
+        );
+        assert_eq!(
+            agent_usage(&other.tracker, PerSenderTracker::GLOBAL_KEY),
+            Some((1, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn role_bucket_sweep_keeps_active_buckets_once_the_threshold_is_reached() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 10_000,
+            ..SecurityPolicy::default()
+        };
+        let in_window = role_budget(&p.tracker, "role:in-window", 100);
+        let in_flight = role_budget(&p.tracker, "role:in-flight", 100);
+
+        SenderRoleActionBudget::scope(Some(in_window), async {
+            assert!(p.record_action());
+        })
+        .await;
+        let held = SenderRoleActionBudget::scope(Some(in_flight), async { p.reserve_action() })
+            .await
+            .expect("in-flight slot");
+        {
+            let mut roles = p.tracker.role_buckets.lock();
+            for index in 0..ROLE_BUCKET_SWEEP_THRESHOLD - 3 {
+                roles
+                    .buckets
+                    .insert(format!("role:idle-{index}"), ActionTracker::new());
+            }
+        }
+
+        let first = role_budget(&p.tracker, "role:first-newcomer", 100);
+        assert!(SenderRoleActionBudget::scope(Some(first), async { p.record_action() }).await);
+        assert_eq!(
+            p.tracker.role_buckets.lock().buckets.len(),
+            ROLE_BUCKET_SWEEP_THRESHOLD,
+            "no sweep below the threshold"
+        );
+
+        let second = role_budget(&p.tracker, "role:second-newcomer", 100);
+        assert!(SenderRoleActionBudget::scope(Some(second), async { p.record_action() }).await);
+        {
+            let roles = p.tracker.role_buckets.lock();
+            let mut keys: Vec<&str> = roles.buckets.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "role:first-newcomer",
+                    "role:in-flight",
+                    "role:in-window",
+                    "role:second-newcomer",
+                ],
+                "the sweep keeps the live buckets and drops the idle ones"
+            );
+        }
+        held.commit();
+    }
+
+    #[test]
+    fn role_bucket_sweep_is_not_repeated_on_every_insert_past_the_threshold() {
+        let tracker = PerSenderTracker::new();
+        let has_bucket = |key: &str| tracker.role_buckets.lock().buckets.contains_key(key);
+        let bucket_count = || tracker.role_buckets.lock().buckets.len();
+        let mut live: Vec<String> = (0..=ROLE_BUCKET_SWEEP_THRESHOLD)
+            .map(|index| format!("role:busy-{index}"))
+            .collect();
+        {
+            let mut roles = tracker.role_buckets.lock();
+            for key in &live {
+                let bucket = ActionTracker::new();
+                bucket.record();
+                roles.buckets.insert(key.clone(), bucket);
+            }
+            roles
+                .buckets
+                .insert("role:idle-before".to_string(), ActionTracker::new());
+        }
+
+        // Past the threshold a newcomer sweeps first: the idle bucket goes
+        // and every live one stays.
+        assert!(tracker.role_buckets.lock().reserve("role:newcomer-0", 1));
+        live.push("role:newcomer-0".to_string());
+        assert!(!has_bucket("role:idle-before"));
+        assert!(live.iter().all(|key| has_bucket(key)));
+
+        // The map still holds more live buckets than the threshold, yet the
+        // next newcomers do not sweep again: an idle bucket added now
+        // survives them, and each one grows the map.
+        tracker
+            .role_buckets
+            .lock()
+            .buckets
+            .insert("role:idle-after".to_string(), ActionTracker::new());
+        for index in 1..=8 {
+            let before = bucket_count();
+            let key = format!("role:newcomer-{index}");
+            assert!(tracker.role_buckets.lock().reserve(&key, 1));
+            live.push(key);
+            assert_eq!(bucket_count(), before + 1, "newcomer {index} swept");
+            assert!(has_bucket("role:idle-after"), "newcomer {index} swept");
+        }
+        assert!(live.iter().all(|key| has_bucket(key)));
+
+        // Sweeping resumes as the map keeps growing, and still keeps every
+        // live bucket.
+        let mut index = 9;
+        while has_bucket("role:idle-after") {
+            assert!(
+                live.len() < 4 * ROLE_BUCKET_SWEEP_THRESHOLD,
+                "the role map stopped sweeping idle buckets"
+            );
+            let key = format!("role:newcomer-{index}");
+            assert!(tracker.role_buckets.lock().reserve(&key, 1));
+            live.push(key);
+            index += 1;
+        }
+        assert!(live.iter().all(|key| has_bucket(key)));
+    }
+
+    #[test]
+    fn idle_bucket_sweep_drops_expired_actions_and_keeps_in_flight_slots() {
+        let expired = ActionTracker::new();
+        expired.record();
+        let held = ActionTracker::new();
+        assert!(held.reserve(1));
+        let after_window = expired.state.lock().committed[0]
+            .checked_add(ACTION_WINDOW + Duration::from_secs(1))
+            .expect("test timestamp");
+        let mut buckets =
+            HashMap::from([("expired".to_string(), expired), ("held".to_string(), held)]);
+
+        sweep_idle_buckets(&mut buckets, after_window);
+
+        assert!(!buckets.contains_key("expired"));
+        assert!(buckets.contains_key("held"));
+    }
+
+    #[test]
+    fn role_budget_debug_omits_the_sender_key() {
+        let tracker = PerSenderTracker::new();
+        let budget = role_budget(&tracker, "discord.main:id:zeroclaw_user", 5);
+
+        let debug = format!("{budget:?}");
+
+        assert!(debug.contains("everyone/guest"));
+        assert!(!debug.contains("zeroclaw_user"));
+    }
+
+    #[tokio::test]
+    async fn policy_debug_omits_role_bucket_keys() {
+        let p = SecurityPolicy::default();
+        let key = "discord.main:id:role-debug-sender-7f3a9c";
+        let budget = role_budget(&p.tracker, key, 5);
+        assert!(SenderRoleActionBudget::scope(Some(budget), async { p.record_action() }).await);
+        assert_eq!(role_usage(&p.tracker, key), Some((1, 0)));
+
+        let debug = format!("{p:?}");
+
+        assert!(debug.contains("RoleBuckets"), "got: {debug}");
+        assert!(!debug.contains("role-debug-sender-7f3a9c"), "got: {debug}");
     }
 
     #[test]

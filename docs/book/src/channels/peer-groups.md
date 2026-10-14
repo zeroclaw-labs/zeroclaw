@@ -28,6 +28,8 @@ A `[peer_groups.<name>]` block carries:
 | `ignore` | Per-group blocklist; travels with the resolved peer set and overrides any grant, including a wildcard. Applied by the channel, under that channel's identity rules. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
 | `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
+| `risk_profile` | Sender role: a `[risk_profiles.<alias>]` that narrows turns the group's `external_peers` start on the group's agents. Unset by default. See [Sender roles](#sender-roles). |
+| `runtime_profile` | Sender-role action budget: a `[runtime_profiles.<alias>]` whose `max_actions_per_hour` caps the actions each sender in the role may take per hour, per agent and channel alias. Requires `risk_profile`. Unset by default. See [Action budget](#action-budget). |
 
 ## Resolution
 
@@ -153,3 +155,182 @@ path. If a `/model --agent` invocation reports "not authorized" for a
 sender you expected to be in scope, restart the daemon after editing
 `admin_for_agent_scope` and re-issue the command from a fresh client
 session before drawing further conclusions.
+
+## Sender roles
+
+By default every sender a channel admits gets the same agent, tools, and
+approvals. `risk_profile` lets one agent treat senders in a shared room
+differently: owners keep the agent's profile, everyone else runs narrowed.
+
+```toml
+[agents.helper]
+risk_profile = "owner"            # what the agent itself may do
+
+[risk_profiles.guest]             # identical to "owner" except:
+excluded_tools = ["shell", "file_write", "delegate"]
+always_ask = ["http_request"]
+
+[risk_profiles.guest.approval_route]
+approver_channel = "discord.ops"
+approver_recipient = "123456789012345678"  # the admins' channel id on discord.ops
+
+[peer_groups.everyone]
+channel = "discord.main"
+external_peers = ["*"]
+risk_profile = "guest"
+
+[peer_groups.owners]
+channel = "discord.main"
+external_peers = ["111111111111111111"]
+risk_profile = "owner"
+```
+
+Resolution, per message:
+
+- A group applies when its `channel` matches and its `agents` list is empty
+  or names the agent. A group whose `ignore` names the sender does not apply
+  to them.
+- A sender named in `external_peers` outranks a `"*"` entry, so the owners
+  above are not guests. Name owners in the form the channel reports as the
+  sender. Telegram, for example, reports the username when the user has one
+  and the numeric id only otherwise, so an owner listed by numeric id who has
+  a username is matched as a guest.
+- A sender matching two groups of the same rank that name different profiles
+  is refused with a message, and the turn does not run. Nothing is guessed.
+- No matching role group means the agent's own profile, exactly as before.
+  An admitted sender that no role group matches is not capped by any role:
+  add a `"*"` group to cap everyone the channel admits who is not named
+  elsewhere.
+
+A role only narrows the agent's profile, and only in the four fields a turn
+can change: `excluded_tools` and `always_ask` are added, `auto_approve` keeps
+only what both profiles allow, and `approval_route` is the role's own, or the
+agent's when the role sets none. The role's exclusions apply even when the
+agent runs at `full`. Every other field
+of the role profile must equal the agent's; validation rejects one that
+differs, because sandbox, command, and autonomy settings are fixed when the
+agent's tools are built.
+
+A role's approval prompts go to that route and never fall back to the room,
+even under `inherit-originator`, so a guest cannot approve their own request.
+Only when neither the role nor the agent sets a route do prompts go to the
+room, as the agent's own turns do, where the channel decides who may answer
+(on Discord, anyone it admits). Give guest roles a route, or exclude the tools
+you would otherwise gate. A role turn also starts with an empty "Always"
+list, so an owner's "Always" answer never carries over to guests. A skill
+wrapper counts as the tool it runs: a wrapper over a tool the role excludes
+is excluded too, and one over a tool the role always asks about asks too.
+
+A role turn cannot start work its restrictions would not follow. Its model is
+not offered, and cannot call, any tool that hands work to another run:
+`delegate`, `spawn_subagent`, `pipeline`, and any other tool that starts
+nested execution without carrying the caller's limits; `cron_add`,
+`cron_update`, `cron_run`, and `schedule`, whose jobs run later under the
+agent's profile; `sop_execute`, `sop_advance`, `sop_approve`, and
+`sop_workshop`, whose steps may run as another agent;
+`send_message_to_peer` and `a2a_send`, which make another agent (a local
+peer or an A2A peer) run a turn under its own profile, and `a2a_cancel` over
+those tasks; and `sessions_send`, which plants a message in another session
+for its next turn. A skill wrapper over any of these is excluded as well. Owners, and
+senders no role matches, keep these tools, unless the owners' group adds a
+budget (see [Action budget](#action-budget)).
+
+Current limits:
+
+- A role cannot restrict to an allowlist (`allowed_tools`, `deny_all_tools`);
+  list what to remove in `excluded_tools`.
+- Exclusions are by tool name. Excluding `shell` does not stop other tools
+  that run programs themselves: coding-agent CLIs (`claude_code`,
+  `codex_cli`, `gemini_cli`, `opencode_cli`, `claude_code_runner`),
+  `browser_delegate`, and skill tools that run a command. Exclude every tool
+  on the agent that can run a program, not only `shell`.
+- A role cannot yet carry its limits into delegated, scheduled, SOP, or
+  peer-agent work, so its turns do not reach those tools at all.
+- Roles narrow tools and approvals, and cap actions when they name a budget
+  (see [Action budget](#action-budget)). They add no memory isolation: what
+  a guest turn can recall is whatever the agent's memory scoping already
+  allows. Exclude `memory_recall` for guests if that matters.
+- Like `admin_for_agent_scope`, roles are read from the config snapshot the
+  runtime started with; edits take effect after a restart.
+
+### Action budget
+
+`runtime_profile` gives a role an hourly action budget. Each sender in the
+role gets a budget of their own, kept per agent and channel alias, and an
+action in that sender's turn runs only when it fits both the sender's budget
+and the agent's own:
+
+```toml
+[runtime_profiles.guest]          # identical to the agent's runtime profile except:
+max_actions_per_hour = 5
+
+[peer_groups.everyone]
+channel = "discord.main"
+external_peers = ["*"]
+risk_profile = "guest"
+runtime_profile = "guest"
+```
+
+- The cap is the named profile's `max_actions_per_hour`; there is no second
+  knob. Every other field of that profile must equal the agent's own runtime
+  profile (the built-in defaults, for an agent that names none). Validation
+  rejects one that differs, because those settings are fixed when the agent
+  is built, and a turn whose budget profile differs anyway is refused.
+  `max_cost_per_day_cents` is one of those fields: there is no per-sender
+  cost ceiling.
+- `runtime_profile` requires `risk_profile`. To add only a budget, name the
+  agent's own risk profile there: the role then keeps the agent's approvals,
+  adds the budget, and loses only the tools no budgeted turn can call (see
+  below). Naming the agent's own runtime profile as well gives each sender a
+  budget at the agent's own number. Validation rejects a group that names a
+  budget without a role, and a sender such a group would place is refused
+  rather than run without the budget.
+- A turn with a budget cannot call the tools whose work leaves the turn, even
+  when its role only adds a budget. These are the tools a narrowing role
+  loses, listed under [Sender roles](#sender-roles): `cron_add`,
+  `cron_update`, `cron_run`, and `schedule`; `sop_execute`, `sop_advance`,
+  `sop_approve`, and `sop_workshop`; `send_message_to_peer`, `a2a_send`,
+  `a2a_cancel`, and `sessions_send`; and `delegate`, `spawn_subagent`,
+  `pipeline`, and any other tool that starts nested execution without
+  carrying the caller's limits. A skill wrapper over any of them is excluded
+  too. Every tool call a budgeted turn makes therefore runs inside the turn,
+  where each action the budget counts is charged to it. A tool the role
+  keeps, such as `shell`, counts as one action however much the program it
+  runs does; exclude such tools in a narrowing role if that matters.
+- A budget counts only what the agent's own budget counts. Tools that never
+  charge the action budget, including WASM plugin tools, are counted by
+  neither.
+- A cap of `0` refuses every counted action. A refused action fails with the
+  same "Rate limit exceeded" tool error the agent's own budget produces; the
+  model carries on and the sender still gets a reply. The system prompt
+  keeps quoting the agent's own limit. Each refusal logs a warning that names
+  the role (`<group>/<runtime_profile>`) and its limit.
+- The role's budget is counted per sender, across all of that sender's
+  messages and threads, while the agent's own budget keeps its existing
+  accounting. A cap above the agent's is therefore valid, and whichever
+  budget is spent first refuses the action.
+- Groups of the same rank that match a sender must agree on the budget as
+  well as on the risk profile. When one names a different budget, or one
+  names a budget and the other none, the sender is refused with a message
+  and the turn does not run.
+- A budget is only as strong as the channel's sender identifier. Where the
+  channel reports the platform's immutable user id (Telegram's numeric id),
+  the budget follows that id through renames. Otherwise it follows whatever
+  the channel reports as the sender: Discord user ids and Matrix
+  `@user:server` ids are stable, but on a channel that reports a display
+  name the budget belongs to the name. A sender who renames starts afresh,
+  and two senders who share a name share one budget, so either can spend
+  the other's. Placement is separate: which role, and so which budget, a
+  sender gets is decided by the matching under [Sender roles](#sender-roles),
+  which compares the sender the channel reports rather than the platform id.
+- Budgets are kept in memory, per agent and channel alias. A sender who
+  talks to two agents, or on two aliases of one channel type, has a separate
+  budget for each, and every budget starts over when the daemon restarts,
+  including a config reload, which rebuilds the channel runtime.
+- SOP runs that channel ingress dispatches for a message start before the
+  sender's role is resolved, so they are not part of the turn and run
+  without the budget.
+- Channels served through [gateway webhooks](../architecture/channel-runtime-lifecycle.md#gateway-webhooks)
+  do not run this turn path, so neither roles nor budgets apply to them.
+- Like the rest of sender roles, budgets are read from the config snapshot
+  the runtime started with; edits take effect after a restart.
